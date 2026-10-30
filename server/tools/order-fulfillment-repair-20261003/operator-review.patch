@@ -1,0 +1,751 @@
+--- a/public/operator.html
++++ b/public/operator.html
+@@ -32,7 +32,7 @@
+     <script src="/counting-calculator.js?v=20260923-operator-inventory-v1"></script>
+     <script src="/damage-draft-cache.js?v=20261001-damage-retry-v1"></script>
+     <script src="/operator-inventory.js?v=20261001-damage-retry-v1"></script>
+-    <script src="/operator.js?v=20260930-receiving-multi-yard-v1"></script>
++    <script src="/operator.js?v=20261003-operator-review-uom-v1"></script>
+     <script src="/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1"></script>
+     <script src="/scm-special-alert.js?v=20260928-special-alert-v1"></script>
+   </body>
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -176,6 +176,7 @@
+ let operatorRequests = [];
+ let activeDeliveryDraft = null;
+ let selectedId = initialOperatorState.selectedId || null;
++/** @type {Record<string, any> | null} */
+ let selectedOrder = null;
+ let selectedLineId = initialOperatorState.selectedLineId || null;
+ let orderPage = Number(initialOperatorState.orderPage || 0);
+@@ -184,6 +185,7 @@
+ let pickupConfirming = false;
+ let installPromptEvent = null;
+ let appInstalled = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
++/** @type {Record<string, any> | null} */
+ let fulfillmentOrder = null;
+ /** @type {string[]} */
+ let fulfillmentPhotoDataUrls = [];
+@@ -195,6 +197,7 @@
+ let fulfillmentStatusText = "";
+ let fulfillmentJobStage = "";
+ let fulfillmentStartedAt = 0;
++/** @type {number | null} */
+ let fulfillmentProgressTimer = null;
+ let fulfillmentValidation = null;
+ let fulfillmentReturnModule = "delivery";
+@@ -2117,7 +2120,7 @@
+ 
+ function preparingOrderId() {
+   if (viewMode !== "active") return null;
+-  if (orderLocksCurrentOperator(selectedOrder)) return selectedOrder.netsuite_id || null;
++  if (orderLocksCurrentOperator(selectedOrder)) return selectedOrder?.netsuite_id || null;
+   return orders.find((order) => orderLocksCurrentOperator(order))?.netsuite_id || activeDeliveryDraft?.netsuite_id || null;
+ }
+ 
+@@ -4771,6 +4774,11 @@
+       </section>
+     `, `<button class="secondary-button" data-action="finish-fulfill" type="button">${t("operator.deliveryPrep", "Delivery")}</button>`);
+   }
++  if (order.posting?.loadBlocked) {
++    return shell(t("operator.loadOrder", "Load Order"), escapeHtml(order.tranid),
++      `<section class="fulfillment-screen"><div class="fulfillment-card">${renderLoadPostingStatus(order)}</div></section>`,
++      `<button class="secondary-button" data-action="continue-operator-work" type="button">${t("common.back", "Back")}</button>`);
++  }
+   return shell(t("operator.loadOrder", "Load Order"), `${order.tranid} | ${t("common.location", "Location")} ${currentLocation()?.text || ""}`, `
+     <section class="fulfillment-screen fulfillment-form-screen fulfillment-load-screen ${isReloadLoad ? "reload-fulfillment-screen" : ""}">
+       <div class="fulfillment-notices">
+@@ -7293,20 +7301,28 @@
+   if (fulfillmentOrder?.is_consolidation_load) return confirmConsolidationLoad();
+   if (!fulfillmentOrder || fulfillmentSubmitting) return;
+   if (fulfillmentOrder.posting?.loadBlocked) return;
++  const requestId = fulfillmentLoadRequestId;
++  const orderId = fulfillmentOrder.netsuite_id;
++  const isCurrent = () => fulfillmentOrder?.netsuite_id === orderId && fulfillmentLoadRequestId === requestId;
++  let retryWithNewRequest = false;
+   fulfillmentSubmitting = true;
+   if (fulfillmentOrder.confirmationSummary) {
+     try {
+       const latest = await api(`/api/delivery/orders/${encodeURIComponent(fulfillmentOrder.netsuite_id)}`);
++      if (!isCurrent()) return;
+       if (latest.posting?.loadBlocked) {
+         fulfillmentOrder.posting = latest.posting;
+         fulfillmentSubmitting = false; render(); return;
+       }
+-      if (JSON.stringify(latest.confirmationSummary) !== fulfillmentOrder.loadConfirmationAcknowledged
+-          && !await confirmMissingLoadLines([latest.confirmationSummary])) {
++      const confirmed = JSON.stringify(latest.confirmationSummary) === fulfillmentOrder.loadConfirmationAcknowledged
++        || await confirmMissingLoadLines([latest.confirmationSummary]);
++      if (!isCurrent()) return;
++      if (!confirmed) {
+         fulfillmentSubmitting = false; render(); return;
+       }
+       fulfillmentOrder = { ...latest, loadConfirmationAcknowledged: JSON.stringify(latest.confirmationSummary) };
+     } catch (error) {
++      if (!isCurrent()) return;
+       fulfillmentSubmitting = false; showToast(error.message); render(); return;
+     }
+   }
+@@ -7317,8 +7333,10 @@
+     try {
+       await refreshCustomerPickupPhotoRequirement();
+     } catch {
++      if (!isCurrent()) return;
+       showToast(t("operator.pickupPhotoPolicyUnavailable", "Could not verify the Customer Pickup photo setting. One photo remains required."));
+     }
++    if (!isCurrent()) return;
+   }
+   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
+   const requiredPhotoCount = fulfillmentRequiredPhotoCount();
+@@ -7330,9 +7348,12 @@
+   }
+   if (!localOnlyPosting) {
+     try {
+-      fulfillmentNetSuitePolicy = await loadOperatorNetSuitePostingPolicy(postingFunction);
++      const policy = await loadOperatorNetSuitePostingPolicy(postingFunction);
++      if (!isCurrent()) return;
++      fulfillmentNetSuitePolicy = policy;
+       fulfillmentNetSuitePolicyError = "";
+     } catch (error) {
++      if (!isCurrent()) return;
+       fulfillmentSubmitting = false;
+       fulfillmentNetSuitePolicy = null;
+       fulfillmentNetSuitePolicyError = error.message || "Could not verify the live NetSuite posting mode.";
+@@ -7346,17 +7367,20 @@
+   fulfillmentJobStage = "Saving load";
+   fulfillmentStatusText = "Saving local loaded status...";
+   fulfillmentValidation = null;
+-  window.clearInterval(fulfillmentProgressTimer);
++  window.clearInterval(fulfillmentProgressTimer ?? undefined);
+   fulfillmentProgressTimer = window.setInterval(() => {
+     if (fulfillmentSubmitting) updateUploadElapsed("[data-fulfillment-upload-elapsed]", fulfillmentStartedAt);
+   }, 1000);
++  const progressTimer = fulfillmentProgressTimer;
+   render();
+   try {
+     const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
+     const photoInput = await prepareOperatorBackgroundPhotos(fulfillmentLoadRequestId, photos);
++    const activeOrder = fulfillmentOrder;
++    if (!isCurrent() || !activeOrder) return;
+     const path = currentModule === "customer-pickup-load"
+-      ? `/api/customer-pickup/orders/${fulfillmentOrder.netsuite_id}/load`
+-      : `/api/delivery/orders/${fulfillmentOrder.netsuite_id}/load`;
++      ? `/api/customer-pickup/orders/${activeOrder.netsuite_id}/load`
++      : `/api/delivery/orders/${activeOrder.netsuite_id}/load`;
+     fulfillmentStatusText = fulfillmentNetSuitePolicy?.effective
+       ? "Creating and verifying the NetSuite fulfillment..."
+       : "Saving local loaded status...";
+@@ -7368,10 +7392,11 @@
+         ...photoInput,
+         requestId: fulfillmentLoadRequestId,
+         locationId,
+-        orderType: fulfillmentOrder.order_type || deliveryOrderType,
++        orderType: activeOrder.order_type || deliveryOrderType,
+         netSuitePostingPolicy: operatorNetSuitePolicyToken(fulfillmentNetSuitePolicy)
+       })
+     });
++    if (!isCurrent()) return;
+     resumeOperatorBackgroundPhotos();
+     if (started.status === "error") throw new Error(started.error || "NetSuite posting could not be verified.");
+     if (started.status === "complete" && started.result) {
+@@ -7381,21 +7406,26 @@
+       fulfillmentJobStage = "Posting to NetSuite";
+       fulfillmentStatusText = t("operator.waitingNetSuiteVerification", "Waiting for NetSuite transaction verification...");
+       render();
+-      fulfillmentResult = await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message }) => {
++      const result = await pollOperatorNetSuitePostingJob(started.jobId, ({ stage, message }) => {
++        if (!isCurrent()) return;
+         fulfillmentJobStage = stage;
+         fulfillmentStatusText = message;
+         render();
+       });
++      if (!isCurrent()) return;
++      fulfillmentResult = result;
+     } else {
+       fulfillmentResult = started;
+     }
+     rememberFulfillmentPosting(null);
+     showToast(fulfillmentNetSuitePolicy?.effective ? "NetSuite verified and order loaded" : "Order loaded locally");
+   } catch (error) {
++    if (!isCurrent()) return;
+     const job = error.payload?.posting;
++    retryWithNewRequest = job?.status === "failed";
+     if (job) rememberFulfillmentPosting(["completed", "failed"].includes(job.status) ? null : postingSummaryFromJob(job));
+     else if (error.status >= 400 && error.status < 500 && !["OPERATOR_NETSUITE_POSTING_IN_PROGRESS", "OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED"].includes(error.payload?.code || error.code)) rememberFulfillmentPosting(null);
+-    fulfillmentJobStage = fulfillmentOrder.posting?.loadBlocked ? "Verification pending" : "Load failed";
++    fulfillmentJobStage = fulfillmentOrder?.posting?.loadBlocked ? "Verification pending" : "Load failed";
+     fulfillmentValidation = error.payload?.validation || null;
+     fulfillmentStatusText = fulfillmentValidation
+       ? "Correct the listed packed lines before loading."
+@@ -7403,10 +7433,13 @@
+     showToast(error.message);
+   } finally {
+     resumeOperatorBackgroundPhotos();
+-    window.clearInterval(fulfillmentProgressTimer);
+-    fulfillmentProgressTimer = null;
+-    fulfillmentSubmitting = false;
+-    render();
++    window.clearInterval(progressTimer);
++    if (isCurrent()) {
++      fulfillmentProgressTimer = null;
++      fulfillmentSubmitting = false;
++      if (retryWithNewRequest) fulfillmentLoadRequestId = createOperatorUuid();
++      render();
++    }
+   }
+ }
+ 
+@@ -7463,18 +7496,70 @@
+   return `<div class="sync-alert danger" data-load-posting-status role="status">
+     <strong>${posting.status === "attention" ? "Needs review" : "Verification pending"}${references ? ` · ${escapeHtml(references)}` : ""}</strong>
+     <span>${escapeHtml(posting.reason || "The previous load is being checked. Check its status before continuing.")}</span>
++    <span>This order is held for verification. You can continue with other orders.</span>
+     <button class="secondary-button" data-action="refresh-load-posting" type="button">Check status</button>
++    <button class="primary-button" data-action="continue-operator-work" type="button">Continue with other orders</button>
+   </div>`;
++}
++
++async function continueOperatorWork() {
++  if (currentModule === "receiving-receipt") {
++    stopReceiptCamera();
++    window.clearInterval(receiptProgressTimer ?? undefined);
++    receiptProgressTimer = null;
++    receiptSubmitting = false;
++    receiptOrder = null;
++    receiptRequestId = "";
++    receiptPhotoDataUrls = [];
++    receiptResult = null;
++    receiptStatusText = "";
++    receiptJobStage = "";
++    receiptNetSuitePolicy = null;
++    receiptNetSuitePolicyError = "";
++    receivingSelectedId = null;
++    receivingSelectedOrder = null;
++    receivingSelectedLineId = null;
++    currentModule = "receiving";
++    saveOperatorState();
++    render();
++    return loadReceivingOrders({ keepSelection: false });
++  }
++  const wasPickup = ["customer-pickup-load", "customer-pickup"].includes(currentModule);
++  stopFulfillmentCamera();
++  window.clearInterval(fulfillmentProgressTimer ?? undefined);
++  fulfillmentProgressTimer = null;
++  fulfillmentSubmitting = false;
++  fulfillmentOrder = null;
++  fulfillmentLoadRequestId = "";
++  fulfillmentPhotoDataUrls = [];
++  fulfillmentResult = null;
++  fulfillmentStatusText = "";
++  fulfillmentJobStage = "";
++  fulfillmentValidation = null;
++  fulfillmentNetSuitePolicy = null;
++  fulfillmentNetSuitePolicyError = "";
++  selectedId = null;
++  selectedOrder = null;
++  selectedLineId = null;
++  currentModule = wasPickup ? "customer-pickup-scan" : (fulfillmentReturnModule || "delivery");
++  if (wasPickup) customerPickupScan = "";
++  saveOperatorState();
++  render();
++  if (!wasPickup) await loadOrders({ keepSelection: false });
+ }
+ 
+ async function refreshLoadPostingStatus() {
+   const order = fulfillmentOrder || selectedOrder;
+   if (!order) return;
++  const requestId = fulfillmentLoadRequestId;
++  const isCurrent = () => (fulfillmentOrder || selectedOrder) === order && fulfillmentLoadRequestId === requestId;
+   const refreshed = await api(`/api/delivery/orders/${encodeURIComponent(order.netsuite_id)}`);
++  if (!isCurrent()) return;
+   if (fulfillmentOrder) {
+     const jobId = refreshed.posting?.jobId || fulfillmentOrder.posting?.jobId || loadPostingJournal(order)?.requestId;
+     if (jobId) {
+       const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(jobId)}`).catch(() => null);
++      if (!isCurrent()) return;
+       if (job?.status === "completed") {
+         fulfillmentResult = job.result?.localFinalization || job.result;
+         rememberFulfillmentPosting(null);
+@@ -7843,6 +7928,7 @@
+   const activeOrder = receiptOrder;
+   const requestId = receiptRequestId;
+   const isCurrent = () => receiptOrder === activeOrder && receiptRequestId === requestId;
++  let retryWithNewRequest = false;
+   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(receiptOrder, "receiving");
+   if (!localOnlyPosting) {
+     try {
+@@ -7924,6 +8010,7 @@
+     if (!isCurrent()) return;
+     const error = /** @type {Record<string, any>} */ (caught);
+     const job = error.payload?.posting;
++    retryWithNewRequest = job?.status === "failed";
+     if (job) observeReceiptPostingJob(job);
+     else if (receiptOrder.posting?.status === "submitting" && error.status >= 400 && error.status < 500
+         && ![408, 429].includes(error.status)
+@@ -7947,6 +8034,7 @@
+     if (isCurrent()) {
+       receiptProgressTimer = null;
+       receiptSubmitting = false;
++      if (retryWithNewRequest) receiptRequestId = createOperatorUuid();
+       render();
+     }
+   }
+@@ -8023,14 +8111,15 @@
+ function renderReceiptPostingStatus(posting) {
+   const transactions = posting.transactions || [];
+   const message = posting.status === "attention"
+-    ? "Local verification needs review. This screen will update when it finishes."
+-    : "Checking the existing receipt. This screen will update when receiving is complete.";
++    ? "Local verification needs Admin review. This order is held; you can continue with other orders."
++    : "Checking the existing receipt. You can continue with other orders while verification finishes.";
+   return `<div class="fulfillment-card" data-receipt-posting-status role="status">
+     <strong>${transactions.length ? "NetSuite receipt created" : "Checking receipt status"}</strong>
+     ${transactions.map((/** @type {Record<string, any>} */ transaction) => `<p>Item Receipt <strong>${escapeHtml(transaction.ref)}</strong></p>`).join("")}
+     <p>${message}</p>
+     ${receiptStatusText ? `<p>${escapeHtml(receiptStatusText)}</p>` : ""}
+     <button class="secondary-button" data-action="refresh-receipt-posting" ${receiptSubmitting || posting.checking ? "disabled" : ""} type="button">Check status</button>
++    <button class="primary-button" data-action="continue-operator-work" type="button">Continue with other orders</button>
+   </div>`;
+ }
+ 
+@@ -10015,6 +10104,7 @@
+     if (button.dataset.action === "start-receive") return startReceipt();
+     if (button.dataset.action === "refresh-receipt-posting") return refreshReceiptPostingStatus();
+     if (button.dataset.action === "cancel-receive") {
++      if (receiptOrder?.posting?.receiveBlocked || receiptSubmitting) return continueOperatorWork();
+       stopReceiptCamera();
+       window.clearInterval(receiptProgressTimer ?? undefined);
+       receiptProgressTimer = null;
+@@ -10204,8 +10294,10 @@
+     if (button.dataset.action === "set-packed") return await setOrderStatus("packed");
+     if (button.dataset.action === "edit-reload-packing") return editReloadPacking();
+     if (button.dataset.action === "refresh-load-posting") return refreshLoadPostingStatus();
++    if (button.dataset.action === "continue-operator-work") return continueOperatorWork();
+     if (button.dataset.action === "start-fulfill") return startFulfillment();
+     if (button.dataset.action === "cancel-fulfill") {
++      if (fulfillmentOrder?.posting?.loadBlocked || fulfillmentSubmitting) return continueOperatorWork();
+       stopFulfillmentCamera();
+       currentModule = currentModule === "customer-pickup-load" ? "customer-pickup" : (fulfillmentReturnModule || "delivery");
+       fulfillmentOrder = null;
+--- a/public/service-worker.js
++++ b/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20261001-damage-retry-v1";
++const CACHE_NAME = "mbbs-yard-operator-20261003-operator-review-uom-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -19,7 +19,7 @@
+   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
+   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+-  "/operator.js?v=20260930-receiving-multi-yard-v1",
++  "/operator.js?v=20261003-operator-review-uom-v1",
+   "/manifest.webmanifest",
+   "/icons/mbbs-yard-192.png",
+   "/icons/mbbs-yard-512.png",
+--- a/src/netsuite-transaction-units.js
++++ b/src/netsuite-transaction-units.js
+@@ -0,0 +1,30 @@
++// @ts-check
++const QUANTITY_FIELDS = ['quantity', 'quantityshiprecv', 'netsuite_received_qty',
++  'netsuite_committed_qty', 'netsuite_backordered_qty', 'fulfilled_quantity',
++  'received_quantity', 'signed_quantity', 'ordered_quantity', 'progress_raw', 'cumulative_progress_quantity'];
++
++/** @param {string} message */
++function unresolved(message) {
++  return Object.assign(new Error(message), { code: 'NETSUITE_TRANSACTION_UOM_UNRESOLVED', status: 409 });
++}
++
++/** SuiteQL quantities are base units; REST and webhook transaction values already
++ * use native units and must not pass through this boundary.
++ * @param {Record<string, any>} row */
++export function normalizeNetSuiteTransactionUnits(row) {
++  if (row.unit_id === null || row.unit_id === undefined || row.unit_id === '') {return row;}
++  const factor = Number(row.unit_conversion_rate);
++  if (!Number.isFinite(factor) || factor <= 0) {
++    throw unresolved(`NetSuite unit ${row.unit_id} has no valid conversion rate. Refresh the Units access before syncing.`);
++  }
++  if (factor === 1) {return row;}
++  const converted = { ...row };
++  for (const field of [...QUANTITY_FIELDS, 'rate']) {
++    if (row[field] === null || row[field] === undefined || row[field] === '') {continue;}
++    const value = Number(row[field]);
++    const native = field === 'rate' ? value * factor : value / factor;
++    if (!Number.isFinite(native)) {throw unresolved(`NetSuite returned an invalid ${field} for unit ${row.unit_id}.`);}
++    converted[field] = Number(native.toPrecision(12));
++  }
++  return converted;
++}
+--- a/src/netsuite.js
++++ b/src/netsuite.js
+@@ -1,3 +1,4 @@
++import { normalizeNetSuiteTransactionUnits } from './netsuite-transaction-units.js';
+ import { isSorFeatureEnabled } from './sor-feature-gate.js';
+ import { isFulfillableNetSuiteLine, isCompletedNetSuitePostingOrder } from './netsuite-fulfillable-items.js';
+ import { getOutboundLocationHierarchy, setOutboundLocationDirectory } from "./outbound-location-domain.js";
+@@ -529,6 +530,7 @@
+ }
+ 
+ function normalizeOpenDeliveryLine(line) {
++  line = normalizeNetSuiteTransactionUnits(line);
+   const orderedQuantity = toNumber(line.quantity);
+   return deriveQuantitiesFromSalesQuantity(line, orderedQuantity);
+ }
+@@ -976,8 +978,9 @@
+   const [sourceItems, sourceRows] = await Promise.all([
+     fetchOperatorNetSuiteSourceItemLinesFromNetSuite('SO', id, { rest }),
+     queryAll(`SELECT tl.id, tl.uniquekey, tl.item, tl.kitmemberof, tl.quantity,
+-                    tl.quantityshiprecv, tl.location, i.itemtype, i.usebins, i.islotitem, i.isserialitem
++                    tl.quantityshiprecv, tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate, tl.location, i.itemtype, i.usebins, i.islotitem, i.isserialitem
+                FROM transactionline tl JOIN item i ON i.id = tl.item
++               LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+               WHERE tl.transaction = ${id} AND tl.mainline = 'F' AND tl.taxline = 'F'
+               ORDER BY tl.linesequencenumber`)
+   ]);
+@@ -988,7 +991,7 @@
+     const result = await rest(`/record/v1/kitItem/${kitId}?expandSubResources=true`, { method: 'GET' });
+     kitDefinitions.push(result.data);
+   }
+-  return { sourceItems, sourceRows, kitDefinitions };
++  return { sourceItems, sourceRows: sourceRows.map(normalizeNetSuiteTransactionUnits), kitDefinitions };
+ }
+ 
+ export async function updateTransferOrderStatusInNetSuite(orderId, { intercompany = false, statusId = "B" } = {}) {
+@@ -1821,6 +1824,7 @@
+       tl.quantity,
+       tl.quantityshiprecv AS netsuite_received_qty,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       i.weight AS item_weight,
+       tl.location AS location_id,
+       BUILTIN.DF(tl.location) AS location,
+@@ -1835,6 +1839,7 @@
+     FROM transaction t
+     INNER JOIN transactionline tl ON tl.transaction = t.id
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE t.id = ${id}
+       AND t.type = '${type}'
+       AND tl.item IS NOT NULL
+@@ -1842,7 +1847,7 @@
+       AND ${taxFilter}
+     ORDER BY tl.uniquekey
+   `);
+-  const rows = result.items || [];
++  const rows = (result.items || []).map(normalizeNetSuiteTransactionUnits);
+   if (!rows.length) {
+     const status = await fetchTransactionStatusFromNetSuite(id, type);
+     return status ? { ...status, record_type: type, lines: [] } : null;
+@@ -2296,6 +2301,7 @@
+       tl.quantitycommitted AS netsuite_committed_qty,
+       tl.quantitybackordered AS netsuite_backordered_qty,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       tl.location AS line_location_id,
+       BUILTIN.DF(tl.location) AS line_location,
+       i.weight AS item_weight,
+@@ -2310,6 +2316,7 @@
+     FROM transaction t
+     INNER JOIN transactionline tl ON tl.transaction = t.id
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE ${filter.sql}
+       AND tl.item IS NOT NULL
+       AND tl.mainline = 'F'
+@@ -2317,7 +2324,7 @@
+     ORDER BY t.id, tl.id, tl.uniquekey
+   `);
+   const orders = new Map();
+-  for (const row of rows) {
++  for (const row of rows.map(normalizeNetSuiteTransactionUnits)) {
+     const id = Number(row.id);
+     const kind = String(row.record_type) === "SalesOrd"
+       ? "SO"
+@@ -2521,7 +2528,8 @@
+         event_line.item AS item_id,
+         BUILTIN.DF(event_line.item) AS item_name,
+         ABS(NVL(event_line.quantity, 0)) AS quantity,
+-        BUILTIN.DF(event_line.units) AS unit,
++        BUILTIN.DF(source_line.units) AS unit,
++        source_line.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+         event_line.location AS location_id,
+         BUILTIN.DF(event_line.location) AS location
+       FROM NextTransactionLineLink link
+@@ -2533,13 +2541,14 @@
+       INNER JOIN transactionline event_line
+         ON event_line.transaction = link.nextdoc
+        AND event_line.id = link.nextline
++      LEFT JOIN UnitsTypeUom uom ON uom.internalid = source_line.units
+       WHERE link.previousdoc IN (${chunk.join(",")})
+         AND event_t.type IN ('ItemShip', 'ItemRcpt')
+         AND event_line.item IS NOT NULL
+         AND (event_line.taxline = 'F' OR event_line.taxline IS NULL)
+       ORDER BY link.previousdoc, event_t.id, event_line.id
+     `);
+-    allRows.push(...rows);
++    allRows.push(...rows.map(normalizeNetSuiteTransactionUnits));
+   }
+   const mapped = allRows.map((row) => ({
+     sourceOrderId: Number(row.source_order_id),
+@@ -2640,6 +2649,7 @@
+       tl.quantitybackordered AS netsuite_backordered_qty,
+       tl.quantityshiprecv AS netsuite_received_qty,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       i.weight AS item_weight,
+       tl.location AS location_id,
+       BUILTIN.DF(tl.location) AS location,
+@@ -2653,6 +2663,7 @@
+       i.custitem_topcs AS to_pcs
+     FROM transactionline tl
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE tl.transaction = ${id}
+       AND EXISTS (
+         SELECT 1
+@@ -2690,7 +2701,7 @@
+            BUILTIN.DF(tl.item) AS item_name,
+            i.itemtype AS item_type,
+            i.isfulfillable AS is_fulfillable,
+-           tl.quantity,
++           tl.quantity, tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+            tl.quantityshiprecv AS fulfilled_quantity,
+            tl.location AS location_id,
+            BUILTIN.DF(tl.location) AS location,
+@@ -2702,11 +2713,12 @@
+        AND tl.mainline = 'F'
+        AND tl.taxline = 'F'
+       LEFT JOIN item i ON i.id = tl.item
++      LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+      WHERE t.id = ${id}
+        AND t.type = 'SalesOrd'
+      ORDER BY tl.uniquekey
+   `);
+-  const rows = result.items || [];
++  const rows = (result.items || []).map(normalizeNetSuiteTransactionUnits);
+   if (!rows.length) return null;
+   const header = rows[0];
+   if (isCompletedNetSuitePostingOrder('SO', {status:header.status,statusText:header.status_text})) {
+@@ -2778,6 +2790,7 @@
+         tl.quantitybackordered AS netsuite_backordered_qty,
+         tl.quantityshiprecv AS netsuite_received_qty,
+         BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+         i.weight AS item_weight,
+         tl.location AS location_id,
+         BUILTIN.DF(tl.location) AS location,
+@@ -2791,6 +2804,7 @@
+         i.custitem_topcs AS to_pcs
+       FROM transactionline tl
+       LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+       WHERE tl.transaction IN (${chunk.join(",")})
+         AND EXISTS (
+           SELECT 1
+@@ -2834,6 +2848,7 @@
+       tl.quantity,
+       tl.quantityshiprecv AS netsuite_received_qty,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       i.weight AS item_weight,
+       tl.location AS location_id,
+       BUILTIN.DF(tl.location) AS location,
+@@ -2847,6 +2862,7 @@
+       i.custitem_topcs AS to_pcs
+     FROM transactionline tl
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE tl.transaction = ${id}
+       AND tl.item IS NOT NULL
+       AND tl.mainline = 'F'
+@@ -2985,6 +3001,7 @@
+       tl.quantity,
+       tl.quantityshiprecv AS netsuite_received_qty,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       i.weight AS item_weight,
+       tl.location AS location_id,
+       BUILTIN.DF(tl.location) AS location,
+@@ -2998,6 +3015,7 @@
+       i.custitem_topcs AS to_pcs
+     FROM transactionline tl
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE tl.transaction = ${id}
+       AND tl.item IS NOT NULL
+       AND tl.mainline = 'F'
+@@ -3088,6 +3106,7 @@
+       ABS(NVL(tl.foreignamount, 0)) AS amount,
+       tl.isclosed AS line_closed,
+       BUILTIN.DF(tl.units) AS unit,
++      tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
+       i.weight AS item_weight,
+       tl.location AS location_id,
+       BUILTIN.DF(tl.location) AS location,
+@@ -3106,12 +3125,13 @@
+      AND tl.mainline = 'F'
+      AND (tl.taxline = 'F' OR tl.taxline IS NULL)
+     LEFT JOIN item i ON i.id = tl.item
++    LEFT JOIN UnitsTypeUom uom ON uom.internalid = tl.units
+     WHERE t.id IN (${ids.join(", ")})
+       AND t.type = 'PurchOrd'
+     ORDER BY t.id, tl.uniquekey
+   `);
+   const byId = new Map();
+-  for (const row of rows) {
++  for (const row of rows.map(normalizeNetSuiteTransactionUnits)) {
+     const id = Number(row.id);
+     if (!byId.has(id)) byId.set(id, []);
+     byId.get(id).push(row);
+--- a/src/operator-netsuite-posting-adapter.js
++++ b/src/operator-netsuite-posting-adapter.js
+@@ -117,6 +117,29 @@
+   }
+ }
+ 
++/** @param {Record<string, any>} step @param {number} orderLine @param {Record<string, any>} actual */
++function assertConfirmedNonInventoryLine(step, orderLine, actual) {
++  const snapshots = (step.lineSnapshot || []).filter((/** @type {any} */ line) =>
++    line.autoIncludedNonInventory === true && Number(line.orderLine) === orderLine);
++  if (step.sourceOrderKind !== 'SO' || step.transactionType !== 'IF' || !snapshots.length) {
++    throw mismatch('The recovered NetSuite transaction contains an unexpected positive line.');
++  }
++  const expected = snapshots[0];
++  const units = String(actual.unitsDisplay ?? actual.units?.refName ?? '').trim().toUpperCase();
++  const localLines = new Set();
++  for (const line of snapshots) {
++    const key = `${line.localOrderKey}:${line.localLineId}`;
++    if (localLines.has(key) || !Number.isFinite(line.quantity) || line.quantity <= 0
++        || !line.salesUom || units !== line.salesUom || line.itemId !== expected.itemId
++        || line.location !== expected.location) {
++      throw mismatch(`The recovered NetSuite sales quantity or UOM for line ${orderLine} does not match.`);
++    }
++    localLines.add(key);
++  }
++  assertMatchingLine(orderLine, { ...expected, quantity: snapshots.reduce((/** @type {number} */ sum, /** @type {any} */ line) => sum + line.quantity, 0) }, actual);
++  assertMatchingItem(step, orderLine, actual);
++}
++
+ /**
+  * A recovered record is acceptable only when it proves the same source,
+  * transaction type, external identity, and exact positive line quantities.
+@@ -127,14 +150,18 @@
+ export function verifyOperatorNetSuitePostingRecord(step, record) {
+   const id = assertRecordIdentity(step, record);
+   const expectedItems = /** @type {Record<string, any>[]} */ (step?.payload?.item?.items || []).filter(receivedItem);
+-  const actualItems = recordItems(record).filter(receivedItem);
++  const sourceItems = recordItems(record);
++  if (sourceItems.some((/** @type {Record<string, any>} */ item) => item.itemReceive !== false && item.itemreceive !== false && !Number.isFinite(Number(item.quantity)))) {
++    throw mismatch('The recovered NetSuite transaction contains an invalid quantity.');
++  }
++  const actualItems = sourceItems.filter(receivedItem);
+   if (!expectedItems.length || !actualItems.length) {
+     throw mismatch("The recovered NetSuite transaction has no verifiable positive lines.");
+   }
+   const expectedByLine = itemsByUniqueLine(expectedItems, "expected");
+   const actualByLine = itemsByUniqueLine(actualItems, "recovered");
+-  if (expectedByLine.size !== actualByLine.size) {
+-    throw mismatch("The recovered NetSuite transaction contains an unexpected positive line.");
++  for (const [orderLine, actual] of actualByLine) {
++    if (!expectedByLine.has(orderLine)) {assertConfirmedNonInventoryLine(step, orderLine, actual);}
+   }
+   for (const [orderLine, expected] of expectedByLine) {
+     assertMatchingLine(orderLine, expected, actualByLine.get(orderLine));
+--- a/src/operator-netsuite-posting-domain.js
++++ b/src/operator-netsuite-posting-domain.js
+@@ -178,6 +178,9 @@
+     localLineId: requiredText(line.localLineId, "Local line ID"),
+     ...(sourceLineKey ? { sourceLineKey } : {}),
+     ...(line.itemId ? { itemId: positiveInteger(line.itemId, 'Selected item ID') } : {}),
++    ...(line.autoIncludedNonInventory === true ? { autoIncludedNonInventory: true,
++      itemId: positiveInteger(line.itemId, 'Confirmed non-inventory item ID'),
++      salesUom: requiredText(line.salesUom, 'Confirmed sales UOM').toUpperCase() } : {}),
+     ...(line.directCompletionEventId ? { directCompletionEventId: positiveInteger(line.directCompletionEventId, 'Direct completion event') } : {}),
+     ...(line.kit ? { kit: canonicalValue(line.kit) } : {})
+   };
+@@ -383,6 +386,13 @@
+         sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey
+       });
+       group.lineSnapshot.push(line);
++    }
++    for (const rawLine of rawTarget.confirmedNonInventoryLines || []) {
++      if (sourceOrderKind !== 'SO' || transactionType !== 'IF' || rawLine.autoIncludedNonInventory !== true
++          || group.availableByLine.has(Number(rawLine.orderLine))) {
++        throw inputError('Automatically included non-inventory evidence must identify a separate SO fulfillment line.');
++      }
++      group.lineSnapshot.push(normalizedSelectedLine(rawLine));
+     }
+   }
+ 
+--- a/src/operator-netsuite-posting-targets.js
++++ b/src/operator-netsuite-posting-targets.js
+@@ -345,7 +345,30 @@
+ /** @param {Record<string, any>} order @param {string} functionKey @param {Record<string, any>} source */
+ function targetMetadata(order, functionKey, source) {
+   return { ...(functionKey === "receiving" ? { memo: String(order.tranid || "").trim() } : {}),
+-    ...(source.postingStrategy ? { postingStrategy: source.postingStrategy } : {}) };
++    ...(source.postingStrategy ? { postingStrategy: source.postingStrategy } : {}),
++    confirmedNonInventoryLines: confirmedNonInventoryLines(order, functionKey, source) };
++}
++
++/** Capture evidence separately from the inventory-only transform payload.
++ * @param {Record<string, any>} order @param {string} functionKey @param {Record<string, any>} source */
++function confirmedNonInventoryLines(order, functionKey, source) {
++  if (functionKey === 'receiving' || source.sourceOrderKind !== 'SO') {return [];}
++  const memberKeys = new Set((source.kitGroups || []).flatMap((/** @type {any} */ group) =>
++    group.members.map((/** @type {any} */ member) => String(member.sourceLineKey))));
++  return (order.lines || []).filter((/** @type {any} */ line) => line.item_type === 'NonInvtPart'
++    && line.confirmed === true && line.netsuite_active !== false && hasPackedQuantity(line)
++    && !memberKeys.has(String(line.line_id))).flatMap((/** @type {any} */ line) => {
++    const matches = (source.nonInventoryLines || []).filter((/** @type {any} */ row) =>
++      String(row.source_line_key) === String(line.line_id) && Number(row.item_id) === Number(line.item_id));
++    const row = matches[0], quantity = fulfillmentLineQuantity(line);
++    const salesUom = String(line.unit || '').trim().toUpperCase();
++    if (matches.length !== 1 || !positiveInteger(row.netsuite_order_line) || !salesUom
++        || salesUom !== String(row.unit || '').trim().toUpperCase() || !(quantity > 0)) {return [];}
++    return [{ orderLine: Number(row.netsuite_order_line), itemId: Number(line.item_id), quantity,
++      salesUom, location: Number(line.location_id || order.outbound_location_id),
++      sourceLineKey: String(line.line_id), localOrderKey: localOrderKey(functionKey, order),
++      localLineId: String(line.id), autoIncludedNonInventory: true }];
++  });
+ }
+ 
+ /** @param {any} source */
+@@ -654,7 +677,7 @@
+   if (sourceOrderKind === "SO") {
+     rows = await runQuery(
+       `SELECT line.line_id AS source_line_key,
+-              line.netsuite_order_line, line.item_id, line.item_type, line.quantity,
++              line.netsuite_order_line, line.item_id, line.item_type, line.quantity, line.unit,
+               line.loaded_qty AS cached_completed_qty, false AS cached_closed,
+               COALESCE(line.location_id, parent.outbound_location_id) AS location_id
+          FROM sales_order_lines line
+@@ -740,6 +763,8 @@
+       }
+     }
+   }
++  const nonInventoryLines = functionKey !== 'receiving' && sourceOrderKind === 'SO'
++    ? (rows.rows || []).filter((/** @type {any} */ row) => row.item_type === 'NonInvtPart') : [];
+   const ignoredSourceKeys = new Set(functionKey === "receiving" ? [] : (rows.rows || [])
+     .filter((/** @type {Record<string, any>} */ row) => row.item_type === "NonInvtPart")
+     .map((/** @type {Record<string, any>} */ row) => String(row.source_line_key)));
+@@ -748,7 +773,7 @@
+   if (sourceOrderKind === 'SO' && (rows.rows || []).some((/** @type {any} */ row) => row.item_type === 'Kit')) {
+     if (typeof fetchKitSource !== 'function') { throw operatorKitError('The authoritative kit reader is unavailable.'); }
+     const source = await fetchKitSource(sourceNetSuiteId);
+-    return { ...source, availableLines: source.availableLines.filter((/** @type {Record<string, any>} */ line) =>
++    return { ...source, nonInventoryLines, availableLines: source.availableLines.filter((/** @type {Record<string, any>} */ line) =>
+       !ignoredSourceKeys.has(String(line.sourceLineKey))),
+       sourceOrderKind, sourceNetSuiteId, sourceOrderRef, postingStrategy: STORED_ORDER_LINE_STRATEGY };
+   }
+@@ -758,7 +783,7 @@
+     const storedLines = storedOperatorPostingLines(sourceRows);
+     const availableLines = sourceOrderKind === "PO" && fetchPoReceiptLines
+       ? refreshPoReceiptAvailability(storedLines, await fetchPoReceiptLines(sourceNetSuiteId)) : storedLines;
+-    return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef,
++    return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef, nonInventoryLines,
+       postingStrategy: STORED_ORDER_LINE_STRATEGY,
+       availableLines };
+   }

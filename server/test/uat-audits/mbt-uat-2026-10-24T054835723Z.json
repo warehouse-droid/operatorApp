@@ -1,0 +1,54 @@
+{
+  "startedAt": "2026-10-24T05:48:35.723Z",
+  "finishedAt": "2026-10-24T05:48:42.027Z",
+  "exitCode": 0,
+  "sourceHashes": {
+    "src": "6269e726f2b1f5a2047f2ef1f2809b2e7a8d20d3c3b21b8796fa19e2e13f8234",
+    "public": "892442a12cf27207ba3465cb8e6bba761b8332a8d794d5ada77a346180a49b2f",
+    "migrations": "799bd4e6d99b9bfa64a82add14284a31d8a962dbf07213b019a079946f1291ff"
+  },
+  "sourceDrift": [],
+  "isolation": "Disposable Compose; fresh database per file; external integrations disabled",
+  "toolchain": {
+    "node": "v20.20.2",
+    "playwright": "1.62.1"
+  },
+  "tests": 5,
+  "pass": 5,
+  "fail": 0,
+  "cancelled": 0,
+  "skipped": 0,
+  "todo": 0,
+  "fileCount": 2,
+  "files": [
+    {
+      "file": "test/mbt/integration/bin-dump-charge.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "dump charge: DUMPGARBAGE/cash waits for completed collection and replay stays single",
+        "dump charge: GARBAGE/card waits for completed collection and replay stays single",
+        "dump charge: SOIL/cash waits for completed collection and replay stays single",
+        "dump charge: DUMP_GARBAGE/cash waits for completed collection and replay stays single"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-uat-garbage-charge.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "UAT H02/P11: 2.5 tonnes at 120 dollars creates one 300-dollar garbage charge only after collection completion"
+      ]
+    }
+  ],
+  "passed": true,
+  "runtime": "/home/ubuntu/apps/operatorApp/server/deployments/bin-weight-warning-20261024/candidate"
+}

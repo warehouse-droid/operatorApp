@@ -16,3 +16,31 @@ docker/backups/
 # Local deployment backups and generated Python caches
 /backups/
 __pycache__/
+
+# Local operational records and generated release/test copies (never source).
+/server/artifacts/
+/server/deployments/
+/server/operational-audits/
+/server/reports/
+*.private.json
+*.orig
+*.rej
+*.log
+*.dump
+*.backup
+test.env
+/server/tools/**/baseline*/
+/server/tools/**/candidate*/
+/server/tools/**/workspace-before*/
+/server/tools/**/workspace-pre-merge/
+/server/tools/**/original-baseline/
+/server/tools/**/original-candidate/
+/server/tools/**/release-baseline*/
+/server/tools/**/live-before*/
+/server/tools/**/live-refresh/
+/server/tools/**/local-before/
+/server/tools/**/worker-candidate/
+/server/tools/**/prior-contract-tests/
+/server/tools/dispatch-grouping-reliability-20261020/tests/
+/server/tools/split-draft-identity-20261020/tests/
+/server/tools/special-shared-orders-20261009/worker/

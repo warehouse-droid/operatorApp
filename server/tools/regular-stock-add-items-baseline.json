@@ -1,0 +1,37 @@
+{
+  "source": "Unchanged live image mbbs-operator-app:backorder-po-alerts-20261027",
+  "sourceHashes": {
+    "src": "f6f6dcb0e3696a78ddabc9ea67e7fe48abec8af25b99e538d612c7829cfc1ca6",
+    "public": "4b535d88d5c884ecaf74cc94609d895b00d102e641956c457dd43e51cb6174d8",
+    "migrations": "42cff455692205a6862188df9c0f4e0ac8b5f4ab7cc28442f7f20e63713adddb"
+  },
+  "files": [
+    {
+      "file": "test/mbt/integration/special-sales-items-copy-http.test.js",
+      "tests": 10,
+      "pass": 9,
+      "fail": 1,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft",
+        "HTTP appends require Sales role, yard access and enabled workflow; anonymous and outside-yard edits change nothing",
+        "HTTP revision conflict and hostile batch validation leave old items, draft, revision and events unchanged",
+        "HTTP rejects additions after orders, closure, remote submission, uncertain operations and pending reviews",
+        "HTTP combined count accepts exactly 100 items and rejects 101 without inserting anything",
+        "database failure on the second insert rolls back the first, SO draft deletion, revision bump and event",
+        "concurrent appends commit once per revision; rejected duplicate submission adds no duplicate lines",
+        "order claim and append serialize on the same row and never leave a claimed SO with an unreviewed new item",
+        "direct item update rejects a missing actor and preserves the request",
+        "hostile item fields cannot mark new items reviewed, alter prices or replace the existing vendor and header",
+        "failing tests:",
+        "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft"
+      ],
+      "failedNames": [
+        "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft"
+      ],
+      "failure": "\u2716 failing tests:\n\ntest at test/mbt/integration/special-sales-items-copy-http.test.js:55:1\n\u2716 HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft (806.347873ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  + actual - expected\n  \n  + 'await_customer_confirmation'\n  - 'confirmed'\n      at TestContext.<anonymous> (file:///app/test/mbt/integration/special-sales-items-copy-http.test.js:56:72)\n      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n      at async Test.run (node:internal/test_runner/test:797:9)\n      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {\n    generatedMessage: true,\n    code: 'ERR_ASSERTION',\n    actual: 'await_customer_confirmation',\n    expected: 'confirmed',\n    operator: 'strictEqual'\n  }\nIsolated mbt-uat run failed in 1/1 file(s): test/mbt/integration/special-sales-items-copy-http.test.js\n"
+    }
+  ]
+}

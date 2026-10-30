@@ -3,6 +3,43 @@ import { query } from "../db.js";
 import { getDispatchPlanEditLease } from "../dispatch-plan-lease-repository.js";
 import { assertPlanningAccess, planningDate, planningError, readPlanningPlan } from "./bin-planning-repository.js";
 import { projectMbtBinPlanningCard } from "./bin-dispatch-service.js";
+import { planningCapacityWarnings } from "./bin-planning-capacity.js";
+
+/** @param {any} visit @param {Map<string, any>} plans */
+async function planningCard(visit, plans) {
+  const card=await projectMbtBinPlanningCard(visit);
+  const planId=visit.dispatch_plan_id ? String(visit.dispatch_plan_id) : null;
+  if (planId && !plans.has(planId)) {plans.set(planId,await readPlanningPlan(planId));}
+  const plan=planId ? plans.get(planId) : null;
+  return {...card,assignment:visit.dispatch_assignment_snapshot,loadId:visit.dispatch_load_id,
+    planningGeneration:Number(visit.planning_generation),...assignmentSummary(plan,visit)};
+}
+
+/** @param {any} plan @param {any} visit */
+function assignmentSummary(plan,visit) {
+  const result={dispatchPlanned:false,dispatchPlanId:visit.dispatch_plan_id || null,dispatchPlanDate:null,
+    dispatchLoadId:null,dispatchTruckPlate:null,dispatchLoadName:null};
+  if (!plan) {return result;}
+  for (const truck of plan.trucks) {
+    const load=truck.loads.find((/** @type {any} */ l)=>String(l.id)===String(visit.dispatch_load_id));
+    if (load) {return {dispatchPlanned:true,dispatchPlanId:String(plan.id),dispatchPlanDate:plan.planDate,
+      dispatchLoadId:load.id,dispatchTruckPlate:truck.plate,dispatchLoadName:load.name};}
+  }
+  return result;
+}
+
+/** Linked cards are needed even when search or pagination excludes them.
+ * @param {any[]} cards @param {Map<string,any>} plans */
+async function linkedPlanningCards(cards,plans) {
+  const present=new Set(cards.map(card=>card.mbt.visitId));
+  const ids=[...new Set(cards.flatMap(card=>[card.workflow?.linkedDeliveryVisitId,card.workflow?.linkedCollection?.visitId])
+    .filter(id=>id && !present.has(id)))];
+  if (!ids.length) {return [];}
+  const visits=await query('SELECT * FROM mbt_service_visits WHERE service_visit_id=ANY($1::uuid[]) ORDER BY service_visit_id',[ids]);
+  const linked=[];
+  for (const visit of visits.rows) {linked.push(await planningCard(visit,plans));}
+  return linked;
+}
 
 /** @param {any} input @param {any} boundary */
 export async function getMbtBinPlanning(input, boundary) {
@@ -12,14 +49,19 @@ export async function getMbtBinPlanning(input, boundary) {
   const limit = Math.min(100, Math.max(1, Number.parseInt(input.limit, 10) || 40));
   const search = String(input.search || "").trim().slice(0, 200);
   const params = [search];
-  const predicate = `v.bin_type_id IS NOT NULL AND v.dispatch_plan_id IS NULL
+  const available = `v.dispatch_plan_id IS NULL
     AND v.status IN ('tentative','ready','in_progress','evidence_pending')
     AND (part.visit_id IS NOT NULL OR (bin_order.order_id IS NOT NULL AND bin_order.configuration IS NULL)
       OR (bin_order.order_id IS NULL AND v.status<>'tentative'
     AND (v.predecessor_visit_id IS NULL OR predecessor.status IN ('completed','cancelled'))
     AND NOT EXISTS (SELECT 1 FROM mbt_service_visits earlier WHERE earlier.contract_id=v.contract_id
       AND earlier.service_line_id IS NOT DISTINCT FROM v.service_line_id
-      AND earlier.visit_number<v.visit_number AND earlier.status NOT IN ('completed','cancelled'))))
+      AND earlier.visit_number<v.visit_number AND earlier.status NOT IN ('completed','cancelled'))))`;
+  const searchable = `(part.visit_id IS NOT NULL
+    OR (bin_order.order_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM mbt_bin_order_parts p WHERE p.order_id=bin_order.order_id))
+    OR (bin_order.order_id IS NULL AND v.service_snapshot->'binWorkflow'->>'orderId' IS NULL
+      AND ((${available}) OR v.dispatch_plan_id IS NOT NULL OR v.status='completed')))`;
+  const predicate = `v.bin_type_id IS NOT NULL AND ${search ? searchable : available}
     AND ($1='' OR concat_ws(' ',v.visit_reference,part.display_reference,bin_order.display_reference,v.service_action,c.contract_number,v.customer_snapshot::text,
       v.site_snapshot::text,(SELECT string_agg(a.asset_code,' ') FROM mbt_bin_assets a
         WHERE a.asset_id IN (v.expected_asset_id,v.outgoing_asset_id,v.incoming_asset_id))) ILIKE '%' || $1 || '%')`;
@@ -34,12 +76,12 @@ export async function getMbtBinPlanning(input, boundary) {
   const plan = planRow.rows[0] ? await readPlanningPlan(planRow.rows[0].id) : null;
   const assigned = plan ? await query(`SELECT v.*,c.contract_number FROM mbt_service_visits v
     JOIN mbt_contracts c ON c.contract_id=v.contract_id WHERE v.dispatch_plan_id=$1 ORDER BY v.visit_number,v.service_visit_id`, [plan.id]) : { rows: [] };
+  const plans = new Map(plan ? [[plan.id,plan]] : []);
   const items = [];
-  for (const visit of candidates.rows) {items.push(await projectMbtBinPlanningCard(visit));}
+  for (const visit of candidates.rows) {items.push(await planningCard(visit,plans));}
   const assignedItems = [];
   for (const visit of assigned.rows) {
-    assignedItems.push({ ...(await projectMbtBinPlanningCard(visit)), assignment: visit.dispatch_assignment_snapshot,
-      loadId: visit.dispatch_load_id, planningGeneration: Number(visit.planning_generation) });
+    assignedItems.push(await planningCard(visit,plans));
   }
   const drivers = await query("SELECT id::text,name,login,active FROM dispatch_drivers WHERE active ORDER BY lower(name),id");
   const trucks = await query(`SELECT t.id::text,t.plate,t.capacity_lbs AS "capacityLbs",t.truck_type AS "truckType",
@@ -48,10 +90,10 @@ export async function getMbtBinPlanning(input, boundary) {
     FROM dispatch_trucks t LEFT JOIN dispatch_truck_bin_types c ON c.truck_id=t.id AND c.active
     LEFT JOIN mbt_bin_types b ON b.bin_type_id=c.bin_type_id AND b.active
     WHERE t.active AND t.truck_type='bin' AND t.bin_service_enabled GROUP BY t.id ORDER BY lower(t.plate)`);
-  return { planDate: date, plan, lease: await getDispatchPlanEditLease(date),
+  return { planDate: date, plan, capacityWarnings:await planningCapacityWarnings(plan),lease: await getDispatchPlanEditLease(date),
     pool: { items, total: count.rows[0].total, offset, limit,
       nextOffset: offset + limit < count.rows[0].total ? offset + limit : null },
-    assigned: assignedItems, drivers: drivers.rows, trucks: trucks.rows };
+    assigned: assignedItems, linked: await linkedPlanningCards([...items,...assignedItems],plans), drivers: drivers.rows, trucks: trucks.rows };
 }
 
 /** @param {any} input @param {any} boundary */
@@ -66,6 +108,6 @@ export async function getMbtBinPlanningVisit(input, boundary) {
   const evidence = await query("SELECT evidence_id,evidence_type,captured_at,recorded_at FROM mbt_evidence WHERE service_visit_id=$1 ORDER BY captured_at", [input.visitId]);
   const workflowEvents=await query(`SELECT action,details,created_at FROM mbt_bin_workflow_events
     WHERE visit_id=$1 OR order_id=$1 ORDER BY created_at DESC LIMIT 100`,[input.visitId]);
-  return { visit: await projectMbtBinPlanningCard(rows[0]), steps: steps.rows, history: history.rows,
+  return { visit: await planningCard(rows[0],new Map()), steps: steps.rows, history: history.rows,
     assignments: assignments.rows, events: [...events.rows,...workflowEvents.rows], evidence: evidence.rows };
 }

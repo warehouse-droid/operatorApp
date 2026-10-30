@@ -1,0 +1,45 @@
+{
+  "passed": true,
+  "counts": {
+    "tests": 60,
+    "pass": 58,
+    "fail": 0,
+    "skipped": 2
+  },
+  "groups": {
+    "focused": {
+      "tests": 53,
+      "pass": 53,
+      "fail": 0,
+      "skipped": 0
+    },
+    "scm-alerts": {
+      "tests": 7,
+      "pass": 5,
+      "fail": 0,
+      "skipped": 2
+    }
+  },
+  "sourceHashes": {
+    "public/stock-request-alert-list.js": "3655474ae637bb3450886fdd5272bf1eaff4e5a17cf30f76ffe3f8d8a62fd9c5",
+    "public/regular-stock-alert.js": "77a38831f0a4ee069659e4eda5a2d2f3ccad1a28cd34673f1822209b5d5f31bb",
+    "public/sales-special-alert.js": "36256e8b710b0cea22f65f11ee4f729681b694d99b474d90c50ddc024e84d021",
+    "public/scm-special-alert.js": "51de19eae128dc2323d3b4943d2297d5c90d8dad12e7f84d2ca7c5189daf34d4",
+    "public/stock-request-conversation-alert.js": "3e081f7ba18f60640750a02237374e801769b823835ed9f65b5e5713829cd838",
+    "public/special-po-reference-alert.js": "a611723fa2e1ca7ff243ccfc2960b850a5f9306954740adc9903e14476bc1097",
+    "public/special-delivery-method-alert.js": "2e8eeeafb98bd2b70a511dd021c1c1fd1fe8b5276870cb46e8948c4256ae317b",
+    "public/app-sidebar.js": "9b4e141ceb64b2b6aab7f10d94a7acf76301de02c8e3acb54320395a23858dd1",
+    "public/sales-stock-requests.html": "b4e15698674f2c245dc856cab7d82207e91aec35560ade76bbcf293dfaed6d41",
+    "public/scm-stock-requests.html": "d5d010da42dcf6e6dd81fb2f4f3f7f46574061f57ade3b96e6b7fd630e747402",
+    "src/special-stock-alerts.js": "1c86ca1e33a901efab84e4ea8e1bf643db6b090971cf2bf140c22babfb4377e5",
+    "src/regular-stock-request-service.js": "2c7f0be54e03c6f864354cc796fd6d8a45d9d35b547a8917f7cd85ea9c488e51",
+    "src/backorder-request-service.js": "444d84f56a8aced683c6f1db4ef34e102da3a69a9d6b21f0ea9cab66395b1ece",
+    "src/server.js": "7e2d63e5ceb831d9990bb3ebfeeb287ba91cc470943c015eb52d1505b007d2f8",
+    "src/stock-request-conversation.js": "1f3f53d2a1dfc5d2f46334b7ab3789796a0c964d4a4dce58e6634ce9322b3924",
+    "src/stock-request-conversation-router.js": "81258b3172c8357452baf7cd5e63ffd17f2df144c34ea6e5cbd153b46042ce00",
+    "public/dispatch-special-stock.js": "fee85c4f30d69780ad4084ec005a7b253b27a8c8b863a09c8608e1073694b0ae",
+    "public/dispatch-special-stock.html": "1c566959f428c0697eb8cc8fa4dd5f9a34c84cf7c3bde63eca330708bc27b3fd"
+  },
+  "scope": "All pending requests appear in a list across stock alerts and conversations; multiple updates combine per request; opening the list makes no acknowledgements; requester/yard scopes and mute preferences retained.",
+  "historicalSuiteLimitation": "The exploratory broader run passed 59/60 tests. The remaining old Transfer ETA test expects a manually entered date; the existing production SCM interface uses SO placement +5 working days. ETA implementation is outside this change; only alert regressions from that shared file are selected here."
+}

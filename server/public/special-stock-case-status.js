@@ -116,11 +116,14 @@ function planningOrderCard(detail, value, compact, { audience, showOrderPreviews
   const preview = showOrderPreviews && !compact && !skipped && id && (audience === 'scm' || kind === 'sales_order');
   const nativeStatus = label === 'SO' ? detail.salesOrderStatus : detail.purchaseOrderStatus;
   const completed = completionTime(/** @type {any} */ (progress).completedAt);
-  return `<${tag} class="special-planning-order${progress.success ? ' is-planned' : ''}"><span><strong>${label} ${escape(skipped ? 'creation skipped (test)' : reference || id)}</strong><small class="special-planning-order-status">${escape(progress.text)}</small>
+  const referenceHtml = `<strong>${label} ${escape(skipped ? 'creation skipped (test)' : reference || id)}</strong>`;
+  const previewButton = preview ? `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">Preview ${label}</button>` : '';
+  const inlinePreview = audience === 'sales' && preview;
+  return `<${tag} class="special-planning-order${progress.success ? ' is-planned' : ''}"><span>${inlinePreview ? `<span class="special-sales-order-reference">${referenceHtml}${previewButton}</span>` : referenceHtml}<small class="special-planning-order-status">${escape(progress.text)}</small>
     ${completed ? `<small class="special-planning-completed-time">${completed}</small>` : ''}
     ${!compact && audience !== 'sales' && nativeStatus ? `<small>NetSuite: ${escape(nativeStatus)}</small>` : ''}
     ${progress.arrival ? `<small class="special-planning-eta">${escape(progress.arrival)}</small>` : ''}</span>
-    ${preview ? `<button type="button" data-special-document="${kind}" data-case-id="${escape(detail.id)}">Preview ${label}</button>` : ''}
+    ${inlinePreview ? '' : previewButton}
     ${label === 'PO' && audience === 'scm' && !compact && id && !skipped ? purchaseOrderActions : ''}</${tag}>`;
 }
 

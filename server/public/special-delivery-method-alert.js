@@ -1,5 +1,6 @@
 /* global HTMLElement, MutationObserver */
 import { specialFulfillmentLabel } from './special-stock-fulfillment.js';
+import {openStockRequestAlertList,requestAlertLink} from './stock-request-alert-list.js?v=20261022-v1';
 
 const appWindow = /** @type {Window & Record<string,any>} */ (window);
 const tokenKeys = ['mbbs.staff.token', 'mbbs.dispatch.token', 'mbbs.control.token', 'mbbs.operator.token'];
@@ -9,19 +10,27 @@ let session = '', generation = 0, checking = false, refreshing = false, again = 
 /** @type {string[]} */ let audiences = [];
 /** @type {any[]} */ let alerts = [];
 /** @type {HTMLDialogElement|null} */ let dialog = null;
+/** @type {any} */ let shown = null;
 /** @type {HTMLButtonElement|null} */ let badge = null;
 /** @type {HTMLElement|null} */ let previousFocus = null;
 /** @type {{addEventListener:Function,close:Function}|null} */ let events = null;
 const headers = () => ({ Accept: 'application/json', Authorization: `Bearer ${session}` });
+let allUpdates=null;
+function openAllUpdates() {
+  allUpdates=openStockRequestAlertList({title:'Special delivery changes',session,rows:alerts.map(notice=>({
+    requestRef:notice.requestRef,category:'Special',summary:`${specialFulfillmentLabel(notice.beforeMethod)} → ${specialFulfillmentLabel(notice.fulfillmentMethod)} · ${notice.yardName}`,
+    href:notice.audience==='scm'?requestAlertLink('scm','special',notice.requestId,notice.requestRef):'/dispatch/special-stock?requestId='+notice.requestId}))});
+}
 /** @param {number} version */
 const live = version => version === generation && token() === session;
 
 function removeDialog() {
-  dialog?.remove(); dialog = null;
+  dialog?.remove(); dialog = null; shown = null;
   if (previousFocus?.isConnected) { previousFocus.focus(); }
   previousFocus = null;
 }
 function stop() {
+  allUpdates?.close();allUpdates=null;
   generation++; checking = false; refreshing = false; again = false; audiences = []; alerts = [];
   window.clearInterval(timer); window.clearTimeout(retry); timer = 0; retry = 0;
   events?.close(); events = null; badge?.remove(); badge = null; removeDialog();
@@ -38,7 +47,7 @@ function paintBadge() {
     || document.querySelector('.dispatch-topbar,.topbar,.mbt-app-topbar') || document.body;
   if (!badge) {
     badge = document.createElement('button'); badge.type = 'button'; badge.className = 'special-delivery-method-alert';
-    badge.addEventListener('click', () => { paint(); void refresh(); });
+    badge.addEventListener('click',openAllUpdates);
   }
   if (badge.parentElement !== host) { host.append(badge); }
   if (badge.hidden !== !alerts.length) { badge.hidden = !alerts.length; }
@@ -65,10 +74,10 @@ async function acknowledge(notice, button, message, version) {
 }
 /** @param {any} notice */
 function show(notice) {
-  const version = generation;
+  const version = generation; shown = notice;
   previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const modal = document.createElement('dialog'); dialog = modal; modal.className = 'special-delivery-method-dialog';
-  modal.setAttribute('aria-labelledby', 'special-delivery-method-title');modal.dataset.osNotificationId=`special-delivery-method:${notice.audience}:${notice.id}`;
+  modal.setAttribute('aria-labelledby', 'special-delivery-method-title');modal.dataset.osNotificationId=`special-delivery-method:${notice.audience}:${notice.id}`;modal.dataset.notificationRole=notice.audience;
   const title = document.createElement('h2'); title.id = 'special-delivery-method-title'; title.textContent = 'Delivery method changed';
   const reference = document.createElement('p'); reference.textContent = notice.requestRef; reference.className = 'special-delivery-method-reference';
   const method = document.createElement('p'); method.textContent = `${specialFulfillmentLabel(notice.beforeMethod)} → ${specialFulfillmentLabel(notice.fulfillmentMethod)}`;
@@ -86,19 +95,22 @@ function show(notice) {
   const button = document.createElement('button'); button.type = 'button'; button.textContent = 'Acknowledge';
   button.addEventListener('click', () => void acknowledge(notice, button, message, version));
   modal.addEventListener('cancel', event => event.preventDefault());
-  controls.append(link, button); modal.append(title, reference, method, yard, orders, instruction, message, controls);
+  const all=document.createElement('button');all.type='button';all.textContent='View all updates';all.addEventListener('click',openAllUpdates);
+  controls.append(link,all,button); modal.append(title, reference, method, yard, orders, instruction, message, controls);
   document.body.append(modal); modal.showModal();
 }
 function paint() {
   if (!audiences.length) { return; }
   paintBadge();
-  for(const notice of alerts) {
+  if(dialog && appWindow.MBBSOSNotifications?.allowsRole(shown?.audience)===false) {removeDialog();}
+  const eligible=alerts.filter(notice=>appWindow.MBBSOSNotifications?.allowsRole(notice.audience)!==false);
+  for(const notice of eligible) {
     void appWindow.MBBSOSNotifications?.notify({id:`special-delivery-method:${notice.audience}:${notice.id}`,title:'Delivery method changed',
       body:`${notice.requestRef} · ${specialFulfillmentLabel(notice.beforeMethod)} → ${specialFulfillmentLabel(notice.fulfillmentMethod)} · ${notice.yardName}`,
-      url:notice.audience==='scm'?'/scm/stock-requests?tab=special&search='+encodeURIComponent(notice.requestRef):'/dispatch/special-stock',session});
+      url:notice.audience==='scm'?'/scm/stock-requests?tab=special&search='+encodeURIComponent(notice.requestRef):'/dispatch/special-stock',role:notice.audience,session});
   }
-  if (document.hidden || dialog || !alerts.length || document.querySelector('dialog[open],[role="dialog"][aria-modal="true"]')) { return; }
-  show(alerts[0]);
+  if (document.hidden || dialog || !eligible.length || document.querySelector('dialog[open],[role="dialog"][aria-modal="true"]')) { return; }
+  show(eligible[0]);
 }
 /** @param {Response} response */
 function authorized(response) {
@@ -123,7 +135,7 @@ async function refresh() {
     }
     // Leave a visible notice intact until its owner acknowledges it. New notices
     // queue behind it; a successful refresh can only remove acknowledged ones.
-    const current = alerts[0]; alerts = next;
+    const current = shown; alerts = next;
     if (dialog && !next.some(row => row.id === current?.id && row.audience === current?.audience)) { removeDialog(); }
     paint();
   } catch { /* Persistent notices remain available after a temporary connection failure. */ }
@@ -172,6 +184,7 @@ document.head.append(style);
 new MutationObserver(paint).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['open', 'aria-modal'] });
 appWindow.MBBSSpecialDeliveryMethodAlerts = { refresh };
 window.addEventListener('mbbs-auth-operator-changed', recheckSession);
+window.addEventListener('mbbs-notification-preferences-changed', paint);
 window.addEventListener('storage', event => { if (!event.key || tokenKeys.includes(event.key)) { recheckSession(); } });
 window.addEventListener('focus', recheckSession);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { recheckSession(); } });

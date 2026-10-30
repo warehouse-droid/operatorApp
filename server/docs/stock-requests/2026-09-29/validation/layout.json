@@ -1,0 +1,264 @@
+{
+  "pages": 28,
+  "screenshots": 29,
+  "layout": [
+    {
+      "page": 1,
+      "id": "start",
+      "title": "Stock requests",
+      "bodyBottom": 929,
+      "footerTop": 1066,
+      "remaining": 129,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 2,
+      "id": "contents",
+      "title": "Find the right workflow",
+      "bodyBottom": 1002,
+      "footerTop": 1066,
+      "remaining": 56,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 3,
+      "id": "navigation",
+      "title": "Open requests and find your work",
+      "bodyBottom": 1002,
+      "footerTop": 1066,
+      "remaining": 56,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 4,
+      "id": "regular-create",
+      "title": "Submit a regular stock request",
+      "bodyBottom": 1036,
+      "footerTop": 1066,
+      "remaining": 22,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 5,
+      "id": "regular-rules",
+      "title": "Understand automatic approval",
+      "bodyBottom": 1044,
+      "footerTop": 1066,
+      "remaining": 14,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 6,
+      "id": "regular-safety",
+      "title": "Review the reason and safety stock",
+      "bodyBottom": 1034,
+      "footerTop": 1066,
+      "remaining": 24,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 7,
+      "id": "regular-decisions",
+      "title": "Decide lines and manage replenishment",
+      "bodyBottom": 1004,
+      "footerTop": 1066,
+      "remaining": 55,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 8,
+      "id": "regular-location",
+      "title": "Link an SO and confirm a location change",
+      "bodyBottom": 971,
+      "footerTop": 1066,
+      "remaining": 87,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 9,
+      "id": "regular-transfer",
+      "title": "When the app creates Transfer Orders",
+      "bodyBottom": 1038,
+      "footerTop": 1066,
+      "remaining": 21,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 10,
+      "id": "regular-expiry",
+      "title": "Wait, retry and read the saved result",
+      "bodyBottom": 894,
+      "footerTop": 1066,
+      "remaining": 164,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 11,
+      "id": "pickup-search",
+      "title": "SCM opens conversion and adds items",
+      "bodyBottom": 945,
+      "footerTop": 1066,
+      "remaining": 113,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 12,
+      "id": "pickup-quantities",
+      "title": "Check final quantities and pallets",
+      "bodyBottom": 1017,
+      "footerTop": 1066,
+      "remaining": 41,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 13,
+      "id": "pickup-confirm",
+      "title": "Confirm TO creation and check the result",
+      "bodyBottom": 1045,
+      "footerTop": 1066,
+      "remaining": 14,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 14,
+      "id": "special-header",
+      "title": "Open a special case",
+      "bodyBottom": 977,
+      "footerTop": 1066,
+      "remaining": 81,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 15,
+      "id": "special-items",
+      "title": "Describe, price and submit the items",
+      "bodyBottom": 937,
+      "footerTop": 1066,
+      "remaining": 121,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 16,
+      "id": "special-quote",
+      "title": "Preview the quote and packing quantities",
+      "bodyBottom": 922,
+      "footerTop": 1066,
+      "remaining": 136,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 17,
+      "id": "special-check",
+      "title": "Record the vendor stock check",
+      "bodyBottom": 978,
+      "footerTop": 1066,
+      "remaining": 80,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 18,
+      "id": "special-decision",
+      "title": "Record the customer’s decision",
+      "bodyBottom": 981,
+      "footerTop": 1066,
+      "remaining": 77,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 19,
+      "id": "special-so-account",
+      "title": "Prepare the SO account and fulfillment",
+      "bodyBottom": 931,
+      "footerTop": 1066,
+      "remaining": 128,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 20,
+      "id": "special-so-create",
+      "title": "Save the draft, then create or link the SO",
+      "bodyBottom": 1030,
+      "footerTop": 1066,
+      "remaining": 28,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 21,
+      "id": "special-po",
+      "title": "Review and create the PO",
+      "bodyBottom": 1031,
+      "footerTop": 1066,
+      "remaining": 27,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 22,
+      "id": "special-readiness",
+      "title": "Check PO approval and stock readiness",
+      "bodyBottom": 1047,
+      "footerTop": 1066,
+      "remaining": 11,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 23,
+      "id": "special-fulfillment",
+      "title": "Update delivery or complete vendor pickup",
+      "bodyBottom": 981,
+      "footerTop": 1066,
+      "remaining": 77,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 24,
+      "id": "special-adjustment",
+      "title": "Request and review an order adjustment",
+      "bodyBottom": 925,
+      "footerTop": 1066,
+      "remaining": 134,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 25,
+      "id": "special-close",
+      "title": "Close a case and keep the record",
+      "bodyBottom": 957,
+      "footerTop": 1066,
+      "remaining": 101,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 26,
+      "id": "statuses",
+      "title": "Read stages, queues and alerts",
+      "bodyBottom": 1036,
+      "footerTop": 1066,
+      "remaining": 22,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 27,
+      "id": "troubleshooting",
+      "title": "Resolve common problems",
+      "bodyBottom": 907,
+      "footerTop": 1066,
+      "remaining": 151,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 28,
+      "id": "quick-reference",
+      "title": "Daily checklist and terminology",
+      "bodyBottom": 1011,
+      "footerTop": 1066,
+      "remaining": 47,
+      "horizontalOverflow": false
+    }
+  ],
+  "brokenImages": [],
+  "brokenLinks": [],
+  "externalDependencies": [],
+  "errors": [],
+  "external": [],
+  "overflows": []
+}

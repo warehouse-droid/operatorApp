@@ -1,5 +1,4 @@
 import { specialPackPayload } from '../public/special-stock-line-details.js';
-import { normalizeSalesOrderPackPayload } from '../public/order-pack-quantities.js';
 import {
   specialPurchaseOrderMarker,
   specialSalesOrderMarker
@@ -32,7 +31,7 @@ function finite(value, label, { allowNegative = false } = {}) {
   return normalized;
 }
 
-function itemPayload(line, { purchase = false, netsuiteLocationId } = {}) {
+function itemPayload(line, { purchase = false, netsuiteLocationId, packing = true } = {}) {
   const payload = {
     item: reference(line.itemId),
     location: reference(netsuiteLocationId),
@@ -41,8 +40,8 @@ function itemPayload(line, { purchase = false, netsuiteLocationId } = {}) {
   };
   if (!purchase) {
     payload.price = reference(-1);
-    Object.assign(payload, specialPackPayload(line));
   }
+  if (packing) Object.assign(payload, specialPackPayload(line));
   // Transaction units are scalar IDs in REST, unlike item/entity references.
   if (line.unitId) payload.units = String(line.unitId);
   const rate = purchase ? line.unitPurchaseCost ?? line.rate : line.rate;
@@ -95,7 +94,7 @@ export function buildSpecialSalesOrderPayload({
             rate: specialDiscountLineAmount(material.quantity, material.rate, discount) }] : [material];
         }),
         ...(draft.ancillaryLines || []).filter(line => preserveZeroDeliveryFees || Number(line.itemId) !== 1987 || Number(line.rate) !== 0)
-          .map(line => itemPayload(line, { netsuiteLocationId }))
+          .map(line => itemPayload(line, { netsuiteLocationId, packing: false }))
       ]
     }
   };
@@ -120,7 +119,7 @@ export function buildSpecialSalesOrderPayload({
       addrText: String(draft.deliveryAddress || "").trim()
     };
   }
-  return normalizeSalesOrderPackPayload(payload);
+  return payload;
 }
 
 /** @param {{caseId?:number,vendorId?:number,netsuiteLocationId?:number,subsidiaryId?:string|number|null,salesOrderRef?:string|null,remarks?:string|null,lines?:any[],vendorDiscountReview?:any}} input */

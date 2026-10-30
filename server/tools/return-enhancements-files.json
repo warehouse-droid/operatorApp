@@ -1,0 +1,17 @@
+[
+  "src/return-batch-ra-domain.js",
+  "src/return-batch-ra-service.js",
+  "src/return-credit-memo.js",
+  "src/return-netsuite.js",
+  "src/return-repository.js",
+  "src/server.js",
+  "src/netsuite.js",
+  "public/operator.js",
+  "public/operator.css",
+  "public/operator.html",
+  "public/return-notifications.js",
+  "src/return-accounting.js",
+  "src/return-automatic-notifications.js",
+  "migrations/319_return_automatic_notifications.sql",
+  "public/operator-display-settings.js"
+]

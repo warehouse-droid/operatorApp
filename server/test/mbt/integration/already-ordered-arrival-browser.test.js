@@ -26,14 +26,14 @@ async function open(role,d,width=1440){
     await context.close();assert.deepEqual(errors,[]);
   }};
 }
-test('Sales replaces the quotation with an SO on mobile; Completed and Waiting for arrival persist in both queues',async()=>{
+test('Sales replaces the quotation with an SO on mobile; In Progress and Waiting for arrival persist in both queues',async()=>{
   const {d}=await ordered(),ui=await open('sales',d,390);
   try{
     const p=ui.page,detail=p.locator('[data-backorder-detail]'),form=detail.locator('[data-action="already-ordered/sales-order"]');
     await expect(form).toBeVisible();await expect(detail.locator('[name="quotationNumber"]')).toHaveCount(0);
     await form.getByLabel('Sales order number',{exact:true}).fill('SO-ARRIVAL-UI');
     await form.getByRole('button',{name:'Save sales order number',exact:true}).click();
-    await expect(detail).toContainText('Waiting for arrival');await expect(detail).toContainText('Completed');
+    await expect(detail).toContainText('Waiting for arrival');await expect(detail.locator('[data-regular-main-status]')).toHaveAttribute('data-regular-main-status','in_progress');
     await p.reload();await expect(form.getByLabel('Sales order number',{exact:true})).toHaveValue('SO-ARRIVAL-UI');
     await expect(detail.locator('[data-backorder-line]')).toContainText('Waiting for arrival');
     assert.ok(await p.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
@@ -41,7 +41,7 @@ test('Sales replaces the quotation with an SO on mobile; Completed and Waiting f
   }finally{await ui.close();}
   const scm=await open('scm',d);
   try{
-    await chooseRegularStatuses(scm.page,'scm','completed');
+    await chooseRegularStatuses(scm.page,'scm','in_progress');
     await scm.page.locator('[data-scm-stock-filter="waitingReason"]').selectOption('arrival');
     await expect(scm.page.locator('.stock-request-list')).toContainText(d.requestRef);
     await expect(scm.page.locator('[data-backorder-detail]')).toContainText('SO-ARRIVAL-UI');
@@ -62,11 +62,11 @@ test('a full PO receipt alerts Sales after an earlier read, opens the Arrived re
     const popup=p.locator('.regular-stock-popup');await expect(popup).toBeVisible();await expect(popup.getByRole('heading')).toHaveText('Stock arrived');await expect(popup).toContainText(row.ref);await expect(popup).toContainText('SO-RECEIVED-UI');
     await p.screenshot({path:out+'/sales-arrival-alert.png',fullPage:true});
     await popup.getByRole('link',{name:'Open request',exact:true}).click();
-    const detail=p.locator('[data-backorder-detail]');await expect(detail).toHaveAttribute('data-backorder-id',String(d.id));await expect(detail).toContainText('Arrived');await expect(detail).toContainText('Completed');
+    const detail=p.locator('[data-backorder-detail]');await expect(detail).toHaveAttribute('data-backorder-id',String(d.id));await expect(detail).toContainText('Arrived');await expect(detail.locator('[data-regular-main-status]')).toHaveAttribute('data-regular-main-status','completed');
     d=await f.detail(d);
     await expect.poll(async()=>(await f.query('SELECT backorder_arrival_key FROM regular_stock_decision_reads WHERE request_id=$1',[d.id])).rows[0]?.backorder_arrival_key).toBe(d.alreadyOrderedArrival.key);
     await p.reload();await p.evaluate(()=>window.MBBSRegularStockAlert.refresh());await expect(p.locator('.regular-stock-popup')).toHaveCount(0);
-    await chooseRegularStatuses(p,'sales','completed');await p.locator('[data-sales-stock-filter="waitingReason"]').selectOption('arrived');await expect(p.locator('.stock-request-list')).toContainText(d.requestRef);
+    await chooseRegularStatuses(p,'sales','in_progress');await p.locator('[data-sales-stock-filter="waitingReason"]').selectOption('arrived');await expect(p.locator('.stock-request-list')).toContainText(d.requestRef);
     assert(!(await f.http('sales','/api/sales/stock-requests/alerts')).body.requests.some(row=>row.id===d.id&&row.action==='arrival'));
   }finally{await ui.close();}
 });

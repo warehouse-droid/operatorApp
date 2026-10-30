@@ -1,0 +1,14 @@
+[
+  "src/backorder-arrival.js",
+  "src/backorder-po-progress.js",
+  "src/backorder-request-service.js",
+  "src/special-stock-request-repository.js",
+  "src/regular-stock-request-service.js",
+  "public/backorder-stock-requests.js",
+  "public/regular-stock-alert.js",
+  "public/sales-stock-requests.js",
+  "public/scm-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "public/scm-stock-requests.html",
+  "migrations/315_backorder_po_alert_receipts.sql"
+]

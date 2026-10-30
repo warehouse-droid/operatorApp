@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after, before } from "node:test";
+import fs from "node:fs/promises";
+import { getIfirPostingRestletEnabled } from "../../../src/netsuite-ifir-posting-policy.js";
 
 import { createOperator } from "../../../src/auth-repository.js";
 import { closeDb, query } from "../../../src/db.js";
@@ -20,6 +22,7 @@ const USERS = Object.freeze({
   dispatcher: `mbt-gates-dispatcher-${RUN_ID}`
 });
 const EXPECTED_FLAGS = Object.freeze([
+  "netsuite_ifir_posting_restlet",
   "sor_rental_workflow",
   "driver_offline_mode",
   "driver_yard_dependency_soft_mode",
@@ -29,6 +32,9 @@ const EXPECTED_FLAGS = Object.freeze([
   "special_stock_request_workflow",
   "special_stock_request_test_skip_orders",
   "dispatch_optimized_order_pool",
+  "operator_netsuite_stock_exchange_it_3445",
+  "operator_netsuite_stock_exchange_it_2967",
+  "operator_netsuite_stock_exchange_it_150",
   "operator_netsuite_customer_pickup_if_3445",
   "operator_netsuite_receiving_ir_3445",
   "operator_netsuite_delivery_prep_if_3445",
@@ -75,6 +81,38 @@ const EXPECTED_FLAGS = Object.freeze([
 let baseUrl;
 let server;
 const tokens = new Map();
+
+test('IR/IF Admin switch changes runtime policy, preserves migration choices and rejects stale/non-admin writes', async () => {
+  const key='netsuite_ifir_posting_restlet';
+  const initial=await request('/api/mbt/config/gates',{token:tokens.get('admin')});
+  const original=gate(initial.payload,key);
+  assert.equal(original.configured,false);assert.equal(original.locked,false);
+  assert.equal(original.deploymentGuarded,false);
+  const body={enabled:true,expectedRevision:original.revision,reason:'Isolated RESTlet routing test'};
+  const headers={'idempotency-key':`ifir-gate-${RUN_ID}`};
+  const denied=await request(`/api/mbt/config/gates/${key}`,{token:tokens.get('dispatcher'),method:'PUT',headers,body});
+  assert.equal(denied.response.status,403);
+  const on=await request(`/api/mbt/config/gates/${key}`,{token:tokens.get('admin'),method:'PUT',headers,body});
+  assert.equal(on.response.status,200,JSON.stringify(on.payload));assert.equal(on.payload.flag.enabled,true);
+  const settings={ifirPostingEnabled:true,directAccessEnabled:true,ifirPostingRestletUrl:'https://test.invalid'};
+  assert.equal(await getIfirPostingRestletEnabled({settings}),true);
+  const migration=await fs.readFile(new URL('../../../migrations/300_ifir_posting_admin_gate.sql',import.meta.url),'utf8');
+  await query(migration);await query(migration);
+  assert.equal(await getIfirPostingRestletEnabled({settings}),true,'Migration replay preserves the Admin choice');
+  const inventory=await request('/api/mbt/config/gates',{token:tokens.get('admin')});
+  assert.equal(gate(inventory.payload,key).configured,true);assert.equal(gate(inventory.payload,key).effective,false,'Deployment remains closed in isolated tests');
+  const stale=await request(`/api/mbt/config/gates/${key}`,{token:tokens.get('admin'),method:'PUT',
+    headers:{'idempotency-key':`ifir-stale-${RUN_ID}`},body:{...body,enabled:false}});
+  assert.equal(stale.response.status,409);assert.equal(await getIfirPostingRestletEnabled({settings}),true);
+  const replay=await request(`/api/mbt/config/gates/${key}`,{token:tokens.get('admin'),method:'PUT',headers,body});
+  assert.equal(replay.response.status,200);assert.equal(replay.response.headers.get('x-mbt-idempotent-replay'),'true');
+  const off=await request(`/api/mbt/config/gates/${key}`,{token:tokens.get('admin'),method:'PUT',
+    headers:{'idempotency-key':`ifir-off-${RUN_ID}`},body:{...body,enabled:false,expectedRevision:on.payload.flag.revision}});
+  assert.equal(off.response.status,200);assert.equal(await getIfirPostingRestletEnabled({settings}),false);
+  const audit=await query('SELECT count(*)::int AS n FROM mbt_audit_events WHERE entity_id=$1 AND idempotency_key=ANY($2::text[])',
+    [key,[headers['idempotency-key'],`ifir-off-${RUN_ID}`]]);
+  assert.equal(audit.rows[0].n,2);
+});
 
 async function request(path, { token, method = "GET", body, headers = {} } = {}) {
   const response = await fetch(`${baseUrl}${path}`, {

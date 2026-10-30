@@ -8,10 +8,27 @@ Use `docker compose down --volumes --remove-orphans` for an isolated Compose
 project and `docker run --rm` for one-off containers. For manually created test
 containers, remove the exact container IDs and their disposable storage.
 
-Do not preserve test databases unless the user explicitly requests it. Keep
-test results and diagnostic logs in the repository's existing artifact folders.
+Do not preserve test databases unless the user explicitly requests it. Generated
+test artifacts, logs, coverage, browser downloads, and temporary source copies
+are disposable and must be removed after the complete test run, including on
+failure or interruption. Use `bash docker/run-isolated-tests.sh [test command]`
+for standard Compose tests. For a custom bounded harness, wrap its full lifecycle
+with `python3 docker/retention/retention.py run -- <command>` and write all
+temporary output under `$MBBS_TEST_ARTIFACT_DIR`; register container teardown
+inside that command. The outer runner deletes its unique artifact directory
+after the command and its teardown finish. Keep only concise evidence in source
+documentation and genuine operational audit records outside disposable output.
 Production containers, production volumes, deployment rollback data, and
 operational audit records are outside test cleanup.
+
+Deployment-copy retention is the latest five complete copies across
+`server/deployments` and `/home/ubuntu/operatorapp-deploy-backups`. Small tracked
+records and files referenced by live Compose configuration are retained separately.
+The hourly `operatorapp-copy-retention.timer` cleans old copies and abandoned
+artifacts after a two-hour inactivity guard. Immediate test cleanup is mandatory;
+the timer is recovery for interrupted/unwrapped historical runs, not a replacement.
+Full database backups retain their existing five-copy policy. Never delete or
+modify production Docker volumes as part of artifact retention.
 
 On this host, the production allowlist is `mbbs-operator-app-app-1`,
 `mbbs-operator-app-db-1`, `mbbs-operator-app-webhook-worker-1`, and

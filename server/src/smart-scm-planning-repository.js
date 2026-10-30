@@ -7,6 +7,7 @@ import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
+import { smartScmRequestedPoHandoff } from "./smart-scm-po-handoff.js";
 import { smartScmBuiltInRouteRule, smartScmIsGormleySource, smartScmRouteRuleKey, smartScmRouteRuleMap } from "./smart-scm-route-repository.js";
 import { listSmartScmActivePlanningExclusionItemIds, resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 import {
@@ -798,6 +799,10 @@ export function smartScmProposalLineForState(state, pallets, extraReason = {}) {
     urgencyScore: urgencyScore(state.urgencyScore, state.urgent),
     reason: {
       ...extraReason,
+      ...(state.requestedPoCoveragePallets === undefined ? {} : {
+        requestedPoCoveragePallets: state.requestedPoCoveragePallets,
+        requiredBeforeRequestedPoPallets: state.requiredBeforeRequestedPoPallets
+      }),
       blanketCoveragePallets: round(positive(state.blanketCoveragePallets)),
       residualRequiredPallets: round(
         state.residualRequiredPallets === undefined
@@ -1824,6 +1829,24 @@ export function smartScmBuildTransferPhaseDrafts({ states = [], settings = {} } 
   return { drafts, exceptions };
 }
 
+async function smartScmRequestedPoLines() {
+  const result = await query(
+    `SELECT p.id AS proposal_id, l.id AS line_id, p.proposal_type, p.proposal_origin,
+            p.status, p.order_requested_at, p.netsuite_purchase_order_id,
+            p.netsuite_purchase_order_ref, p.vendor_resolution_kind, l.vendor_decision,
+            l.item_id, l.destination_location_id, l.proposed_pallets, l.confirmed_pallets
+       FROM scm_smart_proposals p
+       JOIN scm_smart_proposal_lines l ON l.proposal_id = p.id
+      WHERE p.proposal_type = 'PO' AND p.proposal_origin = 'inventory'
+        AND p.order_requested_at IS NOT NULL
+        AND p.netsuite_purchase_order_id IS NULL
+        AND NULLIF(BTRIM(p.netsuite_purchase_order_ref), '') IS NULL
+        AND p.status IN ('order_requested','vendor_replied','confirmed','executing','attention')
+      ORDER BY p.id, l.id`
+  );
+  return result.rows;
+}
+
 async function smartScmExpectedPoEvidence() {
   const result = await query(
     `WITH active_split_remaining AS (
@@ -2389,11 +2412,14 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
           settingsOverride: run.settings_snapshot
         });
         const evidence = await smartScmExpectedPoEvidence();
-        const priorityCoverage=await syncRegularReplenishments({runId:id,planning});
-        const purchaseCoverage=await syncPurchaseStockDemand({runId:id});
-        for(const [key,value] of purchaseCoverage)priorityCoverage.set(key,(priorityCoverage.get(key)||0)+value);
+        await syncRegularReplenishments({runId:id,planning});
+        await syncPurchaseStockDemand({runId:id});
+        // Phase-one draft allocation prevents duplicate PO proposals, but it
+        // is not ordered supply. Only active Order Requests cover TO demand.
+        const handoff = smartScmRequestedPoHandoff(planning.states, await smartScmRequestedPoLines());
+        const handoffByKey = new Map(handoff.states.map((state) => [state.key, state]));
         const calculated = smartScmBuildTransferPhaseDrafts({
-          states: creditRegularReplenishments(planning.states.filter(state=>state.policy.planning_enabled!==false),priorityCoverage),
+          states: handoff.states.filter(state=>state.policy.planning_enabled!==false),
           settings: run.settings_snapshot
         });
         const coverageSnapshot = smartScmBlanketCoverageSnapshot(planning.states);
@@ -2418,6 +2444,7 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
           approvedAt: new Date().toISOString(),
           approvedBy: operatorId || null,
           expectedPurchaseOrderLines: evidence,
+          requestedPoLines: handoff.requestedPoLines,
           splitInboundEvidence: planning.splitInboundEvidence,
           demandStates: planning.states.map((state) => ({
             itemId: Number(state.policy.item_id),
@@ -2431,6 +2458,8 @@ export async function approveSmartScmPoPhase(runId, operatorId = null) {
             reorderPointPallets: round(state.rop),
             preferredStockPallets: round(state.preferred),
             requiredPallets: round(state.requiredPallets),
+            requestedPoCoveragePallets: round(handoffByKey.get(state.key).requestedPoCoveragePallets),
+            toStageRequiredPallets: round(handoffByKey.get(state.key).residualRequiredPallets),
             blanketCoveragePallets: round(state.blanketCoveragePallets),
             residualRequiredPallets: round(state.residualRequiredPallets),
             blanketSourcePoRefs: Array.isArray(state.blanketSourcePoRefs)

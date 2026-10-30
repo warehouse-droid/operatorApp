@@ -1,0 +1,32 @@
+{
+  "passed": true,
+  "acceptanceTests": 12,
+  "returnRegressionTests": 217,
+  "targetedMutantsKilled": 4,
+  "initialBrowserFailuresReproduced": [
+    "missing three-column entry",
+    "search input replaced",
+    "notes unavailable on entry"
+  ],
+  "verifiedLiveFiles": 11,
+  "servedAssetsVerified": [
+    "public/operator.js",
+    "public/operator.css",
+    "public/operator-display-settings.js",
+    "public/return-notifications.js",
+    "public/control.js"
+  ],
+  "deployment": {
+    "deployedAt": "2026-10-26T23:18:08Z",
+    "image": "mbbs-operator-app:pallet-one-page-20261026",
+    "imageId": "sha256:a42a8c05ad2088738bc142d7b8ddbe99789940b3bc7987317ea6b23acfdc946b",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "required": false
+    }
+  },
+  "disposableCleanup": "Runner removed containers, volumes, networks and unique artifact directories; docker ps and docker ps -a contain only the four production services.",
+  "creditMemoNumbering": "Receiving CM location is sent to NetSuite; actual returned CMB/CMA/CMM references are retained."
+}

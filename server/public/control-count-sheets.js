@@ -9,6 +9,7 @@
     const esc = ctx.escape;
     let yards = [], rows = [], locationId = '', detail = null, draft = null, busy = false, error = '';
     let suggestions = [], search = '', timer, searchVersion = 0;
+    const adjustmentEdits = new Map();
     const request = (path, body) => ctx.request(`/api/control/count-sheets${path}`, body === undefined ? undefined : {method:'POST', body:JSON.stringify(body)});
     const button = (action, label, extra = '') => `<button type="button" data-sheet-action="${action}" ${busy ? 'disabled' : ''} ${extra}>${label}</button>`;
     const yardName = id => yards.find(yard => Number(yard.id) === Number(id))?.name || id;
@@ -42,12 +43,22 @@
     function suggestionHtml() {
       return suggestions.filter(item => !draft?.items.some(chosen => String(chosen.item_id) === String(item.item_id))).map(item => button('add',`<strong>${esc(item.item_name)}</strong> ${esc(item.item_description || '')}`,`data-id="${item.item_id}"`)).join('');
     }
+    const adjustmentValue = item => adjustmentEdits.get(String(item.item_id)) ?? item.count?.adjusting ?? 0;
+    function variance(item) {
+      if (item.count?.actual_on_hand === null || item.count?.actual_on_hand === undefined) { return '—'; }
+      const adjusting = Number(adjustmentValue(item) || 0);
+      return Number.isFinite(adjusting) ? qty(Number((Number(item.count.quantity) - Number(item.count.actual_on_hand) + adjusting).toFixed(6))) : '—';
+    }
+    function adjustmentInput(item) {
+      const editable = item.count && ['in_progress','submitted'].includes(detail.status);
+      return `<input type="number" step="0.000001" min="-1000000000000" max="1000000000000" inputmode="decimal" class="count-sheet-adjusting" data-sheet-adjusting="${item.item_id}" aria-label="${esc(t('adjusting','Adjusting'))} ${esc(item.item_name)}" value="${esc(item.count ? adjustmentValue(item) : '')}" ${busy || !editable ? 'disabled' : ''}>`;
+    }
     function renderDetail() {
       return `<h3>${esc(detail.title)}</h3><p><strong data-sheet-status>${esc(status(detail.status))}</strong> · ${detail.counted}/${detail.total} ${t('counted','counted')}</p>
         <p>${t('operator','Operator')}: ${esc(detail.owner_name || '—')} · ${t('attempt','Attempt')}: ${detail.attempt}</p>
-        <div class="count-sheet-toolbar">${detail.status === 'available' ? button('edit',t('editSheet','Edit count sheet')) : ''}${detail.status === 'in_progress' ? button('reset',t('resetSheet','Reset and release sheet')) : ''}${['available','in_progress'].includes(detail.status) ? button('cancel',t('cancelSheet','Cancel sheet')) : ''}</div>
-        <p>${t('packedReviewHelp','Actual on hand = On hand − Packed. Var = Counted − Actual on hand. These comparisons do not change stock. Older counts without a packed snapshot show —.')}</p>
-        <div class="count-sheet-table"><table><thead><tr><th>SKU</th><th>${t('uom','UOM')}</th><th>${t('onHand','On hand')}</th><th>${t('packed','Packed')}</th><th>${t('actualOnHand','Actual on hand')}</th><th>${t('counted','Counted')}</th><th>${t('var','Var')}</th><th>${t('snapshot','Inventory snapshot')}</th></tr></thead><tbody>${detail.items.map(item => `<tr><td><strong>${esc(item.item_name)}</strong><small>${esc(item.item_description || '')}</small></td><td>${esc(item.count?.unit || item.stock_unit || '')}</td><td>${qty(item.count?.system_on_hand)}</td><td>${qty(item.count?.packed_qty)}</td><td>${qty(item.count?.actual_on_hand)}</td><td>${item.count ? qty(item.count.quantity) : t('uncounted','Uncounted')}</td><td>${qty(item.count?.variance)}</td><td>${item.count?.comparison_basis === 'reconstructed_current' ? `<strong>${t('currentReconstruction','Current reconstruction')}</strong><br>` : ''}${esc(date(item.count?.inventory_synced_at))}${item.count?.packed_snapshot_at ? `<small>${t('packed','Packed')}: ${esc(date(item.count.packed_snapshot_at))}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>
+        <div class="count-sheet-toolbar">${detail.status === 'available' ? button('edit',t('editSheet','Edit count sheet')) : ''}${detail.status === 'in_progress' ? button('reset',t('resetSheet','Reset count sheet')) : ''}${['submitted','cancelled'].includes(detail.status) ? button('reopen',t('reopenSheet','Re-open count sheet')) : ''}${['available','in_progress'].includes(detail.status) ? button('cancel',t('cancelSheet','Cancel sheet')) : ''}${['in_progress','submitted'].includes(detail.status) ? button('adjust',t('saveAdjustments','Save adjustments'),adjustmentEdits.size ? '' : 'disabled') : ''}</div>
+        <p>${t('adjustedReviewHelp','Actual on hand = On hand − Packed. Var = Counted − Actual on hand + Adjusting. Var updates as you type; use Save adjustments to keep your changes. These comparisons do not change stock. Older counts without a packed snapshot show —.')}</p>
+        <div class="count-sheet-table"><table><thead><tr><th>SKU</th><th>${t('uom','UOM')}</th><th>${t('onHand','On hand')}</th><th>${t('packed','Packed')}</th><th>${t('actualOnHand','Actual on hand')}</th><th>${t('counted','Counted')}</th><th>${t('adjusting','Adjusting')}</th><th>${t('var','Var')}</th><th>${t('snapshot','Inventory snapshot')}</th></tr></thead><tbody>${detail.items.map(item => `<tr><td><strong>${esc(item.item_name)}</strong></td><td>${esc(item.count?.unit || item.stock_unit || '')}</td><td>${qty(item.count?.system_on_hand)}</td><td>${qty(item.count?.packed_qty)}</td><td>${qty(item.count?.actual_on_hand)}</td><td>${item.count ? qty(item.count.quantity) : t('uncounted','Uncounted')}</td><td>${adjustmentInput(item)}</td><td data-sheet-variance="${item.item_id}">${variance(item)}</td><td>${item.count?.comparison_basis === 'reconstructed_current' ? `<strong>${t('currentReconstruction','Current reconstruction')}</strong><br>` : ''}${esc(date(item.count?.inventory_synced_at))}${item.count?.packed_snapshot_at ? `<small>${t('packed','Packed')}: ${esc(date(item.count.packed_snapshot_at))}</small>` : ''}</td></tr>`).join('')}</tbody></table></div>
         ${detail.attempts?.length ? `<details><summary>${t('previousCounts','Previous attempts (archived counts)')}</summary><div class="count-sheet-table"><table><thead><tr><th>${t('attempt','Attempt')}</th><th>SKU</th><th>${t('counted','Counted')}</th><th>${t('operator','Operator')}</th></tr></thead><tbody>${detail.attempts.map(count => `<tr><td>${count.attempt}</td><td>${esc(count.item_name)}</td><td>${qty(count.quantity)} ${esc(count.unit)}</td><td>${esc(count.operator_name)}</td></tr>`).join('')}</tbody></table></div></details>` : ''}
         <details><summary>${t('history','Activity history')}</summary><ol>${(detail.history || []).map(entry => `<li>${esc(date(entry.created_at))} · ${esc(entry.actor_name || '')} · ${esc(t(`event.${entry.action}`,entry.action))} · ${t('attempt','Attempt')} ${entry.attempt}</li>`).join('')}</ol></details>`;
     }
@@ -65,7 +76,7 @@
       if (action === 'new') {
         draft = {requestId:crypto.randomUUID(), title:'', items:[]}; search = ''; suggestions = []; return;
       }
-      if (action === 'open') { detail = await request(`/${target.dataset.id}`); return; }
+      if (action === 'open') { detail = await request(`/${target.dataset.id}`); adjustmentEdits.clear(); return; }
       if (action === 'edit') { draft = {...detail, items:[...detail.items]}; search = ''; suggestions = []; return; }
       if (action === 'discard') { draft = null; searchVersion++; return; }
       if (action === 'add') {
@@ -78,10 +89,18 @@
         detail = await request(draft.id ? `/${draft.id}/edit` : '', {requestId:draft.requestId, revision:draft.revision, title:draft.title, locationId:Number(locationId), itemIds:draft.items.map(item => item.item_id)});
         draft = null;
       }
-      if (action === 'reset' || action === 'cancel') {
-        const prompt = action === 'reset' ? t('resetConfirm','Archive the current counts and release this sheet for another operator?') : t('cancelConfirm','Cancel this unfinished count sheet?');
+      if (action === 'adjust') {
+        const inputs = [...ctx.root.querySelectorAll('[data-sheet-adjusting]:enabled')];
+        if (inputs.some(input => !input.reportValidity())) { return; }
+        ctx.render();
+        detail = await request(`/${detail.id}/adjust`, {revision:detail.revision, adjustments:[...adjustmentEdits].map(([itemId,adjusting]) => ({itemId:Number(itemId),adjusting:adjusting || '0'}))});
+        adjustmentEdits.clear();
+      }
+      if (action === 'reset' || action === 'reopen' || action === 'cancel') {
+        const prompt = action === 'cancel' ? t('cancelConfirm','Cancel this unfinished count sheet?') : t('recountConfirm','Discard all previous counts and adjustments, and re-open this same sheet for an operator to recount? This cannot be undone.');
         if (!root.confirm(prompt)) { return; }
         detail = await request(`/${detail.id}/${action}`, {revision:detail.revision});
+        adjustmentEdits.clear();
       }
       rows = await request(`?locationId=${locationId}`);
     }
@@ -98,9 +117,18 @@
     ctx.root.addEventListener('input', event => {
       if (event.target.id === 'sheetTitle' && draft) { draft.title = event.target.value; }
       if (event.target.matches('[data-sheet-search]')) { search = event.target.value; clearTimeout(timer); timer = setTimeout(searchItems,250); }
+      if (event.target.matches('[data-sheet-adjusting]') && !busy) {
+        const id = event.target.dataset.sheetAdjusting;
+        const item = detail.items.find(row => String(row.item_id) === id);
+        if (!item?.count) { return; }
+        adjustmentEdits.set(id,event.target.value);
+        const cell = event.target.closest('tr').querySelector('[data-sheet-variance]');
+        cell.textContent = event.target.validity.valid ? variance(item) : '—';
+        ctx.root.querySelector('[data-sheet-action="adjust"]').disabled = false;
+      }
     });
     ctx.root.addEventListener('change', event => {
-      if (event.target.matches('[data-sheet-yard]')) { locationId = event.target.value; detail = null; void load(); }
+      if (event.target.matches('[data-sheet-yard]')) { locationId = event.target.value; detail = null; adjustmentEdits.clear(); void load(); }
     });
     return {load,render};
   }

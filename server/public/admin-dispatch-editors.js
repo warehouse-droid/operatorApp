@@ -9,7 +9,7 @@ window.AdminDispatchEditors = {
         <div class="actions"><button type="button" data-editor-action="refresh">Refresh editors</button></div>
         <div class="table-scroll"><table><thead><tr><th>Plan date</th><th>Editing user</th><th>Last activity</th><th>Expires</th><th>Action</th></tr></thead>
         <tbody>${editors.map((editor, index) => `<tr><td>${escape(editor.planDate)}</td><td>${escape(editor.operatorName)}</td>
-          <td>${escape(new Date(editor.heartbeatAt).toLocaleString())}</td><td>${escape(new Date(editor.expiresAt).toLocaleString())}</td>
+          <td>${escape(new Date(editor.heartbeatAt).toLocaleString(undefined,{timeZone:'America/Toronto'}))}</td><td>${escape(new Date(editor.expiresAt).toLocaleString(undefined,{timeZone:'America/Toronto'}))}</td>
           <td><button type="button" data-editor-action="kick" data-editor-index="${index}">Kick out</button></td></tr>`).join('')
           || '<tr><td colspan="5">No one is editing a date plan.</td></tr>'}</tbody></table></div>`;
     }

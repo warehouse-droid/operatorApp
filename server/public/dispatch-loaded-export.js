@@ -24,6 +24,7 @@ const loadedState = {
   orders: [],
   searchResults: [],
   detail: null,
+  detailLoading: false,
   selectedKey: "",
   search: "",
   itemSearch: "",
@@ -43,10 +44,10 @@ const loadedState = {
     driver: localStorage.getItem("mbbs.dispatch.loaded.driver") || "all"
   },
   searchLoading: false,
-  searchSeq: 0,
   busy: "",
   error: ""
 };
+const loadedReads = window.MBBSMovementReads.create(loadedRequest);
 
 function loadedEscape(value) {
   return String(value ?? "")
@@ -231,8 +232,8 @@ function selectedLoadedOrder() {
     || null;
 }
 
-async function loadedRequest(path) {
-  const response = await fetch(path);
+async function loadedRequest(path, options) {
+  const response = await fetch(path, options);
   const text = await response.text();
   let payload = null;
   try {
@@ -250,12 +251,35 @@ async function loadedRequest(path) {
 async function loadSelectedDetail() {
   loadedState.detail = null;
   const selected = selectedLoadedOrder();
-  if (!selected) return;
+  if (!selected) {
+    loadedReads.cancel("detail");
+    loadedState.detailLoading = false;
+    updateLoadedPanels({ detailOnly: true });
+    return;
+  }
+  loadedState.detailLoading = true;
+  loadedState.error = "";
+  updateLoadedPanels({ detailOnly: true });
   const params = loadedSearchActive() ? loadedSearchQuery() : loadedFilterQuery();
   params.set("direction", selected.direction);
   params.set("orderType", selected.order_type);
   params.set("orderId", selected.order_id);
-  loadedState.detail = await loadedRequest(`${loadedApiBase}/detail?${params.toString()}`);
+  try {
+    await loadedReads.run("detail", `${loadedApiBase}/detail?${params.toString()}`, (detail) => {
+      loadedState.detail = detail;
+    });
+  } finally {
+    loadedState.detailLoading = loadedReads.pending("detail");
+    updateLoadedPanels({ detailOnly: true });
+  }
+}
+
+function cancelLoadedSearch() {
+  clearTimeout(loadedSearchTimer);
+  for (const channel of ["list", "search", "detail"]) loadedReads.cancel(channel);
+  loadedState.searchLoading = false;
+  loadedState.detailLoading = false;
+  loadedState.detail = null;
 }
 
 async function loadLoadedDrivers() {
@@ -269,40 +293,44 @@ async function loadLoadedDrivers() {
 }
 
 async function loadLoadedOrders({ keepSelection = false } = {}) {
-  loadedState.orders = await loadedRequest(`${loadedApiBase}?${loadedFilterQuery().toString()}`);
-  if (!keepSelection || !loadedState.orders.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
-    loadedState.selectedKey = loadedState.orders[0] ? loadedOrderKey(loadedState.orders[0]) : "";
-  }
-  loadedState.detail = null;
+  cancelLoadedSearch();
   updateLoadedPanels();
-  await loadSelectedDetail();
+  await loadedReads.run("list", `${loadedApiBase}?${loadedFilterQuery().toString()}`, async (orders) => {
+    loadedState.orders = orders;
+    if (loadedSearchActive()) return;
+    if (!keepSelection || !loadedState.orders.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
+      loadedState.selectedKey = loadedState.orders[0] ? loadedOrderKey(loadedState.orders[0]) : "";
+    }
+    updateLoadedPanels();
+    await loadSelectedDetail();
+  });
 }
 
 async function loadLoadedSearch() {
   const term = loadedState.search.trim();
   const itemTerm = loadedState.itemSearch.trim();
-  const seq = ++loadedState.searchSeq;
   if (!term && !itemTerm) {
+    loadedReads.cancel("search");
     loadedState.searchResults = [];
     loadedState.searchLoading = false;
     if (!loadedState.orders.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
       loadedState.selectedKey = loadedState.orders[0] ? loadedOrderKey(loadedState.orders[0]) : "";
     }
+    updateLoadedPanels();
     await loadSelectedDetail();
     return;
   }
   loadedState.searchLoading = true;
   updateLoadedPanels();
-  const results = await loadedRequest(`${loadedApiBase}?${loadedSearchQuery().toString()}`);
-  if (seq !== loadedState.searchSeq) return;
-  loadedState.searchResults = results;
-  loadedState.searchLoading = false;
-  if (!results.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
-    loadedState.selectedKey = results[0] ? loadedOrderKey(results[0]) : "";
-  }
-  loadedState.detail = null;
-  updateLoadedPanels();
-  await loadSelectedDetail();
+  await loadedReads.run("search", `${loadedApiBase}?${loadedSearchQuery().toString()}`, async (results) => {
+    loadedState.searchResults = results;
+    loadedState.searchLoading = false;
+    if (!results.some((order) => loadedOrderKey(order) === loadedState.selectedKey)) {
+      loadedState.selectedKey = results[0] ? loadedOrderKey(results[0]) : "";
+    }
+    updateLoadedPanels();
+    await loadSelectedDetail();
+  });
 }
 
 function loadedPhotoSrc(value, { thumbnail = false } = {}) {
@@ -479,6 +507,7 @@ function renderLoadedPhotoSection(title, photos = [], source = "yard") {
 }
 
 function renderLoadedDetail() {
+  if (loadedState.detailLoading) return `<div class="dispatch-loaded-empty" role="status"><strong>${loadedT("common.loading", "Loading...")}</strong></div>`;
   if (!loadedState.detail) return `<div class="dispatch-loaded-empty"><strong>${loadedT("common.selectOrder", "Select an order")}</strong><span>${loadedT("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   const { order, lines = [], photos = [] } = loadedState.detail;
   const driverRecords = loadedState.detail.driverRecords || loadedState.detail.driver_records || [];
@@ -506,9 +535,14 @@ function renderLoadedDetail() {
   `;
 }
 
-function updateLoadedPanels() {
+function updateLoadedPanels({ detailOnly = false } = {}) {
   const list = document.getElementById("dispatchLoadedList");
-  if (list) list.innerHTML = renderLoadedList();
+  if (list && !detailOnly) list.innerHTML = renderLoadedList();
+  if (list && detailOnly) {
+    for (const card of list.querySelectorAll('[data-action="select-loaded-order"]')) {
+      card.classList.toggle("active", card.dataset.key === loadedState.selectedKey);
+    }
+  }
   const detail = document.getElementById("dispatchLoadedDetail");
   if (detail) detail.innerHTML = renderLoadedDetail();
 }
@@ -547,18 +581,21 @@ function renderDispatchLoaded() {
     </section>`;
 }
 
+let loadedActionSeq = 0;
 async function runLoadedAction(label, action) {
-  if (loadedState.busy) return;
+  const seq = ++loadedActionSeq;
   loadedState.busy = label;
   loadedState.error = "";
   renderDispatchLoaded();
   try {
     await action();
   } catch (error) {
-    loadedState.error = error.message;
+    if (seq === loadedActionSeq) loadedState.error = error.message;
   } finally {
-    loadedState.busy = "";
-    renderDispatchLoaded();
+    if (seq === loadedActionSeq) {
+      loadedState.busy = "";
+      renderDispatchLoaded();
+    }
   }
 }
 
@@ -569,12 +606,14 @@ dispatchLoadedApp.addEventListener("input", (event) => {
   if (event.target.id === "dispatchLoadedItemSearch") loadedState.itemSearch = event.target.value || "";
   localStorage.setItem("mbbs.dispatch.loaded.search", loadedState.search);
   localStorage.setItem("mbbs.dispatch.loaded.itemSearch", loadedState.itemSearch);
-  clearTimeout(loadedSearchTimer);
-  loadedSearchTimer = setTimeout(() => loadLoadedSearch().then(updateLoadedPanels).catch((error) => {
+  cancelLoadedSearch();
+  loadedState.searchLoading = loadedSearchActive();
+  updateLoadedPanels();
+  loadedSearchTimer = setTimeout(() => loadLoadedSearch().catch((error) => {
     loadedState.searchLoading = false;
     loadedState.error = error.message;
     renderDispatchLoaded();
-  }), 250);
+  }), 150);
 });
 
 dispatchLoadedApp.addEventListener("click", async (event) => {
@@ -613,11 +652,8 @@ dispatchLoadedApp.addEventListener("click", async (event) => {
   }
   if (action === "select-loaded-order") {
     loadedState.selectedKey = button.dataset.key || "";
-    loadedState.detail = null;
-    updateLoadedPanels();
     try {
       await loadSelectedDetail();
-      updateLoadedPanels();
     } catch (error) {
       loadedState.error = error.message;
       renderDispatchLoaded();
@@ -637,7 +673,10 @@ dispatchLoadedApp.addEventListener("click", async (event) => {
     };
     for (const [key, value] of Object.entries(loadedState.filters)) localStorage.setItem(`mbbs.dispatch.loaded.${key}`, value);
     loadedState.selectedKey = "";
-    await runLoadedAction(loadedT("common.loading", "Loading..."), () => loadLoadedOrders());
+    await runLoadedAction(loadedT("common.loading", "Loading..."), async () => {
+      await loadLoadedOrders();
+      if (loadedSearchActive()) await loadLoadedSearch();
+    });
     return;
   }
   if (action === "refresh-loaded-orders") {

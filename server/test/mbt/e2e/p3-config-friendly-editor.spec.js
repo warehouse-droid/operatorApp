@@ -401,7 +401,8 @@ test("item-owned setup creates per-yard aggregate and changes a dump item to fix
   await expect(createItem.getByLabel("Charging method").locator("option:checked")).toHaveText("Price per cubic yard");
   await createItem.getByLabel("Item code").fill("AGG_GRANITE_TEST");
   await createItem.getByLabel("Display name").fill("Granite test aggregate");
-  await createItem.getByLabel("Density (lb / yard)").fill("2750");
+  await expect(createItem.getByLabel("Density (lb / yard)")).toHaveValue("2600");
+  await expect(createItem.getByLabel("Density (lb / yard)")).toHaveAttribute("readonly", "");
   await createItem.getByRole("button", { name: "Create custom item" }).click();
   await expect(page.locator("#localItemRows")).toContainText("Granite test aggregate");
   await expect(page.locator("#localItemRows")).toContainText("Price per cubic yard");
@@ -419,7 +420,7 @@ test("item-owned setup creates per-yard aggregate and changes a dump item to fix
     itemCode: "AGG_GRANITE_TEST",
     itemType: "aggregate",
     chargeBasis: "per_yard",
-    densityLbsPerYard: 2750,
+    densityLbsPerYard: 2600,
     applicableServiceTypes: ["delivery", "exchange"]
   }));
   const update = calls.find((call) => call.path === "/api/mbt/config/local/items/CLEAN_FILL");

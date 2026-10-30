@@ -49,8 +49,8 @@ test("authorization and transfer each receive their own deadline budget", async 
     clearTimeout: timer => cleared.push(timer)
   });
   assert.equal(await upload.upload(photo(), {ticket}), "r2://fixture/photo.jpg");
-  assert.deepEqual(timers.map(timer => timer.ms), [60000, 90000]);
-  assert.equal(cleared.length, 2);
+  assert.deepEqual(timers.map(timer => timer.ms), [60000, 90000, 30000]);
+  assert.equal(cleared.length, 3);
 });
 
 test("a deadline settles a task that ignores abort", async () => {

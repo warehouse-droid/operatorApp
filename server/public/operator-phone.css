@@ -94,8 +94,8 @@ html[data-operator-phone="true"] #app :is(.order-list,.line-list,.inventory-list
   overflow: visible;
 }
 
-html[data-operator-phone="true"] #app :is(.detail-header,.return-header-fields,.return-quality-fields,.return-line-entry-row,.return-calculated-qty,.return-pallet-compact,.consolidation-selected-item,.consolidation-allocation,.consolidation-queue-row,.consolidation-review-order) { grid-template-columns: minmax(0, 1fr); }
-html[data-operator-phone="true"] #app :is(.status-actions,.selected-actions,.inventory-actions,.cycle-crumbs,.history-toolbar,.consolidation-toolbar,.consolidation-intro,.return-yard-banner,.return-panel-heading,.return-review-header,.return-evidence-heading) { flex-wrap: wrap; }
+html[data-operator-phone="true"] #app :is(.detail-header,.return-header-fields,.return-quality-fields,.return-line-entry-row,.return-calculated-qty,.consolidation-selected-item,.consolidation-allocation,.consolidation-queue-row,.consolidation-review-order) { grid-template-columns: minmax(0, 1fr); }
+html[data-operator-phone="true"] #app :is(.status-actions,.selected-actions,.inventory-actions,.cycle-crumbs,.history-toolbar,.consolidation-toolbar,.consolidation-intro,.return-panel-heading,.return-review-header,.return-evidence-heading) { flex-wrap: wrap; }
 html[data-operator-phone="true"] #app :is(.status-actions,.inventory-actions) > button { flex: 1 1 130px; }
 html[data-operator-phone="true"] #app .panel-title { align-items: start; gap: 8px; flex-wrap: wrap; }
 html[data-operator-phone="true"] #app .panel-title > :is(.order-panel-title,.order-panel-heading-actions) { width: 100%; }
@@ -171,7 +171,7 @@ html[data-operator-phone="true"] #app .fulfillment-summary-row { flex-wrap: wrap
 /* Returns: lookup, quantity entry, evidence, review, success and saved records. */
 html[data-operator-phone="true"] #app :is(.return-card,.return-section,.return-selected-editor,.return-photo-workspace,.return-review-aside,.return-review-shell,.return-record-detail) { padding: 12px; }
 html[data-operator-phone="true"] #app :is(.return-customer-summary,.return-review-meta,.return-review-entry-fields,.return-created-records,.return-line-inputs,.return-evidence-targets,.return-bottom-actions,.return-review-actions) { grid-template-columns: minmax(0, 1fr); }
-html[data-operator-phone="true"] #app .return-line-card { height: auto; grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px; }
+html[data-operator-phone="true"] #app .return-line-card { height: max-content; grid-template-columns: minmax(0, 1fr) fit-content(45%); gap: 8px; padding: 12px; }
 html[data-operator-phone="true"] #app :is(.return-line-identity,.return-customer-summary) :is(strong,span,em) { white-space: normal; overflow-wrap: anywhere; }
 html[data-operator-phone="true"] #app .return-line-card-measures { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 html[data-operator-phone="true"] #app .return-review-line { grid-template-columns: minmax(0, 1fr) auto; }

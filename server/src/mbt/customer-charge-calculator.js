@@ -206,6 +206,19 @@ function pricedLine(raw, paymentCategory, taxRateBasisPoints, currency) {
   };
 }
 
+/** Actual tonnes are decimal evidence, never an estimated upfront dump charge.
+ * @param {string} tonnes @param {number} rateMinor @param {string} method */
+export function calculateGarbageDumpCharge(tonnes, rateMinor, method) {
+  if (!/^\d{1,5}(?:\.\d{1,6})?$/.test(tonnes)) { invalid(422, 'MBT_CHARGE_INPUT_INVALID', 'A measured weight in tonnes is required.'); }
+  const [whole, fraction = ''] = tonnes.split('.');
+  const microTonnes = Number(whole) * 1_000_000 + Number(fraction.padEnd(6, '0'));
+  if (microTonnes <= 0) { invalid(422, 'MBT_CHARGE_INPUT_INVALID', 'The measured weight must be positive.'); }
+  const rate = nonnegativeInteger(rateMinor, 'DumpGarbage per-tonne rate');
+  const amount = roundedRatio(rate,microTonnes,1_000_000,'Measured garbage charge');
+  const {paymentCategory} = paymentEvidence(method);
+  return {configuredAmountMinor:amount,...lineTaxEvidence(amount,true,paymentCategory,1300)};
+}
+
 /** @param {Record<string, any>} bin @param {string} kind */
 function normalizedOutgoingBin(bin, kind) {
   if (kind !== "exchange_bin") {
@@ -336,8 +349,8 @@ function aggregateEvidence(value) {
   return value.map((entry, index) => {
     const line = requiredObject(entry, `Aggregate line ${index + 1}`);
     const itemCode = String(line.itemCode || "").trim().toUpperCase();
-    if (!/^AGG_[A-Z0-9_]+$/u.test(itemCode) || itemCodes.has(itemCode)) {
-      invalid(400, "MBT_CHARGE_AGGREGATE_INVALID", "Aggregate item codes must be distinct configured AGG_ items.");
+    if (!/^[A-Z0-9][A-Z0-9_]{0,63}$/u.test(itemCode) || itemCodes.has(itemCode)) {
+      invalid(400, "MBT_CHARGE_AGGREGATE_INVALID", "Aggregate item codes must be distinct configured material items.");
     }
     itemCodes.add(itemCode);
     const displayName = String(line.displayName || itemCode).trim();

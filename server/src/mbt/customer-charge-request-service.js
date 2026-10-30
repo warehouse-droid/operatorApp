@@ -2,16 +2,21 @@
 import { assertFrontdeskBinDelivered } from "./frontdesk-bin-readiness.js";
 
 import crypto from "node:crypto";
+import { captureCollectionPricing } from './bin-dump-charge.js';
+import { currentContractActionRate } from './frontdesk-action-rates.js';
 
 import { query } from "../db.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from '../dispatch-fleet-status.js';
+import { binOrderChangeSubject, calculateBinOrderChange, materializeBinOrderChange } from './bin-order-change.js';
 import { createDispatchCustomOrder } from "../dispatch-custom-order-repository.js";
 import { executeMbtCommand } from "./command-repository.js";
 import { calculateCustomerCharge } from "./customer-charge-calculator.js";
+import { MBT_AGGREGATE_LBS_PER_YARD } from "./aggregate-density.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
 import { MbtError } from "./errors.js";
 
 const FRONTDESK_ROLES = new Set(["admin", "mbt_admin", "mbt_frontdesk"]);
-const ADMIN_ROLES = new Set(["admin", "mbt_admin"]);
+const RATE_MANAGER_ROLES = new Set(["admin", "mbt_admin", "dispatcher"]);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const ACTIVE_CONTRACT_STATUSES = new Set(["confirmed", "active", "return_due"]);
 const CONFIGURED_AGGREGATE_CODES = Object.freeze([
@@ -115,10 +120,11 @@ function assertFrontdeskActor(actor) {
 }
 
 /** @param {{operatorId?: unknown, roles?: readonly unknown[]}} actor */
-function assertAdminActor(actor) {
-  const normalized = assertFrontdeskActor(actor);
-  if (!normalized.roles.some((role) => ADMIN_ROLES.has(String(role).trim().toLowerCase()))) {
-    throw failure(403, "MBT_ADMIN_REQUIRED", "MBT customer-charge configuration requires an Admin account.");
+function assertRateManagerActor(actor) {
+  const normalized = {operatorId:requiredText(actor?.operatorId,"Operator ID"),
+    roles:Array.isArray(actor?.roles) ? actor.roles.map(String) : []};
+  if (!normalized.roles.some((role) => RATE_MANAGER_ROLES.has(String(role).trim().toLowerCase()))) {
+    throw failure(403, "MBT_ADMIN_REQUIRED", "MBT customer-charge configuration requires an Admin or Dispatcher account.");
   }
   return normalized;
 }
@@ -154,7 +160,7 @@ function exactConfiguredItems(value, expectedCodes, label) {
       itemCode: itemCode(row.itemCode, `${label} item code`),
       amountMinor: positiveConfigurationInteger(row.amountMinor, `${label} amount`),
       ...(label === "Aggregate pricing"
-        ? { densityLbsPerYard: positiveConfigurationInteger(row.densityLbsPerYard, `${label} density`) }
+        ? { densityLbsPerYard: positiveConfigurationInteger(row.densityLbsPerYard ?? MBT_AGGREGATE_LBS_PER_YARD, `${label} density`) }
         : {})
     };
   }).sort((left, right) => left.itemCode.localeCompare(right.itemCode));
@@ -228,7 +234,7 @@ function normalizedCustomerChargeConfiguration(input) {
 /** @param {unknown} value @param {string} label */
 function requestKind(value, label = "Request kind") {
   const kind = requiredText(value, label).toLowerCase();
-  if (!["initial_bin", "add_bin", "exchange_bin", "aggregate_order"].includes(kind)) {
+  if (!["initial_bin", "add_bin", "exchange_bin", "change_bin", "aggregate_order"].includes(kind)) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", `${label} is not supported.`);
   }
   return kind;
@@ -392,7 +398,7 @@ async function itemOwnedCustomerRates(rateCardVersionId) {
 
 /** @param {string} itemCodeValue */
 function dumpContentCode(itemCodeValue) {
-  const normalized = String(itemCodeValue).toLowerCase().replace(/^dump_/u, "");
+  const normalized = String(itemCodeValue).toLowerCase().replace(/^dump_?/u, "");
   for (const content of ["soil", "asphalt", "concrete"]) {
     if (new RegExp(`(?:^|_)${content}(?:_|$)`, "u").test(normalized)) {
       return content;
@@ -416,6 +422,13 @@ async function itemOwnedAggregateDistanceBands(rateCardVersionId) {
   return result.rows;
 }
 
+/** @param {Record<string, unknown>} input */
+async function configurationRateVersion(input) {
+  const requestedVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
+  const contractId = optionalUuid(input.contractId, "Contract ID");
+  return contractId ? currentContractActionRate(contractId, requestedVersionId) : requestedVersionId;
+}
+
 /**
  * Return only complete active configuration. Inactive seeded definitions stay
  * visible in the MBT database but cannot leak into Front Desk pricing.
@@ -424,7 +437,7 @@ async function itemOwnedAggregateDistanceBands(rateCardVersionId) {
  */
 export async function getFrontdeskCustomerChargeConfiguration(input) {
   assertFrontdeskActor(/** @type {any} */ (input.actor));
-  const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
+  const rateCardVersionId = await configurationRateVersion(input);
   await assertActiveRateVersion(rateCardVersionId);
   const [{ configuration, catalog, bands }, itemRates, itemBands] = await Promise.all([
     configuredChargeCatalog(rateCardVersionId),
@@ -433,14 +446,14 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
   ]);
   const legacyAggregateItems = catalog
     .filter((/** @type {any} */ row) => row.item_kind === "aggregate_material"
-      && row.charge_rate_id && Number(row.density_lbs_per_yard) > 0)
+      && row.charge_rate_id)
     .map((/** @type {any} */ row) => ({
       itemCode: String(row.item_code),
       displayName: String(row.display_name),
       description: String(row.description || ""),
       unitOfMeasure: "YARD",
       unitAmountMinor: Number(row.amount_minor),
-      densityLbsPerYard: Number(row.density_lbs_per_yard),
+      densityLbsPerYard: MBT_AGGREGATE_LBS_PER_YARD,
       netsuiteMappingLocalKey: row.netsuite_mapping_local_key
         ? String(row.netsuite_mapping_local_key)
         : null
@@ -462,7 +475,7 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
       description: String(row.description || ""),
       unitOfMeasure: "YARD",
       unitAmountMinor: Number(row.amount_minor),
-      densityLbsPerYard: Number(row.density_lbs_per_yard),
+      densityLbsPerYard: MBT_AGGREGATE_LBS_PER_YARD,
       netsuiteMappingLocalKey: row.netsuite_mapping_local_key ? String(row.netsuite_mapping_local_key) : null
     }));
   const dynamicFixedDumpItems = itemRates
@@ -581,7 +594,7 @@ async function customerChargeAdminDto(rateCardVersionId) {
       displayName: String(row.display_name),
       description: String(row.description || ""),
       amountMinor: row.amount_minor === null ? null : Number(row.amount_minor),
-      densityLbsPerYard: row.density_lbs_per_yard === null ? null : Number(row.density_lbs_per_yard),
+      densityLbsPerYard: MBT_AGGREGATE_LBS_PER_YARD,
       unitOfMeasure: "YARD",
       netsuiteMappingLocalKey: row.netsuite_mapping_local_key
         ? String(row.netsuite_mapping_local_key)
@@ -636,7 +649,7 @@ async function customerChargeAdminDto(rateCardVersionId) {
  * @param {Record<string, unknown>} input
  */
 export async function getFrontdeskCustomerChargeAdminConfiguration(input) {
-  assertAdminActor(/** @type {any} */ (input.actor));
+  assertRateManagerActor(/** @type {any} */ (input.actor));
   const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
   return customerChargeAdminDto(rateCardVersionId);
 }
@@ -715,7 +728,7 @@ async function storeCustomerChargeConfiguration(rateCardVersionId, configuration
  * @param {Record<string, any>} input
  */
 export async function replaceFrontdeskCustomerChargeConfiguration(input) {
-  const actor = assertAdminActor(input.actor);
+  const actor = assertRateManagerActor(input.actor);
   const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
   const expectedRevision = configurationExpectedRevision(input.expectedRevision);
   const reason = snapshotText(input.reason, "Audit reason", 2_000);
@@ -823,7 +836,6 @@ async function aggregateRateLines(input, rateCardVersionId) {
         AND item.item_type = 'aggregate'
         AND item.charge_basis = 'per_yard'
         AND item.active
-        AND item.density_lbs_per_yard > 0
         AND tariff.pricing_basis = 'per_quantity'
         AND upper(tariff.unit_of_measure) = 'YARD'
       ORDER BY item.item_code, version.effective_from DESC NULLS LAST,
@@ -843,13 +855,12 @@ async function aggregateRateLines(input, rateCardVersionId) {
       WHERE catalog.item_code = ANY($1::text[])
         AND catalog.item_kind = 'aggregate_material'
         AND catalog.active
-        AND catalog.unit_of_measure = 'YARD'
-        AND catalog.density_lbs_per_yard > 0`,
+        AND catalog.unit_of_measure = 'YARD'`,
       [requested.map((line) => line.itemCode), rateCardVersionId]
     );
   }
   if (selected.rowCount !== requested.length) {
-    throw failure(422, "MBT_FRONTDESK_AGGREGATE_RATE_MISSING", "Every aggregate material needs an active MBT per-yard rate and density.");
+    throw failure(422, "MBT_FRONTDESK_AGGREGATE_RATE_MISSING", "Every selected aggregate material needs an active MBT per-yard price. Check the material's rate card.");
   }
   const byCode = new Map(selected.rows.map((/** @type {any} */ row) => [String(row.item_code), row]));
   return requested.map((line) => {
@@ -862,7 +873,7 @@ async function aggregateRateLines(input, rateCardVersionId) {
       displayName: String(rate.display_name),
       quantityMilliYards: line.quantityMilliYards,
       unitAmountMinor: nonnegativeInteger(Number(rate.amount_minor), "Aggregate unit amount"),
-      densityLbsPerYard: nonnegativeInteger(Number(rate.density_lbs_per_yard), "Aggregate density"),
+      densityLbsPerYard: MBT_AGGREGATE_LBS_PER_YARD,
       rateCardVersionId: String(rate.rate_card_version_id),
       dumpTariffId: rate.dump_tariff_id ? String(rate.dump_tariff_id) : null,
       chargeRateId: rate.charge_rate_id ? String(rate.charge_rate_id) : null
@@ -1072,6 +1083,7 @@ async function selectFixedDumpRate(incomingContentCode, rateCardVersionId, deliv
         AND (
           lower(item.item_code) = $1
           OR lower(item.item_code) = 'dump_' || $1
+          OR lower(item.item_code) = 'dump' || $1
           OR lower(item.item_code) ~ ('(^|_)' || $1 || '(_|$)')
         )
       ORDER BY version.effective_from DESC NULLS LAST,
@@ -1169,6 +1181,26 @@ function fixedDumpRateEvidence(incomingContentCode, fixedDump) {
     fixedDumpTariffId: row.dump_tariff_id ? String(row.dump_tariff_id) : null,
     fixedDumpChargeRateId: row.charge_rate_id ? String(row.charge_rate_id) : null
   };
+}
+
+/** Prefer the incoming item's effective rate; retain legacy contract rules as fallback.
+ * @param {string} contentCode @param {string} rentalVersionId @param {string} contractVersionId @param {string} binTypeId */
+async function selectBinDeposit(contentCode, rentalVersionId, contractVersionId, binTypeId) {
+  if (contentCode!=="garbage") {return {rows:[]};}
+  for (const versionId of new Set([rentalVersionId || contractVersionId, contractVersionId])) {
+    const selected = await query(`SELECT rule_type,fixed_amount_minor,percentage_basis_points,currency,
+        deposit_rule_id::text,rate_card_version_id::text,
+        ((bin_type_id IS NOT NULL)::int*2+(service_code IS NOT NULL)::int) AS specificity
+      FROM mbt_deposit_rules WHERE rate_card_version_id=$1::uuid AND active
+        AND (bin_type_id IS NULL OR bin_type_id=$2::uuid)
+        AND (service_code IS NULL OR service_code='delivery')
+      ORDER BY specificity DESC,rule_code,deposit_rule_id LIMIT 2`, [versionId,binTypeId]);
+    if (selected.rows.length>1 && selected.rows[0].specificity===selected.rows[1].specificity) {
+      throw failure(422, "MBT_FRONTDESK_DEPOSIT_RATE_AMBIGUOUS", "The incoming garbage bin has multiple matching deposit rules. Keep one active rule for this bin.");
+    }
+    if (selected.rowCount) {return selected;}
+  }
+  return {rows:[]};
 }
 
 /** @param {Record<string, any>} input @param {string} rateCardVersionId @param {number} distanceMetres */
@@ -1311,18 +1343,7 @@ async function binRateEvidence(input, rateCardVersionId, distanceMetres) {
       [rateCardVersionId, incomingBinTypeId, distanceMetres, originYardCode]
     );
   }
-  const deposit = await query(
-      `SELECT rule_type, fixed_amount_minor, percentage_basis_points,
-              currency, deposit_rule_id::text, rate_card_version_id::text
-         FROM mbt_deposit_rules
-        WHERE rate_card_version_id = $1::uuid AND active
-          AND (bin_type_id IS NULL OR bin_type_id = $2::uuid)
-          AND (service_code IS NULL OR service_code = 'delivery')
-        ORDER BY (bin_type_id IS NOT NULL) DESC, (service_code IS NOT NULL) DESC,
-                 rule_code, deposit_rule_id
-        LIMIT 1`,
-      [rateCardVersionId, incomingBinTypeId]
-    );
+  const deposit = await selectBinDeposit(incomingContentCode, rental.rows[0]?.rate_card_version_id, rateCardVersionId, incomingBinTypeId);
   const fixedDump = await selectFixedDumpRate(incomingContentCode, rateCardVersionId, deliveryAt);
   assertBinRateSelections({ binIdentity, rental, delivery, fixedDump }, incomingBinSizeYards, incomingContentCode);
   const currencies = [rental.rows[0].currency, delivery.rows[0].currency];
@@ -1420,7 +1441,10 @@ async function calculatePersistableRequest(input, rateCardVersionId, currentTota
       bin: { ...binRate.calculator, depositMinor: percentageDeposit }
     });
   }
-  return { calculation, binRate, aggregateLines, distanceMetres };
+  const collectionPricing = input.kind === 'exchange_bin'
+    ? await captureCollectionPricing(input.contractId,rateCardVersionId) : null;
+  return { calculation, binRate:binRate ? {...binRate,...(collectionPricing ? {collectionPricing} : {})} : null,
+    aggregateLines, distanceMetres };
 }
 
 /** @param {string} requestId */
@@ -1569,6 +1593,19 @@ export async function persistPreparedFrontdeskInitialCharge(prepared, sourceQuot
   return chargeRequestDto(row);
 }
 
+/** @param {any} normalizedInput @param {string | null} contractId @param {string | null} serviceLineId @param {number | null} revision */
+async function prepareBinChangeInput(normalizedInput,contractId,serviceLineId,revision) {
+  if (!contractId || !serviceLineId || !revision) { throw failure(400,'MBT_FRONTDESK_INPUT_INVALID','A current bin order is required.'); }
+  const subject = await binOrderChangeSubject(contractId,serviceLineId,revision);
+  const previous = subject.previous;
+  if (Array.isArray(normalizedInput.aggregateLines) && normalizedInput.aggregateLines.length) { throw failure(400,'MBT_FRONTDESK_INPUT_INVALID','Change attached aggregate through a separate request.'); }
+  if (String(normalizedInput.paymentMethod)!==previous.paymentMethod) { throw failure(400,'MBT_FRONTDESK_INPUT_INVALID','Keep the original payment method for this price adjustment.'); }
+  normalizedInput.bin = {...normalizedInput.bin,proposedDeliveryAt:new Date(subject.line.planned_delivery_at).toISOString(),proposedReturnAt:new Date(subject.line.planned_return_at).toISOString()};
+  normalizedInput.orderFrom150 = previous.orderFrom150;
+  normalizedInput.distanceMetres = subject.charge.pricing_snapshot.distanceMetres;
+  return previous;
+}
+
 /**
  * Persist a server-owned draft whose prices can be shown to the customer.
  * The draft is replaced, not edited, whenever payment/rates/request inputs
@@ -1588,10 +1625,10 @@ export async function previewFrontdeskChargeRequest(input) {
   const expectedServiceLineRevision = serviceLineId
     ? positiveRevision(input.expectedServiceLineRevision, "Expected service-line revision")
     : null;
-  if (["add_bin", "exchange_bin"].includes(kind) && !contractId) {
+  if (["add_bin", "exchange_bin", "change_bin"].includes(kind) && !contractId) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", `${kind} requires an active contract.`);
   }
-  if (kind === "exchange_bin" && !serviceLineId) {
+  if (["exchange_bin", "change_bin"].includes(kind) && !serviceLineId) {
     throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "An exchange requires the outgoing service line.");
   }
   const billingAddressText = snapshotText(input.billingAddressText, "Billing address", 1_000);
@@ -1617,15 +1654,14 @@ export async function previewFrontdeskChargeRequest(input) {
     correlationId: requiredText(input.correlationId, "Correlation ID"),
     requestId: requiredText(input.requestId, "Request ID"),
     mutation: async () => {
-      await assertActiveRateVersion(rateCardVersionId);
+      if (kind === 'change_bin') { await query('SELECT pg_advisory_xact_lock(hashtext($1))', [DISPATCH_FLEET_PLANNING_LOCK]); }
+      let actionRateCardVersionId = rateCardVersionId;
       let contract = null;
       let customerNetsuiteId;
       let currentTotal = 0;
       if (contractId && expectedContractRevision) {
         contract = await contractPricingSubject(contractId, expectedContractRevision);
-        if (String(contract.rate_card_version_id) !== rateCardVersionId) {
-          throw failure(409, "MBT_FRONTDESK_RATE_CARD_MISMATCH", "The request must use its contract's locked MBT rate version.");
-        }
+        actionRateCardVersionId = await currentContractActionRate(contractId, rateCardVersionId, true);
         customerNetsuiteId = String(contract.customer_netsuite_id);
         currentTotal = await currentContractTotalMinor(contract);
         if (serviceLineId) {
@@ -1644,22 +1680,27 @@ export async function previewFrontdeskChargeRequest(input) {
       } else {
         customerNetsuiteId = requiredText(input.customerNetsuiteId, "Customer NetSuite ID");
       }
+      await assertActiveRateVersion(actionRateCardVersionId);
       await customerSubject(customerNetsuiteId);
       const normalizedInput = {
         ...payload,
+        rateCardVersionId: actionRateCardVersionId,
         kind,
         billingAddressText,
         serviceAddressText,
         contractTelephone,
         reason
       };
-      const priced = await calculatePersistableRequest(normalizedInput, rateCardVersionId, currentTotal);
+      const previous = kind === 'change_bin'
+        ? await prepareBinChangeInput(normalizedInput,contractId,serviceLineId,expectedServiceLineRevision) : null;
+      const priced = await calculatePersistableRequest({...normalizedInput,kind:kind === 'change_bin' ? 'add_bin' : kind}, actionRateCardVersionId, currentTotal);
+      if (previous) { priced.calculation = calculateBinOrderChange(previous, priced.calculation, currentTotal); }
       const row = await insertChargeRequest(normalizedInput, priced.calculation, {
         actorId: actor.operatorId,
         customerNetsuiteId,
         contractId,
         serviceLineId,
-        rateCardVersionId,
+        rateCardVersionId: actionRateCardVersionId,
         expectedContractRevision,
         expectedServiceLineRevision,
         ...priced
@@ -1813,6 +1854,7 @@ async function materializeChargeRequestOperation(context) {
   const { row, actor, chargeRequestId, reason, correlationId, requestId, attachedAggregate } = context;
   const pricing = row.pricing_snapshot || {};
   const calculation = pricing.calculation || {};
+  if (row.request_kind === 'change_bin') { return materializeBinOrderChange(row, actor.operatorId); }
   if (String(row.request_kind) === "add_bin") {
     const { materializeFrontdeskPricedAddBin } = await import("./frontdesk-service.js");
     return materializeFrontdeskPricedAddBin({
@@ -1889,6 +1931,7 @@ export async function confirmFrontdeskChargeRequest(input) {
       }
       const row = selected.rows[0];
       assertConfirmableChargeRequest(row, expectedRevision);
+      if (row.request_kind === "change_bin") { await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]); }
       await assertChargeRequestContractCurrent(row);
       const before = chargeRequestDto(row);
       const attachedAggregate = attachedAggregateEvidence(row);

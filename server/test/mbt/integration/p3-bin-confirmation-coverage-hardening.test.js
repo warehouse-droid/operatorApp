@@ -242,10 +242,12 @@ test("P3 coverage: reservation-ledger slot drift cannot be hidden by a valid fro
   await assertConfirmationRejectedWithoutWrites(fixture, "active_reservation_mismatch");
 });
 
-test("P3 coverage: a driver disabled after assignment fails current capability without confirmation writes", async () => {
+test("P3 coverage: a driver disabled after assignment does not block planning confirmation", async () => {
   const fixture = await newAssignedFixture("coverage-inactive-driver", 31_007);
   await query("UPDATE dispatch_drivers SET active = false WHERE id = $1", [fixture.driverId]);
-  await assertConfirmationRejectedWithoutWrites(fixture, "truck_capability_mismatch");
+  await confirmFixture(fixture);
+  assert.equal((await query("SELECT status FROM dispatch_plans WHERE id=$1", [fixture.planId])).rows[0].status, "confirmed");
+  assert.equal((await query("SELECT active FROM dispatch_drivers WHERE id=$1", [fixture.driverId])).rows[0].active, false);
 });
 
 test("P3 coverage: advancing a missing contract leaves no command receipt, audit, or plan mutation", async () => {

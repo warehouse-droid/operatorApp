@@ -1,4 +1,6 @@
 import { readNetSuiteOrderLine, withNetSuiteOrderLines } from "./netsuite-order-line.js";
+import { AGGREGATE_SOURCE_FILTER } from './aggregate-reconciliation.js';
+import { listPendingAggregateReconciliationSources } from './aggregate-reconciliation-repository.js';
 import { query, withTransaction } from "./db.js";
 import {
   fetchPoToLinkedTransactionsFromNetSuite,
@@ -358,6 +360,8 @@ function mapRunRow(row = {}) {
   return {
     id: Number(row.id),
     runKey: row.run_key || row.runKey || "",
+    sourceFilter: row.source_filter || row.sourceFilter || '',
+    scheduledLocalDate: row.scheduled_local_date || row.scheduledLocalDate || null,
     triggerSource: row.trigger_source || row.triggerSource || "manual",
     scope: row.scope_kind || row.scope || "all",
     soOrderType: normalizeSalesOrderReconciliationType(
@@ -747,7 +751,9 @@ async function resolveRunSources(run, workerLeaseToken) {
     apiRequests = resolved.apiRequests;
     resolutionErrors = resolved.resolutionErrors || [];
   } else {
-    sources = await listLocalScmReconciliationSources({
+    sources = run.sourceFilter === AGGREGATE_SOURCE_FILTER
+      ? await listPendingAggregateReconciliationSources()
+      : await listLocalScmReconciliationSources({
       kind: ["SO", "PO", "TO"].includes(scope) ? scope : "",
       includeTerminalOrders: run.includeTerminalOrders,
       soOrderType: run.soOrderType
@@ -763,7 +769,7 @@ async function resolveRunSources(run, workerLeaseToken) {
           : ""
     });
   const candidateKeys = new Set(sources.map(sourceKey));
-  const applicableExcludedSources = scope === "order_family"
+  const applicableExcludedSources = scope === "order_family" || run.sourceFilter
     ? excludedSources.filter((source) => candidateKeys.has(sourceKey(source)))
     : excludedSources;
   const excludedKeys = new Set(applicableExcludedSources.map(sourceKey));
@@ -2485,6 +2491,7 @@ export async function applyScmReconciliationRun(
       triggerSource: "manual",
       scope,
       soOrderType: proposalRun.soOrderType,
+      sourceFilter: proposalRun.sourceFilter,
       targetOrderKind: proposalRun.targetOrderKind || null,
       targetOrderId: proposalRun.targetOrderId,
       targetOrderRef: proposalRun.targetOrderRef,

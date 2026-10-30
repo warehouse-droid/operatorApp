@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+server_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$server_root/.." && pwd)"
+if [[ -z "${MBBS_TEST_ARTIFACT_DIR:-}" ]]; then
+  exec python3 "$repo_root/docker/retention/retention.py" run --root /tmp/mbbs-ifir-test-artifacts -- bash "$0" "$@"
+fi
+audit_root="$server_root/test-artifacts/ifir-posting-integration-20261021"
+mkdir -p "$MBBS_TEST_ARTIFACT_DIR/ifir-integration" "$audit_root"
+project="mbbs-ifir-integration-test"
+overlay="$MBBS_TEST_ARTIFACT_DIR/compose.ifir.yml"
+compose=(docker compose -p "$project" -f "$repo_root/docker-compose.mbt-test.yml" -f "$overlay")
+cleanup() {
+  "${compose[@]}" --profile tools down --volumes --remove-orphans
+  # The user requested retention of logs and evidence, never test databases.
+  cp -R "$MBBS_TEST_ARTIFACT_DIR/ifir-integration/." "$audit_root/"
+  docker ps --format '{{.Names}} {{.Status}}'
+  docker ps -a --format '{{.Names}} {{.Status}}'
+  if docker ps -aq --filter "label=com.docker.compose.project=$project" | rg -q .; then return 1; fi
+  docker inspect mbbs-operator-app-app-1 --format '{{.State.Health.Status}}'
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+cat > "$overlay" <<EOF
+services:
+  test:
+    image: ${IFIR_INTEGRATION_IMAGE:-mbbs-operator-app:dispatch-editor-control-browser-test-20261015}
+    working_dir: /app
+    labels:
+      com.mbbs.lifecycle: disposable-test
+    volumes:
+      - ${IFIR_INTEGRATION_SOURCE_ROOT:-$server_root/src}:/app/src:ro
+      - $server_root/test:/app/test:ro
+      - $server_root/public:/app/public:ro
+      - $server_root/migrations:/app/migrations:ro
+      - $server_root/contracts:/app/contracts:ro
+      - $server_root/package.json:/app/package.json:ro
+      - $server_root/.env.example:/app/.env.example:ro
+      - $server_root/netsuite-ifir-posting-restlet.js:/app/netsuite-ifir-posting-restlet.js:ro
+      - ${IFIR_INTEGRATION_BASELINE_ROOT:-$server_root/artifacts/ifir-posting-integration-20261021/before}:/app/ifir-before:ro
+      - $MBBS_TEST_ARTIFACT_DIR/ifir-integration:/app/test-artifacts/ifir-integration
+      - $server_root/tools/ifir-integration-gauntlet.mjs:/app/tools/ifir-integration-gauntlet.mjs:ro
+      - $server_root/test-artifacts/operator-to-yard-flow-tooling/node_modules:/app/node_modules:ro
+EOF
+if [[ $# -eq 0 ]]; then set -- node tools/ifir-integration-gauntlet.mjs; fi
+"${compose[@]}" --profile tools run --rm --no-deps test sh -c 'umask 0002; exec "$@"' sh "$@"
+if [[ -f "$MBBS_TEST_ARTIFACT_DIR/ifir-integration/final/report.json" ]]; then
+  python3 "$server_root/tools/ifir-integration-coverage.py" "$MBBS_TEST_ARTIFACT_DIR/ifir-integration/final"
+fi

@@ -97,16 +97,18 @@ test('pre-SO header method change alerts teams and a note-only save does not', (
   d = await repo.updateSpecialStockHeader(d.id, { expectedRevision: d.revision, remarks: 'Call again' }, sales);
   assert.equal((await notifications(d.id)).length, 1);
 }));
-test('wrong yard, stale revision, planned or closed fulfillment cannot create a notice', () => fixture(async () => {
+test('wrong yard, stale revision or closed fulfillment cannot create a notice; planning permits a notified change', () => fixture(async () => {
   const d = await linked(); const change = { expectedRevision: d.revision, fulfillmentMethod: 'yard_pickup' };
   await assert.rejects(() => update(d.id, change, { ...sales, authorizedStoreLocationIds: [28] }), { code: 'SPECIAL_CASE_STORE_FORBIDDEN' });
   await assert.rejects(() => update(d.id, { ...change, expectedRevision: d.revision + 1 }, sales), { code: 'SPECIAL_REVISION_CONFLICT' });
   await query('UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=8899951');
-  await assert.rejects(() => update(d.id, change, sales), { code: 'SPECIAL_FULFILLMENT_PLANNED' });
-  await query('UPDATE sales_orders SET dispatch_planned=false WHERE netsuite_id=8899951');
+  assert.equal((await notifications(d.id)).length, 0);
+  const changed = await update(d.id, change, sales);
+  assert.equal(changed.fulfillmentMethod, 'yard_pickup');
+  assert.equal((await notifications(d.id)).length, 1);
   await query("UPDATE sales_special_stock_cases SET close_status='closed' WHERE request_id=$1", [d.id]);
-  await assert.rejects(() => update(d.id, change, sales), { code: 'SPECIAL_FULFILLMENT_CLOSED' });
-  assert.equal((await notifications(d.id)).length, 0); assert.equal((await repo.getSpecialStockCase(d.id)).fulfillmentMethod, 'vendor_pickup');
+  await assert.rejects(() => update(d.id, {...change, expectedRevision: changed.revision, fulfillmentMethod:'vendor_pickup'}, sales), { code: 'SPECIAL_FULFILLMENT_CLOSED' });
+  assert.equal((await notifications(d.id)).length, 1); assert.equal((await repo.getSpecialStockCase(d.id)).fulfillmentMethod, 'yard_pickup');
 }));
 test('invalid recipient and alert IDs fail without acknowledgement writes', () => fixture(async () => {
   for (const audience of ['sales', 'public', '', null]) { await assert.rejects(() => listSpecialDeliveryMethodAlerts({ ...scm, audience }), { status: 400 }); }

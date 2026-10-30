@@ -7,7 +7,7 @@ import {parseDeliveryExpiryTime,formatDeliveryExpiryDeadline} from './delivery-r
   const labels = {submitted:'Awaiting Dispatch',proposed:'Proposed time',preapproved:'Pre-approved — orders needed',confirmed:'Secured',expired:'Expired',cancelled:'Cancelled'};
   const tripLabels={single:'Single trip',round_trip:'Round trip',multi_stop:'Multi-stop trip'};
   const state = {actor:null,meta:null,rows:[],detail:null,instruction:null,instructionRef:'',draft:null,quote:null,busy:false,generation:0,operation:null};
-  let events = null, poll = null, searchTimer = null;
+  let events = null, poll = null, searchTimer = null, listGeneration = 0;
   const esc = value => String(value ?? '').replace(/[&<>"']/g,char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const money = value => new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD'}).format(Number(value || 0)/100);
   const quantityUnit = row => row.quantityUnit==='yard'?'Yard':row.loadType.toUpperCase();
@@ -42,19 +42,27 @@ import {parseDeliveryExpiryTime,formatDeliveryExpiryDeadline} from './delivery-r
       </div><p class="dr-muted">Changes apply to new quotes and new pre-approvals.</p><button class="primary">Save settings</button></form></details>`;
   }
   async function loadList() {
+    const generation = ++listGeneration;
     const statuses=[...root.querySelectorAll('[data-status]:checked')].map(input=>input.value);
     const query=new URLSearchParams({search:root.querySelector('[data-search]')?.value || ''});
     statuses.forEach(status=>query.append('status',status));
     root.querySelector('[data-status-summary]').textContent=statuses.length?statuses.map(status=>labels[status]).join(', '):'All statuses';
-    const result=await api(`${endpoint}?${query}`);state.rows=result.requests;
+    const result=await api(`${endpoint}?${query}`);
+    if (generation !== listGeneration) return;
+    state.rows=result.requests;
     root.querySelector('[data-list]').innerHTML=state.rows.map(row=>`<button type="button" data-action="open" data-id="${row.id}" aria-current="${row.id===state.detail?.id}">
       <strong>${esc(row.requestRef)} · ${esc(labels[row.status])}${row.pendingWindow?' · Time change pending':''}</strong><span>${esc(row.customerName || row.deliveryAddress)}</span>
       <small>${row.totalUnits} ${esc(quantityUnit(row))} · ${esc(slotText(row.confirmedWindow || row.proposedWindow || row.requestedWindow))}</small></button>`).join('') || '<p class="dr-muted">No requests found.</p>';
+    for (const card of root.querySelectorAll('[data-list] [data-action="open"]')) {
+      const row = state.rows.find(item => Number(item.id) === Number(card.dataset.id));
+      window.MBBSRequestUnreadBadge?.paint(card, row?.unreadMessageCount);
+    }
     if(state.detail && state.rows.some(row=>row.id===state.detail.id && row.revision>state.detail.revision)) {notice('This request has an update. Refresh the request to review it.');}
   }
   async function readDisplayed(row) {
     await api(`${endpoint}/${row.id}/read`,{method:'POST',body:JSON.stringify({revision:row.revision})});
     window.MBBSDeliveryRequestAlerts?.refresh();
+    await loadList();
   }
   async function open(id) {
     const row=await api(`${endpoint}/${id}`);
@@ -442,7 +450,7 @@ import {parseDeliveryExpiryTime,formatDeliveryExpiryDeadline} from './delivery-r
     const row=state.detail,payload={expectedRevision:row.revision,...fields},key=JSON.stringify({name,payload});
     if(state.operation?.key!==key) {state.operation={key,id:crypto.randomUUID()};}
     const result=await api(`${endpoint}/${row.id}/actions/${name}`,{method:'POST',body:JSON.stringify({...payload,operationId:state.operation.id})});
-    state.operation=null;state.detail=result;state.draft=null;renderDetail();await loadList();await readDisplayed(result);
+    state.operation=null;state.detail=result;state.draft=null;renderDetail();await readDisplayed(result);
     if(result.status==='confirmed') {await loadInstruction(instructionOrderRefs(result)[0]);}
   }
   function instructionPath(ref=state.instructionRef) {return audience==='sales'?`/api/sales/delivery-instructions/orders/${encodeURIComponent(ref)}`:`/api/dispatch/orders/${encodeURIComponent(ref)}/delivery-instructions`;}

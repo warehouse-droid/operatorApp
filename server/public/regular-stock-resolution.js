@@ -15,7 +15,7 @@
   /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
   function button(request,busy=false,line) {
     line=line||(request?.lines?.length===1?request.lines[0]:null);
-    return line&&eligible(request,line)?`<button data-scm-stock-action="resolve" data-line-id="${line.id}" type="button" ${busy?'disabled':''}>${t('Resolve','解决')}</button>`:'';
+    return line&&eligible(request,line)?`<button data-scm-stock-action="yard_stock" data-line-id="${line.id}" type="button" ${busy?'disabled':''}>${t('Stock available at destination yard','目的地货场库存充足')}</button><button data-scm-stock-action="resolve" data-line-id="${line.id}" type="button" ${busy?'disabled':''}>${t('Resolve','解决')}</button>`:'';
   }
   /** @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionRequest|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionDraft|null|undefined} draft @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
   function editor(request,draft,busy=false,line) {

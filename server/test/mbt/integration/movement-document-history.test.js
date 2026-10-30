@@ -52,28 +52,31 @@ test("saved IFs display for pickups in both lists and details without a driver w
   assert.deepEqual(await listOperatorHistory({ operatorId: crypto.randomUUID(), date, yardLocationIds: [1] }), []);
 }));
 
-test("waiting ends on the drop, not the pickup, prior delivery, or IF availability", async () => fixture(async (f) => {
+test("SO load history never waits for a Driver drop, pickup, or IF availability", async () => fixture(async (f) => {
   await f.drop("09:00:00");
   await f.load();
   await f.drop("11:00:00", "complete", "pickup");
   await f.drop("11:30:00", "in_progress");
-  assert.equal((await f.history())[0].waitingForDriverCompletion, true);
-  assert.equal((await f.movements())[0].waitingForDriverCompletion, true);
+  assert.equal((await f.history())[0].waitingForDriverCompletion, false);
+  assert.equal((await f.movements())[0].waitingForDriverCompletion, false);
   await f.drop();
   assert.equal((await f.history())[0].waitingForDriverCompletion, false);
   assert.deepEqual((await f.history())[0].documents, []);
   assert.equal((await f.movements())[0].waitingForDriverCompletion, false);
   await f.load("sales_order_delivery_load", {}, "13:00:00");
-  assert.equal((await f.history())[0].waitingForDriverCompletion, true);
-  assert.equal((await f.movements())[0].waitingForDriverCompletion, true);
+  assert.equal((await f.history())[0].waitingForDriverCompletion, false);
+  assert.equal((await f.movements())[0].waitingForDriverCompletion, false);
   await query("UPDATE sales_orders SET local_yard_order_status='Closed' WHERE netsuite_id=$1", [f.orderId]);
   assert.equal((await f.history())[0].waitingForDriverCompletion, false);
 }));
 
-test("driver-created IF follows its saved load snapshot and completion outside the selected date", async () => fixture(async (f) => {
+test("legacy Driver-created IF retains its saved load snapshot and evidence outside the selected date", async () => fixture(async (f) => {
   const load = await f.load();
   const driver = await f.drop();
   const completion = (await query("SELECT id FROM dispatch_order_completion_events WHERE completion_evidence_id=$1", [driver.job_id])).rows[0].id;
+  const legacyId=crypto.randomUUID();
+  await query(`INSERT INTO dispatch_sales_order_if_candidates(id,completion_event_id,dispatch_order_ref,external_id)
+    VALUES($1,$2,$3,$4)`,[legacyId,completion,f.ref,`MBBS-SOIF-${legacyId}`]);
   await query(`UPDATE dispatch_sales_order_if_candidates SET status='completed', completed_at=now(),
     netsuite_transaction_ref='IF-DELIVERED', netsuite_transaction_id=99999999,
     line_snapshot=$2 WHERE completion_event_id=$1`, [completion, JSON.stringify([{ operatorLoadRecordId: String(load) }])]);
@@ -130,9 +133,8 @@ test("transfer load history no longer waits for its driver drop", async () => fi
 
 test("multipart IF numbers show individually even while another part is pending", async () => fixture(async (f) => {
   const load = await f.load();
-  const driver = await f.drop();
-  const candidate = (await query(`SELECT c.id,c.external_id FROM dispatch_sales_order_if_candidates c JOIN dispatch_order_completion_events e
-    ON e.id=c.completion_event_id WHERE e.completion_evidence_id=$1`, [driver.job_id])).rows[0];
+  const candidate = (await query(`SELECT id,external_id FROM dispatch_sales_order_if_candidates
+    WHERE operator_load_record_id=$1`, [load])).rows[0];
   await query("UPDATE dispatch_sales_order_if_candidates SET line_snapshot=$2 WHERE id=$1", [candidate.id, JSON.stringify([{ operatorLoadRecordId: String(load) }])]);
   await query("INSERT INTO netsuite_item_fulfillment_plans(external_id,source_netsuite_id,payload_hash,payload) VALUES($1,$2,$3,'{}')", [candidate.external_id, f.orderId, 'a'.repeat(64)]);
   for (const [location, ref, status] of [[1, 'IF-PART-1', 'posted'], [28, 'IF-PART-2', 'posted'], [15, null, 'pending']]) {

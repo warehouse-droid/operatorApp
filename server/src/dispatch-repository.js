@@ -29,10 +29,8 @@ import {
 } from "./dispatch-enrichment.js";
 import { resolveDispatchSalesTarget } from "./dispatch-order-target-repository.js";
 import { cancelDispatchCoGlobally } from "./dispatch-co-lifecycle.js";
-import {
-  exactNetSuiteClosedSql,
-  netSuiteClosedOrderFamilySql
-} from "./netsuite-closed-order-policy.js";
+import { exactNetSuiteClosedSql } from "./netsuite-closed-order-policy.js";
+import { DISPATCH_CLOSED_ORDER_FAMILY_CTES } from "./dispatch-order-pool-sql.js";
 import { assertNoClosedNetSuiteOrders, listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import {
   dispatchLocationsShareYard,
@@ -86,6 +84,29 @@ function netSuitePendingApprovalSql(alias) {
     OR COALESCE(${alias}.status_text, '') ~*
       '^[[:space:]]*((sales|purchase|transfer)[[:space:]]+order[[:space:]]*:[[:space:]]*)?pending([[:space:]]+supervisor)?[[:space:]]+approval[[:space:]]*$'
   )`;
+}
+
+// Explain a known source order only after the normal Dispatch lookup failed.
+// This does not change which orders are eligible for planning.
+export async function getDispatchOrderUnavailableReason(orderRef) {
+  const ref = String(orderRef || "").trim();
+  if (!ref) return null;
+  const result = await query(
+    `SELECT tranid
+       FROM sales_orders
+      WHERE (UPPER(BTRIM(tranid)) = UPPER($1) OR netsuite_id::text = $1)
+        AND netsuite_active = true
+        AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD}'
+        AND ${netSuitePendingApprovalSql("sales_orders")}
+      LIMIT 1`,
+    [ref]
+  );
+  if (!result.rowCount) return null;
+  return {
+    code: "DISPATCH_ORDER_PENDING_APPROVAL",
+    orderRef: result.rows[0].tranid,
+    error: "This sales order is pending approval in NetSuite. Approve it in NetSuite, then refresh the order pool."
+  };
 }
 
 function dispatchItemHasConversion(item) {
@@ -495,7 +516,8 @@ export async function listDispatchOrders({
   ];
   const result = await query(
     `
-    WITH requested_exact_refs(requested_ref, numeric_id) AS (
+    WITH ${DISPATCH_CLOSED_ORDER_FAMILY_CTES},
+    requested_exact_refs(requested_ref, numeric_id) AS (
       SELECT normalized.requested_ref,
              CASE
                WHEN normalized.requested_ref ~ '^-?[0-9]{1,19}$'
@@ -718,7 +740,7 @@ export async function listDispatchOrders({
         CASE WHEN $2::boolean AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active
       FROM sales_orders
       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
-        AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+        AND sales_orders.netsuite_id NOT IN (SELECT id FROM closed_so_ids)
         AND (COALESCE(is_test_fixture, false) = false OR $2::boolean)
         AND (
           cardinality($8::text[]) = 0
@@ -756,7 +778,7 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_orders
       WHERE from_location_id IS NOT NULL
-        AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+        AND transfer_orders.netsuite_id NOT IN (SELECT id FROM closed_to_ids)
         AND (
           cardinality($8::text[]) = 0
           OR netsuite_id IN (SELECT order_id FROM exact_to_ids)
@@ -861,7 +883,7 @@ export async function listDispatchOrders({
         is_blanket_po,
         netsuite_active
       FROM purchase_orders
-      WHERE ($9::boolean OR NOT ${netSuiteClosedOrderFamilySql("purchase_orders", "PO")})
+      WHERE ($9::boolean OR purchase_orders.netsuite_id NOT IN (SELECT id FROM closed_po_ids))
         AND (
           cardinality($8::text[]) = 0
           OR netsuite_id IN (SELECT order_id FROM exact_po_ids)
@@ -898,7 +920,7 @@ export async function listDispatchOrders({
         netsuite_active
       FROM transfer_orders
       WHERE to_location_id IS NOT NULL
-        AND NOT ${netSuiteClosedOrderFamilySql("transfer_orders", "TO")}
+        AND transfer_orders.netsuite_id NOT IN (SELECT id FROM closed_to_ids)
         AND (
           cardinality($8::text[]) = 0
           OR netsuite_id IN (SELECT order_id FROM exact_to_ids)
@@ -919,7 +941,7 @@ export async function listDispatchOrders({
         JOIN purchase_order_lines source ON source.id = ledger.source_line_id
        ORDER BY ledger.split_line_id, header.updated_at DESC, header.id DESC
     ),
-    receiving_line_source AS (
+    receiving_line_source AS MATERIALIZED (
       SELECT
         po_line.purchase_order_id AS order_id,
         po_line.id,
@@ -3552,18 +3574,18 @@ export async function listScmSchedule({
           CASE
             WHEN COALESCE(l.to_plt, 0) <> 0 OR COALESCE(l.to_lyr, 0) <> 0 OR COALESCE(l.to_sec, 0) <> 0 OR COALESCE(l.to_pcs, 0) <> 0 THEN
               trim(concat_ws(' ',
-                COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
+                COALESCE(CASE WHEN l.item_id=2055 OR lower(btrim(l.item_name))='mbbs-special order' OR lower(btrim(l.sku))='mbbs-special order' THEN NULLIF(btrim(l.item_description),'') END, NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
                 NULLIF(trim(concat_ws(' ',
-                  CASE WHEN GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0), 'FM999999999990.##')) || ' PLT' END,
-                  CASE WHEN GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0), 'FM999999999990.##')) || ' LYR' END,
-                  CASE WHEN GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0), 'FM999999999990.##')) || ' SEC' END,
-                  CASE WHEN GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0) > 0 THEN trim(to_char(GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0), 'FM999999999990.##')) || ' PCS' END
+                  CASE WHEN GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0) > 0 THEN rtrim(rtrim(to_char(GREATEST(COALESCE(l.pallet_qty, 0) - COALESCE(l.received_pallet_qty, 0) - COALESCE(split_alloc.pallet_qty, 0), 0), 'FM999999999990.99'), '0'), '.') || ' PLT' END,
+                  CASE WHEN GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0) > 0 THEN rtrim(rtrim(to_char(GREATEST(COALESCE(l.layer_qty, 0) - COALESCE(l.received_layer_qty, 0) - COALESCE(split_alloc.layer_qty, 0), 0), 'FM999999999990.99'), '0'), '.') || ' LYR' END,
+                  CASE WHEN GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0) > 0 THEN rtrim(rtrim(to_char(GREATEST(COALESCE(l.section_qty, 0) - COALESCE(l.received_section_qty, 0) - COALESCE(split_alloc.section_qty, 0), 0), 'FM999999999990.99'), '0'), '.') || ' SEC' END,
+                  CASE WHEN GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0) > 0 THEN rtrim(rtrim(to_char(GREATEST(COALESCE(l.piece_qty, 0) - COALESCE(l.received_piece_qty, 0) - COALESCE(split_alloc.piece_qty, 0), 0), 'FM999999999990.99'), '0'), '.') || ' PCS' END
                 )), '')
               ))
             ELSE
               trim(concat_ws(' ',
-                COALESCE(NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
-                trim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(split_alloc.sales_qty, 0), 0), 'FM999999999990.######')),
+                COALESCE(CASE WHEN l.item_id=2055 OR lower(btrim(l.item_name))='mbbs-special order' OR lower(btrim(l.sku))='mbbs-special order' THEN NULLIF(btrim(l.item_description),'') END, NULLIF(l.sku, ''), NULLIF(l.item_name, ''), 'Item'),
+                rtrim(rtrim(to_char(GREATEST(COALESCE(l.quantity, 0) - COALESCE(l.netsuite_received_baseline_qty, l.netsuite_received_qty, 0) - COALESCE(split_alloc.sales_qty, 0), 0), 'FM999999999990.999999'), '0'), '.'),
                 NULLIF(l.unit, '')
               ))
           END,
@@ -3600,12 +3622,12 @@ export async function listScmSchedule({
       LEFT JOIN purchase_order_lines l ON l.purchase_order_id = po.netsuite_id AND l.netsuite_active = true
       LEFT JOIN active_po_split_alloc split_alloc ON split_alloc.source_line_id = l.id
       WHERE (po.netsuite_active = true OR $24::boolean)
-        AND ($26::boolean OR NOT EXISTS (
+        AND NOT EXISTS (
           SELECT 1
             FROM dispatch_scm_po_splits cancelled_split
            WHERE cancelled_split.split_po_id = po.netsuite_id
              AND cancelled_split.status = 'cancelled'
-        ))
+        )
         AND ($26::boolean OR NOT EXISTS (
           SELECT 1
             FROM closed_po_family_ids closed_family
@@ -3796,42 +3818,71 @@ export async function listScmSchedule({
       WHERE ($10 = '' OR lower(v.vrma_ref) = lower($10))
       GROUP BY v.id
     ),
-    base AS (
-      SELECT * FROM base_po
-      UNION ALL SELECT * FROM base_to
-      UNION ALL SELECT * FROM base_vrma
+    schedule_completion_status AS MATERIALIZED (
+      SELECT completion.completion_event_id,
+             completion.order_kind,
+             completion.order_kind || ':' || lower(btrim(completion.order_ref)) AS order_key,
+             completion.dispatch_completed_at,
+             completion.completion_evidence_type
+        FROM dispatch_order_completion_status completion
+       WHERE completion.dispatch_completion_status = 'completed'
+         AND completion.order_kind IN ('PO', 'TO', 'VRMA')
+         AND (cardinality($25::text[]) = 0 OR lower(btrim(completion.order_ref)) = ANY($25::text[]))
+    ),
+    base AS MATERIALIZED (
+      SELECT source.*, source.order_kind || ':' || lower(btrim(source.order_ref)) AS completion_order_key,
+             source.order_kind || ':' || lower(source.order_ref) AS planning_order_key
+        FROM (
+          SELECT * FROM base_po
+          UNION ALL SELECT * FROM base_to
+          UNION ALL SELECT * FROM base_vrma
+        ) source
+       WHERE (cardinality($25::text[]) = 0 OR lower(source.order_ref) = ANY($25::text[]))
+         AND ($24::boolean OR NOT EXISTS (
+           SELECT 1 FROM schedule_completion_status completion
+            WHERE completion.order_key = source.order_kind || ':' || lower(btrim(source.order_ref))
+              AND completion.completion_event_id IS NOT NULL
+         ))
     ),
     ${SCM_SCHEDULE_SPECIAL_ORDER_CTES}
     direct_planned AS MATERIALIZED (
       SELECT DISTINCT ON (
-               upper(assignment.assignment->>'dispatchOrderKind'),
+               upper(details."dispatchOrderKind"),
                lower(assignment.order_ref)
              )
-             upper(assignment.assignment->>'dispatchOrderKind') AS order_kind,
+             upper(details."dispatchOrderKind") AS order_kind,
              assignment.order_ref,
              assignment.plan_date AS eta_date,
-             COALESCE(assignment.assignment->>'dispatchEtaTime', '') AS eta_time,
+             COALESCE(details."dispatchEtaTime", '') AS eta_time,
              COALESCE(
-               NULLIF(assignment.assignment->>'dispatchDriverName', ''),
-               NULLIF(assignment.assignment->>'dispatchDriverLogin', ''),
+               NULLIF(details."dispatchDriverName", ''),
+               NULLIF(details."dispatchDriverLogin", ''),
                ''
              ) AS driver,
              trim(concat_ws(' ',
-               NULLIF(assignment.assignment->>'dispatchTruckPlate', ''),
-               NULLIF(assignment.assignment->>'dispatchLoadName', ''),
+               NULLIF(details."dispatchTruckPlate", ''),
+               NULLIF(details."dispatchLoadName", ''),
                CASE
-                 WHEN NULLIF(assignment.assignment->>'dispatchParkingSpot', '') IS NOT NULL
-                   THEN 'Parking ' || (assignment.assignment->>'dispatchParkingSpot')
+                 WHEN NULLIF(details."dispatchParkingSpot", '') IS NOT NULL
+                   THEN 'Parking ' || details."dispatchParkingSpot"
                END
              )) AS notes
         FROM dispatch_plan_order_assignments assignment
         JOIN dispatch_plans p
           ON p.id = assignment.plan_id
          AND p.status <> 'cancelled'
-       WHERE upper(assignment.assignment->>'dispatchOrderKind') IN ('PO', 'TO', 'VRMA')
-       ORDER BY upper(assignment.assignment->>'dispatchOrderKind'),
+       CROSS JOIN LATERAL jsonb_to_record(
+         CASE WHEN jsonb_typeof(assignment.assignment) = 'object'
+           THEN assignment.assignment ELSE '{}'::jsonb END
+       ) details("dispatchOrderKind" text, "dispatchEtaTime" text, "dispatchDriverName" text,
+                 "dispatchDriverLogin" text, "dispatchTruckPlate" text,
+                 "dispatchLoadName" text, "dispatchParkingSpot" text)
+       WHERE upper(details."dispatchOrderKind") IN ('PO', 'TO', 'VRMA')
+         AND (cardinality($25::text[]) = 0 OR lower(assignment.order_ref) = ANY($25::text[]))
+         AND lower(assignment.order_ref) IN (SELECT lower(order_ref) FROM base)
+       ORDER BY upper(details."dispatchOrderKind"),
                 lower(assignment.order_ref), assignment.plan_date DESC,
-                COALESCE(assignment.assignment->>'dispatchEtaTime', '') DESC,
+                COALESCE(details."dispatchEtaTime", '') DESC,
                 assignment.updated_at DESC
     ),
     direct_ship_orders AS MATERIALIZED (
@@ -3848,11 +3899,12 @@ export async function listScmSchedule({
     ),
     linked_po_allocations AS MATERIALIZED (
       SELECT allocation.id, allocation.po_order_id,
-             dispatch_po_allocation_delivery_refs(allocation.id)
-               || ARRAY[allocation.dispatch_target_ref] AS delivery_refs
+             allocation.dispatch_target_kind, allocation.dispatch_target_ref,
+             dispatch_po_allocation_delivery_refs(allocation.id) AS delivery_refs
         FROM dispatch_so_po_allocations allocation
         JOIN purchase_order_lines line ON line.id = allocation.po_line_id
        WHERE allocation.status = 'active'
+         AND allocation.po_order_id IN (SELECT source_id FROM base WHERE order_kind = 'PO')
          AND line.netsuite_active = true
          AND COALESCE(line.item_type, '') IN ('InvtPart', 'NonInvtPart')
          AND GREATEST(allocation.allocated_sales_qty, allocation.allocated_pallet_qty,
@@ -3860,23 +3912,35 @@ export async function listScmSchedule({
          AND NOT dispatch_po_line_is_status_charge(line.item_id, line.sku, line.item_description,
            line.item_type, line.unit, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty)
     ),
-    linked_po_job_candidates AS MATERIALIZED (
-      SELECT allocation.id, allocation.po_order_id,
-             job.stop_type, job.order_refs, job.job_details
+    linked_po_delivery_refs AS MATERIALIZED (
+      SELECT allocation.po_order_id, required.ref
         FROM linked_po_allocations allocation
-        JOIN driver_job_records job
-          ON job.status = 'complete'
+        CROSS JOIN LATERAL unnest(allocation.delivery_refs ||
+          CASE WHEN allocation.dispatch_target_kind = 'group'
+            THEN ARRAY[allocation.dispatch_target_ref] ELSE '{}'::text[] END
+        ) required(ref)
+       WHERE cardinality(allocation.delivery_refs) > 0
+    ),
+    linked_po_job_refs AS MATERIALIZED (
+      SELECT job.stop_type, reference.ref,
+             dispatch_completion_driver_order_kind(reference.ref, job.job_details) AS order_kind
+        FROM driver_job_records job
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+          CASE WHEN jsonb_typeof(job.order_refs) = 'array' THEN job.order_refs ELSE '[]'::jsonb END
+        ) reference(ref)
+       WHERE job.status = 'complete'
          AND job.stop_type IN ('pickup', 'dropoff')
          AND job.completed_at IS NOT NULL
-         AND job.order_refs ?| allocation.delivery_refs
+         AND reference.ref IN (SELECT DISTINCT ref FROM linked_po_delivery_refs)
+         AND job.order_refs ? reference.ref
     ),
     linked_po_progress AS MATERIALIZED (
-      SELECT candidate.po_order_id,
-             bool_or(candidate.stop_type = 'pickup') AS picked_up,
-             bool_or(candidate.stop_type = 'dropoff') AS delivered
-        FROM linked_po_job_candidates candidate
-       WHERE dispatch_po_allocation_driver_job_matches(candidate.id, candidate.order_refs, candidate.job_details)
-       GROUP BY candidate.po_order_id
+      SELECT required.po_order_id,
+             bool_or(job.stop_type = 'pickup') AS picked_up,
+             bool_or(job.stop_type = 'dropoff') AS delivered
+        FROM linked_po_delivery_refs required
+        JOIN linked_po_job_refs job ON job.ref = required.ref AND job.order_kind = 'SO'
+       GROUP BY required.po_order_id
     ),
     fully_linked_po AS MATERIALIZED (
       SELECT DISTINCT allocation.po_order_id,
@@ -3885,39 +3949,59 @@ export async function listScmSchedule({
         JOIN purchase_orders po
           ON po.netsuite_id = allocation.po_order_id
        WHERE allocation.status = 'active'
+         AND allocation.po_order_id IN (SELECT source_id FROM base WHERE order_kind = 'PO')
          AND (dispatch_po_link_fully_covers(allocation.po_order_id)
            OR dispatch_po_link_transport_fully_covers(allocation.po_order_id))
          AND NULLIF(btrim(COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid)), '') IS NOT NULL
+    ),
+    linked_po_target_refs AS MATERIALIZED (
+      SELECT DISTINCT lower(allocation.dispatch_target_ref) AS order_key
+        FROM dispatch_so_po_allocations allocation
+       WHERE allocation.status = 'active'
+         AND allocation.po_order_id IN (SELECT po_order_id FROM fully_linked_po)
+    ),
+    linked_po_assignments AS MATERIALIZED (
+      SELECT lower(assignment.order_ref) AS order_key,
+             lower(NULLIF(assignment.planned_order_ref, '')) AS planned_order_key,
+             assignment.plan_date, assignment.updated_at,
+             COALESCE(details."dispatchEtaTime", '') AS eta_time,
+             COALESCE(
+               NULLIF(details."dispatchDriverName", ''),
+               NULLIF(details."dispatchDriverLogin", ''),
+               ''
+             ) AS driver,
+             trim(concat_ws(' ',
+               NULLIF(details."dispatchTruckPlate", ''),
+               NULLIF(details."dispatchLoadName", ''),
+               CASE
+                 WHEN NULLIF(details."dispatchParkingSpot", '') IS NOT NULL
+                   THEN 'Parking ' || details."dispatchParkingSpot"
+               END
+             )) AS notes
+        FROM dispatch_plan_order_assignments assignment
+        JOIN dispatch_plans plan ON plan.id = assignment.plan_id AND plan.status <> 'cancelled'
+       CROSS JOIN LATERAL jsonb_to_record(
+         CASE WHEN jsonb_typeof(assignment.assignment) = 'object'
+           THEN assignment.assignment ELSE '{}'::jsonb END
+       ) details("dispatchEtaTime" text, "dispatchDriverName" text,
+                 "dispatchDriverLogin" text, "dispatchTruckPlate" text,
+                 "dispatchLoadName" text, "dispatchParkingSpot" text)
+       WHERE lower(assignment.order_ref) IN (SELECT order_key FROM linked_po_target_refs)
+          OR lower(NULLIF(assignment.planned_order_ref, '')) IN (SELECT order_key FROM linked_po_target_refs)
     ),
     linked_po_planned AS MATERIALIZED (
       SELECT DISTINCT ON (lower(fully_linked.po_order_ref))
              'PO'::text AS order_kind,
              fully_linked.po_order_ref AS order_ref,
              assignment.plan_date AS eta_date,
-             COALESCE(assignment.assignment->>'dispatchEtaTime', '') AS eta_time,
-             COALESCE(
-               NULLIF(assignment.assignment->>'dispatchDriverName', ''),
-               NULLIF(assignment.assignment->>'dispatchDriverLogin', ''),
-               ''
-             ) AS driver,
-             trim(concat_ws(' ',
-               NULLIF(assignment.assignment->>'dispatchTruckPlate', ''),
-               NULLIF(assignment.assignment->>'dispatchLoadName', ''),
-               CASE
-                 WHEN NULLIF(assignment.assignment->>'dispatchParkingSpot', '') IS NOT NULL
-                   THEN 'Parking ' || (assignment.assignment->>'dispatchParkingSpot')
-               END
-             )) AS notes
+             assignment.eta_time, assignment.driver, assignment.notes
         FROM fully_linked_po fully_linked
         JOIN dispatch_so_po_allocations linked_allocation
           ON linked_allocation.po_order_id = fully_linked.po_order_id
          AND linked_allocation.status = 'active'
-        JOIN dispatch_plan_order_assignments assignment
-          ON lower(assignment.order_ref) = lower(linked_allocation.dispatch_target_ref)
-          OR lower(NULLIF(assignment.planned_order_ref, '')) = lower(linked_allocation.dispatch_target_ref)
-        JOIN dispatch_plans linked_plan
-          ON linked_plan.id = assignment.plan_id
-         AND linked_plan.status <> 'cancelled'
+        JOIN linked_po_assignments assignment
+          ON assignment.order_key = lower(linked_allocation.dispatch_target_ref)
+          OR assignment.planned_order_key = lower(linked_allocation.dispatch_target_ref)
        WHERE NOT EXISTS (
          SELECT 1
            FROM dispatch_so_po_allocations required
@@ -3925,20 +4009,18 @@ export async function listScmSchedule({
             AND required.status = 'active'
             AND NOT EXISTS (
               SELECT 1
-                FROM dispatch_plan_order_assignments required_assignment
-                JOIN dispatch_plans required_plan
-                  ON required_plan.id = required_assignment.plan_id
-                 AND required_plan.status <> 'cancelled'
-               WHERE lower(required_assignment.order_ref) = lower(required.dispatch_target_ref)
-                  OR lower(NULLIF(required_assignment.planned_order_ref, '')) = lower(required.dispatch_target_ref)
+                FROM linked_po_assignments required_assignment
+               WHERE required_assignment.order_key = lower(required.dispatch_target_ref)
+                  OR required_assignment.planned_order_key = lower(required.dispatch_target_ref)
             )
        )
        ORDER BY lower(fully_linked.po_order_ref), assignment.plan_date DESC, assignment.updated_at DESC
     ),
-    planned AS (
+    planned AS MATERIALIZED (
       SELECT DISTINCT ON (candidate.order_kind, lower(candidate.order_ref))
              candidate.order_kind,
              candidate.order_ref,
+             candidate.order_kind || ':' || lower(candidate.order_ref) AS order_key,
              candidate.eta_date,
              candidate.eta_time,
              candidate.driver,
@@ -3971,6 +4053,8 @@ export async function listScmSchedule({
              END
            ) entry
        ) target
+       WHERE state.order_kind IN ('PO', 'TO', 'VRMA')
+         AND (cardinality($25::text[]) = 0 OR lower(target.order_ref) = ANY($25::text[]))
       UNION ALL
       SELECT state.id,
              state.order_kind,
@@ -3980,7 +4064,9 @@ export async function listScmSchedule({
              state.reconciled_at,
              NULL::text
         FROM scm_reconciliation_order_state state
-       WHERE NOT EXISTS (
+       WHERE state.order_kind IN ('PO', 'TO', 'VRMA')
+         AND (cardinality($25::text[]) = 0 OR lower(state.source_order_ref) = ANY($25::text[]))
+         AND NOT EXISTS (
          SELECT 1
            FROM jsonb_each(
              CASE
@@ -3991,15 +4077,6 @@ export async function listScmSchedule({
            ) entry
           WHERE lower(entry.key) = lower(state.source_order_ref)
        )
-    ),
-    schedule_completion_status AS MATERIALIZED (
-      SELECT completion.completion_event_id,
-             completion.order_kind,
-             lower(btrim(completion.order_ref)) AS order_key,
-             completion.dispatch_completed_at,
-             completion.completion_evidence_type
-        FROM dispatch_order_completion_status completion
-       WHERE completion.dispatch_completion_status = 'completed'
     )
     SELECT
       COALESCE(s.id, 0) AS schedule_id,
@@ -4082,15 +4159,13 @@ export async function listScmSchedule({
                netSuiteMemo: "b.source_memo", remarkPrefix: "special_requests.remark_prefix" })} AS remark
     ) special_order
     LEFT JOIN planned
-      ON planned.order_kind = b.order_kind
-     AND lower(planned.order_ref) = lower(b.order_ref)
+      ON planned.order_key = b.planning_order_key
     LEFT JOIN reconciliation_target_projection reconciliation_projection
       ON reconciliation_projection.state_id = s.reconciliation_order_state_id
      AND reconciliation_projection.order_kind = b.order_kind
      AND lower(reconciliation_projection.order_ref) = lower(b.order_ref)
     LEFT JOIN schedule_completion_status dispatch_completion
-      ON dispatch_completion.order_kind = b.order_kind
-     AND dispatch_completion.order_key = lower(btrim(b.order_ref))
+      ON dispatch_completion.order_key = b.completion_order_key
     LEFT JOIN direct_ship_orders direct_shipping
       ON direct_shipping.order_kind = b.order_kind
      AND direct_shipping.source_id = b.source_id
@@ -4211,6 +4286,7 @@ export async function listScmSchedule({
           ) THEN 'Direct ship'
         ELSE reconciled_status.status
       END AS status
+      OFFSET 0
     ) effective_status
     WHERE (cardinality($25::text[]) = 0 OR lower(b.order_ref) = ANY($25::text[]))
       AND ($1 = '' OR lower(concat_ws(' ', b.order_ref, b.source_ref, b.dispatch_ref, b.party, b.pickup_point, b.dropoff_point, b.brand, b.content, special_order.remark, s.remark_override, CASE WHEN b.order_kind IN ('PO', 'TO') THEN b.source_memo ELSE NULL END, s.packing_slip_ref, s.group_ref)) LIKE '%' || $1 || '%')
@@ -4448,6 +4524,7 @@ export async function listScmSchedule({
       scheduleDropoffPoint: row.schedule_dropoff_point || "",
       brand,
       content: row.content || "",
+      remarkPrefix: row.remark_prefix || "",
       ...remark,
       totalPalletQty: Number(row.total_pallet_qty || 0),
       weightLbs: Number(row.weight_lbs || 0),

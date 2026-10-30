@@ -54,6 +54,7 @@ before(async () => {
   replaced = await split(reusedRef, 4);
   await cancelScmPurchaseOrderSplit({ splitPoRef: reusedRef, cancelledBy: 'cancelled-schedule-test' });
   active = await split(reusedRef, 5);
+  await query("UPDATE scm_transport_schedule SET status='Queued' WHERE order_kind='PO' AND order_ref=$1", [reusedRef]);
   await insertPo(baseId + 1, emptyRef);
   await insertPo(baseId + 2, completedRef, false);
   await query(`INSERT INTO scm_transport_schedule (order_kind,order_ref,status)
@@ -91,10 +92,12 @@ function assertReplacement(rows) {
 
 test('reference reuse hides the cancelled lifecycle and preserves the active replacement', async () => {
   assertReplacement(await listScmSchedule({ search: reusedRef.toLowerCase() }));
+  assertReplacement(await listScmSchedule({ search: reusedRef.toLowerCase(), audience: 'schedule_search' }));
 });
 
 for (const [label, options] of [
   ['global search', { search: retiredRef }],
+  ['cross-order search', { search: retiredRef, audience: 'schedule_search' }],
   ['completed search', { search: retiredRef, view: 'completed' }],
   ['completed filter', { exactRef: retiredRef, status: 'Completed' }],
   ['completed view', { exactRef: retiredRef, view: 'completed' }],
@@ -123,12 +126,16 @@ test('ordinary inactive completed purchase orders remain searchable and visible 
 });
 
 test('authenticated schedule HTTP search returns the replacement and denies anonymous access', async () => {
-  for (const suffix of ['', '&view=completed', '&view=dispatch']) {
+  for (const suffix of ['', '&view=completed', '&view=dispatch', '&surface=dispatch']) {
     const response = await fetch(`${baseUrl}/api/scm/schedule?search=${reusedRef}${suffix}`,
       { headers: { authorization: `Bearer ${token}` } });
     assert.equal(response.status, 200);
     assertReplacement(await response.json());
   }
+  const retiredResponse = await fetch(`${baseUrl}/api/scm/schedule?search=${retiredRef}&surface=dispatch`,
+    { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(retiredResponse.status, 200);
+  assert.deepEqual(await retiredResponse.json(), []);
   assert.equal((await fetch(`${baseUrl}/api/scm/schedule?search=${reusedRef}`)).status, 401);
 });
 
@@ -149,11 +156,13 @@ test('multiple cancelled lifecycles never hide their active replacement despite 
             VALUES ($1,$2,$3,$4,$5,CASE WHEN $5='cancelled' THEN now() ELSE NULL END)`,
           [baseId, sourceRef, id, ref, index === 0 ? 'active' : 'cancelled']);
         }
-        const rows = await listScmSchedule({ search: ref.toLowerCase() });
-        assert.equal(rows.length, 1);
-        assert.equal(String(rows[0].sourceId), String(expectedId));
-        assert.equal(rows[0].totalPalletQty, pallets);
-        assert.equal(rows[0].content, `REGRESSION-SKU ${pallets} PLT`);
+        for (const audience of ['scm', 'schedule_search']) {
+          const rows = await listScmSchedule({ search: ref.toLowerCase(), audience });
+          assert.equal(rows.length, 1);
+          assert.equal(String(rows[0].sourceId), String(expectedId));
+          assert.equal(rows[0].totalPalletQty, pallets);
+          assert.equal(rows[0].content, `REGRESSION-SKU ${pallets} PLT`);
+        }
       }, { rollback: true });
     }
   ), { seed: 1400761, numRuns: 16, endOnFailure: true });

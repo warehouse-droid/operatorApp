@@ -185,6 +185,10 @@ export async function decideRegularStockRequest(id, input, context, dependencies
   const before = await getScmStockRequest(id);
   assertRegularNotBackorder(before);
   if(isWaitlist(before))throw waitlistError('Use the Waitlist allocation workspace.','WAITLIST_WORKFLOW_ONLY',409);
+  if(input.decision==='yard_stock') {
+    const {completeRegularStockFromYard}=await import('./regular-stock-resolution.js');
+    return completeRegularStockFromYard(id,input,context);
+  }
   if(before.regular?.deliveryVersion===1){
     const {decideDeliveryStockRequest}=await import('./regular-stock-delivery.js');
     return decideDeliveryStockRequest(id,input,context,dependencies);
@@ -198,15 +202,17 @@ export async function decideRegularStockRequest(id, input, context, dependencies
   if (reason.length > 1000 || decision === 'reject' && !reason) throw regularError('Rejection requires a reason, at most 1000 characters.', 'REGULAR_REASON_REQUIRED', 400);
   const lineIds = [...new Set((input.lineIds || []).map(requiredId))];
   if (!lineIds.length) throw regularError('Select at least one item.', 'REGULAR_DECISION_INVALID', 400);
-  const evidence = isPurchaseStocking(before) ? await purchaseEvidence({destinationLocationId:before.destinationLocationId,lines:before.lines},dependencies) : await collectEvidence(before.lines.map(line => line.itemId), dependencies);
+  const evidence = decision==='reject' ? {policies:[],error:null} : isPurchaseStocking(before) ? await purchaseEvidence({destinationLocationId:before.destinationLocationId,lines:before.lines},dependencies) : await collectEvidence(before.lines.map(line => line.itemId), dependencies);
   return withTransaction(async () => {
     const row = await lockRequest(id, input.expectedRevision);
     const request = await getScmStockRequest(id);
     if (input.expectedRevision === undefined) throw regularError('Request revision is required.');
     const selected = request.lines.filter(line => lineIds.includes(line.id));
     const pendingStocking=isRegularStockingRequest(request) && !isPurchaseStocking(request) && !request.regular.pickupTransfer && !request.regular.handoffStatus;
-    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !(pendingStocking && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines can be reviewed.');
-    const snapshot = isPurchaseStocking(request) ? {...request.regular.approval,lines:request.lines.map(line=>({lineId:line.id,...evidence.stocks[line.itemId],unit:line.salesUom,reasons:['purchase_scm_review']}))}
+    const expiredReject=decision==='reject' && regularApprovalExpired(request,(dependencies.now || (()=>new Date()))())
+      && !request.transfers?.length && !(await query('SELECT 1 FROM regular_stock_handoffs WHERE request_id=$1',[id])).rowCount;
+    if (selected.length !== lineIds.length || selected.some(line => line.status !== 'submitted' && !((pendingStocking || expiredReject) && decision==='reject' && line.status==='approved'))) throw regularError('Only undecided lines or expired, unused approvals can be reviewed.');
+    const snapshot = decision==='reject' ? request.regular.approval : isPurchaseStocking(request) ? {...request.regular.approval,lines:request.lines.map(line=>({lineId:line.id,...evidence.stocks[line.itemId],unit:line.salesUom,reasons:['purchase_scm_review']}))}
       : evaluateRegularStockApproval({ lines: /** @type {import('./regular-stock-domain.js').RegularLine[]} */ (request.lines), policies: evidence.policies, arrivalAt: request.regular.arrivalAt,
       deliveryMethod: request.regular.deliveryMethod, leadHours: request.regular.approval.leadHours, now: (dependencies.now || (() => new Date()))() });
     for (const line of selected) await query(`UPDATE sales_stock_request_lines SET regular_decision=$2,status=$3,
@@ -215,7 +221,7 @@ export async function decideRegularStockRequest(id, input, context, dependencies
       JSON.stringify(snapshot.lines.find(entry => entry.lineId === line.id))]);
     const updated=await getScmStockRequest(id);
     const minutes=normalizeRegularApprovalMinutes((await query('SELECT regular_stock_approval_minutes FROM scm_smart_settings WHERE id=1')).rows[0].regular_stock_approval_minutes);
-    const window=!isRegularStockingRequest(updated) && updated.lines.some(line=>line.status==='approved') && updated.lines.every(line=>['approved','rejected','cancelled'].includes(line.status))
+    const window=expiredReject ? {} : !isRegularStockingRequest(updated) && updated.lines.some(line=>line.status==='approved') && updated.lines.every(line=>['approved','rejected','cancelled'].includes(line.status))
       ? approvalWindow((dependencies.now || (()=>new Date()))(),minutes) : {approvedAt:null,approvalExpiresAt:null,approvalValidityMinutes:minutes};
     const event = await query(`INSERT INTO sales_stock_request_events(request_id,event_type,actor_id,details)
       VALUES($1,'regular_manual_decision',$2,$3::jsonb) RETURNING id`, [id, context.operatorId, JSON.stringify({ decision, lineIds, reason, evidence: snapshot, evidenceError: evidence.error })]);
@@ -247,10 +253,10 @@ async function regularSalesInputAlerts(operatorId,authorizedDestinationLocationI
   return requests;
 }
 
-export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [] } = {}) {
-  const backorder=await backorderAlerts({scm,operatorId,authorizedDestinationLocationIds});
+export async function regularStockAlerts({ scm = false, operatorId, authorizedDestinationLocationIds = [], includeRequests=false } = {}) {
+  const backorder=await backorderAlerts({scm,operatorId,authorizedDestinationLocationIds,includeRequests});
   if (scm) {
-    const { rows } = await query(`SELECT count(*)::int AS count FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
+    const { rows } = await query(`SELECT ${includeRequests ? 'r.id,r.request_ref' : 'count(*)::int AS count'} FROM sales_stock_requests r WHERE r.workflow_version=2 AND r.request_type='regular'
       AND COALESCE(r.regular_details->>'deliveryMethod','')<>'waitlist'
       AND (EXISTS(SELECT 1 FROM sales_stock_request_lines l WHERE l.request_id=r.id AND (l.status='submitted'
         OR (l.status='approved' AND r.regular_details->>'deliveryMethod'='stocking'
@@ -261,7 +267,9 @@ export async function regularStockAlerts({ scm = false, operatorId, authorizedDe
       FROM regular_waitlist_pools p JOIN purchase_orders o ON o.netsuite_id=p.purchase_order_id JOIN inventory_items i ON i.item_id=p.item_id
       LEFT JOIN regular_waitlist_pool_reads seen ON seen.pool_id=p.id AND seen.operator_id=$1
       WHERE p.last_return_event_id>COALESCE(seen.event_id,0) ORDER BY p.last_return_event_id DESC LIMIT 200`,[operatorId||null])).rows;
-    return { manualReview: rows[0].count+backorder.manualReview, returnedPools:returned.map(p=>({id:Number(p.id),purchaseOrderRef:p.po_ref,itemCode:p.item_name})),total:rows[0].count+backorder.manualReview+returned.length };
+    const manualReview=(includeRequests ? rows.length : rows[0].count)+backorder.manualReview;
+    return {manualReview,returnedPools:returned.map(p=>({id:Number(p.id),purchaseOrderRef:p.po_ref,itemCode:p.item_name})),total:manualReview+returned.length,
+      ...(includeRequests ? {requests:[...rows.map(row=>({id:Number(row.id),requestRef:row.request_ref,message:'SCM review required'})),...backorder.requests]} : {})};
   }
   if (!operatorId || !authorizedDestinationLocationIds.length) return { unread: 0, actionRequired:0, total: 0, requests: [] };
   const { rows } = await query(`SELECT request.id,request.request_ref,request.manual_decision_event_id,event.event_type,event.details FROM sales_stock_requests request
@@ -277,13 +285,13 @@ export async function regularStockAlerts({ scm = false, operatorId, authorizedDe
     lineId:row.details.lineId||null,itemName:row.details.itemName||null,
     eta:row.details.eta||null,purchaseOrderRef:row.details.purchaseOrderRef||null,waitlistRequestId:row.details.waitlistRequestId||null,waitlistRequestRef:row.details.waitlistRequestRef||null }))];
   const activeIds=new Set(inputRequired.map(row=>row.id));
-  const requests=[...inputRequired,...updates.filter(row=>row.action==='arrival' || !activeIds.has(row.id))];
+  const requests=[...inputRequired,...updates.filter(row=>['arrival','po_reference','po_planned'].includes(row.action) || !activeIds.has(row.id))];
   return {stockChecks,unread:updates.length,actionRequired:inputRequired.length,total:requests.length,requests};
 }
 
-export async function acknowledgeRegularStockDecisions(id, { eventId, arrivalKey }, context) {
+export async function acknowledgeRegularStockDecisions(id, { eventId, arrivalKey, poNoticeKeys }, context) {
   const detail=await getSalesStockRequest(id,context);
-  if (detail.regular?.deliveryMethod==='backorder') return acknowledgeBackorderAlert(id,eventId,context,arrivalKey);
+  if (detail.regular?.deliveryMethod==='backorder') return acknowledgeBackorderAlert(id,eventId,context,arrivalKey,poNoticeKeys);
   return withTransaction(async () => {
     const request = await lockRequest(id);
     await getSalesStockRequest(id, context);

@@ -415,7 +415,9 @@ export async function listDispatchOrderPool({
      ), visible_catalog AS (
        SELECT candidate.*
          FROM pool_catalog candidate
-        WHERE (EXISTS (SELECT 1 FROM mbt_feature_flags WHERE flag_key='sor_rental_workflow' AND enabled=true)
+        WHERE NOT mbt_bin_only_source(candidate.card)
+          AND NOT EXISTS(SELECT 1 FROM mbt_transport_sources transport WHERE transport.source_key=lower(candidate.order_ref) AND transport.claimed)
+          AND (EXISTS (SELECT 1 FROM mbt_feature_flags WHERE flag_key='sor_rental_workflow' AND enabled=true)
           OR (candidate.order_ref !~* '^SOR[0-9]'
             AND candidate.card->>'orderKind' IS DISTINCT FROM 'sor_rental_return'
             AND NOT jsonb_path_exists(candidate.card, '$.childOrders[*] ? (@ like_regex "^SOR[0-9]" flag "i")')

@@ -44,8 +44,8 @@ async function fixture(run) {
       // IDs overlap between order families; only PO movements inherit PO parents.
       await query(`INSERT INTO sales_orders(netsuite_id,tranid,outbound_location_id,outbound_location,netsuite_active)
         VALUES($1,$2,1,'3445',true)`, [receiptChild, `SOB-UNRELATED-${suffix}`]);
-      await query(`INSERT INTO operator_load_records(order_id,order_family,load_type,line_snapshot,photo_data_urls,created_at)
-        VALUES($1,'sales_order','sales_order_delivery_load','[]','[]',$2)`, [receiptChild, date + 'T13:00:00Z']);
+      await query(`INSERT INTO operator_load_records(order_id,order_ref,order_family,load_type,line_snapshot,photo_data_urls,created_at)
+        VALUES($1,$3,'sales_order','sales_order_delivery_load','[]','[]',$2)`, [receiptChild, date + 'T13:00:00Z', `SOB-UNRELATED-${suffix}`]);
       await run({sourceRef, savedSourceRef, sourceAlias, receiptChild, driverChild, registered, unprocessed, unrelated, refs, suffix});
     });
   } finally { await rollback.rollback(); }

@@ -261,6 +261,8 @@ function smartProposalDestinationCalculation(proposal, line, movementLabel = "pr
   const reorderPoint = destinationPolicyInvalid ? null : smartReasonNumber(reason, "reorderPointPallets");
   const preferred = destinationPolicyInvalid ? null : smartReasonNumber(reason, "preferredPallets");
   const storedRequired = smartReasonNumber(line, "requiredPallets") ?? smartReasonNumber(line, "proposedPallets") ?? 0;
+  const requestedPoCoverage = smartReasonNumber(reason, "requestedPoCoveragePallets") ?? 0;
+  const remainingTransferNeed = smartReasonNumber(reason, "residualRequiredPallets") ?? storedRequired;
   const proposed = smartReasonNumber(line, "proposedPallets") ?? 0;
   const afterProposal = position === null ? null : position + proposed;
   const planningYard = reason.actualDestinationYard || line.destinationName || proposal.destinationName;
@@ -306,7 +308,7 @@ function smartProposalDestinationCalculation(proposal, line, movementLabel = "pr
       : `<span class="smart-policy-constraint">Policy warning: preferred target is below ROP and the saved capacity is unavailable.</span>` : ""}
     <span class="smart-replenishment-equation">${decision}</span>
     ${orderRule ? `<small>${orderRule}</small>` : ""}
-    ${storedRequirementDiffers ? `<small>Stored line requirement ${smartNumber(storedRequired, 2)} PLT differs after editing/grouping; calculated snapshot need is ${smartNumber(calculatedRequired, 2)} PLT.</small>` : ""}
+    ${requestedPoCoverage > 0 ? `<span>Order Request coverage: <strong>${smartNumber(requestedPoCoverage, 2)} PLT</strong>; remaining for TO planning: <strong>${smartNumber(remainingTransferNeed, 2)} PLT</strong></span>` : storedRequirementDiffers ? `<small>Stored line requirement ${smartNumber(storedRequired, 2)} PLT differs after editing/grouping; calculated snapshot need is ${smartNumber(calculatedRequired, 2)} PLT.</small>` : ""}
     ${allocationDiffersFromPolicy ? proposed < calculatedRequired
       ? `<span>This ${smartEscape(movementLabel)} carries: <strong>${smartNumber(proposed, 2)} of ${smartNumber(calculatedRequired, 2)} PLT calculated policy need</strong></span>`
       : `<span>This ${smartEscape(movementLabel)} allocates: <strong>${smartNumber(proposed, 2)} PLT versus ${smartNumber(calculatedRequired, 2)} PLT calculated policy need</strong></span>` : ""}
@@ -728,12 +730,16 @@ function smartPlanningPhasePanel(plan) {
   if (!plan || plan.planningPhase === "integrated") return "";
   if (plan.planningPhase === "po_pending_approval") {
     return `<div class="smart-notice warn smart-planning-phase" data-smart-planning-phase="po_pending_approval">
-      <div><strong>Phase 1 · Purchase orders ready for review</strong><br><span>Approve only after the intended POs or active local split references exist. Draft proposal statuses do not count as inbound. Approval freezes that evidence, then builds Phase 2 transfers.</span></div>
+      <div><strong>Phase 1 · Purchase orders ready for review</strong><br><span>PO quantities count as covered after Order Request; unrequested quantities carry forward to transfers. Existing open POs and split receipts are counted once. Approval freezes the calculation, then builds Phase 2 transfers.</span></div>
       ${smartCanWrite() ? `<button class="smart-button primary" data-smart-action="approve-po-phase" type="button">Approve PO phase &amp; build transfers</button>` : ""}
     </div>`;
   }
   if (plan.planningPhase === "transfer_ready") {
-    return `<div class="smart-notice success smart-planning-phase" data-smart-planning-phase="transfer_ready"><strong>Phase 2/3 · Transfers and consolidation built</strong><span> The PO evidence used for this run is frozen. Later PO changes will be included in the next planning cycle.</span></div>`;
+    const requestedPoLines = plan.phaseTwoBasis?.requestedPoLines;
+    const requestCoverage = Array.isArray(requestedPoLines)
+      ? ` Order Request coverage: ${smartNumber(requestedPoLines.reduce((sum, line) => sum + Number(line.requestedPallets || 0), 0), 2)} PLT.`
+      : "";
+    return `<div class="smart-notice success smart-planning-phase" data-smart-planning-phase="transfer_ready"><strong>Phase 2/3 · Transfers and consolidation built</strong><span> The PO evidence used for this run is frozen.${requestCoverage} Later PO changes will be included in the next planning cycle.</span></div>`;
   }
   return `<div class="smart-notice smart-planning-phase"><strong>Planning phase:</strong> ${smartEscape(plan.planningPhase)}</div>`;
 }
@@ -938,7 +944,7 @@ smartScmApp.addEventListener("click", async (event) => {
   try {
     if (action === "approve-po-phase") {
       if (!smartState.plan?.id) throw new Error("Select the PO-phase planning run first.");
-      if (!confirm("Approve the PO phase now? Only real active NetSuite POs and active local split references will count as expected inbound. This run's Phase 2 basis will then be frozen.")) return;
+      if (!confirm("Approve the PO phase now? Order Request quantities will cover demand; unrequested quantities carry forward to transfers. Only real active NetSuite POs and active local split references count as actual inbound. This run's Phase 2 calculation will then be frozen.")) return;
       smartState.plan = await smartWork(
         "Building transfer phase",
         () => smartApi(`/api/scm/smart/planning-runs/${smartState.plan.id}/approve-po-phase`, { method: "POST", body: {} }),

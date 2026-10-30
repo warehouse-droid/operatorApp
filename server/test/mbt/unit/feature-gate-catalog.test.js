@@ -56,6 +56,7 @@ function gate(gates, flagKey) {
 
 test("Admin catalog exposes four default-off completion-owned SO IF gates", () => {
   assert.deepEqual(MBT_ADMIN_GATE_KEYS, [
+    "netsuite_ifir_posting_restlet",
     "sor_rental_workflow",
     "driver_offline_mode",
     "driver_yard_dependency_soft_mode",
@@ -65,6 +66,9 @@ test("Admin catalog exposes four default-off completion-owned SO IF gates", () =
     "special_stock_request_workflow",
     "special_stock_request_test_skip_orders",
     "dispatch_optimized_order_pool",
+    "operator_netsuite_stock_exchange_it_3445",
+    "operator_netsuite_stock_exchange_it_2967",
+    "operator_netsuite_stock_exchange_it_150",
     "operator_netsuite_customer_pickup_if_3445",
     "operator_netsuite_receiving_ir_3445",
     "operator_netsuite_delivery_prep_if_3445",

@@ -1,0 +1,308 @@
+PALLET PAYMENT ALLOCATION — INSTALLATION AND USE
+Prepared for NetSuite account 6518947, 21 October 2026.
+
+This package populates your existing Pallet Payment Allocation and Pallet Refund
+Allocation records. Your balance search is confirmed in the account:
+  Title: Pallet Balance by Payment Method
+  Script ID: customsearch_pallet_payment_balance
+  Internal ID: 1196
+
+v3: Existing installations should follow UPGRADE-v3.txt first. It contains the
+automatic refresh setup, corrected historical cash-refund handling, all exact
+IDs, and the one-line Cash summary configuration. The eight JavaScript files
+belong in the SAME folder. ppa_rebuild_mr.js, ppa_watch_ue.js and ppa_dispatch_ss.js
+are entry points; the other five files are libraries.
+
+EARLIER v2 UPLOAD HEADER FIX (21 October 2026)
+
+The v2 revision corrected the JSDoc headers in ppa_config.js, ppa_netsuite.js and
+ppa_service.js. NetSuite requires a line break after @NApiVersion 2.1, before
+the closing */ delimiter. The previous one-line headers could cause:
+  Invalid JSDoc tag value; valid values are: @NApiVersion [2.X, 2.x, 2.0, 2.1]
+v3 retains those valid headers. Use UPGRADE-v3.txt for the new queue record,
+parameter and script deployments required by automatic updates.
+
+1. Upload the files
+
+Go to Documents > Files > File Cabinet > SuiteScripts. Create a folder named
+PalletPayment. Upload these eight files, keeping these exact filenames:
+  ppa_config.js
+  ppa_core.js
+  ppa_netsuite.js
+  ppa_service.js
+  ppa_rebuild_mr.js
+  ppa_refresh_queue.js
+  ppa_watch_ue.js
+  ppa_dispatch_ss.js
+
+Do not create separate script records for the five library files. Install the
+watcher and dispatcher using UPGRADE-v3.txt after creating the initial writer.
+
+2. Create the Map/Reduce script
+
+Go to Customization > Scripting > Scripts > New.
+Select ppa_rebuild_mr.js and click Create Script Record.
+  Name: Pallet Payment Allocation Rebuild
+  Final script ID: customscript_ppa_rebuild
+
+If the ID field already displays the customscript prefix, enter _ppa_rebuild
+as the suffix. Confirm the final saved ID above.
+
+On the Parameters tab, create:
+  Label: Preview Only
+  ID: custscript_ppa_dry_run
+  Type: Check Box
+  Default: Checked
+
+  Label: Customer Internal ID
+  ID: custscript_ppa_customer
+  Type: Free-Form Text
+  Default: blank
+
+  Label: Queue Only
+  ID: custscript_ppa_queue_only
+  Type: Check Box
+  Default: Unchecked
+
+The customer parameter is an internal ID, such as 5240, not the displayed
+account number. Blank means all customers with pallet history or existing
+allocation records. Start with one customer.
+
+3. Create ONE deployment
+
+Click Deploy Script.
+  Final deployment ID: customdeploy_ppa_rebuild
+  Deployed: Checked
+  Status: Not Scheduled (also required for automatic event submissions)
+  Log Level: Audit
+  Concurrency Limit: 1
+  Buffer Size: 1
+
+On the deployment Parameters tab:
+  Preview Only: Checked
+  Queue Only: Unchecked
+  Customer Internal ID: 5240, or a customer you know well
+
+The script deliberately refuses custom-record writes from a differently named
+deployment. Keep one deployment; do not clone it to parallelize rebuilds.
+
+The execution role needs View access to invoices, sales orders, customer
+payments, customer deposits, deposit applications, credit memos, refunds,
+customers, payment methods and currencies. It needs access to customsearch503
+and the same subsidiary/location scope as that physical balance search.
+Grant Edit access to both custom record types, including creation. Keep
+optimistic locking and system notes enabled. The script never saves a financial
+transaction or changes a transaction memo.
+
+4. Run the preview
+
+Use Save and Execute on the deployment. Open the Script Status page to follow
+the Map/Reduce run, then the script's Execution Log.
+
+Look for PREVIEW customer <ID>. It reports issued, credited and physical pallet
+quantities, allocation rows, refund rows, review issues, and the first 12 lots.
+The log preview is deliberately limited; the custom records hold the complete
+detail after a write run. Preview makes no custom-record changes.
+
+Compare the preview against the customer's invoices, applied payments, credits
+and refunds. A REVIEW or failed customer is not a zero balance. Resolve the
+reported issue before treating that customer's balance as verified.
+
+Example required by your rule, with 13% tax:
+  Six pallets at $40 before tax.
+  Cash applied: $220. VISA applied: $800.
+  Cash allocation: 5 pallets x $40 = $200.
+  VISA allocation: 1 pallet x $45.20 = $45.20.
+  Cash's extra $20 does not create a fractional cash pallet.
+
+The script reads each invoice line's actual price and tax rate. It does not
+hardcode every historical pallet to $40 or every invoice to 13% tax.
+
+5. Populate the custom records
+
+After checking the preview, edit that same deployment:
+  Preview Only: Unchecked
+  Customer Internal ID: keep your initial customer
+Use Save and Execute again.
+
+Open your existing balance search. Verified allocations appear there.
+Unverified allocations are still recorded for review but must be excluded from
+the refundable balance search. A failed rebuild leaves affected cached rows
+unverified. Read the execution log for failures occurring before rows exist.
+
+To inspect a review report before reconciliation is complete, you may run the
+same single-customer deployment with Preview Only unchecked. This persists
+custom reporting rows, including unverified rows, and does not issue refunds.
+View those rows using the detailed review search described below. The verified
+balance search will continue to exclude this customer until all issues clear.
+Preview Only checked writes nothing, so its computed rows exist only in the log.
+
+Clear Customer Internal ID and keep Queue Only unchecked to backfill all
+customers once. Then install the watcher, queue and scheduled dispatcher from
+UPGRADE-v3.txt. Keep the writer Not Scheduled; the dispatcher is Scheduled every
+15 minutes as recovery for immediate event submissions. After installation,
+transaction changes update affected customers automatically in the background.
+
+6. Confirm the balance search columns
+
+Criteria:
+  Inactive = No
+  Allocation Verified = Yes
+
+GROUP:
+  Customer
+  Invoice Fields... > Subsidiary
+  Currency
+  Payment Method
+  Card Last 4
+
+SUM:
+  Allocated Pallets
+  Pending Pallets
+  Refunded Pallets (display label: Refunded / Settled Pallets)
+
+Formula (Numeric), Summary SUM, label Available Pallets:
+  NVL({custrecord_ppa_alloc_qty},0)
+  -NVL({custrecord_ppa_pending_qty},0)
+  -NVL({custrecord_ppa_refunded_qty},0)
+
+Formula (Currency), Summary SUM, label Available Deposit:
+  (NVL({custrecord_ppa_alloc_qty},0)
+   -NVL({custrecord_ppa_pending_qty},0)
+   -NVL({custrecord_ppa_refunded_qty},0))
+  *NVL({custrecord_ppa_rate},0)
+
+The rate stored on a cash row excludes tax. The rate on all other methods
+includes tax. Do not SUM the rate itself. Group by currency and subsidiary;
+do not combine their money values. Do not join child refund rows into this
+summary, because that can duplicate parent allocation quantities.
+
+For the same customer, method, currency and subsidiary, matching last fours
+combine across invoices and Sales Orders. Do not GROUP by Invoice, SO or
+Original Payments in this balance summary; keep those columns in the detail
+search. Missing card suffixes must not be combined as a single unknown card.
+They remain separate source-payment lots and are excluded from verified totals.
+
+Create a second, detailed search of Pallet Payment Allocation:
+  ID: customsearch_pallet_payment_review
+  Criteria: Inactive = No, Allocation Verified = No
+  Results: Name, Customer, SO, Invoice, Invoice Line Reference, Original
+    Payments, Payment Method, Card Last 4, Rate, Allocated/Pending/Refunded
+    Pallets, Last Modified.
+  Leave Summary Type blank on every result column. Optionally filter to your
+    initial customer while reviewing the first rebuild.
+Name includes the first review issue when calculation completed. The execution
+log contains review details or the reason calculation failed. NetSuite can
+truncate long log messages; resolve the listed issues and preview again.
+
+7. Record a new pending refund
+
+Go to Customization > Lists, Records & Fields > Record Types. Open the List
+for Pallet Refund Allocation and choose New (or use your custom record menu).
+
+Create one row per original allocation lot:
+  Name: a descriptive return reference
+  Original Allocation: select the invoice/method/card lot being consumed
+  Credit Memo: the actual pallet credit, once created
+  Customer Refund: blank until the refund exists
+  Return Reference: a stable unique return number, e.g. PR-20261021-001
+  Pallet Quantity: whole pallets from this lot
+  Pallet Refund Amount: quantity x the selected allocation's rate
+  Status: PENDING
+
+If a return uses cash and VISA, create two rows with the same Return Reference
+and different Original Allocations. A reservation may precede its credit memo.
+Once the credit exists, add its ID to that same reservation record. Otherwise
+the script cannot reconcile the return against the credit quantity.
+
+Run the rebuild. Pending quantities reduce Available Pallets. Keep one row per
+return/allocation; edit that row through its lifecycle rather than creating a
+second row when it completes. Concurrent reservations are not locked by this
+reporting package; your return/refund process must serialize approval and check
+current NetSuite balances before paying out.
+
+8. Complete or reverse a refund
+
+After the actual NetSuite Customer Refund has been posted and its payment
+result confirmed, edit the SAME Pallet Refund Allocation row:
+  Credit Memo: actual credit used by the refund
+  Customer Refund: actual refund transaction
+  Status: COMPLETED
+
+Rebuild again. Pending decreases and Refunded increases by the same quantity;
+Available does not decrease a second time. A completed row must match the
+refund method/card and an actual applied credit amount sufficient to cover it.
+
+Use REVERSED to cancel a reservation after confirming the associated refund is
+not still outstanding. Reversing a custom row does not reverse a financial
+transaction. If a real refund remains applied, automatic reconciliation still
+counts it. The ledger cannot be used to erase a genuine refund.
+
+9. Reconcile historical exceptions
+
+Pure pallet credits with exact matching applied refund amounts are allocated
+automatically, using oldest eligible original lots of the same method/card,
+currency, subsidiary and rate. Generated refund rows have external IDs starting
+PRA1-. Do not edit those generated rows; they are rebuilt from transactions.
+
+Mixed goods/pallet credits require explicit manual pallet quantities and amounts.
+Some historical cash refunds included tax, unlike your current cash rule. Those
+also require manual quantity review; do not divide their entire refund total by
+$40. The manual amount is the pallet allocation value, and the script verifies
+that the actual applied refund covers it.
+
+For a pallet credit already used to pay later invoices, create reviewed manual
+allocation rows with Status APPLIED, the actual Credit Memo, and no Customer
+Refund. Select the original funding lots from the supporting records. The
+script verifies the credit's actual invoice applications cover the entered
+pallet amount. These rows consume Refunded / Settled Pallets, while the APPLIED
+status distinguishes store-credit settlement from cash/card payment.
+
+For a missing card suffix, check the original terminal receipt or other reliable
+source. ppa_config.js has cardOverrides keyed by the ORIGINAL transaction ID:
+  '12345': { method: '5', last4: '0070', evidence: 'Receipt reviewed by NAME on DATE' }
+Method must match the structured NetSuite payment method. Add an override only
+with evidence, upload the changed config, then rebuild. Do not change original
+memos merely to make the parser accept a guess. Four digits identify a reporting
+group, not a unique payment instrument; original payment IDs remain on each lot.
+
+Other review reasons include unpaid pallets, missing SO lineage, different
+prices/tax, reversed source payments, changed consumed funding, and physical
+quantity mismatches. Do not manually tick Allocation Verified to bypass these.
+
+Working boundaries
+
+This is a background reporting ledger, with balances as of its successful run.
+It does not submit cash/card refunds, authorize refunds, or prove card-processor
+settlement. It does not alter invoices, credit taxes, memos or GL entries.
+
+customsearch503 is already a NET physical pallet balance. The script compares
+gross invoiced pallets minus pallet credits to that search for reconciliation;
+it does not subtract refund quantities again from that net search. A customer
+with incompatible delivery/billing history remains under review.
+
+This account currently uses legacy line tax fields. Missing tax, nonzero second
+tax, SuiteTax, discounts, fractional units and nonuniform unit rounding require
+review/adapter work. Very large customers (over 180 source records to load, over
+6000 query rows, or insufficient governance for a safe write) fail explicitly;
+they need a separately designed staged backfill. Do not remove these limits or
+truncate old history to force a balance through.
+
+v2 successfully ran a native preview for customer 5240. Its first save failed
+because custrecord_ppa_method referenced Transaction rather than Payment Method.
+After the user corrected it, a read-only query confirmed 60 rows, 207 allocated
+pallets and zero refunded, all unverified. v3 has local automated tests; its
+new cash-refund correction and automatic deployments still require native
+installation and validation. No native transactions have been changed here.
+
+Oracle references
+  Map/Reduce deployment and concurrency:
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_1509578980.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_1522350075.html
+  Deposit Applications:
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_N3194216.html
+  Custom-record optimistic locking:
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_N2877583.html
+  Custom-record search field types and explicit joins:
+  https://system.netsuite.com/help/helpcenter/en_US/srbrowser/Browser2025_2/script/record/customrecord.html
+  https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4345777107.html

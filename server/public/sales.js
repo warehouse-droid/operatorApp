@@ -68,6 +68,10 @@ function salesReturnReference(record) {
 function salesReturnStatus(record) {
   const syncStatus = String(salesFirst(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
   const creditMemo = salesFirst(record, ["netSuiteStage", "netsuite_stage"], "") === "credit_memo";
+  if (salesReturnType(record) === "exchange") {
+    if (["voided", "rejected"].includes(record.status)) return record.status;
+    return { disabled: "local_only", failed: "exchange_failed", pending: "exchange_pending", succeeded: "exchange_posted" }[syncStatus] || record.status;
+  }
   if (syncStatus === "failed") {
     return creditMemo || (salesReturnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2) ? "credit_memo_creation_failed" : "ra_creation_failed";
   }
@@ -95,6 +99,9 @@ function salesReturnStatusLabel(recordOrStatus) {
     partially_rejected: "Partially Rejected",
     voided: "Voided",
     local_only: "Local only",
+    exchange_pending: "Inventory Transfer Pending",
+    exchange_posted: "Inventory Transfer Posted",
+    exchange_failed: "Inventory Transfer Failed",
     ra_pending: "RA Pending",
     ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
@@ -118,6 +125,7 @@ function salesReturnType(record) {
   const recordType = String(salesFirst(record, ["returnType", "return_type", "recordType", "record_type", "type"], "stock")).toLowerCase();
   const stockType = String(salesFirst(record, ["stockReturnType", "stock_return_type"], "")).toLowerCase();
   if (recordType.includes("pallet")) return "pallet";
+  if (recordType.includes("exchange")) return "exchange";
   if (stockType.includes("quality") || recordType.includes("quality")) return "quality_stock";
   if (stockType.includes("normal") || recordType.includes("normal") || recordType.includes("good")) return "normal_stock";
   return recordType || "stock";
@@ -126,6 +134,7 @@ function salesReturnType(record) {
 function salesReturnTypeLabel(record) {
   const type = salesReturnType(record);
   if (type === "pallet") return "PALLET Return";
+  if (type === "exchange") return "Stock exchange";
   if (type === "quality_stock") return "Quality Stock Return";
   if (type === "normal_stock") return "Normal Stock Return";
   return String(type).replaceAll("_", " ");
@@ -506,7 +515,7 @@ function renderSalesReturns() {
       <div class="sales-return-filters">
         <label><span>Search</span><input data-sales-return-filter="search" type="search" value="${salesEscape(salesReturnFilters.search)}" placeholder="SR / PR / RB / SO / customer / plate" /></label>
         <label><span>Status</span><select data-sales-return-filter="status"><option value="">All submitted statuses</option>${["pending_approval", "partially_pending", "partially_rejected", "accepted", "approved", "rejected", "voided", "sync_failed", "synced"].map((status) => `<option value="${status}" ${salesReturnFilters.status === status ? "selected" : ""}>${salesEscape(salesReturnStatusLabel(status))}</option>`).join("")}</select></label>
-        <label><span>Type</span><select data-sales-return-filter="type"><option value="">Stock + PALLET</option><option value="normal_stock" ${salesReturnFilters.type === "normal_stock" ? "selected" : ""}>Normal Stock</option><option value="quality_stock" ${salesReturnFilters.type === "quality_stock" ? "selected" : ""}>Quality Stock</option><option value="pallet" ${salesReturnFilters.type === "pallet" ? "selected" : ""}>PALLET</option></select></label>
+        <label><span>Type</span><select data-sales-return-filter="type"><option value="">Stock + PALLET</option><option value="exchange" ${salesReturnFilters.type === "exchange" ? "selected" : ""}>Stock exchange</option><option value="normal_stock" ${salesReturnFilters.type === "normal_stock" ? "selected" : ""}>Normal Stock</option><option value="quality_stock" ${salesReturnFilters.type === "quality_stock" ? "selected" : ""}>Quality Stock</option><option value="pallet" ${salesReturnFilters.type === "pallet" ? "selected" : ""}>PALLET</option></select></label>
         <label><span>Ordering yard</span><select data-sales-return-filter="yardLocationId"><option value="">All authorized yards</option>${SALES_YARDS.filter((yard) => yards.includes(yard.yardCode)).map((yard) => `<option value="${yard.locationId}" ${String(salesReturnFilters.yardLocationId) === String(yard.locationId) ? "selected" : ""}>${yard.yardCode}</option>`).join("")}</select></label>
         <label><span>From</span><input data-sales-return-filter="from" type="date" value="${salesEscape(salesReturnFilters.from)}" /></label>
         <label><span>To</span><input data-sales-return-filter="to" type="date" value="${salesEscape(salesReturnFilters.to)}" /></label>

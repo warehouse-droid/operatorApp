@@ -9,6 +9,7 @@ import { buildSalesOrderCompletionSnapshot } from "./sales-order-auto-fulfillmen
 import { outboundYardLocationId, outboundOrderYards } from './outbound-location-domain.js';
 import { ensureOutboundLocationDirectory } from './outbound-location-runtime.js';
 import { isFulfillableNetSuiteLine } from './netsuite-fulfillable-items.js';
+import {salesOrderLoadSource,salesOrderLoadSnapshotLines} from './sales-order-auto-fulfillment-loads.js';
 
 const TERMINAL_STATUSES = new Set(["historical", "gate_disabled", "completed", "reconciled", "closed", "skipped"]);
 /** @typedef {Record<string, any>} LooseRecord */
@@ -47,6 +48,8 @@ function publicCandidate(row) {
   return {
     id: row.id,
     completionEventId: text(row.completion_event_id),
+    operatorLoadRecordId: row.operator_load_record_id ? text(row.operator_load_record_id) : null,
+    operatorLoadSnapshot: row.operator_load_snapshot || [],
     dispatchOrderRef: row.dispatch_order_ref,
     sourceSalesOrderId: row.source_sales_order_id === null ? null : Number(row.source_sales_order_id),
     sourceSalesOrderRef: row.source_sales_order_ref,
@@ -80,8 +83,8 @@ function publicCandidate(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
-    completionEvidenceType: row.completion_evidence_type || null,
-    completionEvidenceId: row.completion_evidence_id || null,
+    completionEvidenceType: row.operator_load_record_id ? 'operator_load' : row.completion_evidence_type || null,
+    completionEvidenceId: row.operator_load_record_id ? text(row.operator_load_record_id) : row.completion_evidence_id || null,
     dispatchCompletedAt: row.evidence_completed_at || null,
     planDate: row.evidence_plan_date || null,
     loadId: row.evidence_load_id || null
@@ -156,14 +159,12 @@ async function gateDecision(source) {
   const gateKey = `dispatch_netsuite_sales_order_if_${code}`;
   const result = await query(
     `SELECT flag.enabled, flag.revision,
-            watermark.activation_event_id, watermark.activated_at,
-            event.created_at AS completion_created_at
+            watermark.activation_event_id, watermark.activation_load_record_id, watermark.activated_at
        FROM mbt_feature_flags flag
        LEFT JOIN dispatch_sales_order_if_gate_watermarks watermark
          ON watermark.gate_key = flag.flag_key
-       JOIN dispatch_order_completion_events event ON event.id = $2
       WHERE flag.flag_key = $1`,
-    [gateKey, source.id]
+    [gateKey]
   );
   const row = result.rows[0];
   if (!row || row.enabled !== true || row.activation_event_id === null) {
@@ -172,7 +173,9 @@ async function gateDecision(source) {
   // The immutable event sequence is the activation boundary. PostgreSQL now()
   // is transaction-scoped, so timestamp comparison can incorrectly classify an
   // event inserted after a gate update in the same transaction as historical.
-  const afterWatermark = Number(source.id) > Number(row.activation_event_id);
+  const afterWatermark = source.operator_load_record_id
+    ? Number(source.operator_load_record_id) > Number(row.activation_load_record_id)
+    : Number(source.id) > Number(row.activation_event_id);
   if (!afterWatermark) {
     return {
       status: "historical",
@@ -185,7 +188,8 @@ async function gateDecision(source) {
     status: "eligible",
     gateKey,
     gateRevision: row.revision,
-    activationEventId: row.activation_event_id
+    activationEventId: row.activation_event_id,
+    activationLoadRecordId: row.activation_load_record_id
   };
 }
 
@@ -388,25 +392,13 @@ async function directToExecutionEvidence(source, lines) {
   return map;
 }
 
-/** @param {LooseRecord} row @param {LooseRecord} source @param {LooseRecord} decision */
-async function materializeCandidate(row, source, decision) {
-  const allLines = await sourceLines(source);
-  const lines = allLines.filter(isFulfillableNetSuiteLine);
-  if (!lines.length && allLines.length) {
-    await query(`UPDATE dispatch_sales_order_if_candidates
-      SET status='skipped', last_error=NULL, resolution_action='automatic', updated_at=now(),
-          result=jsonb_build_object('reason','non_inventory_fulfillment_not_required'),
-          gate_key=$2, gate_revision=$3, activation_event_id=$4 WHERE id=$1`,
-    [row.id, decision.gateKey, decision.gateRevision, decision.activationEventId]);
-    return;
-  }
-  if (!lines.length) {throw failure("SALES_ORDER_IF_LINES_UNAVAILABLE", "No fulfillable Sales Order lines belong to this completed Dispatch target.");}
-  const yards = outboundOrderYards({ outbound_location_id: source.outbound_location_id, lines });
-  if (yards.length !== 1) {throw failure('SALES_ORDER_IF_MIXED_YARDS', 'The completed SO spans different outbound yards.');}
+/** Legacy snapshots are retained only for explicit Admin review and recovery.
+ * @param {LooseRecord} source @param {LooseRecord[]} lines */
+async function legacyCompletionSnapshotLines(source,lines) {
   const operatorEvidence = await operatorLoadedEvidence(source, lines);
   const poEvidence = await poExecutionEvidence(source, lines);
   const toEvidence = await directToExecutionEvidence(source, lines);
-  const snapshotLines = lines.map((line) => {
+  return lines.map((line) => {
     const operator = operatorEvidence.get(text(line.local_line_id));
     if (!operator?.immutable) {
       throw failure("SALES_ORDER_IF_DIRECT_EVIDENCE_INCOMPLETE", `Operator load evidence is unavailable for ${line.sku || line.item_name || line.local_order_line}.`);
@@ -428,6 +420,31 @@ async function materializeCandidate(row, source, decision) {
       toEvidence: toRows
     };
   });
+}
+
+/** @param {LooseRecord} row @param {LooseRecord} source @param {LooseRecord} decision */
+async function materializeCandidate(row, source, decision) {
+  const allLines = await sourceLines(source);
+  const lines = allLines.filter(isFulfillableNetSuiteLine);
+  const loadLines = row.operator_load_record_id ? salesOrderLoadSnapshotLines(row,source,allLines) : null;
+  if(loadLines && !loadLines.length) {
+    await query(`UPDATE dispatch_sales_order_if_candidates SET status='skipped',last_error=NULL,
+      result=jsonb_build_object('reason','no_new_loaded_fulfillment_quantity'),updated_at=now() WHERE id=$1`,[row.id]);
+    return;
+  }
+  if (!lines.length && allLines.length) {
+    await query(`UPDATE dispatch_sales_order_if_candidates
+      SET status='skipped', last_error=NULL, resolution_action='automatic', updated_at=now(),
+          result=jsonb_build_object('reason','non_inventory_fulfillment_not_required'),
+          gate_key=$2, gate_revision=$3, activation_event_id=$4 WHERE id=$1`,
+    [row.id, decision.gateKey, decision.gateRevision, decision.activationEventId]);
+    return;
+  }
+  if (!lines.length) {throw failure("SALES_ORDER_IF_LINES_UNAVAILABLE", "No fulfillable Sales Order lines belong to this completed Dispatch target.");}
+  const yards = outboundOrderYards({ outbound_location_id: source.outbound_location_id,
+    lines: loadLines ? loadLines.map(line=>({location_id:line.location})) : lines });
+  if (yards.length !== 1) {throw failure('SALES_ORDER_IF_MIXED_YARDS', 'The completed SO spans different outbound yards.');}
+  const snapshotLines=loadLines || await legacyCompletionSnapshotLines(source,lines);
   const snapshot = buildSalesOrderCompletionSnapshot({
     candidateId: row.id,
     dispatchOrderRef: source.order_ref,
@@ -436,6 +453,11 @@ async function materializeCandidate(row, source, decision) {
     locationId: yards[0],
     lines: snapshotLines
   });
+  await persistCandidateSnapshot(row,snapshot,decision);
+}
+
+/** @param {LooseRecord} row @param {LooseRecord} snapshot @param {LooseRecord} decision */
+async function persistCandidateSnapshot(row,snapshot,decision) {
   for (const line of snapshot.lines) {
     const claimed = await query(
       `INSERT INTO dispatch_sales_order_if_line_claims (
@@ -466,6 +488,7 @@ async function materializeCandidate(row, source, decision) {
             gate_key = $5,
             gate_revision = $6,
             activation_event_id = $7,
+            activation_load_record_id = $10,
             snapshot_hash = $8,
             line_snapshot = $9::jsonb,
             status = 'queued',
@@ -482,7 +505,8 @@ async function materializeCandidate(row, source, decision) {
       decision.gateRevision,
       decision.activationEventId,
       snapshot.snapshotHash,
-      JSON.stringify(snapshot.lines)
+      JSON.stringify(snapshot.lines),
+      decision.activationLoadRecordId ?? null
     ]
   );
   await query(
@@ -502,8 +526,16 @@ export async function prepareSalesOrderAutoFulfillmentCandidate(candidateId) {
     if (!row || TERMINAL_STATUSES.has(row.status) || ["attention", "posting", "failed"].includes(row.status)) {
       return publicCandidate(row);
     }
+    if(!row.operator_load_record_id && Number(row.attempt_count)===0
+      && [null,'automatic','recheck'].includes(row.resolution_action)) {
+      await query(`UPDATE dispatch_sales_order_if_candidates SET status='attention',
+        last_error='IF queueing now follows Operator loading. Review this retained legacy candidate before posting.',
+        result=jsonb_build_object('reason','driver_completion_evidence_only'),updated_at=now() WHERE id=$1`,[row.id]);
+      await releaseClaims(row.id);
+      return publicCandidate(await candidateRow(row.id));
+    }
     const alreadyMaterialized = row.status === "queued";
-    const source = await completionSource(row);
+    const source = row.operator_load_record_id ? await salesOrderLoadSource(row) : await completionSource(row);
     if (!source?.local_order_id || Number(source.source_order_id) <= 0) {
       await query(
         `UPDATE dispatch_sales_order_if_candidates
@@ -572,8 +604,10 @@ export async function claimSalesOrderAutoFulfillmentCandidate({ candidateId, wor
         WHERE candidate.id = $1
           AND candidate.status IN ('queued', 'uncertain')
           AND (candidate.lease_expires_at IS NULL OR candidate.lease_expires_at <= now())
-          AND EXISTS (SELECT 1 FROM dispatch_effective_order_completion_events completion
-                       WHERE completion.id = candidate.completion_event_id)
+          AND (EXISTS (SELECT 1 FROM operator_load_records load WHERE load.id=candidate.operator_load_record_id
+                        AND load.load_type='sales_order_delivery_load' AND load.reload_cycle_id IS NULL)
+            OR (candidate.operator_load_record_id IS NULL AND EXISTS
+              (SELECT 1 FROM dispatch_effective_order_completion_events completion WHERE completion.id=candidate.completion_event_id)))
           AND EXISTS (
             SELECT 1
               FROM mbt_feature_flags flag
@@ -586,7 +620,10 @@ export async function claimSalesOrderAutoFulfillmentCandidate({ candidateId, wor
                    'snapshot', 'all_live_remaining', 'custom', 'recover', 'historical_backfill'
                  )
                  OR (
-                   candidate.completion_event_id > watermark.activation_event_id
+                   ((candidate.operator_load_record_id > watermark.activation_load_record_id
+                      AND candidate.activation_load_record_id = watermark.activation_load_record_id)
+                     OR (candidate.operator_load_record_id IS NULL
+                       AND candidate.completion_event_id > watermark.activation_event_id))
                    AND candidate.gate_revision = flag.revision
                    AND candidate.activation_event_id = watermark.activation_event_id
                  )
@@ -818,7 +855,7 @@ export async function listSalesOrderAutoFulfillmentCandidates({ statuses = [], l
             event.plan_date AS evidence_plan_date,
             event.load_id AS evidence_load_id
        FROM dispatch_sales_order_if_candidates candidate
-       JOIN dispatch_order_completion_events event ON event.id = candidate.completion_event_id
+       LEFT JOIN dispatch_order_completion_events event ON event.id = candidate.completion_event_id
       WHERE ($1::text[] = '{}'::text[] OR candidate.status = ANY($1::text[]))
       ORDER BY candidate.created_at DESC, candidate.id DESC
       LIMIT $2`,
@@ -861,7 +898,7 @@ export async function previewHistoricalSalesOrderAutoFulfillmentEvents({ search,
             COALESCE(split.source_so_id, local_order.netsuite_id) AS source_order_id,
             COALESCE(split.source_so_ref, local_order.tranid) AS source_order_ref
        FROM dispatch_effective_order_completion_events event
-       LEFT JOIN dispatch_sales_order_if_candidates candidate
+       JOIN dispatch_sales_order_if_candidates candidate
          ON candidate.completion_event_id = event.id
        LEFT JOIN sales_orders local_order
          ON lower(btrim(local_order.tranid)) = lower(btrim(event.order_ref))
@@ -914,6 +951,7 @@ export async function queueHistoricalSalesOrderAutoFulfillmentCandidates({
     const selected = await query(
       `SELECT event.id, event.order_ref
          FROM dispatch_effective_order_completion_events event
+         JOIN dispatch_sales_order_if_candidates legacy ON legacy.completion_event_id=event.id
         WHERE event.order_kind = 'SO'
           AND event.completion_evidence_type IN ('driver_job', 'manual_dispatch')
           AND (

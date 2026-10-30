@@ -71,7 +71,8 @@ test("Sales regular stock request cannot retain an empty destination while an au
     }
   });
   // This test isolates composer state. The shared yard menu is exercised in the browser.
-  vm.runInContext(source.replace(/import\('\/(?:stock-request-yard-filter|sales-stock-status-filter|sales-stock-list-filters)\.js\?v=[^']+'\)/g, 'Promise.resolve({})'), context, { filename: "sales-stock-requests.js" });
+  vm.runInContext(readPublic('regular-stock-quantity.js'), context, { filename: 'regular-stock-quantity.js' });
+  vm.runInContext(source.replace(/import\('\/(?:stock-request-yard-filter|sales-stock-status-filter|sales-stock-list-filters|stock-request-alert-search)\.js\?v=[^']+'\)/g, 'Promise.resolve({})'), context, { filename: "sales-stock-requests.js" });
   vm.runInContext('salesStockListFiltersHtml = testSalesFilters', context);
 
   const loading = vm.runInContext("salesStockLoad()", context);
@@ -101,7 +102,7 @@ test("Sales regular stock request cannot retain an empty destination while an au
 
   assert.equal(vm.runInContext("salesStockState.composer.destinationLocationId", context), "28");
   assert.match(app.innerHTML, /value="28" selected>2967/);
-  assert.match(app.innerHTML, /data-sales-stock-filter="backorderStageFilter"[^>]*disabled/);
+  assert.match(app.innerHTML, /data-sales-stock-filter="requestTypeFilter"[^>]*disabled/);
 
   const composingRenderCount = renderCount;
   assert.equal(await vm.runInContext("salesStockLoad({ background: true })", context), false);

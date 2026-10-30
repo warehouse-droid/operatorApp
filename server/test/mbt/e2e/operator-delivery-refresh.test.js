@@ -151,9 +151,10 @@ test("P4 partial packing remains in Active and also appears in Packed", async (t
 test("P5 real event-stream handler wakes pickup confirmation through the job API", async (t) => {
   const { page, fixture, calls } = await session(t);
   const endpoint = '/api/operator/netsuite-posting-jobs/browser-job';
+  const firstResponse = page.waitForResponse(response => new URL(response.url()).pathname === endpoint);
   await page.evaluate(() => { window.postingResult = null; window.postingPromise = pollOperatorNetSuitePostingJob('browser-job').then(result => { window.postingResult = result; }); });
   await page.waitForFunction(() => operatorPostingPollWakeups.has('browser-job'));
-  await page.waitForTimeout(30);
+  await firstResponse;
   assert.equal(calls.filter(url => url === endpoint).length, 1);
   fixture.postingJob = { status: 'completed', result: { localFinalization: { verified: true } } };
   await page.evaluate(() => window.displayEvents.emit('delivery.order.loaded', { result: { operatorNetSuitePosting: { commandId: 'browser-job' } } }));

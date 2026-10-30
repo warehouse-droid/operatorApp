@@ -1,0 +1,40 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import {query,withTransaction,closeDb} from '../../../src/db.js';
+import {assertTransportDeliveryEvidence} from '../../../src/mbt/bin-transport-delivery.js';
+import {transportFixture,transportInput} from '../support/bin-transport-fixtures.js';
+import {saveTransportTrip,cancelTransportTrip} from '../../../src/mbt/bin-transport-service.js';
+import {run,storedPlan} from '../support/bin-planning-fixtures.js';
+import {saveCargo,gravelPlan} from '../support/bin-cargo-fixtures.js';
+after(closeDb);
+test('Transport linked delivery: one bin continues to an existing rental with mandatory cargo, auto-planned and unplanned together',async()=>{
+  const f=await transportFixture();await saveCargo(f,gravelPlan(false));
+  const before=(await query('SELECT service_snapshot FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0].service_snapshot;
+  const trip=(await saveTransportTrip({...await transportInput(f,[{lineKey:'loose-1',quantity:'1'}]),
+    returnDestination:{kind:'delivery',visitId:f.part.visitId}})).body.trip;
+  await assert.rejects(saveCargo(f,gravelPlan(false)),/transport|linked/i);
+  assert.equal(trip.route.returnDestination.visitId,f.part.visitId);assert.equal(trip.route.stops.at(-1).actionCode,'cargo_dropoff_1');
+  await run(f,'assign',{visitId:trip.tripId,expectedVisitRevision:trip.revision,assetAssignments:[]});
+  const plan=await storedPlan(f.planId),stops=plan.trucks[0].loads[0].stops;
+  assert.deepEqual(stops.map(s=>s.actionCode),['collect_empty_bin','cargo_pickup_1','cargo_dropoff_1','cargo_pickup_1','deliver_bin']);
+  assert.ok(stops.every(s=>s.assetId===f.assetId));
+  assert.equal(stops.filter(s=>s.actionCode==='collect_empty_bin').length,1);
+  assert.equal((await query('SELECT dispatch_load_id FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0].dispatch_load_id,f.binLoadIds[0]);
+  await withTransaction(async()=>{
+    const visit=(await query('SELECT * FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0];
+    const at=new Date('2030-01-01T12:00:00Z');
+    await assert.rejects(assertTransportDeliveryEvidence(visit,at),/preceding.*cargo drop/i);
+    await query('UPDATE mbt_transport_trips SET cargo_delivered_at=$2 WHERE trip_id=$1',[trip.tripId,at]);
+    await assert.rejects(assertTransportDeliveryEvidence(visit,new Date(at.getTime()-1)),/preceding.*cargo drop/i);
+    await assert.rejects(assertTransportDeliveryEvidence({...visit,planned_truck_id:'-1'},at),/preceding.*cargo drop/i);
+    await assertTransportDeliveryEvidence(visit,at);
+  },{rollback:true});
+  const revision=(await query('SELECT revision FROM mbt_transport_trips WHERE trip_id=$1',[trip.tripId])).rows[0].revision;
+  await run(f,'cancel',{visitId:trip.tripId,expectedVisitRevision:Number(revision)});
+  assert.equal((await query('SELECT dispatch_plan_id FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0].dispatch_plan_id,null);
+  const unplanned=(await query('SELECT revision FROM mbt_transport_trips WHERE trip_id=$1',[trip.tripId])).rows[0].revision;
+  await cancelTransportTrip({tripId:trip.tripId,expectedRevision:Number(unplanned),actor:f.actor,idempotencyKey:crypto.randomUUID(),correlationId:crypto.randomUUID(),requestId:crypto.randomUUID()});
+  const restored=(await query('SELECT service_snapshot FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0].service_snapshot;
+  assert.deepEqual(restored.mandatoryStops,before.mandatoryStops);assert.deepEqual(restored.binWorkflow.source,before.binWorkflow.source);
+});

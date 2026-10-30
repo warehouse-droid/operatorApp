@@ -1,0 +1,57 @@
+{
+  "tests": 128,
+  "pass": 124,
+  "baselineFailures": [
+    "a loaded source CO identifies its own ref and operator instead of the source SO packer",
+    "legacy loaded quantities with no load audit identify the order without inventing an operator",
+    "real HTTP: billed order reopens locally, retains NetSuite truth and becomes PO-linkable",
+    "stale Open header with loaded lines becomes linkable after reopening"
+  ],
+  "newFailures": [],
+  "changedLines": {
+    "changed": 25,
+    "covered": 25,
+    "missing": []
+  },
+  "manualMutantsKilled": [
+    "retain-old-fulfilled-quantities",
+    "lose-history-snapshot",
+    "ignore-new-fulfillment",
+    "restore-remote-directory-lookup",
+    "hide-confirmation",
+    "ignore-active-posting"
+  ],
+  "propertyMutantKilled": true,
+  "restoredPrimary": {
+    "tests": 8,
+    "pass": 8
+  },
+  "types": {
+    "baseline": 1722,
+    "candidate": 880,
+    "newTypes": []
+  },
+  "lint": 0,
+  "sourceHashes": {
+    "src/operator-order-reopen-repository.js": "e7d53b3d9ecfdf02b0381b475d2645fd8861fcb9f9012ef48fecb6e7290cc628",
+    "src/local-sales-order-reopen.js": "ad0f7e48aa519adea8e89cf3e04be545f7505ddfb66401c389ce935e38ca39a5",
+    "public/control-order-reopen.js": "3ab0ca0352488b9bca875f541b98f4b3918b525885eb2c7610882ac3798aefe6",
+    "public/control.html": "484ce968eec16007bff0af984cd6b73943233ef0ea3fcb3da79f9e6e2c2d619d"
+  },
+  "baselineHashes": {
+    "src/operator-order-reopen-repository.js": "f27020c69546ddc89dc89e66110c846520d02cdb9dee695c983202ccc48482f3",
+    "src/local-sales-order-reopen.js": "2ed52ef590e26fa749e6802cde93f012fa81b14e7c57e01e95585114c9e38098",
+    "public/control-order-reopen.js": "d343344a8dff6605dc39fa152bb31fe8a780ed329473ee91167138baeae9f19c",
+    "public/control.html": "84750d291762b221a224a59c5811dabade171f05b8eb6aa1086a781d01a48d87"
+  },
+  "tools": {
+    "playwright": "1.62.1",
+    "c8": "12.0.0",
+    "fast-check": "4.9.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0"
+  },
+  "node": "v20.20.2",
+  "baseImage": "sha256:fc2d82d1c7f00a23379efb8695328e69cba70ee741dc5d5069ed64b633be8f00",
+  "cleanup": "removed containers, volumes and networks; production healthy"
+}

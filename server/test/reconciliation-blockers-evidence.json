@@ -1,0 +1,112 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "red": {
+    "tests": 9,
+    "failed": 8,
+    "retainedRegression": 1
+  },
+  "versions": {
+    "node": "v20.20.2",
+    "c8": "12.0.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0"
+  },
+  "sourceHashes": {
+    "src/server.js": "c81c53aa5effaccd71cfb00e5cf845592586a57544bf76db74dda8db198ce111",
+    "src/return-credit-memo.js": "4edda7b38beafc220d4a0d77fe7b3e521df24321531e615b991023817514b190",
+    "src/return-batch-ra-domain.js": "c86df7835a1263950b847bf3497afea9e9486c22cdd450d0addaf79819bcf9cf",
+    "src/return-batch-ra-service.js": "e431986762a76f82e80232236f3ebddf6fbf340948da319d7535e356fb2e3a1b",
+    "src/return-repository.js": "2982a6f6af2431136dc41a8c2ff8ad9ade431c40cdb2089d3d0113bc29d9e57e",
+    "test/mbt/unit/reconciliation-blockers.test.js": "95ea9783b52d344238d8753fd621e6ab414fdaa6d33a638bfea7bbfd45d685d4",
+    "test/mbt/integration/reconciliation-blockers.test.js": "5c1696697c798282bd20e10b191728044836cb456f8a0ee03ccc6dcf3594c5db",
+    "migrations/304_return_verification_retry_blocks.sql": "aade33f6e156e7f8eadfcf1e74535c27d7dc78d929be7230ebdc02d469e7d8c0"
+  },
+  "skipped": {
+    "repositoryWideSuite": "Focused on all 14 related suites on the shared application host; unrelated suites not run.",
+    "supplyChainAudit": "No dependency changes.",
+    "legacyTypes": "Strict checking covers the changed domain; legacy services use syntax and integration checks."
+  },
+  "lint": {
+    "baseline": 910,
+    "final": 910,
+    "added": 0
+  },
+  "static": {
+    "strictDomainTypes": "passed",
+    "syntaxFiles": 5,
+    "regressionLint": "passed"
+  },
+  "suite": {
+    "tests": 125,
+    "pass": 125,
+    "fail": 0,
+    "skipped": 0
+  },
+  "coverage": {
+    "src/return-credit-memo.js": {
+      "statements": 108,
+      "covered": 108
+    },
+    "src/return-batch-ra-domain.js": {
+      "statements": 198,
+      "covered": 190
+    }
+  },
+  "changedLineCoverage": {
+    "files": {
+      "src/return-credit-memo.js": {
+        "lines": 25,
+        "uncovered": []
+      },
+      "src/return-batch-ra-domain.js": {
+        "lines": 3,
+        "uncovered": []
+      },
+      "src/return-batch-ra-service.js": {
+        "lines": 12,
+        "uncovered": []
+      },
+      "src/return-repository.js": {
+        "lines": 2,
+        "uncovered": []
+      }
+    },
+    "scheduler": "Behavioral VM test and startup wiring contract; excluded from module coverage."
+  },
+  "mutation": [
+    {
+      "name": "accept-unverified-fees",
+      "killed": true
+    },
+    {
+      "name": "reject-valid-fees",
+      "killed": true
+    },
+    {
+      "name": "ignore-material-change",
+      "killed": true
+    },
+    {
+      "name": "retry-permanent-errors",
+      "killed": true
+    },
+    {
+      "name": "retry-invalid-drafts",
+      "killed": true
+    },
+    {
+      "name": "accept-unverified-history",
+      "killed": true
+    },
+    {
+      "name": "compete-with-manual",
+      "killed": true
+    }
+  ],
+  "reorderedSuite": {
+    "tests": 125,
+    "failed": 0
+  },
+  "completedAt": "2026-10-22T01:16:34.384Z"
+}

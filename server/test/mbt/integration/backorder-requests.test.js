@@ -47,8 +47,38 @@ async function http(role,path,method='GET',body){
   return {status:r.status,body:await r.json()};
 }
 const regular='/api/sales/stock-requests';
+test('Backorder creation rejects missing or whitespace-only customer names atomically and trims a supplied name',async()=>{
+  const count=async()=>Number((await query('SELECT count(*) AS n FROM sales_stock_requests')).rows[0].n),before=await count();
+  for(const customerName of [undefined,null,'',' \t\n ','\u00a0']) {
+    const r=await http('sales',regular,'POST',{deliveryMethod:'backorder',destinationLocationId:1,customerName,
+      fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:1,quantityMode:'direct'}]});
+    assert.equal(r.status,400,JSON.stringify(r.body));assert.equal(r.body.code,'SPECIAL_CASE_CUSTOMER_REQUIRED');
+    assert.match(r.body.error,/Customer name is required/);assert.equal(await count(),before);
+  }
+  const d=await create({customerName:'  Customer A  '});
+  assert.equal(d.customerName,'Customer A');assert.equal(d.regular.customerName,'Customer A');
+});
+test('Backorder header requires a customer and rejected edits leave the request and audit unchanged',async()=>{
+  let d=await create();
+  for(const customerName of ['',null,' \t\n ','\u00a0']) {
+    const r=await http('sales',path(d,'sales','header'),'POST',{expectedRevision:d.revision,customerName,remarks:'Must not save'});
+    assert.equal(r.status,400,JSON.stringify(r.body));assert.equal(r.body.code,'SPECIAL_CASE_CUSTOMER_REQUIRED');
+    const saved=(await http('sales',regular+'/'+d.id)).body;
+    assert.equal(saved.revision,d.revision);assert.equal(saved.customerName,d.customerName);
+    assert.equal(saved.remarks,d.remarks);assert.deepEqual(saved.events,d.events);
+  }
+  d=await action(d,'sales','header',{remarks:'Name omitted, existing name retained'});
+  assert.equal(d.customerName,'TEST Backorder Customer');
+  d=await action(d,'sales','header',{customerName:'  Updated Customer  '});
+  assert.equal(d.customerName,'Updated Customer');assert.equal(d.regular.customerName,'Updated Customer');
+  // Pre-existing unnamed requests remain readable and can be given a name.
+  await query("UPDATE sales_special_stock_cases SET customer_name='' WHERE request_id=$1",[d.id]);
+  assert.equal((await http('sales',regular+'/'+d.id)).status,200);
+  d=await action(d,'sales','header',{customerName:'Legacy Customer'});
+  assert.equal(d.customerName,'Legacy Customer');
+});
 async function create(extra={}){
-  const r=await http('sales',regular,'POST',{deliveryMethod:'backorder',workflowVersion:2,destinationLocationId:1,customerName:'',vendorId:331,vendorName:'TEST BO Vendor',inquiryDate:'2099-01-01',fulfillmentMethod:'vendor_pickup',
+  const r=await http('sales',regular,'POST',{deliveryMethod:'backorder',workflowVersion:2,destinationLocationId:1,customerName:'TEST Backorder Customer',vendorId:331,vendorName:'TEST BO Vendor',inquiryDate:'2099-01-01',fulfillmentMethod:'vendor_pickup',
     lines:[{itemId:sku,salesQty:7,quantityMode:'direct',rate:10,discountPercent:5,requiredDate:'2099-02-01'},{itemId:bag,salesQty:9,quantityMode:'direct',rate:12,requiredDate:'2099-02-01'}],...extra});
   assert.equal(r.status,201,JSON.stringify(r.body));requests.push(r.body.id);return r.body;
 }
@@ -194,8 +224,8 @@ test('Backorder Confirmed and PO-linked cases keep due SCM ETA reminders after S
   assert.equal((await http('scm','/api/scm/stock-requests/alerts')).body.manualReview,before+1);
 });
 
-test('Backorder creates an optional-customer Regular STREQ with regular SKU/UOM identity despite shortages',async()=>{
-  const d=await create();assert.equal(d.requestType,'regular');assert.equal(d.workflowVersion,2);assert.match(d.requestRef,/^STREQ-\d{6}$/);assert.equal(d.regular.deliveryMethod,'backorder');assert.equal(d.workflowKind,'backorder');assert.equal(d.customerName,'');assert.equal(d.stage,'new_enquiry');
+test('Backorder creates a named-customer Regular STREQ with regular SKU/UOM identity despite shortages',async()=>{
+  const d=await create();assert.equal(d.requestType,'regular');assert.equal(d.workflowVersion,2);assert.match(d.requestRef,/^STREQ-\d{6}$/);assert.equal(d.regular.deliveryMethod,'backorder');assert.equal(d.workflowKind,'backorder');assert.equal(d.customerName,'TEST Backorder Customer');assert.equal(d.stage,'new_enquiry');
   assert.deepEqual(d.lines.map(l=>[l.itemId,l.uom,l.quantity]),[[sku,'EA',7],[bag,'BAG',9]]);assert.equal(d.operationallyComplete,false);assert.deepEqual(d.transfers,[]);
   const row=(await query('SELECT request_type,workflow_version,regular_details FROM sales_stock_requests WHERE id=$1',[d.id])).rows[0];assert.equal(row.request_type,'regular');assert.equal(row.workflow_version,2);assert.equal(row.regular_details.deliveryMethod,'backorder');
 });
@@ -248,21 +278,21 @@ test('Backorder blocks handcrafted generation, skip, transfer and Special route 
   assert.equal((await query('SELECT count(*)::int AS n FROM sales_stock_transfers WHERE request_id=$1',[d.id])).rows[0].n,0);
   assert.equal((await query('SELECT sales_order_operation_status,purchase_order_operation_status FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0].sales_order_operation_status,'linked');
 });
-test('Backorder quote uses optional customer, regular SKU descriptions and prices, without ancillary rows',async()=>{
-  const d=await create();const quote=buildSpecialQuote(d,{name:'TEST MBBS',taxBps:1300});assert.equal(quote.snapshot.customerName,'');assert.equal(quote.snapshot.lines.length,2);assert.ok(!JSON.stringify(quote).includes('MBBS-Special'));assert.ok(!JSON.stringify(quote).includes('PALLET'));assert.ok(!JSON.stringify(quote).includes('Delivery Charge'));
+test('Backorder quote uses the saved customer, regular SKU descriptions and prices, without ancillary rows',async()=>{
+  const d=await create();const quote=buildSpecialQuote(d,{name:'TEST MBBS',taxBps:1300});assert.equal(quote.snapshot.customerName,'TEST Backorder Customer');assert.equal(quote.snapshot.lines.length,2);assert.ok(!JSON.stringify(quote).includes('MBBS-Special'));assert.ok(!JSON.stringify(quote).includes('PALLET'));assert.ok(!JSON.stringify(quote).includes('Delivery Charge'));
   assert.equal(quote.snapshot.lines[0].unit,'EA');assert.equal(quote.snapshot.lines[0].unitRate,'10');
 });
 test('Backorder rejects unknown stock SKU and ancillary inputs without partially creating a request',async()=>{
   const before=(await query("SELECT count(*)::int AS n FROM sales_stock_requests WHERE regular_details->>'deliveryMethod'='backorder'")).rows[0].n;
   for(const extra of [{lines:[{itemId:999999998,salesQty:1}]},{palletTotal:1},{deliveryFeeRate:10}]){
-    const r=await http('sales',regular,'POST',{deliveryMethod:'backorder',destinationLocationId:1,inquiryDate:'2099-01-01',customerName:'',vendorName:'TEST BO Vendor',fulfillmentMethod:'vendor_pickup',lines:[{itemId:sku,salesQty:1}],...extra});assert.ok([400,404,409].includes(r.status));
+    const r=await http('sales',regular,'POST',{deliveryMethod:'backorder',destinationLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST Backorder Customer',vendorName:'TEST BO Vendor',fulfillmentMethod:'vendor_pickup',lines:[{itemId:sku,salesQty:1}],...extra});assert.ok([400,404,409].includes(r.status));
   }
   assert.equal((await query("SELECT count(*)::int AS n FROM sales_stock_requests WHERE regular_details->>'deliveryMethod'='backorder'")).rows[0].n,before);
 });
 test('Backorder header/material changes remain local after linking, preserve SKU and prices, and require fresh confirmations',async()=>{
   let d=await poLinked(await reviewed(await create()));const before=(await query('SELECT * FROM sales_orders WHERE netsuite_id=$1',[so])).rows[0];
-  d=await action(d,'sales','header',{customerName:'',remarks:'Updated local request',salesInternalRemark:'Private Sales text',fulfillmentMethod:'yard_pickup'});
-  assert.equal(d.customerName,'');assert.equal(d.fulfillmentMethod,'yard_pickup');assert.equal(d.remarks,'Updated local request');
+  d=await action(d,'sales','header',{customerName:'TEST Backorder Customer',remarks:'Updated local request',salesInternalRemark:'Private Sales text',fulfillmentMethod:'yard_pickup'});
+  assert.equal(d.customerName,'TEST Backorder Customer');assert.equal(d.fulfillmentMethod,'yard_pickup');assert.equal(d.remarks,'Updated local request');
   const r=await http('scm','/api/scm/stock-requests/'+d.id);assert.ok(!JSON.stringify(r.body).includes('Private Sales text'));
   d=await action(d,'sales',`lines/${d.lines[0].id}/edit`,{quantity:19,productName:'Changed locally',customerNote:'Request note'});
   assert.equal(d.lines[0].quantity,19);assert.equal(d.lines[0].itemId,sku);assert.equal(d.lines[0].originalRate,10);assert.equal(d.lines[0].salesDecision,'pending');assert.equal(d.lines[1].salesDecision,'accepted');
@@ -397,7 +427,7 @@ test('Backorder accepts the Regular catalog native UOM without imposing the Spec
 });
 test('Backorder keeps the Regular converted quantity and exact native UOM label',async()=>{
   const d=await create({lines:[{itemId:88999004,pallets:3,rate:10}]});assert.equal(d.lines[0].uom,'Ton');assert.equal(d.lines[0].quantity,7.5);assert.equal(d.lines[0].palletQty,3);
-  const rejected=await http('sales',regular,'POST',{deliveryMethod:'backorder',destinationLocationId:1,vendorId:331,vendorName:'TEST BO Vendor',lines:[{itemId:88999004,salesQty:7.5,rate:10}]});assert.equal(rejected.status,400);
+  const rejected=await http('sales',regular,'POST',{deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName:'TEST BO Vendor',lines:[{itemId:88999004,salesQty:7.5,rate:10}]});assert.equal(rejected.status,400);
 });
 
 // Confirmed releases SO and PO linkage independently after review and acceptance.

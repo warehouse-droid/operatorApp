@@ -93,32 +93,42 @@ for (const [label, patch] of [
   ["inactive", "netsuite_active=false"],
   ["closed", "status='H',status_text='Sales Order : Closed'"]
 ]) {
-  test(`${label} still blocks reopening a billed order`, () => withTransaction(async () => {
+  test(`${label} does not block the local-only billed order reset`, () => withTransaction(async () => {
     const f = await billedFixture();
     await query(`UPDATE sales_orders SET ${patch} WHERE netsuite_id=$1`, [f.id]);
     const initial = await state(f);
     const preview = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-    assert.equal(preview.allowed, false);
-    await assert.rejects(() => reopenOperatorOrder(resetInput(f, preview)), { status: 409 });
-    assert.deepEqual(await state(f), initial);
+    assert.equal(preview.allowed, true, JSON.stringify(preview.blockers));
+    const result = await reopenOperatorOrder(resetInput(f, preview));
+    const final = await state(f);
+    assert.equal(final.header.operator_status, "open");
+    assert.equal(final.header.status, initial.header.status);
+    assert.equal(final.header.status_text, initial.header.status_text);
+    const correction = (await query("SELECT before_state FROM operator_order_reopens WHERE id=$1", [result.correctionId])).rows[0];
+    assert.equal(correction.before_state[0].header.last_item_fulfillment_id, initial.header.last_item_fulfillment_id);
   }, { rollback: true }));
 }
 
-test("fulfilled line quantities still block a billed order reset", () => withTransaction(async () => {
+test("fulfilled line quantities are reset locally and retained in the correction", () => withTransaction(async () => {
   const f = await billedFixture();
   await query("UPDATE sales_order_lines SET fulfilled_piece_qty=1 WHERE id=$1", [f.line.id]);
   const preview = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-  assert.equal(preview.allowed, false);
-  assert.ok(preview.blockers.some(row => row.code === "OPERATOR_REOPEN_NETSUITE_EVIDENCE"));
+  assert.equal(preview.allowed, true, JSON.stringify(preview.blockers));
+  const result = await reopenOperatorOrder(resetInput(f, preview));
+  assert.equal(Number((await state(f)).lines[0].fulfilled_piece_qty), 0);
+  const correction = (await query("SELECT before_state FROM operator_order_reopens WHERE id=$1", [result.correctionId])).rows[0];
+  assert.equal(Number(correction.before_state[0].lines[0].fulfilled_piece_qty), 1);
 }, { rollback: true }));
 
 for (const fulfillmentId of [123, null]) {
-  test(`fulfillment record ID=${fulfillmentId}: posted evidence governs billed reopen`, () => withTransaction(async () => {
+  test(`fulfillment record ID=${fulfillmentId}: historical evidence does not block local reopen`, () => withTransaction(async () => {
     const f = await billedFixture();
     await query(`INSERT INTO delivery_fulfillment_records(order_id,item_fulfillment_id,photo_data_url)
       VALUES($1,$2,$3)`, [f.id, fulfillmentId, f.photos[0]]);
     const preview = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-    assert.equal(preview.allowed, fulfillmentId === null, JSON.stringify(preview.blockers));
-    if (fulfillmentId) { await assert.rejects(() => reopenOperatorOrder(resetInput(f, preview)), { code: "OPERATOR_REOPEN_NETSUITE_EVIDENCE" }); }
+    assert.equal(preview.allowed, true, JSON.stringify(preview.blockers));
+    await reopenOperatorOrder(resetInput(f, preview));
+    const records = (await query("SELECT item_fulfillment_id FROM delivery_fulfillment_records WHERE order_id=$1", [f.id])).rows;
+    assert.deepEqual(records.map(row => row.item_fulfillment_id), [fulfillmentId === null ? null : String(fulfillmentId)]);
   }, { rollback: true }));
 }

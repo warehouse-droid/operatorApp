@@ -62,6 +62,46 @@ async function sourceEvent(f, { afterWork = false } = {}) {
   [`transfer_order:${f.id}`, String(f.id), `source-decision-${f.id}`, afterWork ? "1 day" : "-1 day", JSON.stringify({ lines: source.items })]);
 }
 
+test('missed source acceptance can recover its exact baseline after the review is acknowledged', async () => {
+  const f = await seed();
+  const before = (await fixture.request(`/api/dispatch/v2/bootstrap?planId=${f.plan.id}`)).payload.plan;
+  await sourceEvent(f);
+  const first = await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews`);
+  await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews`, { method: 'POST',
+    body: { ...f.body, tokens: [first.payload.reviews[0].token] } });
+  const recovered = await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews?baseRevision=${before.revision}&baseDigest=${before.digest}`);
+  assert.equal(recovered.response.status, 200);
+  assert.equal(recovered.payload.plan?.safeToAdvanceRevision, true);
+  assert.equal(recovered.payload.sourceBaseline?.digest, before.digest);
+  assert.equal(recovered.payload.sourceBaseline?.revision, before.revision);
+  assert.equal(recovered.payload.plan.revision, before.revision + 1);
+  assert.equal(recovered.payload.orders[0].items.length, 1);
+  const trucks = structuredClone(f.plan.trucks);
+  trucks[0].loads.push({ id: `recovered-${f.id}`, name: 'My pending load', driverLogin: 'source-test', driverName: 'Source tester',
+    truckId: 'source-truck', truckPlate: 'BL27129-TEST', driverSequence: 1, stops: [] });
+  const saved = await fixture.request(`/api/dispatch/plans/${f.plan.id}`, { method: 'PUT', body: { ...f.body,
+    planDate: f.plan.planDate, orders: recovered.payload.orders, trucks, summary: { recoveredDraft: true },
+    baseRevision: recovered.payload.plan.revision, baseDigest: recovered.payload.plan.digest } });
+  assert.equal(saved.response.status, 200, JSON.stringify(saved.payload));
+  assert.ok(saved.payload.trucks[0].loads.some(load => load.id === `recovered-${f.id}`));
+  assert.deepEqual((await query('SELECT * FROM driver_job_records WHERE plan_id=$1', [f.plan.id])).rows, f.jobs);
+});
+
+test('source recovery refuses a wrong digest or an intervening planner edit', async () => {
+  const f = await seed();
+  const before = (await fixture.request(`/api/dispatch/v2/bootstrap?planId=${f.plan.id}`)).payload.plan;
+  await sourceEvent(f);
+  await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews`);
+  const wrong = await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews?baseRevision=${before.revision}&baseDigest=wrong`);
+  assert.equal(wrong.payload.sourceBaseline, undefined);
+  assert.equal(wrong.payload.plan?.safeToAdvanceRevision, false);
+  await query("UPDATE dispatch_plans SET revision=revision+1 WHERE id=$1", [f.plan.id]);
+  await query("UPDATE dispatch_plan_snapshots SET summary=summary || '{\"plannerEdit\":true}'::jsonb WHERE plan_id=$1", [f.plan.id]);
+  const unrelated = await fixture.request(`/api/dispatch/plans/${f.plan.id}/executed-order-reviews?baseRevision=${before.revision}&baseDigest=${before.digest}`);
+  assert.equal(unrelated.payload.sourceBaseline, undefined);
+  assert.equal(unrelated.payload.plan?.safeToAdvanceRevision, false);
+});
+
 test("a stale pre-work webhook cannot approve a different later mirror edit", async () => {
   const f = await seed();
   await sourceEvent(f);

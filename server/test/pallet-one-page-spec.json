@@ -1,0 +1,15 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "request": "One-page pallet entry with three equal photo/order/customer columns, optional photo and plate, read-only review, floating warnings, stable customer search and minimum 15px text",
+  "acceptance": [
+    "Desktop/tablet entry uses equal photo, order/scanner and customer columns; phone layout remains usable without horizontal overflow.",
+    "Customer search retains its input node, focus and caret; stale responses and errors cannot overwrite a newer query or follow navigation.",
+    "Phone search matches separators and optional +1 in the local directory and NetSuite fallback; code/name searches remain available.",
+    "Photos, plate and notes entered before selection survive customer/order lookup, review and back navigation. New Return clears them.",
+    "Pallet confirmation accepts absent photos and plate, posts one verified CM and remains idempotent. Invalid supplied photos, stock evidence and pallet quotas remain validated.",
+    "Review shows entered information without editable fields or camera controls; warnings use the Customer Pickup floating notice with Dismiss.",
+    "Pallet labels and numbers remain at least 15px, including when saved display preferences request smaller text.",
+    "CM location follows receiving yard: 3445/1, 2967/28, 150/26. NetSuite generates the number; customer messages retain actual CMB/CMA/CMM references."
+  ],
+  "validation": "Existing bounded disposable runners; mocked providers and synthetic data only. Generated logs, screenshots and mutation copies are removed by the retention wrapper."
+}

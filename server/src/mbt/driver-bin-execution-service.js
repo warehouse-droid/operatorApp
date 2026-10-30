@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 
 import { query, withTransaction } from "../db.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
+import { completedBinDumpPricing } from './bin-dump-charge.js';
 import { releaseMbtBinSuccessorToPool } from "./bin-planning-repository.js";
 import { binVisitDisplayReference } from "./bin-order-workflow-repository.js";
 import { assertBinWorkflowPrerequisites, finishBinWorkflowStep } from "./bin-order-workflow-execution.js";
@@ -452,6 +453,9 @@ function materializedMbtSnapshot(input) {
     issuedVisitRevision: Number(valueOrFallback(assignmentSnapshot.visitRevision, visit.revision)),
     serviceAction: String(visit.service_action),
     actionCode,
+    actionName:String(step.display_name),
+    cargo:stop.cargo || null,
+    cargoDropoffs:stop.cargoDropoffs || [],
     visitStepId: String(step.visit_step_id),
     stepSequence: Number(step.sequence_number),
     stopGroupId: firstText(baseMbt.stopGroupId, visit.service_visit_id),
@@ -498,6 +502,9 @@ function materializedMbtSnapshot(input) {
  * @param {{clientVersion: string, minimumClientVersion: string}} versions
  */
 export async function materializeMbtDriverBinJob(baseJob, versions) {
+  if (baseJob.mbt?.transportTripId) {
+    return (await import('./bin-transport-driver.js')).materializeTransportDriverJob(baseJob,versions);
+  }
   const visitId = requiredText(objectValue(baseJob.mbt).visitId, "BIN visit ID");
   const minimumClientVersion = requiredClientBoundary(versions);
   const { visit, steps, evidence } = await visitExecutionRows(visitId);
@@ -925,6 +932,9 @@ async function registeredOfflineTrace(normalized) {
  * @param {{capability: unknown}} boundary
  */
 export async function startMbtDriverBinJob(input, { capability }) {
+  if (input.job?.mbt?.transportTripId) {
+    return (await import('./bin-transport-driver.js')).applyTransportDriverEvent(input,{capability});
+  }
   assertCapability(capability);
   const normalized = normalizedApplication(input.event, input.job);
   if (normalized.eventType !== "job_started") {
@@ -1424,6 +1434,7 @@ async function insertDumpReceipt(context) {
 
 /** @param {string} actionCode */
 function movementKind(actionCode) {
+  if (/^cargo_(pickup|dropoff)_\d+$/u.test(actionCode)) {return "to_truck";}
   if (["collect_empty_bin", "pickup_bin", "pickup_loaded_bin", "load_bin"].includes(actionCode)) {return "to_truck";}
   if (["deliver_bin", "place_bin"].includes(actionCode)) {return "to_customer";}
   if (["dump_bin", "dump_load"].includes(actionCode)) {return "to_dump";}
@@ -1519,6 +1530,7 @@ function expectedLocationForStatus(context, status) {
 
 /** @param {string} actionCode */
 function defaultBeforeStatuses(actionCode) {
+  if (/^cargo_(pickup|dropoff)_\d+$/u.test(actionCode)) {return ["on_truck"];}
   if (["collect_empty_bin", "load_bin"].includes(actionCode)) {return ["reserved", "available"];}
   if (["pickup_bin", "pickup_loaded_bin"].includes(actionCode)) {return ["at_customer"];}
   if (["return_bin", "return_empty_bin"].includes(actionCode)) {return ["on_truck", "at_dump"];}
@@ -1811,6 +1823,7 @@ async function finishStepAndVisit(context) {
 /** @param {Record<string, any>} context @param {boolean} visitCompleted @param {Record<string, any> | null} receipt */
 async function insertBillingTrigger(context, visitCompleted, receipt) {
   const kind = receipt ? "dump_receipt_recorded" : visitCompleted ? "visit_completed" : "step_completed";
+  const dumpPricing = await completedBinDumpPricing(context,visitCompleted);
   await query(
     `INSERT INTO mbt_driver_bin_billing_triggers (
        billing_trigger_id, source_driver_event_id, contract_id,
@@ -1823,7 +1836,8 @@ async function insertBillingTrigger(context, visitCompleted, receipt) {
         jobId: context.normalized.jobId,
         actionCode: context.step.action_code,
         visitCompleted,
-        receiptId: receipt?.receiptId || null
+        receiptId: receipt?.receiptId || null,
+        ...(dumpPricing ? {dumpPricing} : {})
       })
     ]
   );
@@ -1843,6 +1857,9 @@ async function invokeCompletionHook(hooks, name, value) {
  * @param {{capability: unknown, hooks?: Record<string, Function>}} boundary
  */
 export async function completeMbtDriverBinJob(input, { capability, hooks = {} }) {
+  if (input.job?.mbt?.transportTripId) {
+    return (await import('./bin-transport-driver.js')).applyTransportDriverEvent(input,{capability,hooks});
+  }
   assertCapability(capability);
   const normalized = /** @type {Record<string, any>} */ (normalizedApplication(input.event, input.job));
   if (normalized.eventType !== "job_completed") {
@@ -1928,3 +1945,9 @@ export async function completeMbtDriverBinJob(input, { capability, hooks = {} })
     return { replayed: false, body: persistedBody };
   });
 }
+
+// Transport uses the same version, manifest chronology and durable scan/photo
+// boundary as rental work; its storage and source completion remain separate.
+export const sharedBinDriverEvidence=Object.freeze({assertCapability,requiredClientBoundary,assetIdentities,
+  normalizedApplication,assertCompleteManifestRoute,lockExactAssetStates,assertCompleteManifestChronology,
+  validateRequirements,registeredOfflineTrace});

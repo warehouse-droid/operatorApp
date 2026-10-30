@@ -1,0 +1,32 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import {query,closeDb} from '../../../src/db.js';
+import {transportFixture,transportInput} from '../support/bin-transport-fixtures.js';
+import {saveTransportTrip} from '../../../src/mbt/bin-transport-service.js';
+import {getTransportPlanning} from '../../../src/mbt/bin-transport-read.js';
+import {run} from '../support/bin-planning-fixtures.js';
+after(closeDb);
+
+test('Transport pool: original order becomes numbered trips, remaining quantity stays visible, search finds its saved load',async()=>{
+  const f=await transportFixture();
+  let feed=await getTransportPlanning({planDate:f.planDate,search:f.sourceRef});
+  const source=feed.pool.items.find(c=>c.transport?.sourceRef===f.sourceRef);
+  assert.ok(source);assert.equal(source.mbt.frontLeg.dispatchable,false);
+  assert.equal(source.transport.lines[0].remaining,'2.5');
+  assert.equal(source.serviceAction,'mbr_agg');
+  const saved=await saveTransportTrip(await transportInput(f,[{lineKey:'loose-1',quantity:'1.25'}]));
+  feed=await getTransportPlanning({planDate:f.planDate,search:f.sourceRef});
+  const trip=feed.pool.items.find(c=>c.id===saved.body.trip.tripId);
+  assert.equal(trip.displayReference,`${f.sourceRef} · Trip 1`);
+  assert.equal(trip.mbt.frontLeg.dispatchable,true);assert.equal(trip.mbt.assetRequirements[0].exactAssetCode,f.assetCode);
+  assert.equal(feed.pool.items.find(c=>c.transport?.sourceOnly).transport.lines[0].remaining,'1.25');
+  await run(f,'assign',{visitId:trip.id,expectedVisitRevision:trip.mbt.visitRevision,assetAssignments:[]});
+  feed=await getTransportPlanning({planDate:f.planDate,search:f.sourceRef});
+  const planned=feed.pool.items.find(c=>c.id===trip.id);
+  assert.equal(planned.dispatchPlanned,true);assert.equal(planned.dispatchPlanDate,f.planDate);
+  assert.equal(planned.dispatchPlanId,f.planId);assert.ok(planned.dispatchLoadId);
+  assert.ok(feed.assigned.some(c=>c.id===trip.id));
+  await query("UPDATE mbt_transport_trips SET status='completed',cargo_delivered_at=now(),actual_completed_at=now() WHERE trip_id=$1",[trip.id]);
+  feed=await getTransportPlanning({planDate:f.planDate,search:f.sourceRef});
+  assert.equal(feed.pool.items.find(c=>c.id===trip.id).mbt.status,'completed');
+});

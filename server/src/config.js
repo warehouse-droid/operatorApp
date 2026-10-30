@@ -34,6 +34,11 @@ function palletBalanceRestletUrl(env) {
       : "")).trim();
 }
 
+/** @param {Record<string, string | undefined>} env */
+function ifirPostingRestletUrl(env) {
+  return String(env.NETSUITE_IFIR_POSTING_RESTLET_URL || "").trim();
+}
+
 function buildConfig(env) {
   const mirrorRole = ["source", "consumer"].includes(String(env.NETSUITE_MIRROR_ROLE || "").trim().toLowerCase())
     ? String(env.NETSUITE_MIRROR_ROLE).trim().toLowerCase()
@@ -65,6 +70,7 @@ function buildConfig(env) {
     appBaseUrl: env.APP_BASE_URL || "http://localhost:3000",
     databaseUrl: env.DATABASE_URL,
     mbr: { enabled: booleanValue(env.MBR_CONTRACTS_ENABLED, false) },
+    repair: { enabled: booleanValue(env.REPAIR_ENABLED, false), postingEnabled: booleanValue(env.REPAIR_NETSUITE_POSTING_ENABLED, false) },
     googleMapsApiKey: googleMapsServerApiKey,
     googleMaps: {
       serverApiKey: googleMapsServerApiKey,
@@ -144,6 +150,9 @@ function buildConfig(env) {
       tokenUrl: env.NETSUITE_TOKEN_URL,
       restBaseUrl: env.NETSUITE_REST_BASE_URL,
       palletBalanceRestletUrl: palletBalanceRestletUrl(env),
+      ifirPostingEnabled: booleanValue(env.NETSUITE_IFIR_POSTING_ENABLED, false),
+      ifirPostingQuantityPolicyEnabled: booleanValue(env.NETSUITE_IFIR_POSTING_QUANTITY_POLICY_ENABLED, false),
+      ifirPostingRestletUrl: ifirPostingRestletUrl(env),
       scopes: env.NETSUITE_SCOPES || "rest_webservices",
       m2mSettingsPath: path.resolve(env.NETSUITE_M2M_SETTINGS_PATH || path.join(dataDir, "netsuite-m2m-settings.json")),
       m2mMasterKeyPath: path.resolve(env.NETSUITE_M2M_MASTER_KEY_PATH || path.join(dataDir, ".netsuite-m2m-master-key")),

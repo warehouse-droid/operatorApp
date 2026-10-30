@@ -1,0 +1,286 @@
+{
+  "at": "2026-10-22T23:40:27.566Z",
+  "node": "v20.20.2",
+  "sourceHashes": {
+    "public/backorder-review-policy.js": "0e21cf6296ebb144fb629256bf3eb21cc316bd7c8c371ffc32360d35a8c5aaae",
+    "public/backorder-stock-requests.js": "263c12fc319b74bab2cc9dfe22e2b6b1e167300b0671929571efa853190d0b5d",
+    "src/backorder-request-service.js": "b3ba2bd5897bd3858f2decbb191d3b3b5e020a746e13605365aaadaeb1a9f18a",
+    "public/sales-stock-requests.js": "b46e2df3967d465f4110214d0cafe61091f591a1e4de6ed22451b9f5947d344f",
+    "public/scm-stock-requests.js": "dc1c87b63b9f495a08c449d950a8861b8020413d6e7673905dfe1cb17c4ce3a9",
+    "public/sales-stock-requests.html": "fff7e32e8cdd80d5d72f8d23e3fb720fa601328c443e707cba8eb9f9175c8ba9",
+    "public/scm-stock-requests.html": "fdc683fcfeefc3d0f916e868e3c7eced55e5b6d6c30ffa087cdd141d7575ef29"
+  },
+  "static": {
+    "syntax": 10,
+    "newLint": 0,
+    "secrets": [],
+    "versions": {
+      "typescript": "7.0.2",
+      "eslint": "10.8.0",
+      "fast-check": "4.9.0",
+      "c8": "12.0.0",
+      "@playwright/test": "1.62.1",
+      "pg": "8.21.0"
+    },
+    "types": "passed (new shared policy)"
+  },
+  "fresh": {
+    "tests": 12,
+    "pass": 12,
+    "fail": 0,
+    "skipped": 0,
+    "cancelled": 0,
+    "failures": [],
+    "errors": [],
+    "exit": 0
+  },
+  "coverage": [
+    {
+      "file": "public/backorder-review-policy.js",
+      "changedExecutable": 20,
+      "covered": 20,
+      "uncovered": [],
+      "branches": {
+        "total": 18,
+        "covered": 18,
+        "skipped": 0,
+        "pct": 100
+      }
+    },
+    {
+      "file": "public/backorder-stock-requests.js",
+      "changedExecutable": 30,
+      "covered": 30,
+      "uncovered": [],
+      "branches": {
+        "total": 253,
+        "covered": 246,
+        "skipped": 0,
+        "pct": 97.23
+      }
+    },
+    {
+      "file": "src/backorder-request-service.js",
+      "changedExecutable": 11,
+      "covered": 11,
+      "uncovered": [],
+      "branches": {
+        "total": 120,
+        "covered": 72,
+        "skipped": 0,
+        "pct": 60
+      }
+    }
+  ],
+  "mutations": [
+    {
+      "name": "one reply unlocks all materials",
+      "propertiesOnly": false,
+      "killed": true
+    },
+    {
+      "name": "one reply unlocks all materials",
+      "propertiesOnly": true,
+      "killed": true
+    },
+    {
+      "name": "eligible active requests rejected",
+      "propertiesOnly": false,
+      "killed": true
+    },
+    {
+      "name": "eligible active requests rejected",
+      "propertiesOnly": true,
+      "killed": true
+    },
+    {
+      "name": "Already Ordered compatibility removed",
+      "propertiesOnly": false,
+      "killed": true
+    },
+    {
+      "name": "Already Ordered compatibility removed",
+      "propertiesOnly": true,
+      "killed": true
+    },
+    {
+      "name": "unsaved status treated as SCM reply",
+      "propertiesOnly": false,
+      "killed": true
+    },
+    {
+      "name": "unsaved status treated as SCM reply",
+      "propertiesOnly": true,
+      "killed": true
+    },
+    {
+      "name": "pending Sales confirmation hidden",
+      "propertiesOnly": false,
+      "killed": true
+    },
+    {
+      "name": "pending Sales confirmation hidden",
+      "propertiesOnly": true,
+      "killed": true
+    }
+  ],
+  "regressions": {
+    "tests": 97,
+    "pass": 79,
+    "fail": 18,
+    "skipped": 0,
+    "cancelled": 0,
+    "failures": [
+      "All Already Ordered request shows Completed and no remaining SO/PO steps",
+      "Completing the last material after a PO was linked removes its remaining planning prompt",
+      "Mixed Backorder skips completed materials in PO readiness and finishes remaining normal workflow",
+      "Already Ordered clears an outstanding SCM review alert while the remaining material awaits PO linkage",
+      "Sales attaches the NetSuite quotation number before review and after closure with retained input on conflicts",
+      "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+      "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+      "A pending Backorder save cannot replace another request selected by Sales",
+      "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+      "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+      "New Backorder enquiry hides order links in Sales and SCM",
+      "SCM Request information appears before the material lines",
+      "SCM Regular queue filter supports multiple selections, persists them and clears with other filters",
+      "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+      "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+      "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+      "Manual Backorder links keep revised material confirmations in Sales notifications",
+      "backorder browser: transfer without date, Sales acceptance, then actual SO ETA"
+    ],
+    "errors": [
+      {
+        "test": "All Already Ordered request shows Completed and no remaining SO/PO steps",
+        "error": "expect(locator).toHaveCount(expected) failed",
+        "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('[data-backorder-detail]').locator('form')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('[data-backorder-detail]').locator('form')\n        14 × locator resolved to 1 element\n           - unexpected value \"1\""
+      },
+      {
+        "test": "Completing the last material after a PO was linked removes its remaining planning prompt",
+        "error": "expect(locator).toHaveCount(expected) failed",
+        "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('[data-backorder-detail] form')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('[data-backorder-detail] form')\n        14 × locator resolved to 1 element\n           - unexpected value \"1\""
+      },
+      {
+        "test": "Mixed Backorder skips completed materials in PO readiness and finishes remaining normal workflow",
+        "error": "'false == true'",
+        "detail": "'false == true'"
+      },
+      {
+        "test": "Already Ordered clears an outstanding SCM review alert while the remaining material awaits PO linkage",
+        "error": "'false == true'",
+        "detail": "'false == true'"
+      },
+      {
+        "test": "Sales attaches the NetSuite quotation number before review and after closure with retained input on conflicts",
+        "error": "locator.selectOption: Timeout 10000ms exceeded.",
+        "detail": "|-\n    locator.selectOption: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for locator('[data-scm-stock-filter=\"backorderStageFilter\"]')"
+      },
+      {
+        "test": "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+        "error": "expect(locator).toHaveCount(expected) failed",
+        "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('dialog.regular-stock-popup[open]')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('dialog.regular-stock-popup[open]')\n        14 × locator resolved to 1 element\n           - unexpected value \"1\""
+      },
+      {
+        "test": "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+        "error": "expect(locator).toContainText(expected) failed",
+        "detail": "|-\n    expect(locator).toContainText(expected) failed\n    \n    Locator: locator('dialog.regular-stock-popup[open]')\n    Expected substring: \"STREQ-000065\"\n    Received string:    \"Stock request needs your inputSTREQ-000063Review the SCM response and confirm your decision.Open requestView all updatesClose\"\n    Timeout: 5000ms\n    \n    Call log:\n      - Expect \"to.have.text\" with timeout 5000ms\n      - waiting for locator('dialog.regular-stock-popup[open]')\n        13 × locator resolved to <dialog open=\"\" data-input-request-id=\"63\" class=\"regular-stock-popup\" data-notification-role=\"sales\" aria-labelledby=\"regular-stock-popup-title\" data-os-notification-id=\"regular-stock:input:63:sales_confirmation:2\">…</dialog>\n           - unexpected value \"Stock request needs your inputSTREQ-000063Review the SCM response and confirm your decision.Open requestView all updatesClose\""
+      },
+      {
+        "test": "A pending Backorder save cannot replace another request selected by Sales",
+        "error": "locator.click: Timeout 10000ms exceeded.",
+        "detail": "|-\n    locator.click: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for getByText('Edit request header', { exact: true })\n        - locator resolved to <summary>Edit request header</summary>\n      - attempting click action\n        2 × waiting for element to be visible, enabled and stable\n          - element is visible, enabled and stable\n          - scrolling into view if needed\n          - done scrolling\n          - <dialog open=\"\" data-input-request-id=\"63\" class=\"regular-stock-popup\" data-notification-role=\"sales\" aria-labelledby=\"regular-stock-popup-title\" data-os-notification-id=\"regular-stock:input:63:sales_confirmation:2\">…</dialog> intercepts pointer events\n        - retrying click action\n        - waiting 20ms\n        2 × waiting for element to be visible, enabled and stable\n          - element is visible, enabled and stable\n          - scrolling into view if needed\n  "
+      },
+      {
+        "test": "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+        "error": "locator.fill: Timeout 10000ms exceeded.",
+        "detail": "|-\n    locator.fill: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for locator('[data-backorder-form][data-action=\"information/request\"]').locator('[name=\"question\"]')"
+      },
+      {
+        "test": "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+        "error": "Expected values to be strictly equal:",
+        "detail": "|-\n    Expected values to be strictly equal:\n    + actual - expected\n    \n    + 'await_customer_confirmation'\n    - 'dispatch_arrangement'"
+      },
+      {
+        "test": "New Backorder enquiry hides order links in Sales and SCM",
+        "error": "expect(locator).toContainText(expected) failed",
+        "detail": "|-\n    expect(locator).toContainText(expected) failed\n    \n    Locator: locator('[data-backorder-detail]')\n    Timeout: 5000ms\n    - Expected substring  -  1\n    + Received string     + 16\n    \n    - New enquiry\n    + STREQ-000069 · BackorderPending SCM\n    +       \n    +       \n    +       Review requiredConversationSales and SCMNo messages yet.MessageSend messageRefresh messagesCustomerTEST Backorder CustomerVendorTEST VendorFulfillmentPickupSOPendingPOPendingNetSuite quotation: —Save quotation numberNetSuite quotation numberSave quotation numberSCM must review stock and Sales must accept every open material before linking an SO.\n    +       SCM review → Sales acceptance → Confirmed (Sales links SO; SCM links PO) → PO reference + Queued → Dispatch Arrangement.Edit request headerSave request headerCustomer name *Customer phoneFulfillmentPickupDelivery\n    +     \n    +     Delivery addre"
+      },
+      {
+        "test": "SCM Request information appears before the material lines",
+        "error": "expect(locator).toBeVisible() failed",
+        "detail": "|-\n    expect(locator).toBeVisible() failed\n    \n    Locator: locator('[data-backorder-form][data-action=\"information/request\"]')\n    Expected: visible\n    Timeout: 5000ms\n    Error: element(s) not found\n    \n    Call log:\n      - Expect \"to.be.visible\" with timeout 5000ms\n      - waiting for locator('[data-backorder-form][data-action=\"information/request\"]')"
+      },
+      {
+        "test": "SCM Regular queue filter supports multiple selections, persists them and clears with other filters",
+        "error": "expect(locator).toBeVisible() failed",
+        "detail": "|-\n    expect(locator).toBeVisible() failed\n    \n    Locator: locator('details[aria-label=\"Regular stock request queue\"]')\n    Expected: visible\n    Timeout: 5000ms\n    Error: element(s) not found\n    \n    Call log:\n      - Expect \"to.be.visible\" with timeout 5000ms\n      - waiting for locator('details[aria-label=\"Regular stock request queue\"]')"
+      },
+      {
+        "test": "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+        "error": "'false == true'",
+        "detail": "'false == true'"
+      },
+      {
+        "test": "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+        "error": "The input did not match the regular expression /pending update/. Input:",
+        "detail": "|-\n    The input did not match the regular expression /pending update/. Input:\n    \n    'SCM needs your update. Open the request to reply.'"
+      },
+      {
+        "test": "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+        "error": "The expression evaluated to a falsy value:",
+        "detail": "|-\n    The expression evaluated to a falsy value:\n    \n      assert.ok(alert.body.requests.some(r=>r.id===d.id && r.action==='backorder'))"
+      },
+      {
+        "test": "Manual Backorder links keep revised material confirmations in Sales notifications",
+        "error": "The expression evaluated to a falsy value:",
+        "detail": "|-\n    The expression evaluated to a falsy value:\n    \n      assert.ok(alerts.body.requests.some(row=>row.id===d.id && row.action==='backorder'))"
+      },
+      {
+        "test": "backorder browser: transfer without date, Sales acceptance, then actual SO ETA",
+        "error": "'page.waitForResponse: Timeout 8000ms exceeded while waiting for event \"response\"'",
+        "detail": "'page.waitForResponse: Timeout 8000ms exceeded while waiting for event \"response\"'"
+      }
+    ],
+    "exit": 1
+  },
+  "reordered": [
+    {
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "failures": [],
+      "errors": [],
+      "exit": 0
+    },
+    {
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "failures": [],
+      "errors": [],
+      "exit": 0
+    },
+    {
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "failures": [],
+      "errors": [],
+      "exit": 0
+    }
+  ],
+  "fileOrder": [
+    "test/mbt/integration/backorder-review-flow.test.js",
+    "test/mbt/unit/backorder-review-flow.test.js",
+    "test/mbt/integration/backorder-review-flow-browser.test.js"
+  ],
+  "newFailures": 0,
+  "passed": true
+}

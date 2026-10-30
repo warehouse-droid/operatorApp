@@ -1,4 +1,4 @@
-const HARNESS_COMMAND = /^node (src\/[a-z0-9-]+-harness\.js)$/;
+const HARNESS_COMMAND = /^node (?:(--test) )?(src\/[a-z0-9-]+-harness\.js)((?: test\/[a-z0-9/-]+(?:\.test)?\.m?js)*)$/;
 
 const SECRET_ENVIRONMENT_KEYS = [
   "GOOGLE_MAPS_API_KEY",
@@ -67,7 +67,7 @@ function assertFullHarnessOwnership(profileName, names, excluded, packageScripts
  * @param {{schemaVersion: number, profiles: Record<string, string[]>, excluded?: Record<string, string>}} manifest
  * @param {Record<string, string>} packageScripts
  * @param {string} profileName
- * @returns {{name: string, file: string}[]}
+ * @returns {{name: string, file: string, args?: string[]}[]}
  */
 export function resolveHarnessProfile(manifest, packageScripts, profileName) {
   assertPlainObject(manifest, "Harness manifest");
@@ -104,14 +104,16 @@ export function resolveHarnessProfile(manifest, packageScripts, profileName) {
       throw new Error(`Harness ${name} is not present in package.json scripts.`);
     }
     const match = HARNESS_COMMAND.exec(command.trim());
-    if (!match) {
+    if (!match || (match[3] && !match[1])) {
       throw new Error(`Harness ${name} must be a single Node harness command.`);
     }
-    const file = match[1];
+    const file = match[2];
     if (!file) {
       throw new Error(`Harness ${name} did not resolve to a file.`);
     }
-    return { name, file };
+    return match[1]
+      ? { name, file, args: [match[1], file, ...match[3].trim().split(/\s+/).filter(Boolean)] }
+      : { name, file };
   });
 }
 

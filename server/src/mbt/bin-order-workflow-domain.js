@@ -102,6 +102,10 @@ function collectionPart(input) {
 
 /** @param {any} input */
 function exchangeDependencies(input) {
+  if (input.collectionBinTypeId && input.collectionBinTypeId!==input.binTypeId
+      && (input.sequence!=="delivery_first" || input.reuse!=="different_bin")) {
+    throw new Error("Different bin sizes or types require delivery first with a different replacement bin.");
+  }
   if (!["collection_first","delivery_first"].includes(input.sequence)) {throw new Error("Choose the exchange sequence.");}
   if (!["same_bin","different_bin"].includes(input.reuse)) {throw new Error("Choose same or different replacement bin.");}
   if (input.sequence === "delivery_first" && input.deliveryAssetId === input.collectionAssetId) {

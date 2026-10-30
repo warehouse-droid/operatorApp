@@ -11,7 +11,7 @@ function functionSource(name) {
   return source.slice(match.index, next < 0 ? undefined : match.index + match[0].length + next);
 }
 function client(overrides = {}) {
-  const context = vm.createContext({ returnMode: "stock", returnPalletQuantity: 3, locationId: 1,
+  const context = vm.createContext({ currentModule: "stock-return", returnMode: "stock", returnPalletQuantity: 3, locationId: 1,
     returnPostingPolicies: {}, returnPostingError: "", returnPostingLoading: false, returnPostingGeneration: 0,
     returnSelectedRows: () => [{}], render: () => {}, ...overrides });
   for (const name of ["operatorNetSuitePolicyToken", "returnPostingFunctions", "returnPostingReady", "loadReturnPostingPolicies"]) {

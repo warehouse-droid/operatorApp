@@ -25,7 +25,7 @@ export async function fixture({sku=88999701}={}) {
     return {status:response.status,body:await response.json()};
   }
   async function create(count=2) {
-    const result=await http('sales','/api/sales/stock-requests',{deliveryMethod:'backorder',destinationLocationId:1,fulfillmentMethod:'yard_pickup',
+    const result=await http('sales','/api/sales/stock-requests',{deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',
       lines:Array.from({length:count},(_,i)=>({itemId:sku,salesQty:i+2,quantityMode:'direct',requiredDate:'2099-02-01'}))});
     assert.equal(result.status,201,JSON.stringify(result.body));ids.push(result.body.id);return result.body;
   }

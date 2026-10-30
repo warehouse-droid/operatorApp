@@ -1,0 +1,18 @@
+{
+  "fileDeadlineSeconds": 180,
+  "cleanupGraceSeconds": 30,
+  "events": [
+    {
+      "file": "/app/test/mbt/integration/aggregate-request-browser.test.js",
+      "elapsedSeconds": 211,
+      "terminatedTestChildren": 1,
+      "source": "candidate"
+    },
+    {
+      "file": "/app/test/mbt/integration/aggregate-request-browser.test.js",
+      "elapsedSeconds": 215,
+      "terminatedTestChildren": 1,
+      "source": "baseline"
+    }
+  ]
+}

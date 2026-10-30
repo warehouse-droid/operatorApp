@@ -2,7 +2,7 @@ import {query,withTransaction} from './db.js';
 import {canConvertStockingToBackorder,stockingBackorderMaterials} from '../public/stocking-backorder-conversion.js';
 import {createBackorderCaseForStocking} from './special-stock-request-repository.js';
 import {getBackorderRequest} from './backorder-request-service.js';
-import {minimumSpecialCaseRequiredDate} from './special-stock-request-domain.js';
+import {minimumSpecialCaseRequiredDate,normalizeSpecialCustomerName} from './special-stock-request-domain.js';
 import {torontoDate} from '../public/special-stock-workflow.js';
 import {STOCK_REQUEST_YARDS} from './stock-request-domain.js';
 
@@ -57,24 +57,25 @@ export async function convertStockingToBackorder(requestId,input,context) {
   if (!['yard_pickup','mbt_delivery'].includes(input.fulfillmentMethod)) throw Object.assign(new Error('Select Pickup or Delivery.'),{status:400,code:'STOCKING_BACKORDER_INVALID'});
   await withTransaction(async()=>{
     const {request,lines,items}=await loadConvertible(selected,revision);
+    const customerName=normalizeSpecialCustomerName(String(request.regular_details.customerName || '').trim() || input.customerName);
     const storeId=Number(request.regular_details.requestingLocationId ?? request.destination_location_id);
     const yard=STOCK_REQUEST_YARDS.find(entry=>entry.locationId===storeId);
     if (!yard) throw locked('The original requesting Sales yard is unavailable.');
     const materials=stockingBackorderMaterials(lines,items,{requiredDate:input.requiredDate || minimumSpecialCaseRequiredDate(),vendors:input.vendors});
     const originalDecisionReads=(await query('SELECT * FROM regular_stock_decision_reads WHERE request_id=$1 FOR UPDATE',[selected])).rows;
-    // Only fulfillment and vendor confirmation are editable during conversion.
+    // Preserve the saved customer; a missing name must be supplied for Backorder.
     const fulfillment=Object.fromEntries(['fulfillmentMethod','deliveryAddress','deliveryContactName','deliveryContactPhone','deliveryDate','windowStart','windowEnd','deliveryInstructions'].map(key=>[key,input[key]]));
     // Retire Stocking rows before switching the profile: Backorder's database
     // guard correctly rejects subsequent Stocking-line updates.
     await query("UPDATE sales_stock_request_lines SET status='cancelled',updated_at=now() WHERE request_id=$1",[selected]);
-    await createBackorderCaseForStocking(selected,{...fulfillment,storeLocationId:storeId,inquiryDate:torontoDate(),customerName:request.regular_details.customerName || '',
+    await createBackorderCaseForStocking(selected,{...fulfillment,storeLocationId:storeId,inquiryDate:torontoDate(),customerName,
       customerPhone:request.regular_details.customerPhone || '',remarks:request.remarks,salesInternalRemark:request.regular_details.salesInternalRemark || '',
       vendorName:materials[0].brand,vendorId:materials[0].regularVendorId,lines:materials},
     {operatorId:context.operatorId,authorizedStoreLocationIds:[storeId]});
     const convertedAt=new Date().toISOString();
     await query(`UPDATE sales_stock_requests SET regular_details=$2::jsonb,destination_location_id=$3,destination_name=$4,
       status='submitted',revision=revision+1,manual_decision_event_id=0,updated_at=now() WHERE id=$1`,
-    [selected,JSON.stringify({deliveryMethod:'backorder',customerName:request.regular_details.customerName || '',stockingConversion:{stockingType:request.regular_details.stockingType || 'transfer',
+    [selected,JSON.stringify({deliveryMethod:'backorder',customerName,stockingConversion:{stockingType:request.regular_details.stockingType || 'transfer',
       convertedAt,convertedBy:context.operatorId,originalDestinationLocationId:Number(request.destination_location_id),originalRegular:request.regular_details,
       originalLineStatuses:Object.fromEntries(lines.map(line=>[line.id,line.status])),originalDecisionReads}}),storeId,yard.yardCode]);
     // Stocking reads use event IDs; Backorder reads use request revisions.

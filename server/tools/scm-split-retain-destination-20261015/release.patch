@@ -1,0 +1,225 @@
+--- a/src/dispatch-repository.js
++++ b/src/dispatch-repository.js
+@@ -1270,6 +1270,8 @@
+           'lineId', l.line_id,
+           'netSuiteLineSequence', l.netsuite_line_sequence,
+           'itemId', l.item_id,
++          'netsuiteDestinationLocationId', COALESCE(l.location_id, o.destination_location_id),
++          'netsuiteDestinationYard', COALESCE(NULLIF(l.location, ''), o.destination_location),
+           'destinationLocationId', COALESCE(
+             ${scmScheduleDestinationLocationIdSql("scm.dropoff_point")},
+             l.location_id,
+@@ -7504,6 +7506,7 @@
+   newPoRef = "",
+   pickupPoint = "",
+   destinationLocationId = null,
++  retainNetSuiteDestination = false,
+   status = "Hold",
+   remarkOverride = "",
+   lines = [],
+@@ -7514,6 +7517,9 @@
+ } = {}) {
+   const sourceRef = String(sourcePoRef || "").trim();
+   const splitRef = String(newPoRef || "").trim();
++  if (typeof retainNetSuiteDestination !== "boolean") {
++    throw Object.assign(new Error("Retain NetSuite destination must be true or false."), { status: 400 });
++  }
+   if (!sourceRef) throw new Error("Blanket PO is required.");
+   if (!splitRef) throw new Error("New PO ref number is required.");
+   if (sourceRef.toLowerCase() === splitRef.toLowerCase()) throw new Error("New PO ref must be different from the blanket PO.");
+@@ -7546,12 +7552,13 @@
+     );
+     const source = sourceOrder.rows[0];
+     if (!source) throw new Error(`Blanket PO ${sourceRef} was not found.`);
+-    const splitDestinationLocationId = normalizeScmDestinationLocationId(destinationLocationId)
++    let splitDestinationLocationId = normalizeScmDestinationLocationId(destinationLocationId)
+       || requestedLines.map((line) => line.destinationLocationId).find(Boolean)
+       || normalizeScmDestinationLocationId(source.destination_location_id)
+       || normalizeScmDestinationLocationId(source.destination_location);
+-    if (!splitDestinationLocationId) throw new Error("Destination yard is required for the split PO.");
+-    const splitDestinationLocation = locationTextFromId(splitDestinationLocationId);
++    if (!retainNetSuiteDestination && !splitDestinationLocationId) {
++      throw new Error("Destination yard is required for the split PO.");
++    }
+     const selectedPickupYard = String(pickupPoint || "").trim()
+       ? await resolveScmPurchaseOrderPickupYard(query, source, pickupPoint)
+       : null;
+@@ -7728,7 +7735,15 @@
+       if (salesQty > salesRemaining + 0.000001) {
+         throw new Error(`${label}: blanket PO only has ${salesRemaining} ${sourceLine.unit || "UOM"} remaining.`);
+       }
+-      const lineDestinationLocationId = request.destinationLocationId || splitDestinationLocationId;
++      const lineDestinationLocationId = retainNetSuiteDestination
++        ? normalizeScmDestinationLocationId(sourceLine.location_id)
++          || normalizeScmDestinationLocationId(sourceLine.location)
++          || normalizeScmDestinationLocationId(source.destination_location_id)
++          || normalizeScmDestinationLocationId(source.destination_location)
++        : request.destinationLocationId || splitDestinationLocationId;
++      if (!lineDestinationLocationId) {
++        throw new Error(`${label}: NetSuite destination is missing. Choose a destination yard for the split PO.`);
++      }
+       const lineDestinationLocation = locationTextFromId(lineDestinationLocationId);
+       selected.push({
+         sourceLine,
+@@ -7746,6 +7761,8 @@
+       });
+     }
+ 
++    if (retainNetSuiteDestination) splitDestinationLocationId = selected[0].destinationLocationId;
++    const splitDestinationLocation = locationTextFromId(splitDestinationLocationId);
+     let splitOrderId = extendingSplit?.split_po_id || null;
+     let split = extendingSplit;
+     if (!split) {
+@@ -7812,6 +7829,7 @@
+             ...(details || {}),
+             pickupPoint: splitPickupPoint,
+             pickupAddress: splitPickupAddress,
++            retainNetSuiteDestination,
+             destinationLocationId: splitDestinationLocationId,
+             destinationLocation: splitDestinationLocation
+           })
+@@ -7829,7 +7847,8 @@
+        )
+        ON CONFLICT (order_kind, order_ref) DO UPDATE SET
+          pickup_point = COALESCE(EXCLUDED.pickup_point, scm_transport_schedule.pickup_point),
+-         dropoff_point = COALESCE(NULLIF(scm_transport_schedule.dropoff_point, ''), EXCLUDED.dropoff_point),
++         dropoff_point = CASE WHEN $9::boolean AND NOT $8::boolean THEN EXCLUDED.dropoff_point
++           ELSE COALESCE(NULLIF(scm_transport_schedule.dropoff_point, ''), EXCLUDED.dropoff_point) END,
+          brand = COALESCE(scm_transport_schedule.brand, EXCLUDED.brand),
+          packing_slip_ref = COALESCE(NULLIF(scm_transport_schedule.packing_slip_ref, ''), EXCLUDED.packing_slip_ref),
+          status = CASE WHEN $8::boolean THEN scm_transport_schedule.status ELSE EXCLUDED.status END,
+@@ -7840,12 +7859,13 @@
+       [
+         splitRef,
+         splitPickupPoint,
+-        splitDestinationLocation,
++        retainNetSuiteDestination ? "" : splitDestinationLocation,
+         selectedPickupYard?.vendor || "",
+         splitInitialStatus,
+         splitRemarkOverride || "",
+         createdBy || null,
+-        Boolean(extendingSplit)
++        Boolean(extendingSplit),
++        retainNetSuiteDestination
+       ]
+     );
+     const createdLines = [];
+@@ -8013,6 +8033,7 @@
+         sourcePoId: source.netsuite_id,
+         splitPoRef: splitRef,
+         splitPoId: splitOrderId,
++        retainNetSuiteDestination,
+         destinationLocationId: splitDestinationLocationId,
+         destinationLocation: splitDestinationLocation,
+         pickupPoint: splitPickupPoint,
+--- a/src/server.js
++++ b/src/server.js
+@@ -17520,7 +17520,7 @@
+     dispatchPrivateNoStore(res);
+     const includeRestricted = canViewRestrictedScmOrders(req.operator);
+     let order = await getScmPurchaseOrderCatalogOrder(req.params.ref, { includeRestricted });
+-    if (!order) {
++    if (!order || (order.items || []).some((line) => !Object.hasOwn(line, "netsuiteDestinationYard"))) {
+       order = (await targetedScmPurchaseOrdersForResponse([req.params.ref], req.operator))
+         .find((candidate) => String(candidate.id || "").toLowerCase() === String(req.params.ref || "").toLowerCase()) || null;
+       if (order) {
+@@ -17562,6 +17562,7 @@
+       newPoRef: req.body?.newPoRef,
+       pickupPoint: req.body?.pickupPoint,
+       destinationLocationId: req.body?.destinationLocationId,
++      retainNetSuiteDestination: req.body?.retainNetSuiteDestination,
+       status: req.body?.status,
+       remarkOverride: req.body?.remarkOverride,
+       lines: req.body?.lines,
+--- a/public/dispatch-scm.js
++++ b/public/dispatch-scm.js
+@@ -277,7 +277,9 @@
+ }
+ 
+ function ensureScmDestinationLocation(order = scmSelectedOrder()) {
+-  if (!scmDestinationLocationId) scmDestinationLocationId = scmDefaultDestinationLocationId(order);
++  if (!scmDestinationLocationId) {
++    scmDestinationLocationId = scmOrderIsSplit(order) ? scmDefaultDestinationLocationId(order) : "netsuite";
++  }
+   return scmDestinationLocationId;
+ }
+ 
+@@ -285,7 +287,7 @@
+   const fallback = ensureScmDestinationLocation(order);
+   const selected = String(scmApp.querySelector('[data-action="split-destination-yard"]')?.value || "").trim();
+   const matched = SCM_DESTINATION_YARDS.find((yard) => yard.id === selected);
+-  scmDestinationLocationId = matched?.id || fallback;
++  scmDestinationLocationId = selected === "netsuite" ? "netsuite" : matched?.id || fallback;
+   return scmDestinationLocationId;
+ }
+ 
+@@ -960,8 +962,10 @@
+           <label class="scm-ref-input">
+             <span>${t("dispatch.destinationYard", "Destination Yard")}</span>
+             <select data-action="split-destination-yard">
++              <option value="netsuite" ${selectedDestination === "netsuite" ? "selected" : ""}>Retain NetSuite destination</option>
+               ${SCM_DESTINATION_YARDS.map((yard) => `<option value="${yard.id}" ${yard.id === selectedDestination ? "selected" : ""}>${yard.text}</option>`).join("")}
+             </select>
++            <small>Retain keeps each selected line's NetSuite destination. Choosing a yard sends all selected lines there.</small>
+           </label>
+           <div class="scm-ref-input">
+             ${renderScmPickupYardControl(order, { action: "split-pickup-yard", field: false })}
+@@ -981,7 +985,9 @@
+               <article>
+                 <strong>${escapeHtml(item.sku || item.itemName || "Item")}</strong>
+                 <span>${escapeHtml(scmSelectedLineLabel(item, quantities))}</span>
+-                <small>${t("dispatch.destinationYard", "Destination Yard")}: ${escapeHtml(item.destinationYard || order?.destinationYard || "--")}</small>
++                <small>${t("dispatch.destinationYard", "Destination Yard")}: ${escapeHtml(selectedDestination === "netsuite"
++                  ? item.netsuiteDestinationYard ?? item.destinationYard ?? order?.destinationYard ?? "--"
++                  : SCM_DESTINATION_YARDS.find((yard) => yard.id === selectedDestination)?.text || "--")}</small>
+                 <small>${escapeHtml(scmLineWeightText(item, quantities))}</small>
+               </article>
+             `).join("") || `<div class="empty-state">${t("dispatch.noLinesSelected", "No lines selected.")}</div>`}
+@@ -1046,6 +1052,7 @@
+     ...quantities
+   }));
+   const destinationLocationId = scmLiveSplitDestinationLocationId(order);
++  const retainNetSuiteDestination = destinationLocationId === "netsuite";
+   const pickupPoint = scmVendorYardOptions(order).length ? scmLiveSplitPickupPoint(order) : "";
+   const status = scmLiveSplitInitialStatus();
+   const remarkOverride = scmLiveSplitRemark();
+@@ -1074,7 +1081,8 @@
+         sourcePoRef: order.originalPoRef || order.id,
+         newPoRef: scmRef.trim(),
+         pickupPoint,
+-        destinationLocationId,
++        destinationLocationId: retainNetSuiteDestination ? null : destinationLocationId,
++        retainNetSuiteDestination,
+         status,
+         remarkOverride,
+         lines,
+@@ -1608,7 +1616,7 @@
+       return;
+     }
+     scmSummaryOpen = true;
+-    scmDestinationLocationId = scmDefaultDestinationLocationId(scmSelectedOrder());
++    scmDestinationLocationId = "netsuite";
+     scmPickupPoint = scmDefaultPickupPoint(scmSelectedOrder());
+     scmSplitInitialStatus = "Hold";
+     scmSplitRemark = "";
+@@ -1727,6 +1735,10 @@
+   const target = event.target;
+   if (target.dataset.action === "split-destination-yard" || target.dataset.action === "existing-split-destination-yard") {
+     scmDestinationLocationId = target.value;
++    if (target.dataset.action === "split-destination-yard") {
++      scmLiveSplitRemark();
++      renderScm();
++    }
+   }
+   if (target.dataset.action === "split-pickup-yard" || target.dataset.action === "existing-split-pickup-yard" || target.dataset.action === "existing-pickup-yard") {
+     scmPickupPoint = target.value;
+--- a/public/dispatch-scm.html
++++ b/public/dispatch-scm.html
+@@ -12,6 +12,6 @@
+     <script src="/i18n.js?v=20260718-po-total-header-v3"></script>
+     <script src="/app-sidebar.js?v=20260819-scm-custom-orders-v1"></script>
+     <script src="/dispatch-auth.js?v=20261003-staff-reset-1"></script>
+-    <script src="/dispatch-scm.js?v=20261001-status-parity-v1"></script>
++    <script src="/dispatch-scm.js?v=20261015-retain-netsuite-destination-v1"></script>
+   </body>
+ </html>

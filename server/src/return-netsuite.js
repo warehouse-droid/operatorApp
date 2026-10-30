@@ -125,6 +125,7 @@ function normalizeReturnOrderRows(rows = []) {
       name: first.customer_name || first.customer || "",
       companyName: first.customer_name || first.customer || "",
       phone: first.customer_phone || "",
+      email: first.customer_email || "",
       address: first.customer_address || ""
     }
   };
@@ -172,6 +173,7 @@ export async function fetchReturnSalesOrderFromNetSuite(code, {
       c.entityid AS customer_code,
       COALESCE(NULLIF(c.companyname, ''), BUILTIN.DF(t.entity)) AS customer_name,
       c.phone AS customer_phone,
+      c.email AS customer_email,
       BUILTIN.DF(c.defaultshippingaddress) AS customer_address,
       tl.uniquekey AS line_id,
       tl.id AS suiteql_line_number,
@@ -278,7 +280,7 @@ export async function fetchReturnCustomersFromNetSuite(search, { limit = 25 } = 
     throw Object.assign(new Error("Enter at least two characters to search customers."), { status: 400 });
   }
   const safeTerm = sqlText(term, { maxLength: 100 });
-  const safePhoneTerm = sqlText(term.replace(/[()\s+.-]/g, ""), { maxLength: 100 });
+  const safePhoneTerm = sqlText(term.replace(/[()\s+.-]/g, "").replace(/^1(?=\d{10}$)/, ""), { maxLength: 100 });
   const safeLimit = Math.min(50, Math.max(1, Number(limit) || 25));
   const cacheKey = `${term.toUpperCase()}|${safeLimit}`;
   const cached = cachedValue(returnCustomerSearchCache, cacheKey);
@@ -309,6 +311,7 @@ export async function fetchReturnCustomersFromNetSuite(search, { limit = 25 } = 
       c.entityid,
       c.companyname,
       c.phone,
+      c.email,
       BUILTIN.DF(c.defaultshippingaddress) AS address,
       c.isinactive
     FROM customer c
@@ -334,6 +337,7 @@ export async function fetchReturnCustomersFromNetSuite(search, { limit = 25 } = 
     name: row.companyname || row.entityid || "",
     companyName: row.companyname || "",
     phone: row.phone || "",
+    email: row.email || "",
     address: row.address || ""
   }));
   for (const customer of customers) {
@@ -359,6 +363,7 @@ export async function fetchActiveReturnCustomerDirectoryFromNetSuite() {
       c.entityid,
       c.companyname,
       c.phone,
+      c.email,
       BUILTIN.DF(c.defaultshippingaddress) AS address,
       c.isinactive
     FROM customer c
@@ -373,6 +378,7 @@ export async function fetchActiveReturnCustomerDirectoryFromNetSuite() {
     name: row.companyname || row.entityid || "",
     companyName: row.companyname || "",
     phone: row.phone || "",
+    email: row.email || "",
     address: row.address || ""
   }));
 }
@@ -389,6 +395,7 @@ export async function fetchReturnCustomerFromNetSuite(customerId, { force = fals
       c.entityid,
       c.companyname,
       c.phone,
+      c.email,
       BUILTIN.DF(c.defaultshippingaddress) AS address,
       c.isinactive
     FROM customer c
@@ -404,6 +411,7 @@ export async function fetchReturnCustomerFromNetSuite(customerId, { force = fals
     name: row.companyname || row.entityid || "",
     companyName: row.companyname || "",
     phone: row.phone || "",
+    email: row.email || "",
     address: row.address || ""
   } : null;
   if (customer) {

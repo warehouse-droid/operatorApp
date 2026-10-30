@@ -13,7 +13,7 @@ export function mountStockRequestConversationRoutes(app, {salesGuards, scmRead, 
   for (const audience of ['sales', 'scm']) {
     const read = audience === 'sales' ? salesGuards : [scmRead], write = audience === 'sales' ? salesGuards : [scmWrite];
     const base = `/api/${audience}/stock-requests/:id/conversation`;
-    app.get(`/api/${audience}/stock-request-conversation-alerts`, ...read, handler(audience, (_req, context) => listStockRequestConversationAlerts(context)));
+    app.get(`/api/${audience}/stock-request-conversation-alerts`, ...read, handler(audience, (req, context) => listStockRequestConversationAlerts(context,{includeRequests:req.query.includeRequests==='1'})));
     app.get(base, ...read, handler(audience, (req, context) => listStockRequestConversation(req.params.id, context)));
     app.post(base, ...write, handler(audience, (req, context) => sendStockRequestConversation(req.params.id, req.body, context), true));
     app.post(`${base}/read`, ...read, handler(audience, (req, context) => readStockRequestConversation(req.params.id, req.body, context)));

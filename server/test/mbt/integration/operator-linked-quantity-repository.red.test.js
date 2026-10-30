@@ -6,6 +6,7 @@ import test, { after } from "node:test";
 
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import { getDeliveryOrder } from "../../../src/delivery-repository.js";
+import { operatorSalesUi as ui, operatorSalesServer as server } from "../../support/operator-sales-allocation-functions.mjs";
 
 after(closeDb);
 
@@ -143,7 +144,7 @@ async function seedLinkedDeliveryOrder() {
       ]
     );
   }
-  return { salesOrderId };
+  return { salesOrderId, lineId: lineByNumber.get(1) };
 }
 
 test("L1-L4 repository projects PO and direct TO separately and retains fully linked evidence", async () => {
@@ -174,3 +175,46 @@ test("L1-L4 repository projects PO and direct TO separately and retains fully li
     assert.equal(fullyLinked.linked_supply_label, "No yard load required—direct supply");
   });
 });
+
+for (const scenario of [
+  { name: '100 PO and 100 yard', po: 100, direct: 0, yardTo: 0 },
+  { name: '100 direct TO and 100 yard', po: 0, direct: 100, yardTo: 0 },
+  { name: '60 PO plus 40 direct TO and 100 yard', po: 60, direct: 40, yardTo: 0 },
+  { name: '100 PO and 100 replenishment TO still needs 100 yard outbound', po: 100, direct: 0, yardTo: 100 },
+  { name: '100 PO plus 100 direct TO leaves no yard work', po: 100, direct: 100, yardTo: 0 },
+  { name: '200 PO leaves no yard work', po: 200, direct: 0, yardTo: 0 }
+]) {
+  test(`Operator 200 sales units: ${scenario.name}`, async () => inRollback(async () => {
+    const fixture = await seedLinkedDeliveryOrder();
+    await query(`UPDATE sales_order_lines SET quantity=200, pallet_qty=4, piece_qty=0,
+      to_plt=50, to_pcs=1 WHERE id=$1`, [fixture.lineId]);
+    await query(`UPDATE dispatch_so_po_allocations SET allocated_sales_qty=$2,
+      allocated_pallet_qty=0, allocated_piece_qty=0 WHERE sales_line_id=$1 AND status='active'`,
+    [fixture.lineId, scenario.po]);
+    await query(`UPDATE order_dependency_lines l SET allocated_quantity=CASE
+      WHEN d.dependency_mode='direct_to_customer' THEN $2::numeric ELSE $3::numeric END,
+      pallet_qty=0, piece_qty=0 FROM order_dependencies d
+      WHERE d.id=l.dependency_id AND l.sales_line_id=$1`, [fixture.lineId, scenario.direct, scenario.yardTo]);
+    const order = await getDeliveryOrder(fixture.salesOrderId);
+    const line = order.lines.find(row => Number(row.id) === fixture.lineId);
+    const residual = 200 - scenario.po - scenario.direct;
+    assert.equal(Number(line.original_quantity), 200);
+    assert.equal(Number(line.linked_po_sales_qty), scenario.po);
+    assert.equal(Number(line.linked_direct_to_sales_qty), scenario.direct);
+    assert.equal(Number(line.operator_required_sales_qty), residual);
+    assert.equal(Number(line.quantity), residual);
+    assert.equal(line.linked_quantity_blocked, false);
+    assert.equal(line.no_yard_load_required, residual === 0);
+    assert.equal(server.lineRequiredSalesQuantity(line), residual);
+    assert.equal(ui.lineRequiredSalesQty(line), residual);
+    assert.equal(ui.remainingValue(line, 'sales'), residual);
+    assert.equal(ui.remainingValue(line, 'pallets') * 50 + ui.remainingValue(line, 'pieces'), residual);
+    assert.equal(ui.hasRemainingQty(line), residual > 0);
+    assert.match(ui.renderLinkedSupplyBreakdown(line), new RegExp(`Operator residual</span><b>${residual} EA`));
+    if (residual) {
+      const loaded = { ...line, loaded_qty: 25 };
+      assert.equal(ui.remainingValue(loaded, 'sales'), 75);
+      assert.equal(ui.remainingValue(loaded, 'pallets') * 50 + ui.remainingValue(loaded, 'pieces'), 75);
+    }
+  }));
+}

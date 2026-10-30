@@ -3,6 +3,7 @@
   const calc=root.MBBSCountingCalculator;
   const physical=[['pallets','PLT','to_plt'],['layers','LYR','to_lyr'],['sections','SEC','to_sec'],['pieces','PCS','to_pcs']];
   const t=(key,en)=>root.MBBS_I18N?.t(`inventory.${key}`,en) || en;
+  const reasonLabel=value=>root.MBBS_I18N?.message(value) || value || '—';
   const quantity=value=>Number(value || 0).toLocaleString(undefined,{maximumFractionDigits:6});
   const status=value=>t(`status.${value}`,({available:'Available',in_progress:'In progress',submitted:'Submitted',cancelled:'Cancelled',pending:'Waiting to post',posting:'Posting',posted:'Posted',attention:'Needs attention',superseded:'Superseded by another report',removed:'Removed from transfer',missing:'Transfer not found'})[value] || value);
   function create(ctx) {
@@ -122,7 +123,7 @@
           <aside class="damage-quantity-panel"><h2>${item?esc(item.item_name):t('selectSku','Select a SKU')}</h2><p>${esc(item?.item_description || '')}</p>
             ${item?units(item,true).map(u=>`<label class="inventory-quantity-label">${esc(u.label)}<div class="stepper"><button data-inv-action="step-damage" data-unit="${u.key}" data-delta="-1" type="button" ${busy || damageLocked()?'disabled':''}>−</button><input aria-label="${esc(u.label)}" type="number" min="0" step="any" inputmode="decimal" data-damage-quantity="${u.key}" value="${esc(values[u.key] ?? 0)}" ${busy || damageLocked()?'disabled':''}><button data-inv-action="step-damage" data-unit="${u.key}" data-delta="1" type="button" ${busy || damageLocked()?'disabled':''}>+</button></div></label>`).join(''):''}
             <p class="inventory-total" data-damage-total>${quantity(damageQuantity())} ${esc(item?.sales_unit || '')}</p>
-            <label for="damageReason">${t('reason','Damage reason')}</label><select id="damageReason" ${busy || damageLocked()?'disabled':''}><option value="">${t('chooseReason','Choose a reason')}</option>${config.reasons.map(r=>`<option value="${r.id}" ${String(reason)===String(r.id)?'selected':''}>${esc(r.label)}</option>`).join('')}</select>
+            <label for="damageReason">${t('reason','Damage reason')}</label><select id="damageReason" ${busy || damageLocked()?'disabled':''}><option value="">${t('chooseReason','Choose a reason')}</option>${config.reasons.map(r=>`<option value="${r.id}" ${String(reason)===String(r.id)?'selected':''}>${esc(reasonLabel(r.label))}</option>`).join('')}</select>
             <button class="primary-button" data-inv-action="submit-damage" type="button" ${canSubmitDamage()?'':'disabled'}>${busy?t('saving','Saving…'):t('submitDamage','Submit damage')}</button>
           </aside>
         </div>`;
@@ -211,7 +212,7 @@
       const entered=physical.filter(([key])=>Number(row.values?.[key])>0).map(([key,label])=>`${quantity(row.values[key])} ${label}`).join(' / ');
       return `<h2>${esc(row.item_name)}</h2><p class="inventory-total">${quantity(row.quantity)} ${esc(row.unit)}</p><p>${esc(entered)}</p>
         ${row.adjusted && row.original?`<p>${t('originalReport','Originally reported')}: ${esc(row.original.item_name)} · ${quantity(row.original.quantity)} ${esc(row.original.unit)}</p>`:''}
-        <dl class="inventory-details"><dt>${t('reason','Damage reason')}</dt><dd>${esc(row.reason_label || '—')}</dd><dt>${t('operator','Operator')}</dt><dd>${esc(row.operator_name || '—')}</dd>
+        <dl class="inventory-details"><dt>${t('reason','Damage reason')}</dt><dd>${esc(reasonLabel(row.reason_label))}</dd><dt>${t('operator','Operator')}</dt><dd>${esc(row.operator_name || '—')}</dd>
           <dt>${t('date','Date')}</dt><dd>${esc(row.created_at?new Date(row.created_at).toLocaleString(undefined,{timeZone:'America/Toronto'}): '—')}</dd><dt>${t('transfer','Inventory Transfer')}</dt><dd>${esc(row.transfer_ref || '—')}</dd><dt>${t('status','Status')}</dt><dd>${esc(status(row.status))}</dd></dl>
         ${row.last_error?`<p class="inventory-error">${esc(row.last_error)}</p>`:''}
         ${row.status==='attention'?button('retry-report',row.safe_to_retry?t('retry','Retry posting'):t('recheck','Recheck posting'),`data-id="${esc(row.id)}" ${busy?'disabled':''}`):''}

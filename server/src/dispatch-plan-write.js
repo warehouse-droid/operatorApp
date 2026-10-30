@@ -1,3 +1,4 @@
+import {assertTransportOrderOwnership} from "./mbt/bin-transport-ownership.js";
 import crypto from 'node:crypto';
 import { query, withTransaction } from './db.js';
 import { DISPATCH_FLEET_PLANNING_LOCK } from './dispatch-fleet-status.js';
@@ -57,6 +58,7 @@ export async function withDispatchPlanWrite({ planId, editLease, operation, requ
     const result = await commit(stored);
     await assertDispatchPlanEditLease(editLease);
     const committed = await selectStored(planId);
+    await assertTransportOrderOwnership(stored,committed);
     // Confirmation and reopening change status/note, both covered by the digest.
     await query('UPDATE dispatch_plan_snapshots SET plan_digest=$2 WHERE plan_id=$1 AND plan_digest IS DISTINCT FROM $2', [planId, committed.digest]);
     const plan = result.plan || result;

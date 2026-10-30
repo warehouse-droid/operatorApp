@@ -1,6 +1,7 @@
 // @ts-check
 
 import { isAmbiguousOperatorNetSuiteFailure } from "./operator-netsuite-posting-service.js";
+import { deliveryFulfillmentPostingPlan } from './sales-order-auto-fulfillment-kits.js';
 import {
   buildSalesOrderItemFulfillmentPayload,
   compareSalesOrderFulfillmentSnapshot,
@@ -153,7 +154,7 @@ export function createSalesOrderAutoFulfillmentProcessor({
     const snapshotOrderLines = new Set(snapshotLines.map((line) => Number(line.orderLine)));
     const comparison = compareSalesOrderFulfillmentSnapshot({
       snapshotLines: candidate.lineSnapshot,
-      liveOrder: candidate.isSplit
+      liveOrder: candidate.isSplit || candidate.operatorLoadRecordId
         ? { ...liveOrder, lines: liveLines.filter((line) => snapshotOrderLines.has(Number(line.orderLine))) }
         : liveOrder
     });
@@ -170,7 +171,7 @@ export function createSalesOrderAutoFulfillmentProcessor({
       return repository.attention({ candidateId: candidate.id, liveOrder, issues: comparison.issues });
     }
 
-    const selectedLines = recoveryPayload
+    let selectedLines = recoveryPayload
       ? retainedRecoveryLines(candidate, recoveryPayload)
       : resolveSalesOrderFulfillmentLines({
           action: resolutionAction(candidate),
@@ -182,9 +183,25 @@ export function createSalesOrderAutoFulfillmentProcessor({
     if (!selectedLines.length) {
       return repository.get(candidate.id);
     }
+    if (recoveryPayload && candidate.liveSnapshot?.kitPostingLines) {
+      liveOrder = {...liveOrder,kitPostingLines:candidate.liveSnapshot.kitPostingLines};
+    }
+    let availableLines = liveOrder.lines || [];
+    if (!recoveryPayload) {
+      try {
+        const plan = deliveryFulfillmentPostingPlan(candidate, selectedLines, liveOrder);
+        selectedLines = plan.selectedLines;
+        availableLines = plan.availableLines;
+        liveOrder = plan.liveOrder;
+      } catch (error) {
+        return repository.attention({candidateId:candidate.id,sourceReadFailed:true,
+          error:error instanceof Error?error.message:String(error),issues:[{code:'kit_selection_invalid'}]});
+      }
+    }
     const payload = recoveryPayload || buildSalesOrderItemFulfillmentPayload({
       selectedLines,
-      availableLines: [...(liveOrder.lines || []), ...(liveOrder.excludedLines || [])],
+      availableLines: [...availableLines, ...(liveOrder.excludedLines || [])
+        .filter((/** @type {LooseRecord} */ line) => !availableLines.some((/** @type {LooseRecord} */ available) => Number(available.orderLine) === Number(line.orderLine)))],
       externalId: candidate.externalId
     });
     candidate = await repository.claim({
@@ -215,7 +232,7 @@ export function createSalesOrderAutoFulfillmentProcessor({
           const transformed = await adapter.transform(candidate, payload);
           const transactionId = Number(transformed?.id);
           if (Number.isSafeInteger(transactionId) && transactionId > 0) {
-            record = await adapter.fetchById(candidate, transactionId);
+            record = transformed.record ?? await adapter.fetchById(candidate, transactionId);
             if (!record) {
               throw Object.assign(new Error("NetSuite SO fulfillment was created but could not be read for verification."), {
                 code: "SALES_ORDER_IF_RESULT_UNVERIFIED",

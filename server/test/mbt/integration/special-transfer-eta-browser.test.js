@@ -32,7 +32,7 @@ after(async()=>{
 });
 async function pageFor(role,kind,id) {
  const context=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:'block'});
- await context.addInitScript(token=>{localStorage.setItem('mbbs.staff.token',token);localStorage.setItem('mbbs.sales.stockRequests.bucket','pending');localStorage.setItem('mbbs.scm.stockRequests.queue','request');},users[role].token);
+ await context.addInitScript(user=>{localStorage.setItem('mbbs.staff.token',user.token);localStorage.setItem('mbbs.sales.stockRequests.bucket','pending');localStorage.setItem('mbbs.scm.stockRequests.queue','request');localStorage.setItem(`mbbs.alert-role.muted.${user.id}.sales`,'true');}, {token:users[role].token,id:users[role].id});
  const page=await context.newPage(),errors=[];page.setDefaultTimeout(8000);page.on('pageerror',error=>errors.push(error.message));await page.coverage.startJSCoverage({resetOnNavigation:false});
  await page.route('**/stock-requests/backorder/vendors?*',route=>route.fulfill({json:{vendors:[]}}));
  await page.goto(`${base}/${role}/stock-requests?tab=${kind==='special'?'special':'regular'}&requestId=${id}`);
@@ -42,7 +42,7 @@ for(const kind of ['special','backorder'])test(`${kind} browser: transfer withou
  const context={operatorId:users.sales.id,authorizedStoreLocationIds:[1]};
  let d=kind==='special'?await repo.createSpecialStockCase({storeLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST transfer browser',vendorId:8899200,vendorName:'TEST Vendor',fulfillmentMethod:'yard_pickup',
   lines:[{productName:'TEST browser slab',quantity:2,uom:'PCS',rate:10,requiredDate:'2099-02-01'}]},context)
-  :await submitBackorderRequest({destinationLocationId:1,vendorName:'TEST Vendor',vendorId:8899200,fulfillmentMethod:'yard_pickup',lines:[{itemId:8899261,salesQty:2,quantityMode:'direct',requiredDate:'2099-02-01'}]},
+  :await submitBackorderRequest({customerName:'TEST Backorder Customer',destinationLocationId:1,vendorName:'TEST Vendor',vendorId:8899200,fulfillmentMethod:'yard_pickup',lines:[{itemId:8899261,salesQty:2,quantityMode:'direct',requiredDate:'2099-02-01'}]},
   {operatorId:users.sales.id,authorizedDestinationLocationIds:[1]});
  ids.push(d.id);const lineId=d.lines[0].id;
  const get=()=>kind==='special'?repo.getSpecialStockCase(d.id,{audience:'scm'}):getBackorderRequest(d.id,{audience:'scm'});
@@ -62,15 +62,17 @@ for(const kind of ['special','backorder'])test(`${kind} browser: transfer withou
   const decision=sales.page.locator(kind==='special'?`[data-special-decision-line="${lineId}"]`:`[data-backorder-line="${lineId}"] [data-action$="/decision"]`);
   await expect(sales.page.locator(kind==='special'?'[data-special-supply-status]':'[data-backorder-line]').first()).toContainText('SO placement +5 working days');
   await decision.locator('[name=decision]').selectOption('accepted');
-  const decided=sales.page.waitForResponse(r=>r.request().method()==='POST' && new URL(r.url()).pathname.endsWith(kind==='special'?'/customer-decisions':'/decision'));
-  await sales.page.getByRole('button',{name:kind==='special'?'Save customer decisions':'Save Sales confirmation',exact:true}).click();
-  assert.equal((await decided).status(),200);d=await get();assert.equal(d.lines[0].salesDecision,'accepted');
+  const [decided]=await Promise.all([
+   sales.page.waitForResponse(r=>r.request().method()==='POST' && new URL(r.url()).pathname.endsWith(kind==='special'?'/customer-decisions':'/decision')),
+   sales.page.getByRole('button',{name:kind==='special'?'Save customer decisions':'Save Sales confirmation',exact:true}).click()
+  ]);
+  assert.equal(decided.status(),200);d=await get();assert.equal(d.lines[0].salesDecision,'accepted');
   await scm.reload();
   if(kind==='special') {
    const readiness=scm.page.locator(`[data-special-stock-line="${lineId}"]`);
    await expect(readiness.locator('[name=eta]')).toBeHidden();await expect(readiness.locator('[data-special-transfer-eta]')).toBeVisible();
-   await readiness.locator('[name=ready]').selectOption('true');await expect(readiness.locator('[data-special-transfer-eta]')).toBeHidden();
-   await readiness.locator('[name=ready]').selectOption('false');
+   await readiness.locator('[name=supplyStatus]').selectOption('in_stock');await expect(readiness.locator('[data-special-transfer-eta]')).toBeHidden();
+   await readiness.locator('[name=supplyStatus]').selectOption('vendor_transfer');
   }else {
    await scm.page.getByText('Check readiness',{exact:true}).first().click();
    await expect(scm.page.locator('[data-backorder-readiness-eta]')).toBeHidden();
@@ -98,5 +100,8 @@ for(const kind of ['special','backorder'])test(`${kind} browser: transfer withou
   await expect(sales.page.locator(kind==='special'?'[data-special-supply-status]':'[data-backorder-line]').first()).toContainText('2026-10-19');
   await sales.page.screenshot({path:`${out}/${kind}-placed-eta.png`,fullPage:true});
   assert.deepEqual(scm.errors,[]);assert.deepEqual(sales.errors,[]);
+ }catch(error){
+  if(sales)error.message+='\nSales screen: '+(await sales.page.locator('body').innerText()).slice(-5000);
+  throw error;
  }finally{await scm.close();await sales?.close();}
 });

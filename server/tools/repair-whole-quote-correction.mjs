@@ -1,0 +1,6 @@
+// Explicit operational correction requested by the user. No HTTP endpoint exposes it.
+import {createRepairRepository} from './src/repair/repository.js';
+import {query,closeDb} from './src/db.js';
+const input={commandId:'e7eb9258-2510-492f-8e18-06505864214a',quoteId:'b20bda41-3240-4b62-904e-98d3e6099c08',jobId:'68aa0ecb-058c-41f8-aaab-60d31defd023',requestId:'539a8eb5-8cef-4ad4-bccd-69043120da53',reason:'User requested that the existing line rejection apply to the whole quote.'};
+async function snapshot(){return {quote:(await query('SELECT * FROM repair_quotes WHERE id=$1',[input.quoteId])).rows[0],job:(await query('SELECT * FROM repair_jobs WHERE id=$1',[input.jobId])).rows[0],request:(await query('SELECT * FROM repair_requests WHERE id=$1',[input.requestId])).rows[0]};}
+try{const before=await snapshot();if(before.job?.number!=='REP-0000002-J02'||before.quote?.job_id!==input.jobId||before.job.request_id!==input.requestId)throw new Error('The production correction target does not match the authorized request.');let result=null;if(process.argv.includes('--apply'))result=await createRepairRepository().normalizeRejectedQuote({id:'maintenance:whole-quote-20261029',role:'admin'},input);const after=await snapshot();console.log(JSON.stringify({applied:Boolean(result),input,before,after,result}));}finally{await closeDb();}

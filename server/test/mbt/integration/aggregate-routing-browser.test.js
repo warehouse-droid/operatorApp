@@ -1,0 +1,42 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import {chromium,expect} from '@playwright/test';
+import {app} from '../../../src/server.js';
+import {config} from '../../../src/config.js';
+import {query,closeDb} from '../../../src/db.js';
+import {updateOperatorPassword,loginOperator} from '../../../src/auth-repository.js';
+import {transportFixture} from '../support/bin-transport-fixtures.js';
+import {writeFileSync} from 'node:fs';
+import {withBrowserCoverageSources} from '../support/browser-source-coverage.js';
+after(closeDb);
+test('Aggregate Routing browser: Admin searches stable catalog ID, previews orders and changes routing; Dispatcher sees rate cards only', {timeout:60000},async()=>{
+  const f=await transportFixture();
+  await query("UPDATE operators SET role='admin',roles=ARRAY['admin'] WHERE id=$1",[f.actor.operatorId]);
+  await query("INSERT INTO inventory_items(item_id,item_name,stock_unit) VALUES(9909,'Loose screening','YARD') ON CONFLICT(item_id) DO NOTHING");
+  await updateOperatorPassword(f.actor.operatorId,'aggregate-browser-password');
+  const token=(await loginOperator(f.actor.operatorId,'aggregate-browser-password')).token;
+  config.mbt.enabled=true;config.mbtPhase3.masterDataEnabled=true;
+  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key IN ('mbt_enabled','mbt_master_data')");
+  const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});let browser;
+  try {
+    browser=await chromium.launch({headless:true,executablePath:'/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell',args:['--no-sandbox','--disable-dev-shm-usage']});
+    const context=await browser.newContext();context.setDefaultTimeout(10000);
+    await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),token);
+    const page=await context.newPage();await page.coverage.startJSCoverage({resetOnNavigation:false});
+    await page.goto(`http://127.0.0.1:${server.address().port}/mbt/config`);
+    await page.getByRole('tab',{name:'Aggregate Routing',exact:true}).click();
+    await page.getByLabel('Search catalog items').fill('9909');await page.getByRole('button',{name:'Search items',exact:true}).click();
+    const row=page.locator('[data-aggregate-item="9909"]');await expect(row).toContainText(f.sourceRef);
+    await expect(row).toContainText('YARD');await expect(row).toContainText('Active');
+    await row.getByRole('button',{name:'Allow flatbed',exact:true}).click();
+    await expect(row.getByRole('button',{name:'Require BIN',exact:true})).toBeVisible();
+    assert.equal((await query('SELECT bin_only FROM mbt_aggregate_routing_items WHERE item_id=9909')).rows[0].bin_only,false);
+    const adminCoverage=await withBrowserCoverageSources(page,await page.coverage.stopJSCoverage());
+    await page.coverage.startJSCoverage({resetOnNavigation:false});
+    await query("UPDATE operators SET role='dispatcher',roles=ARRAY['dispatcher'] WHERE id=$1",[f.actor.operatorId]);
+    await page.reload();await expect(page.getByRole('tab',{name:'Rate Cards',exact:true})).toHaveAttribute('aria-selected','true');
+    await expect(page.getByRole('tab',{name:'Aggregate Routing',exact:true})).toHaveCount(0);
+    await expect(page.locator('#rateCardsPanel')).toBeVisible();
+    writeFileSync('test-artifacts/aggregate-routing-browser-v8.json',JSON.stringify([...adminCoverage,...await withBrowserCoverageSources(page,await page.coverage.stopJSCoverage())]));
+  } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
+});

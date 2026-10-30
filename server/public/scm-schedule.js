@@ -56,6 +56,12 @@ const SCM_SCHEDULE_SHEET_PREF_KEY = "mbbs.scmSchedule.sheetPreferences.v1";
 const SCM_SCHEDULE_COLUMN_PREF_KEY = "mbbs.scmSchedule.columns.v1";
 const SCM_SCHEDULE_RECONCILIATION_PREF_KEY = "mbbs.scmSchedule.showReconciliationDetails.v1";
 const SCM_SCHEDULE_FILTER_PREF_KEY = "mbbs.scmSchedule.filters.v1";
+const SCM_SCHEDULE_SALES_TEXT_FILTER_KEYS = new Set([
+  "contentSearch",
+  "remarkSearch",
+  "orderSearch",
+  "packingSearch"
+]);
 const SCM_SCHEDULE_EXTENDED_FILTER_KEYS = new Set([
   "queuedFrom",
   "queuedTo",
@@ -419,6 +425,7 @@ function scmScheduleColumnFilterHtml(column, {
   dropoffOptions = [],
   brandOptions = []
 } = {}) {
+  const showTextColumnFilters = showFullColumnFilters || scmScheduleSalesHost;
   if (column.key === "timing") {
     const context = { showMethodFilter, showTypeFilter, showFullColumnFilters, yardManagerView, dropoffOptions, brandOptions };
     const filters = [["eta", "ETA"], ["driver", "Driver"], ["sla", "SLA"]].map(([key, label]) => {
@@ -467,21 +474,21 @@ function scmScheduleColumnFilterHtml(column, {
       column: true
     });
   }
-  if (column.key === "content" && showFullColumnFilters) {
+  if (column.key === "content" && showTextColumnFilters) {
     return scmScheduleTextFilterHtml({
       field: "contentSearch",
       label: "Content",
       value: scmScheduleFilters.contentSearch
     });
   }
-  if (column.key === "remark" && showFullColumnFilters) {
+  if (column.key === "remark" && showTextColumnFilters) {
     return scmScheduleTextFilterHtml({
       field: "remarkSearch",
       label: "Remark",
       value: scmScheduleFilters.remarkSearch
     });
   }
-  if (column.key === "order" && showFullColumnFilters) {
+  if (column.key === "order" && showTextColumnFilters) {
     return scmScheduleTextFilterHtml({
       field: "orderSearch",
       label: "Order number",
@@ -501,7 +508,7 @@ function scmScheduleColumnFilterHtml(column, {
       alignRight: true
     });
   }
-  if (column.key === "packing" && showFullColumnFilters) {
+  if (column.key === "packing" && showTextColumnFilters) {
     return scmScheduleTextFilterHtml({
       field: "packingSearch",
       label: "Packing slip",
@@ -717,7 +724,8 @@ function scmScheduleQuery() {
     if (key === "search") return;
     if (key === "status" && search && scmScheduleCanViewRestrictedOrders()) return;
     if (key === "method" && !scmScheduleCanShowMethodFilter()) return;
-    if (SCM_SCHEDULE_EXTENDED_FILTER_KEYS.has(key) && !scmScheduleCanShowFullColumnFilters()) return;
+    if (SCM_SCHEDULE_EXTENDED_FILTER_KEYS.has(key) && !scmScheduleCanShowFullColumnFilters()
+      && !(scmScheduleSalesHost && SCM_SCHEDULE_SALES_TEXT_FILTER_KEYS.has(key))) return;
     if (Array.isArray(value)) {
       value.filter(Boolean).forEach((item) => params.append(key, item));
       return;

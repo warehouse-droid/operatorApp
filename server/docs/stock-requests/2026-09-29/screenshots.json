@@ -1,0 +1,161 @@
+{
+  "captures": [
+    {
+      "name": "01-navigation",
+      "filename": "screenshots/01-navigation.png",
+      "caption": "Sales queue, filters and alerts"
+    },
+    {
+      "name": "10-special-new-header",
+      "filename": "screenshots/10-special-new-header.png",
+      "caption": "Required customer, vendor, Sales Rep and expiry"
+    },
+    {
+      "name": "11-special-new-item",
+      "filename": "screenshots/11-special-new-item.png",
+      "caption": "Special item specification, selling price, dates and packaging"
+    },
+    {
+      "name": "02-regular-form",
+      "filename": "screenshots/02-regular-form.png",
+      "caption": "Regular request with method, Toronto arrival and source-yard stock"
+    },
+    {
+      "name": "03-regular-scm",
+      "filename": "screenshots/03-regular-scm.png",
+      "caption": "SCM review reason, safety stock and decisions"
+    },
+    {
+      "name": "04-regular-so",
+      "filename": "screenshots/04-regular-so.png",
+      "caption": "Sales enters the SO created at the Sales yard"
+    },
+    {
+      "name": "04b-regular-busy",
+      "filename": "screenshots/04b-regular-busy.png",
+      "caption": "Waiting for NetSuite \u2014 controls remain disabled"
+    },
+    {
+      "name": "05-regular-location-dialog",
+      "filename": "screenshots/05-regular-location-dialog.png",
+      "caption": "Confirm a single-source location change"
+    },
+    {
+      "name": "06-regular-to-dialog",
+      "filename": "screenshots/06-regular-to-dialog.png",
+      "caption": "Confirm transfer orders for multiple-source routing"
+    },
+    {
+      "name": "07-regular-expired",
+      "filename": "screenshots/07-regular-expired.png",
+      "caption": "Re-raise an unused expired Pickup or Delivery approval"
+    },
+    {
+      "name": "08-pickup-autocomplete",
+      "filename": "screenshots/08-pickup-autocomplete.png",
+      "caption": "SCM edits quantities and finds additional items"
+    },
+    {
+      "name": "09-pickup-editor",
+      "filename": "screenshots/09-pickup-editor.png",
+      "caption": "Final Stocking items and pallet quantity before review"
+    },
+    {
+      "name": "09b-pickup-confirm",
+      "filename": "screenshots/09b-pickup-confirm.png",
+      "caption": "SCM confirms the direct TO action"
+    },
+    {
+      "name": "09c-pickup-history",
+      "filename": "screenshots/09c-pickup-history.png",
+      "caption": "Saved Stocking quantities, TO reference and completion time"
+    },
+    {
+      "name": "12-special-scm-stock",
+      "filename": "screenshots/12-special-scm-stock.png",
+      "caption": "SCM vendor check, ETA and separate Sales/internal notes"
+    },
+    {
+      "name": "13-special-customer-decision",
+      "filename": "screenshots/13-special-customer-decision.png",
+      "caption": "Record customer acceptance of the vendor ETA"
+    },
+    {
+      "name": "14-special-so",
+      "filename": "screenshots/14-special-so.png",
+      "caption": "Save the SO draft, then create or link the Sales Order"
+    },
+    {
+      "name": "14a-special-so-account",
+      "filename": "screenshots/14a-special-so-account.png",
+      "caption": "SO customer account, Sales Rep and delivery details"
+    },
+    {
+      "name": "14b-special-so-items",
+      "filename": "screenshots/14b-special-so-items.png",
+      "caption": "SO materials, pallets, charges and create/link actions"
+    },
+    {
+      "name": "15-special-po",
+      "filename": "screenshots/15-special-po.png",
+      "caption": "SCM confirms material quantities, vendor cost and vendor discount"
+    },
+    {
+      "name": "16-special-po-approval",
+      "filename": "screenshots/16-special-po-approval.png",
+      "caption": "PO approval holds the request at Confirmed"
+    },
+    {
+      "name": "16a-special-po-approval",
+      "filename": "screenshots/16a-special-po-approval.png",
+      "caption": "PO approval status and separate Dispatch planning status"
+    },
+    {
+      "name": "17-special-readiness",
+      "filename": "screenshots/17-special-readiness.png",
+      "caption": "SCM readiness confirmation for a waiting order"
+    },
+    {
+      "name": "18-special-delivery",
+      "filename": "screenshots/18-special-delivery.png",
+      "caption": "Sales may update delivery details while the case remains unplanned"
+    },
+    {
+      "name": "19-special-po-reference",
+      "filename": "screenshots/19-special-po-reference.png",
+      "caption": "Shared PO reference and packing slip reference"
+    },
+    {
+      "name": "20-special-adjustment",
+      "filename": "screenshots/20-special-adjustment.png",
+      "caption": "SCM review of changes to the issued SO and PO"
+    },
+    {
+      "name": "21-special-close",
+      "filename": "screenshots/21-special-close.png",
+      "caption": "SCM confirms or rejects closure of the linked SO and PO"
+    },
+    {
+      "name": "22-special-vendor-pickup",
+      "filename": "screenshots/22-special-vendor-pickup.png",
+      "caption": "Record actual customer pickup at the vendor"
+    },
+    {
+      "name": "23-regular-settings",
+      "filename": "screenshots/23-regular-settings.png",
+      "caption": "Regular stock request approval settings"
+    },
+    {
+      "name": "24-regular-priority",
+      "filename": "screenshots/24-regular-priority.png",
+      "caption": "Priority replenishment follows the request until SCM releases it"
+    },
+    {
+      "name": "11b-special-quote",
+      "filename": "screenshots/11b-special-quote.png",
+      "caption": "Generated special quote PDF with fictional packing quantities; verified deployed renderer."
+    }
+  ],
+  "errors": [],
+  "source": "Deployed app UI, synthetic training fixtures, no live order writes"
+}

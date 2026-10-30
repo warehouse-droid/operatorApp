@@ -64,11 +64,11 @@ test('signed adjustments conserve the active total or reject a negative result a
 test('active physical-bin cards omit cancelled bins and retain the other bins', () => {
   const texts = [];
   const node = () => ({ hidden: false, append() {}, replaceChildren() {} });
-  const api = functions('public/mbt-frontdesk.js', ['renderContract'], {
+  const api = functions('public/mbt-frontdesk.js', ['renderContract', 'deliveryCanChange'], {
     contractCard: node(), workspaceEmpty: node(), quoteCard: node(),
     element: (_name, text) => { texts.push(text); return node(); }, button: node,
     fullAddress: () => '', displayDate: () => '', contractLineContent: () => '', binAvailableForService: () => false,
-    state: { contract: { revision: 1, contractNumber: 'Synthetic' }, chargeRequests: [], amendments: [], visits: [],
+    state: { contract: { revision: 1, contractNumber: 'Synthetic' }, chargeRequests: [], amendments: [], visits: [], dumpCharges: [],
       serviceLines: [{ serviceLineId: 'cancelled', lineNumber: 1, status: 'cancelled' },
         { serviceLineId: 'active', lineNumber: 2, status: 'scheduled', customerConfirmation: {} }] }
   });

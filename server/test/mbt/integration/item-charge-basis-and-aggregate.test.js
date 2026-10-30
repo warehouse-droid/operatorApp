@@ -176,7 +176,7 @@ test("activated per-tonne evidence survives a Dump switch; new cards accept BIN 
     const aggregate = created.body.entities.find((item) => item.itemCode === aggregateCode);
     assert.equal(soil.chargeBasis, "per_tonne");
     assert.equal(aggregate.chargeBasis, "per_yard");
-    assert.equal(aggregate.densityLbsPerYard, 2_750);
+    assert.equal(aggregate.densityLbsPerYard, 2_600);
 
     const oldCard = await applyLocalRateCardDraft({
       actor: ACTOR,
@@ -285,7 +285,7 @@ test("activated per-tonne evidence survives a Dump switch; new cards accept BIN 
       itemCode: aggregateCode,
       unitOfMeasure: "YARD",
       unitAmountMinor: 7_250,
-      densityLbsPerYard: 2_750
+      densityLbsPerYard: 2_600
     }]);
     assert.deepEqual(frontdesk.fixedDumpItems.map((item) => ({
       itemCode: item.itemCode,

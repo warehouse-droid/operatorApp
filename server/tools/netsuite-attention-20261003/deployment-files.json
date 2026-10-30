@@ -1,0 +1,8 @@
+[
+  "src/netsuite.js",
+  "src/sales-order-auto-fulfillment-service.js",
+  "src/sales-order-auto-fulfillment-repository.js",
+  "src/netsuite-fulfillment-exclusions.js",
+  "src/sales-order-fulfillment-first-split.js",
+  "public/mbt-gates.js"
+]

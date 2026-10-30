@@ -1,0 +1,198 @@
+[
+  {
+    "page": 1,
+    "id": "start",
+    "section": "用户手册",
+    "title": "库存申请",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 2,
+    "id": "contents",
+    "section": "开始使用",
+    "title": "选择正确的申请流程",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 3,
+    "id": "navigation",
+    "section": "开始使用",
+    "title": "打开申请并查找待办事项",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 4,
+    "id": "regular-create",
+    "section": "常规申请 · 销售",
+    "title": "提交常规库存申请",
+    "audience": "销售"
+  },
+  {
+    "page": 5,
+    "id": "regular-rules",
+    "section": "常规申请 · 审批",
+    "title": "理解自动审批规则",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 6,
+    "id": "regular-safety",
+    "section": "常规申请 · SCM",
+    "title": "查看审核原因和每行安全库存",
+    "audience": "SCM"
+  },
+  {
+    "page": 7,
+    "id": "regular-decisions",
+    "section": "常规申请 · SCM",
+    "title": "审批明细并管理优先补货",
+    "audience": "SCM"
+  },
+  {
+    "page": 8,
+    "id": "regular-location",
+    "section": "常规申请 · 销售",
+    "title": "关联 SO 并确认更改地点",
+    "audience": "销售"
+  },
+  {
+    "page": 9,
+    "id": "regular-transfer",
+    "section": "常规申请 · 销售",
+    "title": "哪些情况会生成调货单",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 10,
+    "id": "regular-expiry",
+    "section": "常规申请 · 跟进",
+    "title": "等待、重试及查询处理结果",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 11,
+    "id": "pickup-search",
+    "section": "常规申请 · 备货",
+    "title": "SCM 打开转换窗口并添加商品",
+    "audience": "SCM"
+  },
+  {
+    "page": 12,
+    "id": "pickup-quantities",
+    "section": "常规申请 · 备货",
+    "title": "核对最终数量和托盘数量",
+    "audience": "SCM"
+  },
+  {
+    "page": 13,
+    "id": "pickup-confirm",
+    "section": "常规申请 · 备货",
+    "title": "确认生成 TO 并检查结果",
+    "audience": "SCM + 销售"
+  },
+  {
+    "page": 14,
+    "id": "special-header",
+    "section": "特殊申请 · 销售",
+    "title": "新建特殊商品询价",
+    "audience": "销售"
+  },
+  {
+    "page": 15,
+    "id": "special-items",
+    "section": "特殊申请 · 销售",
+    "title": "填写商品、价格并提交询价",
+    "audience": "销售"
+  },
+  {
+    "page": 16,
+    "id": "special-quote",
+    "section": "特殊申请 · 销售 + SCM",
+    "title": "预览报价及包装数量",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 17,
+    "id": "special-check",
+    "section": "特殊申请 · SCM",
+    "title": "记录供应商供货回复",
+    "audience": "SCM"
+  },
+  {
+    "page": 18,
+    "id": "special-decision",
+    "section": "特殊申请 · 销售",
+    "title": "记录客户决定",
+    "audience": "销售"
+  },
+  {
+    "page": 19,
+    "id": "special-so-account",
+    "section": "特殊申请 · 销售",
+    "title": "准备 SO 客户账户及交付信息",
+    "audience": "销售"
+  },
+  {
+    "page": 20,
+    "id": "special-so-create",
+    "section": "特殊申请 · 销售",
+    "title": "先保存草稿，再创建或关联 SO",
+    "audience": "销售"
+  },
+  {
+    "page": 21,
+    "id": "special-po",
+    "section": "特殊申请 · SCM",
+    "title": "审核并创建 PO",
+    "audience": "SCM"
+  },
+  {
+    "page": 22,
+    "id": "special-readiness",
+    "section": "特殊申请 · SCM",
+    "title": "检查 PO 批准状态和备货状态",
+    "audience": "SCM"
+  },
+  {
+    "page": 23,
+    "id": "special-fulfillment",
+    "section": "特殊申请 · 交付",
+    "title": "更新送货资料或完成供应商自取",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 24,
+    "id": "special-adjustment",
+    "section": "特殊申请 · 变更",
+    "title": "申请和审核订单调整",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 25,
+    "id": "special-close",
+    "section": "特殊申请 · 关闭",
+    "title": "关闭申请并保留记录",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 26,
+    "id": "statuses",
+    "section": "参考资料",
+    "title": "理解阶段、队列及提醒",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 27,
+    "id": "troubleshooting",
+    "section": "参考资料",
+    "title": "常见问题处理",
+    "audience": "销售 + SCM"
+  },
+  {
+    "page": 28,
+    "id": "quick-reference",
+    "section": "参考资料",
+    "title": "日常核对清单和术语",
+    "audience": "销售 + SCM"
+  }
+]

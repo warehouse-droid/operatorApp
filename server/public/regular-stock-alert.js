@@ -3,11 +3,14 @@
   const keys = ['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'];
   const token = () => keys.map(key=>localStorage.getItem(key)).find(Boolean)||'';
   const t = (en,zh) => window.MBBS_I18N?.language?.()==='zh-CN'?zh:en;
+  const viewingAlertSearch = location.pathname==='/sales/stock-requests'&&new URLSearchParams(location.search).get('alerts')==='1';
   let session='',generation=0,controller=null,events=null,timer=null,observer=null,checking=null;
   let audiences=[],counts={},links={};
   let actorId='',dialog=/** @type {HTMLDialogElement|null} */ (null),previousFocus=null,pendingRefresh=false;
   const displayed=new Map();
-  const noticeKey=row=>row.action==='arrival'?`arrival:${row.id}:${row.arrivalKey}`:row.action==='input_required'?`input:${row.id}:${row.reason}`:row.id;
+  const poNotice=row=>['po_reference','po_planned'].includes(row.action);
+  const poTitle=row=>row.action==='po_reference'?t('PO reference available','采购单参考号已可用'):t('PO planned','采购单已排程');
+  const noticeKey=row=>poNotice(row)?`po:${row.id}:${row.noticeKey}`:row.action==='arrival'?`arrival:${row.id}:${row.arrivalKey}`:row.action==='input_required'?`input:${row.id}:${row.reason}`:row.id;
   const notificationId=row=>`regular-stock:${noticeKey(row)}:${row.eventId}`;
   const stockChecks=new Map();
   let stockChecksInitialized=false;
@@ -33,15 +36,17 @@
   }
   function popup(){
     if(!actorId)return;
+    if(viewingAlertSearch)return;
+    if(window.MBBSOSNotifications?.allowsRole('sales')===false){if(dialog)closePopup();return;}
     const key=`mbbs.regular.stock.popup.${actorId}`;
     const seen=popupSeen(key),checkKey=`mbbs.stockCheck.popup.${actorId}`,checkSeen=popupSeen(checkKey);
-    const candidates=[...stockChecks.values(),...(counts.sales?.requests||[])].filter(item=>['stock_check','reply','resolve','waitlist','backorder','input_required','arrival'].includes(item.action)&&Number.isSafeInteger(item.id)&&item.id>0
+    const candidates=[...stockChecks.values(),...(counts.sales?.requests||[])].filter(item=>['stock_check','reply','resolve','waitlist','backorder','input_required','arrival','po_reference','po_planned'].includes(item.action)&&Number.isSafeInteger(item.id)&&item.id>0
       && !(item.action==='backorder' && Number(document.querySelector('[data-backorder-id]')?.getAttribute('data-backorder-id'))===item.id)
       &&Number.isSafeInteger(item.eventId)&&item.eventId>Math.max(Number((item.action==='stock_check'?checkSeen:seen)[noticeKey(item)])||0,displayed.get(item.action==='stock_check'?'check:'+item.id:noticeKey(item))||0));
     for(const item of candidates) {
-      void window.MBBSOSNotifications?.notify({id:notificationId(item),title:item.action==='arrival'?t('Stock arrived','库存已到货'):item.action==='input_required'?t('Stock request needs your input','库存申请需要您的处理'):item.action==='stock_check'?'SCM updated the stock check':'Stock request updated',
+      void window.MBBSOSNotifications?.notify({id:notificationId(item),title:poNotice(item)?poTitle(item):item.action==='arrival'?t('Stock arrived','库存已到货'):item.action==='input_required'?t('Stock request needs your input','库存申请需要您的处理'):item.action==='stock_check'?'SCM updated the stock check':'Stock request updated',
         body:[item.requestRef,item.itemName,item.message,item.purchaseOrderRef && `PO: ${item.purchaseOrderRef}`,item.eta && `ETA: ${item.eta}`].filter(Boolean).join(' · '),
-        url:item.action==='waitlist'&&item.waitlistRequestId?`/sales/stock-requests?tab=waitlist&requestId=${item.waitlistRequestId}`:item.special?`/sales/stock-requests?tab=special&search=${encodeURIComponent(item.requestRef)}`:`/sales/stock-requests?tab=regular&requestId=${item.id}`,session});
+        url:item.action==='waitlist'&&item.waitlistRequestId?`/sales/stock-requests?tab=waitlist&requestId=${item.waitlistRequestId}`:item.special?`/sales/stock-requests?tab=special&search=${encodeURIComponent(item.requestRef)}`:`/sales/stock-requests?tab=regular&requestId=${item.id}`,role:'sales',session});
     }
     const row=candidates[0];
     if(!row||document.hidden||dialog||document.querySelector('dialog[open],[role="dialog"][aria-modal="true"]'))return;
@@ -52,11 +57,12 @@
       if(duplicate){seen[row.id]=duplicate.eventId;displayed.set(row.id,duplicate.eventId);savePopupSeen(key,seen);}
     }else{displayed.set(noticeKey(row),row.eventId);seen[noticeKey(row)]=row.eventId;savePopupSeen(key,seen);}
     previousFocus=document.activeElement;
-    const modal=document.createElement('dialog');dialog=modal;modal.className='regular-stock-popup';modal.dataset.osNotificationId=notificationId(row);modal.setAttribute('aria-labelledby','regular-stock-popup-title');
+    const modal=document.createElement('dialog');dialog=modal;modal.className='regular-stock-popup';modal.dataset.osNotificationId=notificationId(row);modal.dataset.notificationRole='sales';modal.setAttribute('aria-labelledby','regular-stock-popup-title');
     if(row.action==='input_required')modal.dataset.inputRequestId=String(row.id);
     if(row.action==='backorder')modal.dataset.backorderId=String(row.id);
     if(row.action==='arrival')modal.dataset.arrivalNotice=noticeKey(row);
-    const title=document.createElement('h2');title.id='regular-stock-popup-title';title.textContent=row.action==='arrival'?t('Stock arrived','库存已到货'):row.action==='input_required'?t('Stock request needs your input','库存申请需要您的处理'):row.action==='stock_check'?t('SCM updated the stock check','SCM 已更新库存检查'):row.action==='backorder'?t('Backorder update','欠货申请更新'):row.action==='waitlist'?t('Stocking item moved to waitlist','备货商品已转入候补清单'):row.action==='resolve'?t('Stocking material resolved','备货商品已解决'):t('SCM replied to your Stocking material','SCM 已回复您的备货商品');
+    if(poNotice(row))modal.dataset.poNotice=noticeKey(row);
+    const title=document.createElement('h2');title.id='regular-stock-popup-title';title.textContent=poNotice(row)?poTitle(row):row.action==='arrival'?t('Stock arrived','库存已到货'):row.action==='input_required'?t('Stock request needs your input','库存申请需要您的处理'):row.action==='stock_check'?t('SCM updated the stock check','SCM 已更新库存检查'):row.action==='backorder'?t('Backorder update','欠货申请更新'):row.action==='waitlist'?t('Stocking item moved to waitlist','备货商品已转入候补清单'):row.action==='resolve'?t('Stocking material resolved','备货商品已解决'):t('SCM replied to your Stocking material','SCM 已回复您的备货商品');
     const reference=document.createElement('p');reference.textContent=[row.requestRef,row.itemName].filter(Boolean).join(' · ');
     const message=document.createElement('p');message.style.whiteSpace='pre-wrap';message.textContent=row.message||t('Open the request to review the resolution.','请打开申请查看处理结果。');
     const details=document.createElement('p');details.textContent=[row.purchaseOrderRef?`PO: ${row.purchaseOrderRef}`:'',row.eta?`ETA: ${row.eta}`:''].filter(Boolean).join(' · ');
@@ -66,10 +72,13 @@
     if(row.action==='waitlist'&&Number.isSafeInteger(row.waitlistRequestId)&&row.waitlistRequestId>0)open.href=`/sales/stock-requests?tab=waitlist&requestId=${row.waitlistRequestId}`;
     close.type='button';close.textContent=t('Close','关闭');close.addEventListener('click',()=>{closePopup();popup();});
     modal.addEventListener('cancel',event=>{event.preventDefault();closePopup();popup();});
-    controls.append(open,close);modal.append(title,reference,message,details,controls);document.body.append(modal);modal.showModal();
+    const all=document.createElement('button');all.type='button';all.textContent=t('View all updates','查看所有更新');
+    all.dataset.regularAlertAll='';all.addEventListener('click',()=>{location.href='/sales/stock-requests?tab=regular&alerts=1';});
+    controls.append(open,all,close);modal.append(title,reference,message,details,controls);document.body.append(modal);modal.showModal();
   }
   function paint(){
     if(dialog?.dataset.arrivalNotice&&!counts.sales?.requests?.some(row=>row.action==='arrival'&&noticeKey(row)===dialog.dataset.arrivalNotice))closePopup();
+    if(dialog?.dataset.poNotice&&!counts.sales?.requests?.some(row=>poNotice(row)&&noticeKey(row)===dialog.dataset.poNotice))closePopup();
     if(dialog?.dataset.inputRequestId&&!counts.sales?.requests?.some(row=>row.action==='input_required'&&String(row.id)===dialog.dataset.inputRequestId))closePopup();
     if(dialog?.dataset.backorderId && document.querySelector(`[data-backorder-detail][data-backorder-id="${dialog.dataset.backorderId}"]`))closePopup();
     const host=document.querySelector('.dispatch-topbar .topbar-actions, .topbar .topbar-actions, .topbar > .actions')||document.querySelector('.dispatch-topbar,.topbar,.mbt-app-topbar');
@@ -77,10 +86,11 @@
     for(const audience of audiences){
       const data=counts[audience];
       if(!data)continue;
-      const link=links[audience]||document.createElement('a');links[audience]=link;
+      const link=links[audience]||document.createElement('a');
+      links[audience]=link;
       link.className='regular-stock-alert';link.dataset.audience=audience;
       const returned=audience==='scm'&&data.returnedPools?.[0];
-      link.href=audience==='scm'?(returned?`/scm/stock-requests?tab=waitlist&poolId=${Number(returned.id)}`:'/scm/stock-requests?tab=regular&review=1'):`/sales/stock-requests?tab=regular&requestId=${Number(data.requests?.[0]?.id)||''}`;
+      link.href=`/${audience}/stock-requests?tab=regular&alerts=1`;
       const label=audience==='scm'?(returned?t('Waitlist stock returned · Re-allocate','候补库存已退回 · 重新分配'):t('Stock requests to review','库存申请待审核')):data.actionRequired?t('Stock requests need your input','库存申请需要您的处理'):t('Stock request updates','库存申请更新');
       const text=`${label} · ${audience==='sales'&&data.actionRequired?data.actionRequired:data.total}`;
       if(link.textContent!==text)link.textContent=text;
@@ -154,10 +164,11 @@
   }
   const style=document.createElement('style');
   style.textContent='.regular-stock-alert{display:inline-flex;align-items:center;padding:7px 10px;margin:3px;border:1px solid #a16207;border-radius:8px;background:#fffbeb;color:#78350f;font:700 12px/1.3 system-ui;text-decoration:none}.regular-stock-alert[hidden]{display:none}.regular-stock-alert:focus-visible{outline:3px solid #a16207;outline-offset:2px}';
-  style.textContent+='.regular-stock-popup{width:min(460px,calc(100vw - 48px));padding:24px;border:1px solid #cbd5e1;border-radius:12px;background:white;color:#0f172a;font:15px/1.5 system-ui;overflow-wrap:anywhere}.regular-stock-popup::backdrop{background:#0f172a66}.regular-stock-popup .stock-request-actions{display:flex;gap:16px;align-items:center}.regular-stock-popup button{padding:8px 16px;border-radius:8px;border:1px solid #94a3b8;background:white;cursor:pointer}.regular-stock-popup a{color:#075e50;font-weight:700}';
+  style.textContent+='.regular-stock-popup{width:min(460px,calc(100vw - 48px));padding:24px;border:1px solid #cbd5e1;border-radius:12px;background:white;color:#0f172a;font:15px/1.5 system-ui;overflow-wrap:anywhere}.regular-stock-popup::backdrop{background:#0f172a66}.regular-stock-popup .stock-request-actions{display:flex;flex-wrap:wrap;gap:16px;align-items:center}.regular-stock-popup button{padding:8px 16px;border-radius:8px;border:1px solid #94a3b8;background:white;cursor:pointer}.regular-stock-popup a{color:#075e50;font-weight:700}';
   document.head.append(style);
   window.MBBSRegularStockAlert={refresh};
   window.addEventListener('mbbs-auth-operator-changed',()=>{checking?.abort();stop();session='';void checkSession();});
+  window.addEventListener('mbbs-notification-preferences-changed',()=>popup());
   window.addEventListener('mbbs-language-changed',paint);
   window.addEventListener('storage',event=>{if(keys.includes(event.key)||event.key===null)void checkSession();});
   window.addEventListener('focus',checkSession);

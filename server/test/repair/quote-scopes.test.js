@@ -1,0 +1,50 @@
+import {startedAction} from './fixture.js';
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {query,withTransaction,closeDb} from '../../src/db.js';
+import {createRepairRepository} from '../../src/repair/repository.js';
+import {createRepairWorker} from '../../src/repair/worker.js';
+const repo=createRepairRepository();assert.equal(process.env.MBT_TEST_ISOLATED,'1');after(closeDb);
+const actor=role=>({id:role,role,roles:[role],yardLocationIds:[1]}),office=actor('repair_office'),tech=actor('repair_technician'),dispatch=actor('dispatcher');
+const cmd=revision=>({commandId:randomUUID(),revision}),scenario=fn=>withTransaction(fn,{rollback:true});
+const line=id=>({id,kind:'labor',description:'Repair '+id,quantity:'1',unitPrice:'100',taxBps:1300});
+async function inspected(company='MBT'){const vehicle=randomUUID();await query("INSERT INTO repair_vehicles(id,company,customer_id,alias,data) VALUES($1,$2,'7973','Request truck',$3)",[vehicle,company,{equipmentType:'truck'}]);const job=await repo.create(office,{...cmd(),vehicleId:vehicle,meter:'10',meterUnit:'km',defect:'First fault',condition:'out_of_service'});return startedAction(repo,tech,job.id,{...cmd(job.revision),action:'inspection_complete',done:'Inspected initial fault'});}
+async function quote(job,id,mode='revision',quoteId,issueId){return repo.quote(office,job.id,{...cmd(job.revision),mode,quoteId,issueId,title:'Repair '+id,lines:[line(id)]});}
+async function approve(job,q,status='approved'){await repo.decide(dispatch,q.jobId||job.id,{...cmd(),quoteId:q.id,decisions:q.lines.map(l=>({id:l.id,status}))});return repo.get(office,q.jobId||job.id);}
+test('one request lists once while independent repair jobs keep their approvals, parts and revision',()=>scenario(async()=>{
+ let first=await inspected();const q1=await quote(first,'initial','initial');first=await approve(first,q1);const revision=first.revision;
+ const q2=await quote(first,'additional','additional');assert.notEqual(q2.jobId,first.id);let second=await repo.get(office,q2.jobId);first=await repo.get(office,first.id);
+ assert.equal(Number((await query("SELECT count(*) FROM repair_postings WHERE request_id=$1 AND kind='inspection'",[first.id])).rows[0].count),1);assert.equal(first.workJobs.length,2);assert.equal(first.revision,revision,'creating another job must not stale the first job');assert.equal(first.stage,'queue_for_repair');assert.equal(second.stage,'wait_for_approval');assert.equal(second.data.inspectionRequired,false);assert.equal(second.data.inspectionComplete,true);assert.equal(second.requestId,first.id);
+ assert.equal((await repo.list(office)).filter(r=>r.id===first.id).length,1);assert.equal((await repo.list(tech,{workJobs:true})).filter(j=>j.requestId===first.id).length,2);
+ first=await repo.action(tech,first.id,{...cmd(first.revision),action:'start_repair'});await assert.rejects(repo.action(tech,second.id,{...cmd(second.revision),action:'start_repair'}),/approved/i);
+ const req=await repo.requestParts(tech,first.id,{...cmd(first.revision),quoteLineId:'initial',description:'First job part',quantity:'1'});first=await repo.get(office,first.id);assert.equal(first.stage,'queue_for_repair');assert.equal(first.partsStatus,'wait_for_po');assert.equal((await repo.get(office,second.id)).partsStatus,null);
+ await repo.issuePurchaseOrder(office,first.id,{...cmd(first.revision),vendorId:'12821',eta:'2026-12-01',purchaseDate:'2026-10-27',lines:[{partRequestId:req.id,quantity:'1',unitPrice:'5'}]});second=await approve(second,q2);assert.equal(second.request.totals.totalMinor,22600);assert.equal(second.request.totals.creditMinor,15000);
+ await assert.rejects(repo.requestParts(tech,second.id,{...cmd(second.revision),quoteLineId:'initial',description:'Wrong job scope',quantity:'1'}),/approved/i);
+ const hidden=await repo.get(tech,second.id);assert.equal(hidden.quote.lines[0].unitMinor,undefined);assert.equal(hidden.request.totals,undefined);
+}));
+test('new issues do not stop the old job; parent receipt and posting wait for every child job',()=>scenario(async()=>{
+ await query('DELETE FROM repair_postings');let first=await inspected();const q1=await quote(first,'first','initial');first=await approve(first,q1);
+ first=await startedAction(repo,tech,first.id,{...cmd(first.revision),action:'report_fault',done:'Found another leak'});first=await repo.get(office,first.id);assert.equal(first.stage,'queue_for_repair');assert.ok(first.issues.some(i=>i.description==='Found another leak'));assert.ok((await repo.notifications(office)).some(n=>n.kind==='additional_fault'));
+ first=await startedAction(repo,tech,first.id,{...cmd(first.revision),action:'complete',done:'First repair done'});assert.equal(first.status,'completed');assert.notEqual(first.receipt,'pending');assert.equal(Number((await query("SELECT count(*) FROM repair_postings WHERE request_id=$1 AND kind='work_update'",[first.id])).rows[0].count),0);
+ first=await repo.get(office,first.id);const q2=await quote(first,'second','additional',undefined,first.issues[0].id);let second=await repo.get(office,q2.jobId);assert.notEqual(second.receipt,'pending','unfinished additional job prevents parent receipt');second=await approve(second,q2);second=await startedAction(repo,tech,second.id,{...cmd(second.revision),action:'complete',done:'Second repair done'});assert.equal(second.receipt,'pending');assert.equal((await repo.get(office,first.id)).request.stage,'completed');
+ await query("DELETE FROM repair_postings WHERE kind='inspection'");await query("UPDATE repair_settings SET data=jsonb_set(data,'{postingEnabled}','true')");const calls=[];const worker=createRepairWorker({query,transaction:withTransaction,enabled:()=>true,repo,adapter:{complete:async(job,_mapping,lines)=>{calls.push({id:job.id,lines});return {worId:'501',sosId:'502'};}}});assert.equal((await worker.tick()).state,'done');assert.equal(calls.length,1);assert.equal(calls[0].id,first.id);assert.deepEqual(calls[0].lines.map(l=>l.id).sort(),['first','second']);
+ const data=(await query('SELECT data FROM repair_requests WHERE id=$1',[first.id])).rows[0].data;assert.equal(data.worId,'501');assert.equal(data.sosId,'502');
+}));
+test('revising one job quote preserves the other job and public approval links',()=>scenario(async()=>{
+ let first=await inspected('EXTERNAL');const q1=await quote(first,'first','initial'),link1=await repo.quoteLink(office,first.id,q1.id);first=await repo.get(office,first.id);const q2=await quote(first,'second','additional');const second=await repo.get(office,q2.jobId);const link2=await repo.quoteLink(office,second.id,q2.id);assert.equal((await repo.publicQuote(link1.token)).quote.id,q1.id);
+ const changed=await quote(second,'second-new','revision',q2.id);assert.equal(changed.scopeRevision,2);assert.equal(changed.jobId,second.id);await assert.rejects(repo.publicQuote(link2.token),/not found/i);assert.equal((await repo.publicQuote(link1.token)).quote.id,q1.id);
+ first=await repo.get(office,first.id);await assert.rejects(quote(first,'second-new','additional'),/identifier|another quote|unique/i);assert.equal((await repo.get(office,first.id)).workJobs.length,2,'invalid additional quote must not leave an orphan job');
+}));
+test('an additional quote rejected by the approver keeps the parent unrepaired hold',()=>scenario(async()=>{
+ let first=await inspected();const q1=await quote(first,'first','initial');first=await approve(first,q1);const q2=await quote(first,'second','additional');const second=await approve(await repo.get(office,q2.jobId),q2,'rejected');first=await repo.get(office,first.id);
+ await startedAction(repo,tech,first.id,{...cmd(first.revision),action:'complete',done:'First repair completed'});assert.equal(second.status,'completed','rejected jobs resolve without Team completion');assert.ok(!(await repo.list(tech,{workJobs:true})).some(j=>j.id===second.id));const parent=(await repo.get(office,first.id)).request;assert.equal(parent.outcome,'declined');assert.equal(parent.totals.totalMinor,11300);assert.equal(parent.stage,'completed');
+}));
+
+test('additional issue quotes serialize and replay without duplicate jobs; dismissing an issue needs an office reason',async()=>{
+ let first=await inspected();const q1=await quote(first,'race-first-'+randomUUID(),'initial');first=await approve(first,q1);first=await startedAction(repo,tech,first.id,{...cmd(first.revision),action:'report_fault',done:'Race issue'});first=await repo.get(office,first.id);const issue=first.issues[0],input={...cmd(first.revision),mode:'additional',issueId:issue.id,title:'Extra repair',lines:[line('race-extra-'+randomUUID())]};
+ const [one,two]=await Promise.all([repo.quote(office,first.id,input),repo.quote(office,first.id,input)]);assert.equal(one.id,two.id);assert.equal(one.jobId,two.jobId);assert.equal((await repo.get(office,first.id)).workJobs.length,2);
+ await assert.rejects(repo.quote(office,first.id,{...input,commandId:randomUUID()}),/already been resolved/i);assert.equal((await repo.get(office,first.id)).workJobs.length,2);
+ first=await repo.get(office,first.id);first=await startedAction(repo,tech,first.id,{...cmd(first.revision),action:'report_fault',done:'Cosmetic mark only'});first=await repo.get(office,first.id);const cosmetic=first.issues.find(i=>i.status==='reported');await assert.rejects(repo.dismissIssue(tech,cosmetic.id,{...cmd(),reason:'Technician cannot dismiss'}),/permission|allowed|access/i);await assert.rejects(repo.dismissIssue(office,cosmetic.id,{...cmd(),reason:''}),/Reason/i);
+ const dismiss={...cmd(),reason:'Inspected mark is cosmetic; no additional repair needed'};assert.deepEqual(await repo.dismissIssue(office,cosmetic.id,dismiss),{ok:true});assert.deepEqual(await repo.dismissIssue(office,cosmetic.id,dismiss),{ok:true});first=await repo.get(office,first.id);assert.equal(first.issues.find(i=>i.id===cosmetic.id).status,'dismissed');assert.equal(first.request.data.quoteNeeded,false);assert.ok(first.history.some(e=>e.kind==='issue_dismissed'&&e.data.reason===dismiss.reason));
+});

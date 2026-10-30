@@ -1,0 +1,60 @@
+{
+  "startedAt": "2026-10-27T14:17:48.698Z",
+  "finishedAt": "2026-10-27T14:17:53.729Z",
+  "sourceHashes": {
+    "src": "40da8bba240256308af38c9071783ab5ea6c6d71b6b80650da1a08bf97084b8d",
+    "public": "8ebadbd635542c30f862dcaa2227e30af1d6ad1678ba4db8798e187b40d49d31",
+    "migrations": "caca7f5301a243940317d0c220f92cd90cc00d60e841dd6b6e2b8db015ad37f2"
+  },
+  "tests": 29,
+  "pass": 2,
+  "fail": 27,
+  "fileCount": 2,
+  "runtime": "Captured unchanged live source and migrations before this task",
+  "files": [
+    {
+      "file": "test/mbt/integration/direct-po-materialized-split-range.test.js",
+      "tests": 20,
+      "pass": 0,
+      "fail": 20,
+      "failedNames": [
+        "split S1 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S2 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S3 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S4 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S5 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S6 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S7 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S8 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S9 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S10 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S11 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S12 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S13 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S14 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S15 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S16 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S17 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S18 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S19 advances its linked PO through Direct ship, In Transit and Completed",
+        "split S20 advances its linked PO through Direct ship, In Transit and Completed"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/direct-po-materialized-split.test.js",
+      "tests": 9,
+      "pass": 2,
+      "fail": 7,
+      "failedNames": [
+        "materialized split references match the exact allocation and advance Direct ship through In Transit to Completed",
+        "sibling split deliveries cannot satisfy the allocated materialized split",
+        "property: arbitrary split suffixes and quantities recognize only the exact split",
+        "historical completion recovery preserves source records, creates no receipt, rolls back and is idempotent",
+        "unexpected receipt queue admission aborts the entire historical status repair",
+        "SQL function replacement and migration rollback preserve the previously installed definition",
+        "a reopened driver visit cannot be recovered as current completion"
+      ]
+    }
+  ],
+  "reason": "Existing direct-PO materialized split tests expect migration 291_direct_po_materialized_split_status.sql and behaviors absent from the captured live release."
+}

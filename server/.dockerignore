@@ -9,3 +9,13 @@ npm-debug.log*
 *.backup
 .git
 .gitignore
+test-artifacts
+artifacts
+deployments
+tools/**/baseline*
+tools/**/candidate*
+tools/**/workspace-before*
+tools/**/workspace-pre-merge
+tools/**/original-baseline
+tools/**/original-candidate
+tools/**/release-baseline*

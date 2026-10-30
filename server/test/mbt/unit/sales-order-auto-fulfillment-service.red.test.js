@@ -53,6 +53,23 @@ function memoryRepository(candidate = readyCandidate()) {
   };
 }
 
+test('IFIR automatic SO fulfillment verifies returned record without an extra read', async () => {
+  const repository = memoryRepository();
+  const saved = { id: 9001, tranId: 'IF9001', externalId: readyCandidate().externalId };
+  let verified = 0;
+  const processor = createSalesOrderAutoFulfillmentProcessor({ repository, workerId: 'test-worker',
+    fetchLiveOrder: async () => liveOrder(), adapter: {
+      findByExternalId: async () => null,
+      transform: async () => ({ id: saved.id, record: saved }),
+      fetchById: async () => { assert.fail('RESTlet response must avoid the extra GET'); },
+      verify: (_candidate, record) => { assert.equal(record, saved); verified += 1;
+        return { id: record.id, transactionRef: record.tranId }; }
+    } });
+  const result = await processor.process('candidate-one');
+  assert.equal(result.status, 'completed');
+  assert.equal(verified, 1);
+});
+
 test('Delivery Prep invalid SO source errors are persisted for Admin without a transform', async()=>{
   const repository=memoryRepository();
   const processor=createSalesOrderAutoFulfillmentProcessor({repository,workerId:'test',adapter:{transform:async()=>assert.fail()},

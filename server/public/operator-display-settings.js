@@ -65,6 +65,10 @@
         const target = `${prefix} :is(${selectors[role]})`;
         if (style.fontSizePx !== null) {
           css.push(`${target}{font-size:${style.fontSizePx}px!important;}`);
+          const returnModules = area === "general" ? ["pallet-return", "stock-return", "stock-exchange"] : ["stock-return", "stock-exchange"];
+          for (const module of returnModules) {
+            css.push(`${target.replace(scope, `#app[data-module="${module}"]`)}{font-size:${Math.max(15, style.fontSizePx)}px!important;}`);
+          }
           // Quantity preferences may be smaller for labels, but editable
           // values stay readable on both phones and tablets.
           if (role === "quantities") css.push(`${prefix} .stepper input{font-size:${Math.max(25, style.fontSizePx)}px!important;}`);

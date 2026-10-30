@@ -1,0 +1,163 @@
+--- a/src/server.js
++++ b/src/server.js
+@@ -121,6 +121,7 @@
+ } from "./netsuite-delayed-status-refresh-repository.js";
+ import { createDelayedStatusRefreshWorker } from "./netsuite-delayed-status-refresh-service.js";
+ import {
++  SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS,
+   createScmScheduleStatusRefresh
+ } from "./scm-schedule-status-refresh.js";
+ import {
+@@ -25092,7 +25093,6 @@
+   if (returnReconciliationTickRunning) return;
+   returnReconciliationTickRunning = true;
+   try {
+-    if (await hasActiveScmReconciliationRun()) { return; }
+     await reconcileReturnRecords({ limit: 100 });
+   } catch (error) {
+     console.error("Scheduled return reconciliation failed:", error.message);
+@@ -25478,11 +25478,13 @@
+     startSalesOrderAutoFulfillmentRuntime();
+     bossApprovalRuntime.start();
+     void delayedStatusRefreshTick();
++    setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);
+     autoSyncTick();
+     photoArchiveAutoTick();
+     void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error));
+     setInterval(autoSyncTick, 60000);
+     setInterval(() => void delayedStatusRefreshTick(), DELAYED_STATUS_REFRESH_POLL_INTERVAL_MS);
++    setInterval(() => void scmScheduleStatusRefreshTick(), SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS);
+     setInterval(photoArchiveAutoTick, 60000);
+     setInterval(
+       () => void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error)),
+--- a/src/return-credit-memo.js
++++ b/src/return-credit-memo.js
+@@ -57,35 +57,10 @@
+   }
+ }
+ 
+-/** @param {any} value */
+-function finiteAmount(value) {
+-  return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+-}
+-
+-/** @param {Record<string, any>} line @param {number} itemId */
+-function isDiscountAdjustment(line, itemId) {
+-  return Number.isSafeInteger(itemId) && itemId > 0 && finiteAmount(line.rate)
+-    && Number(line.rate) <= 0 && Number(line.amount) <= 0;
+-}
+-
+-/** @param {Record<string, any>} line @param {Set<number>} materialIds */
+-function isAccountingAdjustment(line, materialIds) {
+-  const itemId = ref(line.item);
+-  if (materialIds.has(itemId) || (line.quantity !== null && line.quantity !== undefined) || !finiteAmount(line.amount)) { return false; }
+-  const type = line.itemType?.id ?? line.itemType;
+-  if (type === "Subtotal") { return itemId === -2 && Number(line.amount) >= 0; }
+-  return type === "Discount" && isDiscountAdjustment(line, itemId);
+-}
+-
+-/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean, allowAccountingAdjustments?: boolean}} [options] */
+-export function verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive = false, allowAccountingAdjustments = false } = {}) {
++/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean}} [options] */
++export function verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive = false } = {}) {
+   verifyHeader(intent, snapshot, allowInactive);
+-  const materialIds = new Set(intent.lines.map((/** @type {Record<string, any>} */ line) => Number(line.itemId)));
+-  const rows = snapshot.item?.items;
+-  // Accounting may add a subtotal/restocking discount after a CM was verified.
+-  // The caller must establish that history; creation and manual links stay exact.
+-  const actual = allowAccountingAdjustments === true && Array.isArray(rows)
+-    ? rows.filter((/** @type {Record<string, any>} */ line) => !isAccountingAdjustment(line, materialIds)) : rows;
++  const actual = snapshot.item?.items;
+   if (!Array.isArray(actual) || !intent.lines.length || actual.length !== intent.lines.length) {
+     throw mismatch("item rows were added, removed or merged.");
+   }
+--- a/src/return-batch-ra-domain.js
++++ b/src/return-batch-ra-domain.js
+@@ -145,9 +145,9 @@
+   }
+ }
+ 
+-/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean, allowAccountingAdjustments?: boolean}} [options] */
+-export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = false, allowAccountingAdjustments = false } = {}) {
+-  if (intent.transactionType === "credit_memo") { return verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive, allowAccountingAdjustments }); }
++/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean}} [options] */
++export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = false } = {}) {
++  if (intent.transactionType === "credit_memo") { return verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive }); }
+   verifyHeader(intent, snapshot, allowInactive);
+   const actual = snapshot.item?.items;
+   if (!Array.isArray(actual) || actual.length !== intent.lines.length) {throw mismatch("item rows were added, removed or merged.");}
+--- a/src/return-batch-ra-service.js
++++ b/src/return-batch-ra-service.js
+@@ -61,7 +61,7 @@
+ 
+ function transactionRefOf(snapshot) { return snapshot?.tranId || snapshot?.tranid || null; }
+ 
+-async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null, errorCode = null } = {}) {
++async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null } = {}) {
+   const reference = transactionRefOf(snapshot);
+   const remoteStatus = transactionStatus || transactionStatusOf(snapshot);
+   await checkpoint(async q => {
+@@ -69,9 +69,8 @@
+       netsuite_transaction_ref=COALESCE($4,netsuite_transaction_ref),
+       netsuite_transaction_status=COALESCE($5,netsuite_transaction_status),
+       netsuite_snapshot=COALESCE($6::jsonb,netsuite_snapshot),
+-      attempted_at=CASE WHEN $7 THEN NULL ELSE attempted_at END,last_synced_at=now(),updated_at=now(),
+-      sync_error_code=$8,automatic_retry_blocked=COALESCE($8 IN ('RETURN_CM_VERIFICATION_FAILED','RETURN_RA_VERIFICATION_FAILED'),false)
+-      WHERE batch_id=$1`, [batchId, status, message, reference, remoteStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt, errorCode]);
++      attempted_at=CASE WHEN $7 THEN NULL ELSE attempted_at END,last_synced_at=now(),updated_at=now()
++      WHERE batch_id=$1`, [batchId, status, message, reference, remoteStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt]);
+     await q(`UPDATE return_records r SET netsuite_sync_status=a.sync_status,netsuite_sync_error=a.sync_error,
+       netsuite_transaction_ref=a.netsuite_transaction_ref,netsuite_transaction_status=a.netsuite_transaction_status,
+       netsuite_stage=COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),
+@@ -204,7 +203,7 @@
+   // transaction or remove it from the reconciliation queue.
+   if (manualTransactionId && ["succeeded", "manual_linked", "cancelled"].includes(batch.sync_status)) { return; }
+   await setState(batch.batch_id, "failed", { message: String(problem.message || problem).slice(0, 4000),
+-    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId, errorCode: problem.code || null });
++    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId });
+ }
+ 
+ function alreadyDeletedCreditMemo(batch, manualTransactionId) {
+@@ -213,12 +212,6 @@
+ 
+ function canReuseVerifiedBatch(batch, reconcile, manualTransactionId) {
+   return !reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status);
+-}
+-
+-function hasVerifiedCreditMemo(batch) {
+-  return returnBatchTransactionType(batch) === "credit_memo" && !batch.draft_id
+-    && Number(batch.netsuite_transaction_id) > 0
+-    && Number(batch.netsuite_snapshot?.id) === Number(batch.netsuite_transaction_id);
+ }
+ 
+ async function recordDeletedCreditMemo(batch, actorOperatorId) {
+@@ -272,8 +265,7 @@
+         reconcile ? "returns.reconcile" : "returns.pending", () => manualTransactionId
+           ? verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) : postOrRecover(batch));
+       verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: transactionId }, snapshot,
+-        { allowInactive: allowInactiveBatch(batch, reconcile),
+-          allowAccountingAdjustments: !manualTransactionId && hasVerifiedCreditMemo(batch) });
++        { allowInactive: allowInactiveBatch(batch, reconcile) });
+       const inactive = /cancel|void|reject/i.test(transactionStatusOf(snapshot));
+       await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId });
+       await finalizeStagedReturnBatch(batch);
+--- a/src/return-repository.js
++++ b/src/return-repository.js
+@@ -2801,7 +2801,7 @@
+       WHERE r.status NOT IN ('voided', 'rejected')
+         AND (a.batch_id IS NULL OR r.id=(SELECT min(member.id) FROM return_records member WHERE member.batch_id=r.batch_id))
+         AND (
+-          (a.posting_policy->>'effective' = 'true' AND a.automatic_retry_blocked = false AND (a.sync_status='pending'
++          (a.posting_policy->>'effective' = 'true' AND (a.sync_status='pending'
+             OR (a.sync_status='failed' AND a.attempted_at IS NOT NULL)))
+           OR (a.batch_id IS NULL AND r.workflow_version = 2 AND r.netsuite_posting_policy->>'effective' = 'true'
+             AND (r.netsuite_sync_status = 'pending'
+@@ -2825,7 +2825,7 @@
+       summary.failed += 1;
+     }
+   }
+-  const staged = await query(`SELECT batch_id FROM return_batch_authorizations WHERE draft_id IS NOT NULL AND automatic_retry_blocked = false
++  const staged = await query(`SELECT batch_id FROM return_batch_authorizations WHERE draft_id IS NOT NULL
+     AND (sync_status IN ('pending','succeeded') OR (sync_status='failed' AND (attempted_at IS NOT NULL OR netsuite_transaction_id IS NOT NULL)))
+     ORDER BY updated_at,batch_id LIMIT $1`, [Math.min(100, Math.max(1, Number(limit) || 25))]);
+   summary.queued += staged.rowCount;

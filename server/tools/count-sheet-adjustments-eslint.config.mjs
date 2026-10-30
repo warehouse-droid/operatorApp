@@ -1,0 +1,2 @@
+import base from './operator-inventory-eslint.config.mjs';
+export default [{...base[0],files:['src/count-sheet-adjustments.js','src/count-sheet-repository.js','src/count-sheet-reconstruction.js','src/operator-inventory-router.js','public/control-count-sheets.js','test/count-sheet-adjustments*.test.js','test/support/count-sheet-adjustments-mutation-loader.mjs','tools/count-sheet-adjustments*.mjs']}];

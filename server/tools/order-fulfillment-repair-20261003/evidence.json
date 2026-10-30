@@ -1,0 +1,396 @@
+{
+  "recordedAt": "2026-10-03T01:04:49.769780+00:00",
+  "outcome": "Deployed; named orders reconciled to existing fulfillments; no duplicate NetSuite records created.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "sourceTrees": {
+    "baseline": {
+      "image": "sha256:8b6eb015cc441511c754769b5ffa51979fed154e4b53ad0d821962f0d04a3b51",
+      "sha256": "ab93842179a388edae2478caa3e3977e624feffcbb64b994201af8f0fa076aff"
+    },
+    "candidate": {
+      "image": "sha256:fb3397d75e711be17f2ac8754083068717f4447bff1f6299258b7fa441ba48c9",
+      "sha256": "c74f86ec129a0fcb90e31f1249d53512c1ec47dc7c94afcfa470ed32b22800fb"
+    },
+    "worker-baseline": {
+      "image": "sha256:b7a774612d725d0369cdcfa527717ee2447aaec892ed1a4f4d238241ccbe507f",
+      "sha256": "87e329d92a16eef8413ff85a338e5a76d0b165fcde68220ab4e976424ee72a62"
+    },
+    "worker-candidate": {
+      "image": "sha256:f41a2254a50e361741ff8a58eb3701f2b50e6437b8e071e4ddf8adbcb1ceab72",
+      "sha256": "6694ea429be1aec817b8b76fbeae313771a8924339faeececfbfad0f3ee1846f"
+    }
+  },
+  "deployedFileHashes": {
+    "public/operator.html": "3266d5b5ad496211bc644563e9692d68d1bbb72a407e35f00cd097ca3fa5932a",
+    "public/operator.js": "7b151cafd86e4bd01bb78cfd4ed81413d097135460b224b91c987c021cc6e0c8",
+    "public/service-worker.js": "53dddfa11af9f6b0a5c1ad0805925e83b64a9b5a390454899aa0914552cf2222",
+    "src/netsuite-transaction-units.js": "5c679322311b7dbfdd17be3bea8a76a4dd4bc3fdeeae0961fc031ba3f3aeee40",
+    "src/netsuite.js": "4a200ef2634d34a56c284b606f06731e8483181b79edbbd9013875f7308c6ca9",
+    "src/operator-netsuite-posting-adapter.js": "41633e151158ecedfec7bcfcf919ff05013390f622274123e7a58b361a7fcb11",
+    "src/operator-netsuite-posting-domain.js": "c8dfc2eb54d88aaee9eee25b399c7cb5754a94087516448e4ccdc81a009da2c1",
+    "src/operator-netsuite-posting-targets.js": "32d2629d390f33f70e7451f675907433e7386d4a3107a92a40c6e33b968fa6c9"
+  },
+  "toolchain": {
+    "node": "20.20.2",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fastCheck": "4.9.0",
+    "playwright": "1.62.1",
+    "postgres": "18",
+    "testImage": "sha256:b36611e8d01bdd5cef6e030735a25fe0f8bc0ac2fa4d02de331fb66946029242",
+    "postgresImage": "sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+  },
+  "reproduce": {
+    "command": "python3 tools/order-fulfillment-repair-20261003/verify-all.py --live",
+    "offlineCommand": "python3 tools/order-fulfillment-repair-20261003/verify-all.py",
+    "prerequisites": [
+      "Docker access and the pinned private application and tool images; source trees can be extracted automatically from those images.",
+      "Existing repository tests and incident tools; live checks additionally require the configured application, database and NetSuite account."
+    ],
+    "entrypointStatus": "Assembled after the final component runs; evidence-only mode checked. Components were executed individually; the combined rerun is not claimed as executed.",
+    "mutationCommands": [
+      "python3 tools/order-fulfillment-repair-20261003/checks.py mutations"
+    ],
+    "liveChanges": "Read-only NetSuite queries and rollback-only SOM refresh; no repair apply or deployment commands are invoked."
+  },
+  "specToTests": [
+    {
+      "spec": "spec.json",
+      "tests": [
+        "evidence.test.mjs",
+        "run.py rehearse",
+        "run.py verify"
+      ],
+      "invariants": "Existing transaction identity, original actor/photos/request, exact line evidence, no duplicate fulfillment, rollback and idempotence."
+    },
+    {
+      "spec": "ui-spec.json",
+      "tests": [
+        "ui.test.mjs",
+        "ui-browser.mjs",
+        "mutations.mjs",
+        "release.py verify"
+      ],
+      "invariants": "Retain journals and uncertain request IDs; release screen state; ignore late responses; preserve unrelated runtime files and configuration."
+    },
+    {
+      "spec": "review-rule-spec.json",
+      "tests": [
+        "review-rule.test.mjs",
+        "review-rule-db.test.mjs",
+        "review-mutations.mjs",
+        "candidate-posting"
+      ],
+      "invariants": "Exact confirmed non-inventory evidence; immutable hashed snapshot; inventory/kit strictness; receipt rules retained."
+    },
+    {
+      "spec": "som-spec.json",
+      "tests": [
+        "som-evidence.test.mjs",
+        "som-run.py rehearse",
+        "som-run.py verify",
+        "sync-verification.mjs"
+      ],
+      "invariants": "Native 1 Yard; original payload immutable; existing IF only; rollback and repeat-safe reconciliation."
+    },
+    {
+      "spec": "units-spec.json",
+      "tests": [
+        "units.test.mjs",
+        "units-mutations.mjs",
+        "units-live.mjs",
+        "cache-refresh.py rehearse",
+        "sync-verification.mjs"
+      ],
+      "invariants": "Configured per-unit rates; consistent ordered/progress units; prices and quantities preserve amount; no native webhook double conversion; fail closed on missing rate."
+    }
+  ],
+  "checks": {
+    "candidate-regression": {
+      "exit": 0,
+      "counts": [
+        "# tests 55",
+        "# pass 55",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "new-tests": {
+      "exit": 0,
+      "counts": [
+        "# tests 18",
+        "# pass 18",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "review-rule": {
+      "exit": 0,
+      "counts": [
+        "# tests 5",
+        "# pass 5",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "units": {
+      "exit": 0,
+      "counts": [
+        "# tests 10",
+        "# pass 10",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "worker-units": {
+      "exit": 0,
+      "counts": [
+        "# tests 10",
+        "# pass 10",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "candidate-posting": {
+      "exit": 0,
+      "counts": [
+        "# tests 68",
+        "# pass 68",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    },
+    "baseline-uom-regression": {
+      "exit": 1,
+      "counts": [
+        "# tests 65",
+        "# pass 64",
+        "# fail 1",
+        "# skipped 0"
+      ],
+      "failures": [
+        "not ok 3 - /app/src/scm-netsuite-po-history-harness.js"
+      ]
+    },
+    "candidate-uom-regression": {
+      "exit": 1,
+      "counts": [
+        "# tests 65",
+        "# pass 64",
+        "# fail 1",
+        "# skipped 0"
+      ],
+      "failures": [
+        "not ok 3 - /app/src/scm-netsuite-po-history-harness.js"
+      ]
+    },
+    "db-migrations": {
+      "exit": 0,
+      "counts": []
+    },
+    "db-regression": {
+      "exit": 0,
+      "counts": [
+        "# tests 7",
+        "# pass 7",
+        "# fail 0"
+      ]
+    },
+    "receiving-browser": {
+      "exit": 0,
+      "counts": [],
+      "failures": []
+    },
+    "review-browser": {
+      "exit": 0,
+      "counts": [],
+      "failures": []
+    },
+    "mutations": {
+      "exit": 0,
+      "counts": [],
+      "failures": []
+    },
+    "review-mutations": {
+      "exit": 0,
+      "counts": [],
+      "failures": []
+    },
+    "units-mutations": {
+      "exit": 0,
+      "counts": [],
+      "failures": []
+    },
+    "backend-coverage": {
+      "exit": 0,
+      "counts": [
+        "# tests 15",
+        "# pass 15",
+        "# fail 0",
+        "# skipped 0"
+      ],
+      "failures": []
+    }
+  },
+  "staticComparison": {
+    "lint": {
+      "baseline": 23,
+      "candidate": 23,
+      "new": []
+    },
+    "types": {
+      "baseline": 1267,
+      "candidate": 1221,
+      "new": []
+    },
+    "backendLint": {
+      "baseline": 6,
+      "candidate": 6,
+      "new": []
+    },
+    "backendTypes": {
+      "baseline": 8243,
+      "candidate": 8243,
+      "new": []
+    }
+  },
+  "mutations": {
+    "manualDistinct": 13,
+    "killed": 13,
+    "ui": 4,
+    "review": 5,
+    "unitConversion": 4,
+    "propertyOnlyRerun": "All 5 review and 4 unit-conversion mutants also killed by their property-only suites."
+  },
+  "properties": {
+    "seed": 20261003,
+    "reviewCases": 50,
+    "unitConversionCases": 250
+  },
+  "concurrency": "Real PostgreSQL integration tests include 32-way admission races, immutable persistence and conflicting replays.",
+  "coverage": {
+    "newUnitConversionHelper": {
+      "lines": 100,
+      "branches": 100,
+      "functions": 100
+    },
+    "otherChangedCode": "Node backend coverage and browser V8 coverage captured; complete changed-line/branch coverage across all changed files was not established. Behavior, adversarial and mutation tests cover the specified cases.",
+    "log": "backend-coverage.log"
+  },
+  "browser": {
+    "receivingScenarios": 4,
+    "reviewScenarios": 3,
+    "javascriptErrors": 0,
+    "visuallyInspected": [
+      "pickup",
+      "receipt"
+    ]
+  },
+  "deployment": {
+    "health": 200,
+    "servedAssetHashes": 3,
+    "deployed": true,
+    "imageId": "sha256:fb3397d75e711be17f2ac8754083068717f4447bff1f6299258b7fa441ba48c9",
+    "files": [
+      "public/operator.html",
+      "public/operator.js",
+      "public/service-worker.js",
+      "src/netsuite-transaction-units.js",
+      "src/netsuite.js",
+      "src/operator-netsuite-posting-adapter.js",
+      "src/operator-netsuite-posting-domain.js",
+      "src/operator-netsuite-posting-targets.js"
+    ],
+    "configurationPreserved": true,
+    "databaseAndOllamaPreserved": true,
+    "workerImageId": "sha256:f41a2254a50e361741ff8a58eb3701f2b50e6437b8e071e4ddf8adbcb1ceab72",
+    "workerConfigurationPreserved": true,
+    "at": "2026-10-03T00:58:02.028751+00:00"
+  },
+  "secrets": {
+    "findings": []
+  },
+  "orders": [
+    {
+      "id": 1023363,
+      "ref": "SOA09472",
+      "operatorStatus": "loaded",
+      "status": "F",
+      "statusText": "Sales Order : Pending Billing",
+      "posting": null,
+      "confirmationSummary": {
+        "orderId": "1023363",
+        "orderRef": "SOA09472",
+        "total": 0,
+        "confirmed": 0,
+        "missing": []
+      }
+    },
+    {
+      "id": 1032550,
+      "ref": "TOB01183",
+      "operatorStatus": "loaded",
+      "status": "F",
+      "statusText": "Transfer Order : Pending Receipt",
+      "posting": null,
+      "confirmationSummary": {
+        "orderId": "1032550",
+        "orderRef": "TOB01183",
+        "total": 0,
+        "confirmed": 0,
+        "missing": []
+      }
+    },
+    {
+      "orderRef": "SOM06812",
+      "quantity": 1,
+      "unit": "Yard",
+      "operatorStatus": "loaded",
+      "posting": null,
+      "transactionRef": "IF156257"
+    }
+  ],
+  "refreshVerification": {
+    "order": "SOM06812",
+    "nativeQuantity": 1,
+    "unit": "Yard",
+    "afterRefreshQuantity": 1,
+    "loadedQuantity": 1,
+    "reviewHeld": false,
+    "refreshRolledBack": true
+  },
+  "cacheCorrection": {
+    "lines": 31,
+    "orders": 29,
+    "rehearsalRolledBack": true,
+    "repeatApplyChangedLines": 0,
+    "scope": "Untouched recent sales lines only; exact item, source key, UOM and configured conversion ratio required; every change audited."
+  },
+  "capabilityReview": "Uses existing authenticated NetSuite reads with the newly enabled Lists Units View permission. No new production dependencies, migrations, filesystem access, subprocesses or external record writes. Incident tools use isolated Docker tests and guarded local database transactions.",
+  "knownLimitsAndSkippedLayers": [
+    "The full repository suite was not run; relevant Operator posting, receiving, UOM, kit, concurrency and adversarial suites were run against both captured baseline and candidate where applicable.",
+    "One existing UOM-suite harness failure remains unchanged: scm-netsuite-po-history-harness.js expects an inline purchaseOrderPdf action in code already refactored in the baseline.",
+    "Existing lint and type diagnostics remain; there are zero new diagnostics. Full-project clean types/lint is not claimed.",
+    "No randomized test order run; deterministic seeds and repeated targeted runs were used. This leaves reduced suite-order confidence.",
+    "No new dependencies; dependency audit and license re-audit skipped because the dependency set was unchanged.",
+    "No dedicated automated complexity budget or latency benchmark; the conversion helper is isolated and no latency budget was specified.",
+    "TOB01183 was reconciled to its existing fulfillment; a general transfer-order sublist mapping rewrite was outside this correction.",
+    "Older unrelated review holds and historical cached lines were not mass-reconciled. Future sync uses configured native units.",
+    "User spec review did not occur; this evidence supports the stated scenarios, not an independent approval of their completeness."
+  ],
+  "resolvedDuringVerification": [
+    "Rebased narrow changes on the then-current app image and preserved the worker's separate source baseline.",
+    "NetSuite rejected DF(NVL(...)) in linked-transaction queries; direct original source-line unit lookup passed all five live readers.",
+    "Database test corrected to assert the actual idempotency conflict code; test claim identifiers made unique for repeatability.",
+    "Docker image build used pinned local base tags and historical Compose overrides were read through sudo; resulting environment and startup configuration verified unchanged."
+  ],
+  "privateEvidenceDirectory": "/home/ubuntu/operatorapp-investigations/operator-review-navigation-20261003",
+  "repairEvidenceDirectory": "/home/ubuntu/operatorapp-investigations/order-fulfillment-repair-20261003"
+}

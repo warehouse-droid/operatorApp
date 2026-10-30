@@ -40,6 +40,23 @@ under `backups`, ordered by modification time. Keep partial schema, repair and
 deployment snapshots in `docker/backups`, `operatorapp-deploy-backups` or
 `server/deployments`; those locations are outside full-database retention.
 
+Host deployment copies now retain the latest five complete copies across
+`server/deployments` and `/home/ubuntu/operatorapp-deploy-backups`. The hourly
+`operatorapp-copy-retention.timer` removes older copies and abandoned test
+artifacts, preserving live Compose files, tracked records, and operational audits.
+It leaves recently active trees for at least two hours and checks production
+container identity and health before and after deletion.
+
+Run host tests with `bash docker/run-isolated-tests.sh [command ...]`. This uses
+the bounded isolated Compose configuration, a unique project and artifact folder,
+and unconditional container/volume/network teardown. Its outer runner deletes
+the run's artifacts after success, failure, or interruption. For custom bounded
+harnesses, use `python3 docker/retention/retention.py run -- <command>` and write
+all temporary output under `$MBBS_TEST_ARTIFACT_DIR`. Keep concise source evidence
+and operational audits separately; the hourly sweep is recovery, not a substitute
+for immediate teardown. Validate retention changes with
+`bash docker/retention/check.sh`.
+
 Normal operation:
 
 ```powershell

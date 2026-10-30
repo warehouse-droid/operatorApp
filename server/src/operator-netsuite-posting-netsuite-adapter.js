@@ -6,6 +6,7 @@ import {
   fetchPurchaseOrderHistorySnapshotFromNetSuite,
   fetchSalesOrderFulfillmentStateFromNetSuite,
   findOperatorNetSuitePostingTransactionByExternalId,
+  postIfirViaNetSuiteRestlet,
   transformPurchaseOrderToItemReceipt,
   transformSalesOrderToItemFulfillment,
   transformTransferOrderToItemFulfillment,
@@ -18,11 +19,12 @@ import { itemFulfillmentPartsRepository } from './item-fulfillment-parts-reposit
 import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.js';
 import { assertOperatorKitStepCurrent, operatorKitError, operatorStepHasKits } from './operator-netsuite-posting-kits.js';
 import { assertDirectPoReceiptStepCurrent } from './direct-po-auto-receipt-domain.js';
+import {assertAllocatedPoReceiptCurrent} from './direct-po-allocation-receipt.js';
 import { assertDispatchFulfillmentStepCurrent } from './netsuite-fulfillable-items.js';
 import { assertTransferPostingStepReady } from './transfer-order-posting-repository.js';
 import { assertTransferPostingSourceCurrent } from './transfer-order-posting-domain.js';
 import { fetchLiveSourceFromNetSuite } from './operator-netsuite-posting-targets.js';
-import { prepareSalesOrderFulfillmentPayload, readSalesOrderFulfillmentSource } from './operator-netsuite-posting-fulfillment-lines.js';
+import { prepareSalesOrderFulfillmentPayload, prepareDeferredSalesOrderNativePayload, readSalesOrderFulfillmentSource } from './operator-netsuite-posting-fulfillment-lines.js';
 
 /** @param {Record<string,any>} step */
 async function recheckTransferPosting(step) {
@@ -82,6 +84,7 @@ async function recheckKitSource(step, readSource) {
  * @param {Function} [dependencies.fetchDispatchFulfillmentSource]
  * @param {Function} [dependencies.fetchSalesOrderFulfillmentSource]
  * @param {Function} [dependencies.checkTransferPosting]
+ * @param {Function|null} [dependencies.postIfirRestlet]
  */
 export function createOperatorNetSuitePostingAdapter({
   findTransactionByExternalId,
@@ -96,11 +99,22 @@ export function createOperatorNetSuitePostingAdapter({
   fetchPurchaseReceiptSource = fetchPurchaseOrderHistorySnapshotFromNetSuite,
   fetchDispatchFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
   fetchSalesOrderFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
-  checkTransferPosting = async () => {}
+  checkTransferPosting = async () => {},
+  postIfirRestlet = null
 }) {
   const endpointTypes = new WeakMap();
-  // Source proof stays out of the remote record and can only come from our read.
+  // Source proof comes from our authenticated read or the validated RESTlet envelope.
   const purchaseChargeSources = new WeakMap();
+  /** @param {any} step @param {any} payload @param {Function} native */
+  async function post(step, payload, native) {
+    const result = await postIfirRestlet?.({ ...step, payload });
+    if (result) {
+      purchaseChargeSources.set(result.record, result.source);
+      endpointTypes.set(result.record, step.transactionType);
+      return result;
+    }
+    return native(step.sourceNetSuiteId, payload);
+  }
   async function readChargeSource(/** @type {any} */ step, /** @type {any} */ record) {
     if (!purchaseReceiptNeedsChargeSource(step, record) || purchaseChargeSources.has(record)) { return; }
     try {
@@ -165,24 +179,26 @@ export function createOperatorNetSuitePostingAdapter({
             source = await readSalesOrderFulfillmentSource(step, fetchSalesOrderFulfillmentSource);
           }
           const payload = step.payload?.item?.items?.length ? prepareSalesOrderFulfillmentPayload(step, source) : step.payload;
-          return salesOrderFulfillment(step.sourceNetSuiteId, payload);
+          return post(step, payload, (/** @type {number} */ id, /** @type {any} */ nativePayload) =>
+            salesOrderFulfillment(id, prepareDeferredSalesOrderNativePayload(step, nativePayload, source)));
         });
       }
       if (step.transactionType === "IF" && step.sourceOrderKind === "TO") {
         await checkTransferPosting(step);
-        return operatorNetSuiteRequestPool.run(() => transferOrderFulfillment(step.sourceNetSuiteId, step.payload));
+        return operatorNetSuiteRequestPool.run(() => post(step, step.payload, transferOrderFulfillment));
       }
       if (step.transactionType === "IR" && step.sourceOrderKind === "PO") {
         return operatorNetSuiteRequestPool.run(async () => {
-          if ((step.lineSnapshot || []).some((/** @type {Record<string,any>} */ line)=>line.directCompletionEventId)) {
+          await assertAllocatedPoReceiptCurrent(step);
+          if ((step.lineSnapshot || []).some((/** @type {Record<string,any>} */ line)=>line.directCompletionEventId || line.directReceiptJobId)) {
             assertDirectPoReceiptStepCurrent(step,await fetchDirectReceiptSource(step.sourceNetSuiteId));
           }
-          return purchaseOrderReceipt(step.sourceNetSuiteId, step.payload);
+          return post(step, step.payload, purchaseOrderReceipt);
         });
       }
       if (step.transactionType === "IR" && step.sourceOrderKind === "TO") {
         await checkTransferPosting(step);
-        return operatorNetSuiteRequestPool.run(() => transferOrderReceipt(step.sourceNetSuiteId, step.payload));
+        return operatorNetSuiteRequestPool.run(() => post(step, step.payload, transferOrderReceipt));
       }
       throw unsupported(`A ${step.sourceOrderKind || "missing"} source cannot create ${step.transactionType || "this transaction"}.`);
     },
@@ -202,6 +218,7 @@ const nativePostingAdapter = createOperatorNetSuitePostingAdapter({
   transformTransferOrderToItemReceipt,
   fetchItemFulfillment: fetchItemFulfillmentFromNetSuite,
   fetchItemReceipt: fetchItemReceiptFromNetSuite,
+  postIfirRestlet: postIfirViaNetSuiteRestlet,
   checkTransferPosting: recheckTransferPosting
 });
 

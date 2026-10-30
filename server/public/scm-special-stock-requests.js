@@ -1,4 +1,6 @@
 (() => {
+  const alertSearchReady = import('/stock-request-alert-search.js?v=20261023');
+  let alertSearch;
   const mount = document.getElementById("scmStockRequestApp");
   if (!mount) return;
 
@@ -43,13 +45,15 @@
   let purchasePalletLine;
   /** @type {typeof import('./special-stock-purchase-pricing.js').specialLineSubtotal} */
   let purchaseSubtotal;
+  const poEditorReady = import('/special-stock-po-editor.js?v=20261029');
+  let poEditor, poUomField, poPackFields;
   const purchasePricingReady = import('/special-stock-purchase-pricing.js' + '?v=20260930-pallet-routing-v1');
   purchasePricingReady.then(module => { vendorDiscountReview = module.specialVendorLineDiscountReview; purchasePalletLine = module.specialPurchasePalletLine; purchaseSubtotal = module.specialLineSubtotal; });
   /** @type {typeof import('./special-stock-po-routing.js').specialPoRoutingHtml} */
   let poRoutingHtml = () => '';
   /** @type {typeof import('./special-stock-po-routing.js').specialPoRoutingPatch} */
   let poRoutingPatch;
-  const poRoutingReady = import('/special-stock-po-routing.js' + '?v=20261001-po-mini-rows-v1');
+  const poRoutingReady = import('/special-stock-po-routing.js' + '?v=20261028-child-po');
   poRoutingReady.then(module => { poRoutingHtml = module.specialPoRoutingHtml; poRoutingPatch = module.specialPoRoutingPatch; if (state.enabled) render(); });
   const formsReady = import('/special-stock-form-state.js?v=20260928-batch-v1');
   let specialDocumentActions = () => '';
@@ -149,13 +153,20 @@
         && !state.detail.salesOrderId && !state.detail.salesOrderSkipped));
   }
 
+  function supplyStatusOptions(selected) {
+    const options = [['in_stock', 'In stock'], ['low_inventory', 'Low inventory'], ['production', 'Wait For Production'], ['vendor_transfer', 'Wait for Transfer'], ['no_stock', 'No stock or ETA']];
+    if (selected === 'allocation') options.push(['allocation', 'Waiting for allocation']);
+    return options.map(([value, label]) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${label}</option>`).join('');
+  }
+
   function responseForm(line) {
     if (!canCheckStock(line)) return line.salesDecision === 'declined' && canEditSpecialCaseLines(state.detail) && canCheckStock({ ...line, salesDecision: 'pending' })
       ? `<button type="button" data-special-scm-action="revise-stock-check" data-line-id="${line.id}">Revise stock check</button>` : '';
     const pendingTransfer = isSpecialTransferEta(line) && !state.detail.salesOrderId;
-    if (line.salesDecision === 'accepted') return `<div class="stock-request-line-fields" data-special-stock-line="${line.id}" data-kind="readiness" data-line-id="${line.id}" data-transfer-pending="${pendingTransfer}">
-      <label><span>Stock readiness</span><select name="ready"><option value="false" ${!specialStockAvailable(line.supplyStatus) ? 'selected' : ''}>Not ready</option><option value="true" ${specialStockAvailable(line.supplyStatus) ? 'selected' : ''}>Ready for Arrangement</option></select></label>
-      <label data-special-eta ${specialStockAvailable(line.supplyStatus) ? 'hidden' : ''}><span>ETA *</span><input name="eta" type="date" ${specialStockAvailable(line.supplyStatus) ? 'disabled' : 'required'} value="${escapeHtml(line.availableDate || '')}" /></label><p data-special-transfer-eta ${pendingTransfer ? '' : 'hidden'}>SO placement +5 working days</p></div>`;
+    const datedReadiness = requiresSupplyEta(line.supplyStatus) || line.supplyStatus === 'allocation' || (line.supplyStatus === 'vendor_transfer' && !pendingTransfer);
+    if (line.salesDecision === 'accepted') return `<div class="stock-request-line-fields" data-special-stock-line="${line.id}" data-kind="readiness" data-line-id="${line.id}" data-transfer-pending="${pendingTransfer}" data-original-status="${escapeHtml(line.supplyStatus)}">
+      <label><span>Stock readiness</span><select name="supplyStatus">${supplyStatusOptions(line.supplyStatus)}</select></label>
+      <label data-special-eta ${datedReadiness ? '' : 'hidden'}><span>ETA *</span><input name="eta" type="date" ${datedReadiness ? 'required' : 'disabled'} value="${escapeHtml(line.availableDate || '')}" /></label><p data-special-transfer-eta ${pendingTransfer ? '' : 'hidden'}>SO placement +5 working days</p></div>`;
     const editingItem = state.editingStockLineIds.has(line.id);
     return `<div class="stock-request-form special-response-form" data-special-stock-line="${line.id}" data-kind="response" data-line-id="${line.id}">
       <div class="special-response-heading"><h4>SCM stock check</h4><button type="button" data-special-scm-action="edit-stock-line" data-line-id="${line.id}" aria-expanded="${editingItem}" aria-controls="special-scm-item-fields-${line.id}">${editingItem ? 'Hide details' : 'Edit'}</button></div>
@@ -164,7 +175,7 @@
       <div id="special-scm-item-fields-${line.id}" data-special-scm-item-fields ${editingItem ? '' : 'hidden'}>${specialLineFields(specialLineFieldValues(line), { sales: false, itemLabel: 'Item name *', showRequiredDate: false })}</div>
       <div class="stock-request-line-fields special-response-stock-row${requiresSupplyEta(line.supplyStatus) || line.supplyStatus === 'vendor_transfer' ? ' has-eta' : ''}">
       <label><span>Required date *</span><input name="requiredDate" type="date" ${line.requiredDate ? 'required' : ''} value="${escapeHtml(line.requiredDate || '')}" /></label>
-      <label><span>Supply status *</span><select name="supplyStatus"><option value="in_stock" ${line.supplyStatus === 'in_stock' ? 'selected' : ''}>In stock</option><option value="low_inventory" ${line.supplyStatus === 'low_inventory' ? 'selected' : ''}>Low inventory</option><option value="production" ${line.supplyStatus === 'production' ? 'selected' : ''}>Wait For Production</option><option value="vendor_transfer" ${line.supplyStatus === 'vendor_transfer' ? 'selected' : ''}>Wait for Transfer</option><option value="no_stock" ${line.supplyStatus === 'no_stock' ? 'selected' : ''}>No stock or ETA</option></select></label>
+      <label><span>Supply status *</span><select name="supplyStatus">${supplyStatusOptions(line.supplyStatus)}</select></label>
       <label class="stock-request-item-search"><span>Vendor *</span><input name="vendorName" data-special-scm-vendor-search data-line-id="${line.id}" required value="${escapeHtml(line.responseVendorName || state.detail.vendorName)}" /><div class="stock-request-suggestions" data-special-scm-vendor-suggestions="${line.id}"></div></label>
       <label data-special-eta ${requiresSupplyEta(line.supplyStatus) ? '' : 'hidden'}><span>ETA *</span><input name="availableDate" type="date" ${requiresSupplyEta(line.supplyStatus) ? 'required' : 'disabled'} value="${escapeHtml(line.availableDate || '')}" /></label>
       <p data-special-transfer-eta ${line.supplyStatus === 'vendor_transfer' ? '' : 'hidden'}>ETA: SO placement +5 working days</p>
@@ -222,20 +233,23 @@
     const purchaseLines = independentPurchase && detail.vendorDiscountReview?.mode !== 'per_line'
       ? (/** @type {any[]} */ (detail.lines || [])).filter(line => line.salesDecision === 'accepted').map(line => ({
         caseLineId: line.id, itemId: 2055, ancillary: false, description: specialItemDescription(line),
-        quantity: line.quantity, uom: line.uom, unitPurchaseCost: line.unitPurchaseCost
+        quantity: line.quantity, uom: line.uom, unitPurchaseCost: line.unitPurchaseCost,
+        palletQty:line.palletQty,sectionQty:line.sectionQty,layerQty:line.layerQty,pieceQty:line.pieceQty
       })) : [...detail.purchaseOrderLines];
     const pallet = purchaseLines.find(line => line.itemId === 1784);
     const palletQuantity = pallet?.quantity ?? detail.vendorDiscountReview?.pallet?.quantity ?? detail.palletTotal ?? 0;
-    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : (independentPurchase || detail.localAdjustedAt) ? 'Review the request materials and vendor costs below to create a standalone NetSuite PO. The linked SO stays unchanged.' : 'The reviewed quantity, UOM and description will update the SO first, then create a standalone NetSuite PO for this request. Sales prices remain unchanged.'}</p>
+    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : 'Review the items, quantities and vendor costs to create an independent NetSuite PO. These changes and added items apply only to the PO; the SO stays unchanged.'}</p>
       <form data-special-po-form><fieldset ${retry ? 'disabled' : ''} style="border:0;padding:0">
       ${purchaseLines.filter(line => !line.ancillary).map(line => `<article class="stock-request-line" data-special-po-line="${line.caseLineId}"><strong>MBBS-Special</strong><div class="stock-request-line-fields">
         <label class="stock-request-wide"><span>Order description *</span><input name="description" required value="${escapeHtml(line.description)}" /></label>
         <div class="special-po-pricing-row"><label><span>Quantity *</span><input name="quantity" type="number" min="0.000001" step="any" required value="${escapeHtml(line.quantity)}" /></label>
-        <label><span>UOM *</span><input name="uom" required value="${escapeHtml(line.uom)}" /></label>
+        ${poUomField(line)}
         <label><span>Unit cost ($) *</span><input name="unitPurchaseCost" type="number" min="0" step="any" required value="${escapeHtml(detail.vendorDiscountReview?.lines?.find(review => review.caseLineId === line.caseLineId)?.grossUnitCost ?? line.unitPurchaseCost ?? '')}" /></label>
         <label><span>Vendor discount % *</span><input name="vendorDiscountPercent" type="number" min="0" max="100" step="0.0001" required placeholder="Enter 0 if none" value="${escapeHtml(detail.vendorDiscountReview?.mode === 'per_line' ? detail.vendorDiscountReview.lines.find(review => review.caseLineId === line.caseLineId)?.vendorDiscountPercent ?? '' : '')}" /></label>
-        </div></div><p data-special-vendor-line-total></p></article>`).join('')}
+        </div></div>${poPackFields(detail.vendorDiscountReview?.independent ? line : {...line,
+          ...Object.fromEntries(['palletQty','sectionQty','layerQty','pieceQty'].map(field => [field,line[field] ?? detail.lines.find(item=>item.id===line.caseLineId)?.[field]]))})}<p data-special-vendor-line-total></p></article>`).join('')}
       <p>Enter unit cost before discount and confirm the vendor discount for each material. NetSuite will show one combined vendor discount.</p>
+      ${poEditor.extrasHtml(detail)}
       <article class="stock-request-line"><strong>PALLET</strong><div class="stock-request-line-fields">
         <label><span>PALLET quantity (EACH) *</span><input name="purchasePalletQuantity" type="number" min="0" max="1000000000" step="1" required value="${escapeHtml(palletQuantity)}" /><small>0 omits the PALLET line from the PO.</small></label>
         <label><span>PALLET purchase cost ($ / EACH)</span><input name="purchasePalletCost" type="number" min="0" max="1000000000" step="0.000001" ${Number(palletQuantity) > 0 ? 'required' : ''} value="${escapeHtml(pallet?.unitPurchaseCost ?? detail.vendorDiscountReview?.pallet?.unitPurchaseCost ?? '')}" /><small>Review the vendor cost separately from the SO selling price.</small></label>
@@ -277,36 +291,43 @@
       return;
     }
     if (!detailOnly || !window.StockRequestView?.renderDetail(mount, detail(), state.detail?.id)) {
-    mount.innerHTML = `${header()}<section class="stock-request-page">${window.MBBSStockRequestTabs?.html() || `<div class="stock-request-tabs"><button aria-selected="true" type="button">Special</button><button data-special-scm-action="regular" type="button">Regular</button></div>`}<div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-special-scm-search value="${escapeHtml(state.search)}" placeholder="Search case, customer, vendor, SO, PO, or item" />${yardFilterHtml(state.yards, state.storeLocationIds)}${vendorFilterHtml(state.vendors, state.vendorNames)}${stageFilterHtml(state.stages, "data-special-scm-stage")}<button data-special-scm-action="refresh" type="button">Refresh</button></div></div><div class="stock-request-feedback">${specialClosureQueueAlert(state.requests)}${state.notice ? `<div class="stock-request-notice">${escapeHtml(state.notice)}</div>` : ""}${state.error ? `<div class="stock-request-notice stock-request-error">${escapeHtml(state.error)}</div>` : ""}</div><div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${list()}</aside><section class="stock-request-panel stock-request-detail">${detail()}</section></div></section>`;
+    mount.innerHTML = `${header()}<section class="stock-request-page">${window.MBBSStockRequestTabs?.html() || `<div class="stock-request-tabs"><button aria-selected="true" type="button">Special</button><button data-special-scm-action="regular" type="button">Regular</button></div>`}<div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-special-scm-search type="search" value="${escapeHtml(state.search)}" placeholder="Search case, customer, vendor, SO, PO, or item" />${yardFilterHtml(state.yards, state.storeLocationIds)}${vendorFilterHtml(state.vendors, state.vendorNames)}${stageFilterHtml(state.stages, "data-special-scm-stage")}<button data-special-scm-action="refresh" type="button">Refresh</button></div></div><div class="stock-request-feedback">${specialClosureQueueAlert(state.requests)}${state.notice ? `<div class="stock-request-notice">${escapeHtml(state.notice)}</div>` : ""}${state.error ? `<div class="stock-request-notice stock-request-error">${escapeHtml(state.error)}</div>` : ""}</div><div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${list()}</aside><section class="stock-request-panel stock-request-detail">${detail()}</section></div></section>`;
     }
     restoreTabFocus?.();
     mount.querySelector('.stock-request-page')?.classList.add('special-stock-page');
     restoreSpecialForms?.(mount, state.formDrafts);
+    poEditor?.refresh();
     for (const form of mount.querySelectorAll('[data-special-stock-line]')) updateEtaVisibility(form);
     updatePurchaseTotals();
     busyUI?.render();
     window.StockRequestConversation?.watchQueue(mount, {url:`/api/scm/special-stock-requests?${queueKey()}`, requests:state.requests,
-      active, read:api, error:()=>updates?.changed(),
+      active, read:(path,options)=>(alertSearch || {load:api}).load(path,options), error:()=>updates?.changed(),
       accept:requests=>{state.requests=requests; const host=mount.querySelector('.stock-request-list'); if(host)host.innerHTML=list();}});
     window.StockRequestConversation?.render(mount, state.detail, 'scm', {onWorkflowUpdated:()=>load({force:true})});
     restoreScroll?.();
     void loadPoRouting();
     updates?.paint();
+    alertSearch?.paint(mount);
   }
 
   async function loadPoRouting(force = false) {
     const detail = state.detail, ref = detail?.purchaseOrderRef;
     if (!detail?.purchaseOrderId || !ref) { state.poRouting = null; return; }
-    if (!force && state.poRouting?.ref === ref) return;
-    /** @type {{ref:string,order:any,error:string}} */
-    const entry = {ref, order:null, error:''};
+    const key = `${detail.id}:${ref}:${detail.purchaseOrderSplitId || ''}`;
+    if (!force && state.poRouting?.key === key) return;
+    const entry = {ref, key, order:null, error:'',splits:[]};
     state.poRouting = entry;
     try {
       await poRoutingReady;
-      const displayRef = detail.purchaseOrderReference || ref;
+      const choices = await api(`/api/scm/special-stock-requests/${detail.id}/purchase-order/splits`);
+      entry.splits = choices.splits || [];
+      const displayRef = detail.purchaseOrderSplitId ? detail.purchaseOrderTargetRef : detail.purchaseOrderReference || ref;
       const payload = await api(`/api/dispatch/scm/v2/purchase-orders/${encodeURIComponent(displayRef)}`);
-      if (!payload.order || String(payload.order.originalPoRef || payload.order.id) !== ref) throw new Error('The PO routing record does not match this request.');
-      const {note} = await api(`/api/scm/special-stock-requests/${detail.id}/purchase-order/note`);
+      if (!payload.order || (detail.purchaseOrderSplitId
+        ? Number(payload.order.scmSplitId)!==detail.purchaseOrderSplitId || payload.order.sourcePoRef!==ref
+        : String(payload.order.originalPoRef || payload.order.id) !== ref)) throw new Error('The PO routing record does not match this request.');
+      const {note} = detail.purchaseOrderSplitId ? {note:payload.order.scm?.notes || ''}
+        : await api(`/api/scm/special-stock-requests/${detail.id}/purchase-order/note`);
       if (typeof note !== 'string') throw new Error('The NetSuite PO Note could not be loaded.');
       entry.order = {...payload.order, netSuiteNote:note};
     } catch (error) { entry.error = error instanceof Error ? error.message : String(error); }
@@ -319,7 +340,7 @@
   const active = () => (!window.MBBSStockRequestTabs || window.MBBSStockRequestTabs.isActive('special'));
   const updates = window.StockRequestView?.create({mount,active});
   const editing = () => state.busy || (!busyUI?.remote() && state.dirty);
-  const queueKey = () => new URLSearchParams({ search: state.search, stages: state.search.trim() ? '' : state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames) }).toString();
+  const queueKey = () => { const params = new URLSearchParams({ search: state.search, stages: state.search.trim() ? '' : state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames) }); return (alertSearch?.params(params) || params).toString(); };
 
   async function initializeQueue() {
     if (queue) return;
@@ -327,7 +348,7 @@
     if (queue) return;
     queue = createSpecialQueueLoader({
       autoReload: false,
-      read: (key,signal) => api(`/api/scm/special-stock-requests?${key}`, {signal}),
+      read: (key,signal) => (alertSearch || {load:api}).load(`/api/scm/special-stock-requests?${key}`, {signal}),
       blocked: () => !active() || editing(),
       loading: value => { state.loading = value; if (value && !state.requests.length) render(); },
       error: error => { state.error = error.message; render(); },
@@ -362,7 +383,7 @@
   function selectCase(id) {
     const detail = state.requests.find(row => String(row.id) === String(id));
     if (!detail || detail.id === state.detail?.id) return;
-    state.formDrafts.clear(); state.dirty = false;
+    state.formDrafts.clear(); state.dirty = false; poEditor?.reset();
     state.revisingDeclinedLineIds.clear();
     state.editingStockLineIds.clear();
     state.poRouting = null;
@@ -377,8 +398,9 @@
 
   function updateEtaVisibility(form) {
     const status = form.querySelector('[name=supplyStatus]');
-    const relative = status ? status.value === 'vendor_transfer' : form.dataset.transferPending === 'true' && form.querySelector('[name=ready]')?.value === 'false';
-    const waiting = status ? requiresSupplyEta(status.value) : !relative && form.querySelector('[name=ready]')?.value === 'false';
+    const readiness = form.dataset.kind === 'readiness';
+    const relative = status.value === 'vendor_transfer' && (!readiness || form.dataset.originalStatus !== 'vendor_transfer' || form.dataset.transferPending === 'true');
+    const waiting = requiresSupplyEta(status.value) || (readiness && (status.value === 'allocation' || (status.value === 'vendor_transfer' && !relative)));
     const transferLabel = form.querySelector('[data-special-transfer-eta]');
     if (transferLabel) transferLabel.hidden = !relative;
     form.querySelector('.special-response-stock-row')?.classList.toggle('has-eta', waiting || relative);
@@ -388,7 +410,8 @@
       eta.querySelector('input').disabled = !waiting;
       eta.querySelector('input').required = waiting;
     }
-    if (status) form.querySelector('[name=vendorYard]').required = status.value !== 'no_stock';
+    const vendorYard = form.querySelector('[name=vendorYard]');
+    if (vendorYard) vendorYard.required = status.value !== 'no_stock';
   }
 
   function purchaseReviewLines(form) {
@@ -408,8 +431,9 @@
       const review = vendorDiscountReview(purchaseReviewLines(form));
       const pallet = purchasePalletLine(palletInput);
       const palletTotal = pallet ? purchaseSubtotal(pallet.quantity,pallet.unitPurchaseCost) : 0;
+      const extraTotal = poEditor?.totals() || 0;
       for (const line of review.lines) form.querySelector(`[data-special-po-line="${line.caseLineId}"] [data-special-vendor-line-total]`).textContent = `Vendor discount: ${money(line.discountAmount)} · Net line total: ${money(line.netTotal)}`;
-      display.textContent = `Gross purchase total: ${money(review.grossTotal + palletTotal)} · Vendor discount: ${money(review.amount)} · Net purchase total: ${money(review.netTotal + palletTotal)}${pallet ? ` · PALLET: ${money(palletTotal)}` : ''}`;
+      display.textContent = `Gross purchase total: ${money(review.grossTotal + palletTotal + extraTotal)} · Vendor discount: ${money(review.amount)} · Net purchase total: ${money(review.netTotal + palletTotal + extraTotal)}${pallet ? ` · PALLET: ${money(palletTotal)}` : ''}${extraTotal ? ` · Added items: ${money(extraTotal)}` : ''}`;
     } catch (error) {
       for (const line of form.querySelectorAll('[data-special-vendor-line-total]')) line.textContent = '';
       display.textContent = state.detail.purchaseOrderSubmissionStartedAt && state.detail.vendorDiscountReview?.mode !== 'per_line' ? `Submitted vendor discount: ${money(state.detail.vendorDiscountReview?.amount || 0)} · Original purchase costs retained for recovery.` : error.message;
@@ -465,7 +489,7 @@
       if (filter) filter.open = true;
       return;
     }
-    if (event.target.matches('[name=supplyStatus], [name=ready]')) updateEtaVisibility(event.target.closest('[data-special-stock-line]'));
+    if (event.target.matches('[name=supplyStatus]')) updateEtaVisibility(event.target.closest('[data-special-stock-line]'));
     if (event.target.closest('form')) state.dirty = true;
     rememberSpecialForm?.(state.formDrafts, event.target.closest('form'));
     if (!event.target.matches("[data-special-scm-stage]")) return;
@@ -487,7 +511,7 @@
 
   mount.addEventListener('submit', async event => {
     const form = /** @type {HTMLFormElement} */ (event.target);
-    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
+    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-split-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
     event.preventDefault();
     if (state.busy) return;
     state.busy = true; state.error = '';
@@ -508,12 +532,16 @@
           }));
           const element = /** @type {HTMLElement} */ (group);
           const line = { lineId: Number(element.dataset.specialStockLine), kind: element.dataset.kind };
-          if (line.kind === 'readiness') return { ...line, ready: fields.ready === 'true', eta: fields.eta };
+          if (line.kind === 'readiness') return { ...line, supplyStatus: fields.supplyStatus, eta: fields.eta || null };
           if (!fields.vendorId) throw new Error('Select a vendor from the suggestions for every stock check.');
           const eta = requiresSupplyEta(fields.supplyStatus) ? fields.availableDate : null;
           if (requiresSupplyEta(fields.supplyStatus) && !eta) throw new Error('Enter an ETA for stock awaiting supply.');
           return { ...fields, ...line, availableDate: eta, availabilityMode: fields.supplyStatus === 'vendor_transfer' ? 'so_placement' : eta ? 'dated' : 'no_projection' };
         });
+      } else if (form.matches('[data-special-po-split-form]')) {
+        path = 'purchase-order/link';
+        payload.purchaseOrderSplitId = values.purchaseOrderSplitId || null;
+        state.poRouting = null;
       } else if (form.matches('[data-special-po-sent-form]')) {
         path = 'purchase-order/sent-to-vendor';
       } else if (form.matches('[data-special-po-routing-form]')) {
@@ -539,6 +567,7 @@
         payload.operationId = state.detail.purchaseOrderOperationId || crypto.randomUUID();
         if (!state.detail.purchaseOrderSubmissionStartedAt) {
           payload.lines = purchaseReviewLines(form);
+          payload.extraLines = poEditor.extraLines();
           payload.pallet = purchasePalletReview(form);
           await purchasePricingReady;
           vendorDiscountReview(payload.lines);
@@ -637,6 +666,13 @@
     }
   });
 
+  mount.addEventListener('input', event => {
+    if (event.target.matches('[data-special-scm-search]') && !event.target.value) {
+      state.search = '';
+      void load({selectedId:null});
+    }
+  });
+
   window.MBBSSCMSpecialStock = {
     async open({ operator } = {}) {
       if (!busyUI) {
@@ -654,8 +690,16 @@
       ({ canEditSpecialCaseLines } = await caseEditsReady);
       ({ specialRequestPalletLine } = await palletDisplayReady);
       ({ specialFormKey, rememberSpecialForm, restoreSpecialForms, preserveSpecialScroll } = await formsReady);
+      const editorModule = await poEditorReady;
+      poUomField = editorModule.specialPurchaseUomField; poPackFields = editorModule.specialPurchasePackFields;
+      poEditor ||= editorModule.createSpecialPurchaseEditor(mount,{api,getDetail:()=>state.detail,changed:()=>{
+        state.dirty=true;rememberSpecialForm(state.formDrafts,mount.querySelector('[data-special-po-form]'));updatePurchaseTotals();
+      }});
       state.operator = operator || state.operator;
-      if (!state.detail && new URLSearchParams(location.search).get('requestRef')) state.search = new URLSearchParams(location.search).get('requestRef');
+      alertSearch ||= (await alertSearchReady).createStockAlertSearch({audience:'scm',tab:'special',state,read:api});
+      try { await alertSearch.initialize(state.operator); }
+      catch (error) { state.error = error.message; state.loading = false; render(); return; }
+      if (!state.detail && new URLSearchParams(location.search).get('requestRef')) alertSearch.focusRequest(new URLSearchParams(location.search).get('requestRef'));
       if (state.enabled !== null) { render(); if (state.enabled) await load(); return; }
       state.loading = true;
       render();

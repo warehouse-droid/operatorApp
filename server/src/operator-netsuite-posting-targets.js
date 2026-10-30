@@ -10,6 +10,7 @@ import { fetchOperatorKitSource } from './operator-netsuite-posting-kit-source.j
 import { applyVerifiedPoReceiptProgress } from "./receiving-receipt-progress.js";
 import { refreshPoReceiptAvailability } from "./operator-po-receipt-availability.js";
 import { isSqftPostingUnit } from './operator-netsuite-posting-quantity.js';
+import { getIfirQuantityPolicyEnabled } from './netsuite-ifir-posting-policy.js';
 import { receivingOrderYards, scopeReceivingOrderYard } from './receiving-yard-scope.js';
 import { fetchPickupExistingFulfillment } from './operator-pickup-existing-if-source.js';
 import { outboundOrderYards, outboundYardLocationId } from './outbound-location-domain.js';
@@ -587,7 +588,7 @@ export function createOperatorNetSuitePostingTargetResolver({
     const postingChildren = children.filter((/** @type {Record<string, any>} */ child) => !localChildren.includes(child));
     const netSuitePostingOwner = functionKey === "delivery_prep"
       && root.order_type !== "transfer_order"
-      ? "driver_completion"
+      ? (root.order_type === "sales_order" ? "sales_load_background" : "driver_completion")
       : ((functionKey === "delivery_prep" || functionKey === "receiving") && root.order_type === "transfer_order")
       ? "transfer_background"
       : "operator";
@@ -648,9 +649,9 @@ export function createOperatorNetSuitePostingTargetResolver({
  * SQL selection is intentionally centralized so SO/PO/TO lineage and line
  * offsets cannot diverge across separate production adapters.
  *
- * @param {{query: Function, fetchLiveSource?: Function, fetchKitSource?: Function, fetchPickupSource?: Function, fetchPoReceiptLines?: Function, useStoredOrderLines?: boolean}} dependencies
+ * @param {{query: Function, fetchLiveSource?: Function, fetchKitSource?: Function, fetchPickupSource?: Function, fetchPoReceiptLines?: Function, useStoredOrderLines?: boolean, deferSqftQuantityCheck?: ()=>Promise<boolean>}} dependencies
  */
-export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery, fetchLiveSource, fetchKitSource, fetchPickupSource, fetchPoReceiptLines, useStoredOrderLines = false }) {
+export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuery, fetchLiveSource, fetchKitSource, fetchPickupSource, fetchPoReceiptLines, useStoredOrderLines = false, deferSqftQuantityCheck = async () => false }) {
   // eslint-disable-next-line complexity
   return async function resolveRealSourceFromDatabase(/** @type {Record<string, any>} */ order, /** @type {{functionKey: string, selectedItems?: Record<string, any>[]}} */ { functionKey, selectedItems }) {
   const orderType = String(order?.order_type || "");
@@ -810,8 +811,14 @@ export function createOperatorNetSuitePostingRealSourceResolver({ query: runQuer
       ? refreshPoReceiptAvailability(storedLines, await fetchPoReceiptLines(sourceNetSuiteId)) : storedLines;
     if (sourceOrderKind === 'SO' && availableLines.some(line => isSqftPostingUnit(line.salesUom))
         && typeof fetchLiveSource === 'function') {
-      availableLines = refreshSqftPostingAvailability(availableLines,
-        await fetchLiveSource({ sourceOrderKind, sourceNetSuiteId, functionKey }));
+      if (await deferSqftQuantityCheck()) {
+        availableLines = availableLines.map(line => isSqftPostingUnit(line.salesUom)
+          ? { ...line, orderedQuantity: null, completedQuantity: null, remainingQuantity: null, quantityCheckDeferred: true }
+          : line);
+      } else {
+        availableLines = refreshSqftPostingAvailability(availableLines,
+          await fetchLiveSource({ sourceOrderKind, sourceNetSuiteId, functionKey }));
+      }
     }
     return { sourceOrderKind, sourceNetSuiteId, sourceOrderRef, nonInventoryLines,
       postingStrategy: STORED_ORDER_LINE_STRATEGY,
@@ -934,6 +941,7 @@ const resolveRealSourceFromDatabase = createOperatorNetSuitePostingRealSourceRes
   query,
   fetchLiveSource: fetchLiveSourceFromNetSuite,
   fetchKitSource: fetchOperatorKitSource,
+  deferSqftQuantityCheck: getIfirQuantityPolicyEnabled,
   fetchPickupSource: fetchPickupExistingFulfillment,
   fetchPoReceiptLines: (/** @type {number} */ sourceId) => fetchOperatorNetSuiteSourceItemLinesFromNetSuite("PO", sourceId),
   useStoredOrderLines: config.netsuite.operatorStoredOrderLinePosting

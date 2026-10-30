@@ -30,6 +30,7 @@ services:
       - $server_root/src:/app/src:ro
       - $server_root/test:/app/test:ro
       - $server_root/package.json:/app/package.json:ro
+      - $server_root/.env.example:/app/.env.example:ro
       - $server_root/public:/app/public:ro
       - $server_root/artifacts/ifir-posting-restlet-20261021:/app/test-artifacts/ifir-response
       - ${IFIR_RESTLET_SOURCE:-$server_root/netsuite-ifir-posting-restlet.js}:/app/netsuite-ifir-posting-restlet.js:ro

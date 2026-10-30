@@ -1,0 +1,803 @@
+{
+  "command": {
+    "id": "537ee8b8-2967-4f52-a992-590bc4336837",
+    "inputHash": "03ed74c080dce3f42accef077cede70125073fc46f410d12ae4e3c509f2f6eba",
+    "status": "attention",
+    "functionKey": "receiving",
+    "transactionType": "IR",
+    "canonicalLocationId": 1,
+    "inputSnapshot": {
+      "steps": [
+        {
+          "payload": {
+            "item": {
+              "items": [
+                {
+                  "location": 1,
+                  "quantity": 56,
+                  "orderLine": 1,
+                  "custcol_lyr": 0,
+                  "custcol_pcs": 0,
+                  "custcol_plt": 1,
+                  "custcol_sec": 0,
+                  "itemReceive": true
+                },
+                {
+                  "location": 1,
+                  "quantity": 192,
+                  "orderLine": 2,
+                  "custcol_lyr": 0,
+                  "custcol_pcs": 0,
+                  "custcol_plt": 6,
+                  "custcol_sec": 0,
+                  "itemReceive": true
+                },
+                {
+                  "location": 1,
+                  "quantity": 728,
+                  "orderLine": 3,
+                  "custcol_lyr": 0,
+                  "custcol_pcs": 0,
+                  "custcol_plt": 13,
+                  "custcol_sec": 0,
+                  "itemReceive": true
+                },
+                {
+                  "location": 1,
+                  "quantity": 168,
+                  "orderLine": 4,
+                  "custcol_lyr": 0,
+                  "custcol_pcs": 0,
+                  "custcol_plt": 3,
+                  "custcol_sec": 0,
+                  "itemReceive": true
+                },
+                {
+                  "location": 1,
+                  "quantity": 23,
+                  "orderLine": 19,
+                  "custcol_lyr": 0,
+                  "custcol_pcs": 0,
+                  "custcol_plt": 0,
+                  "custcol_sec": 0,
+                  "itemReceive": true
+                }
+              ]
+            },
+            "memo": "POB04042",
+            "custbody9": "POB04042",
+            "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1"
+          },
+          "stepIndex": 1,
+          "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1",
+          "payloadHash": "5955b9007392d72ff695b449ebbf634b2c64afb127609c4c65acbaabe6d008c9",
+          "lineSnapshot": [
+            {
+              "location": 1,
+              "quantity": 56,
+              "salesUom": "EACH",
+              "orderLine": 1,
+              "localLineId": "540007",
+              "localOrderKey": "receiving:purchase_order:1059322",
+              "sourceLineKey": "5128086",
+              "packQuantities": {
+                "layers": 0,
+                "pieces": 0,
+                "pallets": 1,
+                "sections": 0
+              }
+            },
+            {
+              "location": 1,
+              "quantity": 192,
+              "salesUom": "EACH",
+              "orderLine": 2,
+              "localLineId": "540008",
+              "localOrderKey": "receiving:purchase_order:1059322",
+              "sourceLineKey": "5128087",
+              "packQuantities": {
+                "layers": 0,
+                "pieces": 0,
+                "pallets": 6,
+                "sections": 0
+              }
+            },
+            {
+              "location": 1,
+              "quantity": 728,
+              "salesUom": "EACH",
+              "orderLine": 3,
+              "localLineId": "540009",
+              "localOrderKey": "receiving:purchase_order:1059322",
+              "sourceLineKey": "5128088",
+              "packQuantities": {
+                "layers": 0,
+                "pieces": 0,
+                "pallets": 13,
+                "sections": 0
+              }
+            },
+            {
+              "location": 1,
+              "quantity": 168,
+              "salesUom": "EACH",
+              "orderLine": 4,
+              "localLineId": "540010",
+              "localOrderKey": "receiving:purchase_order:1059322",
+              "sourceLineKey": "5128089",
+              "packQuantities": {
+                "layers": 0,
+                "pieces": 0,
+                "pallets": 3,
+                "sections": 0
+              }
+            },
+            {
+              "location": 1,
+              "quantity": 23,
+              "salesUom": "EACH",
+              "orderLine": 19,
+              "localLineId": "545315",
+              "localOrderKey": "receiving:purchase_order:1059322",
+              "sourceLineKey": "5138328",
+              "packQuantities": {
+                "layers": 0,
+                "pieces": 0,
+                "pallets": 0,
+                "sections": 0
+              }
+            }
+          ],
+          "sourceOrderRef": "POB04042",
+          "sourceOrderKind": "PO",
+          "transactionType": "IR",
+          "sourceNetSuiteId": 1059322
+        }
+      ],
+      "claims": [
+        "receiving:purchase_order:1059322",
+        "source:IR:PO:1059322"
+      ],
+      "policy": {
+        "gateKey": "operator_netsuite_receiving_ir_3445",
+        "revision": 4,
+        "yardCode": "3445",
+        "effective": true,
+        "locationId": 1,
+        "functionKey": "receiving",
+        "transactionType": "IR"
+      },
+      "requestId": "537ee8b8-2967-4f52-a992-590bc4336837",
+      "functionKey": "receiving",
+      "localPayload": {
+        "item": {
+          "items": [
+            {
+              "location": 1,
+              "quantity": 56,
+              "orderLine": 5128086,
+              "itemReceive": true
+            },
+            {
+              "location": 1,
+              "quantity": 192,
+              "orderLine": 5128087,
+              "itemReceive": true
+            },
+            {
+              "location": 1,
+              "quantity": 728,
+              "orderLine": 5128088,
+              "itemReceive": true
+            },
+            {
+              "location": 1,
+              "quantity": 168,
+              "orderLine": 5128089,
+              "itemReceive": true
+            },
+            {
+              "location": 1,
+              "quantity": 23,
+              "orderLine": 5138328,
+              "itemReceive": true
+            }
+          ]
+        }
+      },
+      "localOperation": {
+        "kind": "receiving_receipt",
+        "orderId": "1059322",
+        "orderType": "purchase_order"
+      },
+      "postingStrategy": "stored_order_line_v1",
+      "transactionType": "IR",
+      "lineReconciliation": {
+        "lines": [
+          {
+            "salesUom": "EACH",
+            "orderLine": 1,
+            "localLines": [
+              {
+                "quantity": 56,
+                "localLineId": "540007",
+                "localOrderKey": "receiving:purchase_order:1059322",
+                "sourceLineKey": "5128086"
+              }
+            ],
+            "authoritative": false,
+            "sourceLineKey": "5128086",
+            "postedQuantity": 56,
+            "sourceOrderRef": "POB04042",
+            "orderedQuantity": 56,
+            "sourceOrderKind": "PO",
+            "sourceNetSuiteId": 1059322,
+            "completedQuantity": 0,
+            "requestedQuantity": 56,
+            "sourceLineAliases": [
+              "5128086"
+            ],
+            "linkedTransactions": [],
+            "reconciledQuantity": 0,
+            "remainingQuantityAfter": null,
+            "remainingQuantityBefore": 56
+          },
+          {
+            "salesUom": "EACH",
+            "orderLine": 2,
+            "localLines": [
+              {
+                "quantity": 192,
+                "localLineId": "540008",
+                "localOrderKey": "receiving:purchase_order:1059322",
+                "sourceLineKey": "5128087"
+              }
+            ],
+            "authoritative": false,
+            "sourceLineKey": "5128087",
+            "postedQuantity": 192,
+            "sourceOrderRef": "POB04042",
+            "orderedQuantity": 192,
+            "sourceOrderKind": "PO",
+            "sourceNetSuiteId": 1059322,
+            "completedQuantity": 0,
+            "requestedQuantity": 192,
+            "sourceLineAliases": [
+              "5128087"
+            ],
+            "linkedTransactions": [],
+            "reconciledQuantity": 0,
+            "remainingQuantityAfter": null,
+            "remainingQuantityBefore": 192
+          },
+          {
+            "salesUom": "EACH",
+            "orderLine": 3,
+            "localLines": [
+              {
+                "quantity": 728,
+                "localLineId": "540009",
+                "localOrderKey": "receiving:purchase_order:1059322",
+                "sourceLineKey": "5128088"
+              }
+            ],
+            "authoritative": false,
+            "sourceLineKey": "5128088",
+            "postedQuantity": 728,
+            "sourceOrderRef": "POB04042",
+            "orderedQuantity": 728,
+            "sourceOrderKind": "PO",
+            "sourceNetSuiteId": 1059322,
+            "completedQuantity": 0,
+            "requestedQuantity": 728,
+            "sourceLineAliases": [
+              "5128088"
+            ],
+            "linkedTransactions": [],
+            "reconciledQuantity": 0,
+            "remainingQuantityAfter": null,
+            "remainingQuantityBefore": 728
+          },
+          {
+            "salesUom": "EACH",
+            "orderLine": 4,
+            "localLines": [
+              {
+                "quantity": 168,
+                "localLineId": "540010",
+                "localOrderKey": "receiving:purchase_order:1059322",
+                "sourceLineKey": "5128089"
+              }
+            ],
+            "authoritative": false,
+            "sourceLineKey": "5128089",
+            "postedQuantity": 168,
+            "sourceOrderRef": "POB04042",
+            "orderedQuantity": 168,
+            "sourceOrderKind": "PO",
+            "sourceNetSuiteId": 1059322,
+            "completedQuantity": 0,
+            "requestedQuantity": 168,
+            "sourceLineAliases": [
+              "5128089"
+            ],
+            "linkedTransactions": [],
+            "reconciledQuantity": 0,
+            "remainingQuantityAfter": null,
+            "remainingQuantityBefore": 168
+          },
+          {
+            "salesUom": "EACH",
+            "orderLine": 19,
+            "localLines": [
+              {
+                "quantity": 23,
+                "localLineId": "545315",
+                "localOrderKey": "receiving:purchase_order:1059322",
+                "sourceLineKey": "5138328"
+              }
+            ],
+            "authoritative": false,
+            "sourceLineKey": "5138328",
+            "postedQuantity": 23,
+            "sourceOrderRef": "POB04042",
+            "orderedQuantity": 23,
+            "sourceOrderKind": "PO",
+            "sourceNetSuiteId": 1059322,
+            "completedQuantity": 0,
+            "requestedQuantity": 23,
+            "sourceLineAliases": [
+              "5138328"
+            ],
+            "linkedTransactions": [],
+            "reconciledQuantity": 0,
+            "remainingQuantityAfter": null,
+            "remainingQuantityBefore": 23
+          }
+        ],
+        "schemaVersion": "operator-netsuite-line-reconciliation-v1"
+      }
+    },
+    "photoRefs": [
+      "r2://test-only/one.jpg",
+      "r2://test-only/two.jpg"
+    ],
+    "steps": [
+      {
+        "id": 2013,
+        "commandId": "537ee8b8-2967-4f52-a992-590bc4336837",
+        "stepIndex": 1,
+        "sourceOrderKind": "PO",
+        "sourceNetSuiteId": 1059322,
+        "sourceOrderRef": "POB04042",
+        "transactionType": "IR",
+        "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1",
+        "payloadHash": "5955b9007392d72ff695b449ebbf634b2c64afb127609c4c65acbaabe6d008c9",
+        "payload": {
+          "item": {
+            "items": [
+              {
+                "location": 1,
+                "quantity": 56,
+                "orderLine": 1,
+                "custcol_lyr": 0,
+                "custcol_pcs": 0,
+                "custcol_plt": 1,
+                "custcol_sec": 0,
+                "itemReceive": true
+              },
+              {
+                "location": 1,
+                "quantity": 192,
+                "orderLine": 2,
+                "custcol_lyr": 0,
+                "custcol_pcs": 0,
+                "custcol_plt": 6,
+                "custcol_sec": 0,
+                "itemReceive": true
+              },
+              {
+                "location": 1,
+                "quantity": 728,
+                "orderLine": 3,
+                "custcol_lyr": 0,
+                "custcol_pcs": 0,
+                "custcol_plt": 13,
+                "custcol_sec": 0,
+                "itemReceive": true
+              },
+              {
+                "location": 1,
+                "quantity": 168,
+                "orderLine": 4,
+                "custcol_lyr": 0,
+                "custcol_pcs": 0,
+                "custcol_plt": 3,
+                "custcol_sec": 0,
+                "itemReceive": true
+              },
+              {
+                "location": 1,
+                "quantity": 23,
+                "orderLine": 19,
+                "custcol_lyr": 0,
+                "custcol_pcs": 0,
+                "custcol_plt": 0,
+                "custcol_sec": 0,
+                "itemReceive": true
+              }
+            ]
+          },
+          "memo": "POB04042",
+          "custbody9": "POB04042",
+          "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1"
+        },
+        "lineSnapshot": [
+          {
+            "location": 1,
+            "quantity": 56,
+            "salesUom": "EACH",
+            "orderLine": 1,
+            "localLineId": "540007",
+            "localOrderKey": "receiving:purchase_order:1059322",
+            "sourceLineKey": "5128086",
+            "packQuantities": {
+              "layers": 0,
+              "pieces": 0,
+              "pallets": 1,
+              "sections": 0
+            }
+          },
+          {
+            "location": 1,
+            "quantity": 192,
+            "salesUom": "EACH",
+            "orderLine": 2,
+            "localLineId": "540008",
+            "localOrderKey": "receiving:purchase_order:1059322",
+            "sourceLineKey": "5128087",
+            "packQuantities": {
+              "layers": 0,
+              "pieces": 0,
+              "pallets": 6,
+              "sections": 0
+            }
+          },
+          {
+            "location": 1,
+            "quantity": 728,
+            "salesUom": "EACH",
+            "orderLine": 3,
+            "localLineId": "540009",
+            "localOrderKey": "receiving:purchase_order:1059322",
+            "sourceLineKey": "5128088",
+            "packQuantities": {
+              "layers": 0,
+              "pieces": 0,
+              "pallets": 13,
+              "sections": 0
+            }
+          },
+          {
+            "location": 1,
+            "quantity": 168,
+            "salesUom": "EACH",
+            "orderLine": 4,
+            "localLineId": "540010",
+            "localOrderKey": "receiving:purchase_order:1059322",
+            "sourceLineKey": "5128089",
+            "packQuantities": {
+              "layers": 0,
+              "pieces": 0,
+              "pallets": 3,
+              "sections": 0
+            }
+          },
+          {
+            "location": 1,
+            "quantity": 23,
+            "salesUom": "EACH",
+            "orderLine": 19,
+            "localLineId": "545315",
+            "localOrderKey": "receiving:purchase_order:1059322",
+            "sourceLineKey": "5138328",
+            "packQuantities": {
+              "layers": 0,
+              "pieces": 0,
+              "pallets": 0,
+              "sections": 0
+            }
+          }
+        ],
+        "baselineTransactionIds": [],
+        "status": "uncertain",
+        "attemptCount": 1,
+        "netSuiteTransactionId": null,
+        "netSuiteTransactionRef": null,
+        "response": {
+          "observedTransaction": {
+            "id": 1071915,
+            "tranId": "IR15183",
+            "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1"
+          }
+        },
+        "fulfillmentParts": [],
+        "lastError": "The recovered NetSuite transaction contains an unexpected positive line.",
+        "createdAt": "2026-10-19T11:10:26.915Z",
+        "updatedAt": "2026-10-19T11:11:00.362Z",
+        "postedAt": null
+      }
+    ]
+  },
+  "receipt": {
+    "id": "1071915",
+    "tranId": "IR15183",
+    "externalId": "MBBS-OP-537ee8b8-2967-4f52-a992-590bc4336837-1",
+    "createdFrom": {
+      "id": "1059322"
+    },
+    "item": {
+      "items": [
+        {
+          "generateAccruals": true,
+          "item": {
+            "id": "4041"
+          },
+          "itemFxAmount": 417.2,
+          "itemReceive": true,
+          "itemType": "InvtPart",
+          "itemUnitPrice": 7.45,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 1,
+          "quantity": 56,
+          "unitsDisplay": "EACH"
+        },
+        {
+          "generateAccruals": true,
+          "item": {
+            "id": "2058"
+          },
+          "itemFxAmount": 2544,
+          "itemReceive": true,
+          "itemType": "InvtPart",
+          "itemUnitPrice": 13.25,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 2,
+          "quantity": 192,
+          "unitsDisplay": "EACH"
+        },
+        {
+          "generateAccruals": true,
+          "item": {
+            "id": "609"
+          },
+          "itemFxAmount": 3559.92,
+          "itemReceive": true,
+          "itemType": "InvtPart",
+          "itemUnitPrice": 4.89,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 3,
+          "quantity": 728,
+          "unitsDisplay": "EACH"
+        },
+        {
+          "generateAccruals": true,
+          "item": {
+            "id": "609"
+          },
+          "itemFxAmount": 0,
+          "itemReceive": true,
+          "itemType": "InvtPart",
+          "itemUnitPrice": 0,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 4,
+          "quantity": 168,
+          "unitsDisplay": "EACH"
+        },
+        {
+          "generateAccruals": true,
+          "item": {
+            "id": "1784"
+          },
+          "itemFxAmount": 575,
+          "itemReceive": true,
+          "itemType": "InvtPart",
+          "itemUnitPrice": 25,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 19,
+          "quantity": 23,
+          "unitsDisplay": "EACH"
+        },
+        {
+          "generateAccruals": false,
+          "item": {
+            "id": "3025"
+          },
+          "itemFxAmount": 130.42,
+          "itemReceive": true,
+          "itemSubtype": "Purchase",
+          "itemType": "OthCharge",
+          "itemUnitPrice": 130.42,
+          "location": {
+            "id": "1"
+          },
+          "orderLine": 22,
+          "quantity": 1
+        }
+      ]
+    }
+  },
+  "source": {
+    "id": 1059322,
+    "tranid": "POB04042",
+    "status": "F",
+    "lines": [
+      {
+        "lineId": 5128086,
+        "restLineId": 1,
+        "itemId": 4041,
+        "itemName": "Sakrete RAPID POST 30KG",
+        "itemType": "InvtPart",
+        "itemTypeText": "Inventory Item",
+        "description": "Sakrete RAPID POST 30KG  \n56bags/plt  \n(624822)",
+        "quantity": 56,
+        "receivedQuantity": 56,
+        "rate": 7.45,
+        "amount": 417.2,
+        "closed": false,
+        "unit": "EACH",
+        "itemWeight": null,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 1,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": 56,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": 1
+      },
+      {
+        "lineId": 5128087,
+        "restLineId": 2,
+        "itemId": 2058,
+        "itemName": "Sakrete Stone Veneer Mortar 20KG",
+        "itemType": "InvtPart",
+        "itemTypeText": "Inventory Item",
+        "description": "Sakrete Stone Veneer Mortar 20KG\n32bags/plt \n(645291)",
+        "quantity": 192,
+        "receivedQuantity": 192,
+        "rate": 13.25,
+        "amount": 2544,
+        "closed": false,
+        "unit": "EACH",
+        "itemWeight": null,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 6,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": 32,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": 1
+      },
+      {
+        "lineId": 5128088,
+        "restLineId": 3,
+        "itemId": 609,
+        "itemName": "Sakrete Concrete Mix 30KG",
+        "itemType": "InvtPart",
+        "itemTypeText": "Inventory Item",
+        "description": "Sakrete Concrete Mix 30KG \n56bags/plt \n(645071)",
+        "quantity": 728,
+        "receivedQuantity": 728,
+        "rate": 4.89,
+        "amount": 3559.92,
+        "closed": false,
+        "unit": "EACH",
+        "itemWeight": null,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 13,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": 56,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": 1
+      },
+      {
+        "lineId": 5128089,
+        "restLineId": 4,
+        "itemId": 609,
+        "itemName": "Sakrete Concrete Mix 30KG",
+        "itemType": "InvtPart",
+        "itemTypeText": "Inventory Item",
+        "description": "1 FREE SKID for every 5 Skid  of Concrete Mix ordered\nSakrete Concrete Mix 30KG \n56bags/plt \n(645071)",
+        "quantity": 168,
+        "receivedQuantity": 168,
+        "rate": 0,
+        "amount": 0,
+        "closed": false,
+        "unit": "EACH",
+        "itemWeight": null,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 3,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": 56,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": 1
+      },
+      {
+        "lineId": 5138328,
+        "restLineId": 19,
+        "itemId": 1784,
+        "itemName": "PALLET",
+        "itemType": "InvtPart",
+        "itemTypeText": "Inventory Item",
+        "description": "**PALLET DEPOSIT** INTERLOCK,CEMENT, CONCRETE",
+        "quantity": 23,
+        "receivedQuantity": 23,
+        "rate": 25,
+        "amount": 575,
+        "closed": false,
+        "unit": "EACH",
+        "itemWeight": 40,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 0,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": null,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": null
+      },
+      {
+        "lineId": 5138331,
+        "restLineId": 22,
+        "itemId": 3025,
+        "itemName": "SURCHARGE",
+        "itemType": "OthCharge",
+        "itemTypeText": "Other Charge",
+        "description": "Freight",
+        "quantity": 1,
+        "receivedQuantity": 1,
+        "rate": 130.42,
+        "amount": 130.42,
+        "closed": false,
+        "unit": "",
+        "itemWeight": null,
+        "locationId": 1,
+        "location": "3445",
+        "palletQuantity": 0,
+        "layerQuantity": 0,
+        "sectionQuantity": 0,
+        "pieceQuantity": 0,
+        "toPlt": null,
+        "toLyr": null,
+        "toSec": null,
+        "toPcs": null
+      }
+    ]
+  }
+}

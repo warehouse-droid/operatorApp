@@ -13,6 +13,7 @@ const MIN_INTERVAL_MINUTES = 5;
 const MAX_INTERVAL_MINUTES = 43200;
 
 const PHOTO_REFERENCE_TARGETS = [
+  { table: "repair_attachments", column: "storage_key", kind: "text" },
   { table: "operator_background_photos", column: "r2_ref", kind: "text" },
   { table: "operator_load_records", column: "photo_data_url", kind: "text" },
   { table: "operator_load_records", column: "photo_data_urls", kind: "jsonb" },

@@ -17,12 +17,14 @@ async function readAlerts(context, requestId=null, lock=false) {
       COALESCE(to_char(po.dispatch_ref_updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),'') AS reference_updated_at
     FROM sales_stock_requests request
     JOIN sales_special_stock_cases special ON special.request_id=request.id
-    JOIN purchase_orders po ON po.netsuite_id=special.purchase_order_netsuite_id
+    JOIN special_stock_purchase_targets target ON target.request_id=special.request_id
+    JOIN purchase_orders po ON po.netsuite_id=target.po_id
     JOIN special_stock_workflow_stages workflow ON workflow.request_id=request.id
     WHERE special.close_status='active' AND request.status<>'cancelled'
       AND workflow.stage NOT IN ('closed','completed') AND NOT special.purchase_order_skipped
       AND btrim(COALESCE(po.dispatch_ref,''))<>''
-      AND NOT EXISTS (SELECT 1 FROM dispatch_scm_po_splits split WHERE split.split_po_id=po.netsuite_id)
+      AND (special.purchase_order_split_id IS NOT NULL
+        OR NOT EXISTS (SELECT 1 FROM dispatch_scm_po_splits split WHERE split.split_po_id=po.netsuite_id))
       AND ($1::bigint IS NULL OR request.id=$1)
       AND (($2='sales' AND special.fulfillment_method IN ('vendor_pickup','yard_pickup','mbt_delivery') AND request.requested_by=$3
         AND request.destination_location_id=ANY($4::bigint[]))

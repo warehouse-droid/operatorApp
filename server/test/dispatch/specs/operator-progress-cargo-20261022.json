@@ -1,0 +1,21 @@
+{
+  "tier": 2,
+  "specApproval": "not obtained (autonomous run)",
+  "problem": "SOA10414 was unpacked, but imported loaded quantities on Delivery Charge and Discount rows make the split preview report Loaded.",
+  "behaviors": [
+    "An Open order with unpacked cargo and positive accounting-line loaded or packed values remains Open.",
+    "Accounting-only types OthCharge, Discount, Markup, Subtotal, Description, Payment and Service do not establish physical progress.",
+    "Delivery Charge and Sales Credit rows follow the existing Delivery exclusion even when classified NonInvtPart.",
+    "Inventory, non-inventory cargo, unknown item types and historical inactive cargo retain loaded and packed protection.",
+    "Explicit packed or loaded header status and loaded consolidation evidence continue to block splitting.",
+    "The preview and progress reads preserve every order quantity, item, confirmation and history record."
+  ],
+  "failureModel": {
+    "falseLoaded": "Regression and property tests inject positive accounting values into otherwise Open orders.",
+    "lostCargoProtection": "Loaded, packed, confirmed, inactive, missing-type and unknown-type cargo tests plus deliberate mutants.",
+    "readSideMutation": "Database integration compares complete header and line snapshots around the preview.",
+    "unrelatedDeployment": "One-file image overlay over captured live image, with configuration and dependency identity checks and rollback."
+  },
+  "setup": "Use existing Node, fast-check, c8, ESLint and TypeScript; no new dependency, migration, production data edit or git commit. Use the disposable test runner with automatic cleanup.",
+  "scope": ["src/operator-order-progress-repository.js"]
+}

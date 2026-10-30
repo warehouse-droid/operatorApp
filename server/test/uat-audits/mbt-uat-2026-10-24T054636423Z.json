@@ -1,0 +1,126 @@
+{
+  "startedAt": "2026-10-24T05:46:36.423Z",
+  "finishedAt": "2026-10-24T05:47:01.531Z",
+  "exitCode": 1,
+  "sourceHashes": {
+    "src": "6269e726f2b1f5a2047f2ef1f2809b2e7a8d20d3c3b21b8796fa19e2e13f8234",
+    "public": "892442a12cf27207ba3465cb8e6bba761b8332a8d794d5ada77a346180a49b2f",
+    "migrations": "799bd4e6d99b9bfa64a82add14284a31d8a962dbf07213b019a079946f1291ff"
+  },
+  "sourceDrift": [],
+  "isolation": "Disposable Compose; fresh database per file; external integrations disabled",
+  "toolchain": {
+    "node": "v20.20.2",
+    "playwright": "1.62.1"
+  },
+  "tests": 30,
+  "pass": 29,
+  "fail": 1,
+  "cancelled": 0,
+  "skipped": 0,
+  "todo": 0,
+  "fileCount": 6,
+  "files": [
+    {
+      "file": "test/mbt/unit/frontdesk-pricing-adapter.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "server pricing resolves and hashes a toll-free Google route without retaining the API key",
+        "server pricing also accepts explicit origin and destination addresses for local MBBS calculation",
+        "server pricing fails closed without route authority and exposes the Ontario HST policy",
+        "the production MBT router is wired to the server-owned pricing adapter"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/mbt-bin-cancellation.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "approved -110000-cent adjustment changes the active customer total to 55000",
+        "approved 0-cent adjustment changes the active customer total to 165000",
+        "approved 10000-cent adjustment changes the active customer total to 175000",
+        "an adjustment cannot make the active total negative",
+        "signed adjustments conserve the active total or reject a negative result across 200 generated amounts",
+        "active physical-bin cards omit cancelled bins and retain the other bins"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/mbt-bin-cancellation.test.js",
+      "tests": 10,
+      "pass": 10,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cancel Bin 1, remove its 110000 cents, preserve Bin 2 and confirmed evidence, and replay once",
+        "cancellation refuses driver-started without changing any bin or price",
+        "cancellation refuses step-started without changing any bin or price",
+        "cancellation refuses assigned-load without changing any bin or price",
+        "cancellation refuses wrong-line-charge without changing any bin or price",
+        "cancellation refuses wrong-revision without changing any bin or price",
+        "cancellation refuses wrong-amount without changing any bin or price",
+        "a late audit failure rolls back the cancellation, pricing adjustment, draft and driver steps",
+        "simultaneous cancellation commands deduct the charge once",
+        "invalid and duplicate adjustment inputs cannot change the contract"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dump-charge.test.js",
+      "tests": 5,
+      "pass": 4,
+      "fail": 1,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "dump charge: DUMPGARBAGE/cash/2.250000 TONNE waits for completed collection and replay stays single",
+        "dump charge: GARBAGE/card/2.250000 TONNE waits for completed collection and replay stays single",
+        "dump charge: SOIL/cash/2.250000 TONNE waits for completed collection and replay stays single",
+        "dump charge: DUMP_GARBAGE/cash/2.250000 KG waits for completed collection and replay stays single",
+        "dump charge: DUMPGARBAGE/cash/2.500000 TONNE waits for completed collection and replay stays single",
+        "failing tests:",
+        "dump charge: DUMPGARBAGE/cash/2.500000 TONNE waits for completed collection and replay stays single"
+      ],
+      "failure": "\u2716 failing tests:\n\ntest at test/mbt/integration/bin-dump-charge.test.js:12:3\n\u2716 dump charge: DUMPGARBAGE/cash/2.500000 TONNE waits for completed collection and replay stays single (82.17247ms)\n  error: duplicate key value violates unique constraint \"mbt_materials_material_code_key\"\n      at /app/node_modules/pg-pool/index.js:45:11\n      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n      at async TestContext.<anonymous> (file:///app/test/mbt/integration/bin-dump-charge.test.js:14:5)\n      at async Test.run (node:internal/test_runner/test:797:9)\n      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {\n    length: 251,\n    severity: 'ERROR',\n    code: '23505',\n    detail: 'Key (material_code)=(DUMPGARBAGE) already exists.',\n    hint: undefined,\n    position: undefined,\n    internalPosition: undefined,\n    internalQuery: undefined,\n    where: undefined,\n    schema: 'public',\n    table: 'mbt_materials',\n    column: undefined,\n    dataType: undefined,\n    constraint: 'mbt_materials_material_code_key',\n    file: 'nbtinsert.c',\n    line: '666',\n    routine: '_bt_check_unique'\n  }\n\n"
+    },
+    {
+      "file": "test/mbt/integration/bin-uat-weight-boundaries.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "UAT WT01-WT03: 47999 lb on a 48000 lb truck saves and confirms; only excess warns",
+        "UAT WT01-WT03: 48000 lb on a 48000 lb truck saves and confirms; only excess warns",
+        "UAT WT01-WT03: 48001 lb on a 48000 lb truck saves and confirms; only excess warns",
+        "UAT WT06: overweight Load 2 does not block a 17350 lb trip on Load 4, and warning stays on Load 2"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-uat-layout-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "UAT ER09: populated Collection cards contain their content at all five tester-pack widths, before and after unlocking"
+      ]
+    }
+  ],
+  "passed": false,
+  "runtime": "/home/ubuntu/apps/operatorApp/server/deployments/bin-weight-warning-20261024/candidate"
+}

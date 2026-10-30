@@ -29,17 +29,17 @@ test.before(async()=>{
   }}});
   product=await runtime.repo.upsertScrapedProduct(1,sample);
   await runtime.repo.saveAccount(1,{label:'Fixture login',username:'fixture-user',password:'fixture-secret'},actor);
-  await query("INSERT INTO inventory_items(item_id,item_name,display_name,stock_unit,vendor,vendor_id) VALUES(88997702,'TEST-LIVE-UI',$1,'SQFT','Unilock Ltd',331) ON CONFLICT DO NOTHING",[sample.name]);
+  await query("INSERT INTO inventory_items(item_id,item_name,display_name,stock_unit,vendor,vendor_id,to_plt) VALUES(88997702,'TEST-LIVE-UI',$1,'SQFT','Unilock Ltd',331,5) ON CONFLICT DO NOTHING",[sample.name]);
   browser=await chromium.launch({args:['--no-sandbox','--disable-dev-shm-usage']});
 });
 test.after(async()=>{await fs.writeFile('test-artifacts/stock-check/lines-browser-coverage.json',JSON.stringify(coverage));await browser?.close();if(http) {http.closeAllConnections();await new Promise(resolve=>http.close(resolve));}await closeDb();});
 async function fixture(kind='special',vendorName='Unilock Ltd',exact=true) {
   if(kind==='backorder') {
-    return submitBackorderRequest({destinationLocationId:1,vendorId:331,vendorName,fulfillmentMethod:'yard_pickup',lines:[{itemId:88997702,salesQty:5,quantityMode:'direct',detailSpec:sample.sku}]},
+    return submitBackorderRequest({customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName,fulfillmentMethod:'yard_pickup',lines:[{itemId:88997702,pallets:1,quantityMode:'direct',detailSpec:sample.sku}]},
       {operatorId:actor,authorizedDestinationLocationIds:[1]});
   }
   return createSpecialStockCase({storeLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST Live Stock',vendorId:331,vendorName,fulfillmentMethod:'yard_pickup',
-    lines:[{productName:exact?sample.name:'Endura Coping',color:sample.colour,size:exact?sample.size:'',quantity:5,uom:'SQFT',rate:10,requiredDate:'2099-02-01'}]},
+    lines:[{productName:exact?sample.name:'Endura Coping',color:sample.colour,size:exact?sample.size:'',quantity:5,palletQty:1,uom:'SQFT',rate:10,requiredDate:'2099-02-01'}]},
     {operatorId:actor,authorizedStoreLocationIds:[1]});
 }
 async function pageFor(t,d,kind='special',width=1440) {

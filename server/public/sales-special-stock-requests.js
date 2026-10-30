@@ -1,4 +1,6 @@
 (() => {
+  const alertSearchReady = import('/stock-request-alert-search.js?v=20261023');
+  let alertSearch;
   const mount = document.getElementById("salesStockRequestApp");
   if (!mount) return;
 
@@ -19,7 +21,7 @@
   let syncSpecialFulfillmentForm=()=>{};
   /** @type {typeof import('./special-stock-internal-remark.js').syncSpecialInternalRemarkForm} */
   let syncSpecialInternalRemarkForm=()=>{};
-  import(new URL('/special-stock-fulfillment.js?v=20261016-delivery-recovery-v1', location.href).href).then(module=>{
+  import(new URL('/special-stock-fulfillment.js?v=20261027-planned-method-v2', location.href).href).then(module=>{
     specialFulfillmentEditor=module.specialFulfillmentEditor;syncSpecialFulfillmentForm=module.syncSpecialFulfillmentForm;
     syncSpecialInternalRemarkForm=module.syncSpecialInternalRemarkForm;
     if(state.enabled)render();
@@ -84,7 +86,7 @@
   /** @type {typeof import('./special-stock-case-status.js').specialSupplyWaitingStatus} */
   let specialSupplyWaitingStatus = () => '';
   let specialClosureStatus = () => '', canRequestSpecialClosure = () => false;
-  import(new URL('/special-stock-case-status.js?v=20261005-status-following-v1&waitingLabels=20261016', location.href).href).then(status => {
+  import(new URL('/special-stock-case-status.js?inlineSo=20261027-v1&v=20261005-status-following-v1&waitingLabels=20261016', location.href).href).then(status => {
     specialSupplyWaitingStatus = status.specialSupplyWaitingStatus;
     specialPlanningStatus = (detail, compact = false) => status.specialPlanningStatus(detail, compact, { audience: 'sales', showOrderPreviews: !compact }); specialClosureStatus = status.specialClosureStatus;
     canRequestSpecialClosure = status.canRequestSpecialClosure;
@@ -612,7 +614,7 @@
     if (!detailOnly || !window.StockRequestView?.renderDetail(mount, state.composer ? composerView() : detailView(), state.detail?.id)) {
     mount.innerHTML = `${header()}<section class="stock-request-page special-stock-page">
       <div class="stock-request-tabs"><button aria-selected="true" type="button">Special</button><button data-special-sales-action="regular" type="button">Regular</button></div>
-      <div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-special-search value="${escapeHtml(state.search)}" placeholder="Search case, customer, vendor, SO, PO, or item" />${yardFilterHtml(state.yards, state.storeLocationIds)}${vendorFilterHtml(state.vendors, state.vendorNames)}${stageFilterHtml(state.stages)}<label class="special-own-filter"><input type="checkbox" data-special-mine ${state.mine ? "checked" : ""}> My requests</label><button class="primary" data-special-sales-action="new" type="button">New Special case</button><button data-special-sales-action="refresh" type="button">Refresh</button></div></div>
+      <div class="stock-request-toolbar"><div class="stock-request-actions"><input class="stock-request-search" data-special-search type="search" value="${escapeHtml(state.search)}" placeholder="Search case, customer, vendor, SO, PO, or item" />${yardFilterHtml(state.yards, state.storeLocationIds)}${vendorFilterHtml(state.vendors, state.vendorNames)}${stageFilterHtml(state.stages)}<label class="special-own-filter"><input type="checkbox" data-special-mine ${state.mine ? "checked" : ""}> My requests</label><button class="primary" data-special-sales-action="new" type="button">New Special case</button><button data-special-sales-action="refresh" type="button">Refresh</button></div></div>
       <div class="stock-request-feedback">${state.notice ? `<div class="stock-request-notice">${escapeHtml(state.notice)}</div>` : ""}${state.error ? `<div class="stock-request-notice stock-request-error">${escapeHtml(state.error)}</div>` : ""}</div>
       <div class="stock-request-workspace"><aside class="stock-request-panel stock-request-list">${caseList()}</aside><section class="stock-request-panel stock-request-detail">${state.composer ? composerView() : detailView()}</section></div>
     </section>`;
@@ -627,17 +629,18 @@
     syncSoActionAvailability();
     busyUI?.render();
     window.StockRequestConversation?.watchQueue(mount, {url:`/api/sales/special-stock-requests?${queueKey()}`, requests:state.requests,
-      active, read:api, error:()=>updates?.changed(),
+      active, read:(path,options)=>(alertSearch || {load:api}).load(path,options), error:()=>updates?.changed(),
       accept:requests=>{state.requests=requests; const list=mount.querySelector('.stock-request-list'); if(list)list.innerHTML=caseList();}});
     window.StockRequestConversation?.render(mount, state.composer ? null : state.detail, 'sales', {onWorkflowUpdated:()=>load({force:true})});
     restoreScroll?.();
     updates?.paint();
+    alertSearch?.paint(mount);
   }
 
   const active = () => window.MBBSSalesStockActiveTab !== 'regular';
   const updates = window.StockRequestView?.create({mount,active});
   const editing = () => state.busy || state.confirmingAddItems || Boolean(state.addItemsDraft) || Boolean(state.caseEditDraft) || (!busyUI?.remote() && (Boolean(state.composer) || state.soDraftDirty || state.formDrafts.size > 0));
-  const queueKey = () => new URLSearchParams({ search: state.search, stages: state.search.trim() ? '' : state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames), mine: state.mine ? '1' : '' }).toString();
+  const queueKey = () => { const params = new URLSearchParams({ search: state.search, stages: state.search.trim() ? '' : state.stages.join(','), storeLocationIds: state.storeLocationIds.join(','), vendorNames: JSON.stringify(state.vendorNames), mine: state.mine ? '1' : '' }); return (alertSearch?.params(params) || params).toString(); };
 
   async function initializeQueue() {
     if (queue) return;
@@ -645,7 +648,7 @@
     if (queue) return;
     queue = createSpecialQueueLoader({
       autoReload: false,
-      read: (key,signal) => api(`/api/sales/special-stock-requests?${key}`, {signal}),
+      read: (key,signal) => (alertSearch || {load:api}).load(`/api/sales/special-stock-requests?${key}`, {signal}),
       blocked: () => !active() || editing(),
       loading: value => { state.loading = value; if (value && !state.requests.length) render(); },
       error: error => { state.error = error.message; render(); },
@@ -1299,6 +1302,13 @@
     load({ selectedId: null }).catch((error) => { state.error = error.message; render(); });
   });
 
+  mount.addEventListener('input', event => {
+    if (event.target.matches('[data-special-search]') && !event.target.value) {
+      state.search = '';
+      void load({selectedId:null});
+    }
+  });
+
   window.MBBSSalesSpecialStock = {
     async open({ operator, yards } = {}) {
       window.MBBSSalesRegularStock?.suspend();
@@ -1323,7 +1333,10 @@
       ({ specialLineNotes } = await lineNotesReady);
       ({ specialDiscountLineSubtotal: specialLineSubtotal, specialNativeLinePricing: specialNativePricing, earliestSpecialDeliveryDate } = await pricingReady);
       state.operator = operator || state.operator;
-      if (!state.detail && new URLSearchParams(location.search).get('requestRef')) state.search = new URLSearchParams(location.search).get('requestRef');
+      alertSearch ||= (await alertSearchReady).createStockAlertSearch({audience:'sales',tab:'special',state,read:api});
+      try { await alertSearch.initialize(state.operator); }
+      catch (error) { state.error = error.message; state.loading = false; render(); return; }
+      if (!state.detail && new URLSearchParams(location.search).get('requestRef')) alertSearch.focusRequest(new URLSearchParams(location.search).get('requestRef'));
       state.yards = yards || state.yards;
       if (state.enabled !== null) { render(); if (state.enabled) await load(); return; }
       state.loading = true;

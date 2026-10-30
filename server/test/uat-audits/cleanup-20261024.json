@@ -1,0 +1,41 @@
+{
+  "checkedAt": "2026-10-24T05:49:25.822009+00:00",
+  "running": [
+    "mbbs-operator-app-app-1",
+    "mbbs-operator-app-webhook-worker-1",
+    "mbbs-operator-app-ollama-1",
+    "mbbs-operator-app-db-1"
+  ],
+  "allContainers": [
+    "mbbs-operator-app-app-1",
+    "mbbs-operator-app-webhook-worker-1",
+    "mbbs-operator-app-ollama-1",
+    "mbbs-operator-app-db-1"
+  ],
+  "disposableContainers": [],
+  "disposableVolumes": [],
+  "disposableNetworks": [],
+  "testProjects": {
+    "mbbs-source-save-3512579": {
+      "container": [],
+      "volume": [],
+      "network": []
+    },
+    "mbbs-source-save-3532903": {
+      "container": [],
+      "volume": [],
+      "network": []
+    },
+    "mbbs-source-save-3535335": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  },
+  "healthHttpStatus": "200",
+  "liveImage": "mbbs-operator-app:bin-weight-warning-20261024",
+  "artifactDirectoriesUnderServerTestArtifacts": [],
+  "passed": true,
+  "disposableArtifactRoot": "/home/ubuntu/apps/operatorApp/server/test-artifacts/.runs",
+  "remainingDisposableArtifactEntries": []
+}

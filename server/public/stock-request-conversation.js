@@ -17,6 +17,35 @@
   function acceptQueue(view, requests) {
     if (!currentQueue(view)) return;
     view.requests = order(requests); view.accept(view.requests);
+    paintUnread(view);
+  }
+  function paintUnread(view) {
+    if (!currentQueue(view)) return;
+    for (const card of view.mount.querySelectorAll('.stock-request-card[data-id]')) {
+      window.MBBSRequestUnreadBadge?.paint(card, view.unread.get(Number(card.dataset.id)) || 0);
+    }
+  }
+  async function refreshUnread(view = queueView) {
+    if (!view || !currentQueue(view)) return;
+    if (view.unreadLoading) {view.unreadPending = true; return;}
+    const audience = /^\/api\/(sales|scm)\//.exec(view.url)?.[1];
+    if (!audience) return;
+    view.unreadLoading = true;
+    try {
+      const response = await fetch(`/api/${audience}/stock-request-conversation-alerts?includeRequests=1`, {
+        cache:'no-store', headers:{Authorization:`Bearer ${view.session}`, Accept:'application/json'}, signal:AbortSignal.timeout(15000)
+      });
+      if (!response.ok) throw Object.assign(new Error('Unread messages unavailable'), {status:response.status});
+      const data = await response.json();
+      if (!currentQueue(view)) return;
+      view.unread = new Map((data.requests || []).map(row => [Number(row.id), Number(row.unreadCount)]));
+      paintUnread(view);
+    } catch (error) {
+      if (currentQueue(view) && [401,403].includes(error.status)) {view.unread.clear(); paintUnread(view);}
+    } finally {
+      view.unreadLoading = false;
+      if (view.unreadPending && currentQueue(view)) {view.unreadPending = false; void refreshUnread(view);}
+    }
   }
   async function refreshQueue(view) {
     if (view.loading) {view.pending = true; return;}
@@ -44,6 +73,7 @@
       try {
         const message = JSON.parse(event.data), payload = message.payload || {};
         if (!['stock-request.updated','special-stock-request.updated'].includes(message.type)) return;
+        void refreshUnread();
         if (payload.source === 'stock-conversation') noteActivity(payload.requestId, payload.conversationEventId);
         if (!payload.requestId || Number(payload.requestId) === Number(active?.state.id)) void refresh();
       } catch { /* Ignore invalid events. */ }
@@ -52,8 +82,8 @@
   function watchQueue(mount, options) {
     if (session !== token()) reset();
     if (!options.url) {queueView = null; return;}
-    if (queueView?.mount !== mount || queueView.url !== options.url) queueView = {mount, session};
-    Object.assign(queueView, options); connect();
+    if (queueView?.mount !== mount || queueView.url !== options.url) queueView = {mount, session, unread:new Map()};
+    Object.assign(queueView, options); connect(); paintUnread(queueView); void refreshUnread();
   }
   async function api(state, suffix = '', body) {
     const response = await fetch(`/api/${state.audience}/stock-requests/${state.id}/conversation${suffix}`, {
@@ -121,7 +151,10 @@
     } catch (error) {state.error = error.message; state.sendError = true;}
     finally {state.sending = false; paint(state);}
   }
-  function reset() {active?.panel.remove(); active = null; queueView = null; drafts.clear(); activity.clear(); stream?.close(); stream = null; session = token();}
+  function reset() {
+    for (const card of queueView?.mount.querySelectorAll('.stock-request-card[data-id]') || []) window.MBBSRequestUnreadBadge?.paint(card, 0);
+    active?.panel.remove(); active = null; queueView = null; drafts.clear(); activity.clear(); stream?.close(); stream = null; session = token();
+  }
   function render(mount, request, audience, {onWorkflowUpdated} = {}) {
     if (session !== token()) reset();
     const host = mount?.querySelector('.stock-request-detail');
@@ -150,8 +183,10 @@
     paint(state); void refresh();
     connect();
   }
-  setInterval(() => {if (!document.hidden) void refresh();}, 20000);
-  document.addEventListener('visibilitychange', () => {if (!document.hidden) void refresh();});
+  setInterval(() => {if (!document.hidden) {void refresh(); void refreshUnread();}}, 20000);
+  document.addEventListener('visibilitychange', () => {if (!document.hidden) {void refresh(); void refreshUnread();}});
+  window.addEventListener('focus', () => void refreshUnread());
+  window.addEventListener('stock-conversation-read', () => void refreshUnread());
   window.addEventListener('storage', () => {if (session !== token()) reset();});
   window.addEventListener('mbbs-auth-operator-changed', () => {if (session !== token()) reset();});
   window.addEventListener('pagehide', reset);

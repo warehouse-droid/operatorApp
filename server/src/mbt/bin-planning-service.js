@@ -1,5 +1,7 @@
 // @ts-check
 import crypto from "node:crypto";
+import {assignTransportVisit,unplanTransportVisit,validateTransportPlan} from "./bin-transport-planning.js";
+import {assertBinAvailabilityDependencies} from "./bin-availability.js";
 import { query, afterTransactionCommit } from "../db.js";
 import { withDispatchPlanWrite } from "../dispatch-plan-write.js";
 import { confirmDispatchPlan } from "../dispatch-plan-repository.js";
@@ -8,11 +10,14 @@ import { insertMbtAuditEvent } from "./audit-repository.js";
 import { assignMbtBinFrontLeg, confirmMbtBinDispatchPlan } from "./bin-dispatch-service.js";
 import { assertPlanningCapacity } from "./bin-planning-capacity.js";
 import { assertBinWorkflowPlanDependencies } from "./bin-order-workflow-planning.js";
+import {assertFinalCollectionReady} from "./bin-final-collection.js";
+import { planLinkedBinCommand } from "./bin-linked-delivery-planning.js";
 import { stagePlanningAssignment, withdrawPlanningAssignment, publishPlanningAssignments } from "./bin-planning-assignments.js";
 import { releasePlanningReservations } from "./bin-planning-reservations.js";
 import { sequenceBinVisit, binVisitGroups } from "./bin-planning-domain.js";
 import { binDispatchOrders } from "./dispatch-bin-safety.js";
 import { saveBinPlanningBoard, binBoardLoadFields, isBinBoardLoad } from "./bin-planning-board.js";
+import {validateBinBoardStopTimings} from "./bin-planning-metadata.js";
 import { MbtError } from "./errors.js";
 import { assertPlanningAccess, planningText, planningDate, planningError, readPlanningPlan,
   lockPlanningVisit, planningLoad, removePlanningVisit, persistPlanningPlan, syncPlanningProjections,
@@ -30,8 +35,9 @@ function assertAssignedHere(visit, input) {
 }
 
 /** @param {any} input */
-async function cancelVisit(input) {
+export async function cancelVisit(input) {
   const visit = await lockPlanningVisit(input.visitId, input.expectedVisitRevision);
+  if (visit.transportTripId) {return unplanTransportVisit(input,visit);}
   assertAssignedHere(visit, input);
   const previous = await readPlanningPlan(input.planId);
   const next = structuredClone(previous);
@@ -47,21 +53,22 @@ async function cancelVisit(input) {
   return { visitId: input.visitId, visitRevision: Number(updated.rows[0].revision), priorAssignment: visit.dispatch_assignment_snapshot };
 }
 
-/** @param {any} input @param {any} boundary @param {any[]} [stopOverrides] @param {any[]} [stopTimings] */
-async function assignVisit(input, boundary, stopOverrides = [], stopTimings = []) {
+/** @param {any} input @param {any} boundary @param {any[]} [stopOverrides] @param {any[]} [stopTimings]
+ * @param {any} [previousAssignment] Server-locked visit before a same-plan rebuild; never request data. */
+export async function assignVisit(input, boundary, stopOverrides = [], stopTimings = [], previousAssignment = null) {
+  validateBinBoardStopTimings(stopTimings);
   const visit = await lockPlanningVisit(input.visitId, input.expectedVisitRevision);
+  if (visit.transportTripId) {return assignTransportVisit(input,visit,stopOverrides,stopTimings);}
+  const prior=previousAssignment?.service_visit_id===visit.service_visit_id
+    && previousAssignment.dispatch_plan_id===input.planId ? previousAssignment : visit;
+  await assertFinalCollectionReady(prior);
   const plan = await readPlanningPlan(input.planId);
   const { truck, load } = planningLoad(plan, input.loadId);
   if ((load.stops || []).some((/** @type {any} */ s) => !s.mbt?.visitId)) {
     throw planningError(409, "MBT_BIN_LOAD_REQUIRED", "Choose a BIN-only load.");
   }
-  const timing = dispatchLoadAssignment(truck, load);
-  if (timing.plannedStartMinute === null || timing.plannedFinishMinute === null) {
-    throw planningError(409, "MBT_BIN_LOAD_TIME_REQUIRED", "Set the BIN load start and finish time first.");
-  }
-  const assets = await planningAssets(input, visit);
-  const window = await query(`SELECT (($1::date+$2::int*interval '1 minute') AT TIME ZONE 'America/Toronto') AS start,
-    (($1::date+$3::int*interval '1 minute') AT TIME ZONE 'America/Toronto') AS finish`, [plan.planDate, timing.plannedStartMinute, timing.plannedFinishMinute]);
+  const assets=await planningAssets(input,visit);
+  const window=await rentalReservationWindow(plan,truck,load,stopTimings);
   const result = await assignMbtBinFrontLeg({ ...input, assetAssignments: assets, expectedPlanRevision: plan.revision,
     reservationStartAt: window.rows[0].start, reservationEndAt: window.rows[0].finish }, { ...boundary, planning: true });
   const saved = await readPlanningPlan(input.planId);
@@ -69,6 +76,17 @@ async function assignVisit(input, boundary, stopOverrides = [], stopTimings = []
   applyPlanningStopTimings(saved, input, stopTimings, visit);
   const staged = await stagePlanningAssignment(input.visitId, saved, input, false);
   return { ...result.body, ...staged };
+}
+
+/** @param {any} plan @param {any} truck @param {any} load @param {any[]} stopTimings */
+async function rentalReservationWindow(plan,truck,load,stopTimings) {
+  const timing = dispatchLoadAssignment(truck, load);
+  if (timing.plannedStartMinute === null || timing.plannedFinishMinute === null) {
+    throw planningError(409, "MBT_BIN_LOAD_TIME_REQUIRED", "Set the BIN load start and finish time first.");
+  }
+  return query(`SELECT (($1::date+$2::int*interval '1 minute') AT TIME ZONE 'America/Toronto') AS start,
+    (($1::date+$3::int*interval '1 minute') AT TIME ZONE 'America/Toronto') AS finish`, [plan.planDate,
+      stopTimings[0]?.arrival ?? timing.plannedStartMinute,stopTimings.at(-1)?.depart ?? timing.plannedFinishMinute]);
 }
 
 /** @param {any} plan @param {any} input @param {any[]} stopTimings @param {any} visit */
@@ -230,20 +248,16 @@ async function sequenceVisit(input) {
 
 /** @param {any} input @param {any} boundary */
 async function applyPlanningAction(input, boundary) {
+  if (["assign","cancel","move","recover"].includes(input.action)) {
+    return planLinkedBinCommand(input,boundary,{assignVisit,cancelVisit});
+  }
   /** @type {Map<string, () => Promise<any>>} */
   const actions = new Map(/** @type {Array<[string, () => Promise<any>]>} */ ([
     ["save_board", () => saveBinPlanningBoard(input, boundary, { cancelVisit, assignVisit, saveLoad })],
-    ["assign", () => assignVisit(input, boundary)], ["cancel", () => cancelVisit(input)],
     ["save_load", () => saveLoad(input)], ["sequence", () => sequenceVisit(input)]
   ]));
   const action = actions.get(input.action);
   if (action) {return action();}
-  if (input.action === "move" || input.action === "recover") {
-    const cancelled = await cancelVisit(input);
-    return assignVisit({ ...input, loadId: planningText(input.toLoadId, "Destination load"),
-      assetAssignments: [], expectedVisitRevision: cancelled.visitRevision,
-      idempotencyKey: `${input.idempotencyKey}:reassign` }, boundary);
-  }
   const plan = await readPlanningPlan(input.planId);
   if (input.action === "confirm") {
     assertPlanningSchedule(plan, true);
@@ -318,6 +332,10 @@ export async function runMbtBinPlanningCommand(raw, boundary) {
           .flatMap((/** @type {any} */ l)=>l.stops || []).map((/** @type {any} */ s)=>s.mbt?.visitId).filter(Boolean));
         for (const id of ids) {await assertBinWorkflowPlanDependencies(String(id),false);}
       }
+      const assets=[...new Set([previous,plan].flatMap(p=>p.trucks || []).flatMap(t=>t.loads || [])
+        .flatMap(l=>l.stops || []).map(s=>s.assetId || s.mbt?.assetId).filter(Boolean))];
+      await assertBinAvailabilityDependencies(assets);
+      await validateTransportPlan(plan);
       await syncPlanningProjections(plan);
       await insertMbtAuditEvent({ actor: input.actor, correlationId, requestId, idempotencyKey: input.idempotencyKey,
         audit: { action: `mbt.bin_planning.${input.action}`, entityType: "dispatch_plan", entityId: input.planId,

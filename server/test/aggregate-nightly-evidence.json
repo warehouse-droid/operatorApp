@@ -1,0 +1,274 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "red": {
+    "newBehaviorTests": 10,
+    "failed": 10
+  },
+  "command": "MBBS_TEST_BUILD_TARGET=test-e2e python3 server/tools/reconciliation-blockers-run.py node tools/aggregate-nightly-checks.mjs",
+  "harnessCorrections": [
+    "Schedule fixture supplies both approval timestamp and actor, as required by the existing database constraint.",
+    "Browser checks use the repository test-e2e image.",
+    "Independent settings patches exposed an existing Date-to-string validation bug; canonical YYYY-MM-DD mapping fixed.",
+    "Test image has no patch binary; reverse source hunks in Node and verify original SHA-256 hashes instead.",
+    "Mutation reruns exposed non-cascading fixture line cleanup; delete fixture lines explicitly before headers.",
+    "Retained the 90% coverage gate and added clock rollback, SQL alias and operational-probe edge cases.",
+    "Fixed new UI lint findings; normalized only shifted line numbers when comparing existing lint messages.",
+    "The secret scanner rejected fixed disposable-test passwords; tests now generate unique credentials without changing the scanner."
+  ],
+  "skipped": {
+    "repositoryWideSuite": "Scoped reconciliation, response-sharing and reopen regressions run on the shared application host.",
+    "legacyTypes": "Strict checking for pure new modules; legacy dependency graph checked with baseline lint, syntax and integration tests.",
+    "dependencyAudit": "No new or changed dependencies.",
+    "liveNetSuiteInTests": "NetSuite financial writes are disabled in disposable tests; existing executor and live scope inspected separately."
+  },
+  "sourceHashes": {
+    "src/scm-reconciliation-repository.js": "194e97fd46716eb9a491ebe8895a2f14439b76b6132e0ac9f27d987af5ab08bc",
+    "src/scm-reconciliation-service.js": "170592e4738b4496c5f5f7753672e8ac612cea8b39cb3e63e1a5fe44b9ae2663",
+    "src/server.js": "5917e9b11c4d7145cad855e459ffd324191e8a9cd313b0cc44a5d7b38b5c30b6",
+    "public/control.js": "b9f1cccfc5aff5a006544990cfcea20b1ad6d8392ede3c80bac888f4b2f90a03",
+    "src/delivery-repository.js": "e1c2f074c53137080998a2882043542d3e78eaaaf764b4ada256f7f919d47144",
+    "src/sales-order-reconciliation-repository.js": "fe16a5957d6453acc9676ea682bdd5ff4a70cbe8c027f35cd458c49af77a645d",
+    "src/aggregate-reconciliation.js": "383d9e6598141139f2fef97213a42dbeaa5bce87e8ab029b0482e56456577542",
+    "src/aggregate-reconciliation-repository.js": "102d6b38fed0f9c696bac2e030f0de48075bcd4acda22c4fe65127a8bd5a05a2",
+    "src/aggregate-reconciliation-service.js": "d6877008f9b8b028f79fb2dfce6f01eae5897b8251fa5057273bc0bf82ebcf3b",
+    "src/applied-sales-order-billing.js": "f827f578871576ec991b3cabb3646c4e02a4923d178587139d1a80aa0935c30d",
+    "test/mbt/unit/aggregate-nightly.test.js": "b1c9a067c12540feb4f4cd0024b01e4e64f034981492803557ff7021a98516a8",
+    "test/mbt/unit/aggregate-nightly-ui.test.js": "8b64174ab7c35d119ec4bc8544fd5066fd8f76e22335ca7f7847789918ee184a",
+    "test/mbt/unit/aggregate-nightly-service.test.js": "0aa5bc388ced536a3560b7e60abd009655013e261b6c72cb974a543928ac946f",
+    "test/mbt/integration/aggregate-nightly.test.js": "a0d40d2bae3c68dbbc46286fbc0691497722f6b9554c8073c51adaad9b81ce8d",
+    "test/mbt/integration/aggregate-nightly-schedule.test.js": "cd12840b2be08c13d24b97eacb0e28881f29a0fc23ed42801365515dc7310e32",
+    "test/mbt/integration/aggregate-nightly-http.test.js": "5a316a799b16496dbbf0c30aa810a2ff2756ecc06ef5eff41889a2be81df9329",
+    "test/mbt/integration/aggregate-nightly-browser.test.js": "43bfc1417cfd9f0b32ae1928e8d568f019f5d04fe3298502aa34f365187f6ac2",
+    "test/mbt/integration/operator-reconciled-billed.test.js": "b94fcbb27e14849b568fdb29fec1449ec3d2632f4dfed3b640dbcf4610c961d3",
+    "migrations/305_aggregate_nightly_reconciliation.sql": "3001b6b849744455dc9f90c81b8f87d18fee44e0d2e01da4cd7f955ded185de7"
+  },
+  "mutation": [
+    {
+      "name": "material-fail-open",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "material-fail-closed",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "repeat-date",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "ignore-enabled",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "operational-overlap",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "wrong-status",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "ignore-billed-result",
+      "killed": true,
+      "propertyOnlyKilled": false
+    }
+  ],
+  "versions": {
+    "node": "v20.20.2",
+    "c8": "12.0.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0",
+    "playwright": "1.62.1"
+  },
+  "reopenBaseline": {
+    "before": {
+      "tests": 11,
+      "pass": 10,
+      "fail": 1,
+      "skipped": 0
+    },
+    "after": {
+      "tests": 11,
+      "pass": 10,
+      "fail": 1,
+      "skipped": 0
+    },
+    "existingFailures": [
+      "real HTTP: billed order reopens locally, retains NetSuite truth and becomes PO-linkable"
+    ],
+    "failureDetails": [
+      "not ok 2 - real HTTP: billed order reopens locally, retains NetSuite truth and becomes PO-linkable\n  ---\n  duration_ms: 223.522261\n  location: '/app/test-artifacts/baseline/test/dispatch/integration/billed-order-reopen.test.js:53:1'\n  failureType: 'testCodeFailure'\n  error: |-\n    Expected values to be strictly equal:\n    \n    true !== false\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected: false\n  actual: true\n  operator: 'strictEqual'\n  stack: |-\n    TestContext.<anonymous> (file:///app/test-artifacts/baseline/test/dispatch/integration/billed-order-reopen.test.js:57:10)\n    process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    async Test.run (node:internal/test_runner/test:797:9)\n    async Test.processPendingSubtests (node:internal/test_runner/test:526:7)\n"
+    ]
+  },
+  "lint": {
+    "baseline": 1167,
+    "final": 1167,
+    "added": 0
+  },
+  "static": {
+    "strictPureModuleTypes": "passed",
+    "newSourceLint": "passed",
+    "legacySyntax": "passed"
+  },
+  "suite": {
+    "tests": 31,
+    "pass": 31,
+    "fail": 0,
+    "skipped": 0
+  },
+  "coverage": {
+    "total": {
+      "lines": {
+        "total": 103,
+        "covered": 103,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 103,
+        "covered": 103,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 7,
+        "covered": 7,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 51,
+        "covered": 50,
+        "skipped": 0,
+        "pct": 98.03
+      },
+      "branchesTrue": {
+        "total": 0,
+        "covered": 0,
+        "skipped": 0,
+        "pct": "Unknown"
+      }
+    },
+    "/app/src/aggregate-reconciliation-repository.js": {
+      "lines": {
+        "total": 36,
+        "covered": 36,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 2,
+        "covered": 2,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 36,
+        "covered": 36,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 9,
+        "covered": 9,
+        "skipped": 0,
+        "pct": 100
+      }
+    },
+    "/app/src/aggregate-reconciliation-service.js": {
+      "lines": {
+        "total": 17,
+        "covered": 17,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 2,
+        "covered": 2,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 17,
+        "covered": 17,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 15,
+        "covered": 14,
+        "skipped": 0,
+        "pct": 93.33
+      }
+    },
+    "/app/src/aggregate-reconciliation.js": {
+      "lines": {
+        "total": 31,
+        "covered": 31,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 2,
+        "covered": 2,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 31,
+        "covered": 31,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 23,
+        "covered": 23,
+        "skipped": 0,
+        "pct": 100
+      }
+    },
+    "/app/src/applied-sales-order-billing.js": {
+      "lines": {
+        "total": 19,
+        "covered": 19,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 1,
+        "covered": 1,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 19,
+        "covered": 19,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 4,
+        "covered": 4,
+        "skipped": 0,
+        "pct": 100
+      }
+    }
+  },
+  "reorderedSuite": {
+    "tests": 31,
+    "pass": 31,
+    "fail": 0,
+    "skipped": 0
+  },
+  "completedAt": "2026-10-22T04:30:41.573Z",
+  "operationalVerification": "deployments/aggregate-nightly-20261022/final-verification.json",
+  "coverageScope": "All 103 lines in the four new modules executed; 50/51 branches. Legacy wiring is covered by actual HTTP, browser, empty-scope executor and pending-order integration checks."
+}

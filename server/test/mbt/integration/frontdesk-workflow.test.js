@@ -1,3 +1,4 @@
+import { addLegacyCollection } from "../support/legacy-bin-collection-fixture.js";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
@@ -295,8 +296,8 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
     billingType: "mbt_contract",
     billingStatus: "open"
   });
-  assert.equal(first.body.visits.length, 2);
-  const [delivery, returnVisit] = first.body.visits;
+  assert.equal(first.body.visits.length, 1);
+  const [delivery] = first.body.visits;
   assert.deepEqual({
     number: delivery.visitNumber,
     action: delivery.serviceAction,
@@ -307,17 +308,6 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
     action: "delivery",
     status: "ready",
     predecessorVisitId: null
-  });
-  assert.deepEqual({
-    number: returnVisit.visitNumber,
-    action: returnVisit.serviceAction,
-    status: returnVisit.status,
-    predecessorVisitId: returnVisit.predecessorVisitId
-  }, {
-    number: 2,
-    action: "return_bin",
-    status: "tentative",
-    predecessorVisitId: delivery.visitId
   });
 
   const durable = await query(
@@ -340,7 +330,7 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
       ORDER BY v.visit_number`,
     [accepted.quoteId]
   );
-  assert.equal(durable.rowCount, 2);
+  assert.equal(durable.rowCount, 1);
   assert.equal(new Set(durable.rows.map(({ contract_id }) => contract_id)).size, 1);
   assert.equal(new Set(durable.rows.map(({ billing_case_id }) => billing_case_id)).size, 1);
   assert.deepEqual(durable.rows.map((row) => ({
@@ -350,12 +340,7 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
     predecessorVisitId: row.predecessor_visit_id
   })), [
     { visitNumber: 1, serviceAction: "delivery", status: "ready", predecessorVisitId: null },
-    {
-      visitNumber: 2,
-      serviceAction: "return_bin",
-      status: "tentative",
-      predecessorVisitId: durable.rows[0].visit_id
-    }
+
   ]);
   assert.equal(durable.rows[0].customer_snapshot.netsuiteId, accepted.fixture.customerNetsuiteId);
   assert.deepEqual(durable.rows[0].site_snapshot, {});
@@ -363,15 +348,12 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
   assert.equal(durable.rows[0].terms_snapshot.rentalCalendarDays, 14);
   assert.equal(durable.rows[0].tax_snapshot.basisPoints, FRONTDESK_PRICING.taxBasisPoints);
   assert.equal(durable.rows[0].pricing_snapshot.totalMinor, FRONTDESK_PRICING.totalMinor);
-  assert.equal(
-    durable.rows[1].service_snapshot.predecessorVisitId,
-    durable.rows[0].visit_id
-  );
+
   assert.deepEqual(await quoteConversionEvidence(accepted.quoteId), {
     quote_status: "converted",
     quote_revision: 4,
     contracts: 1,
-    visits: 2,
+    visits: 1,
     billing_cases: 1
   });
 
@@ -398,7 +380,7 @@ test("P3-F13: accepted conversion is atomic, exactly replayable, explicitly orde
     quote_status: "converted",
     quote_revision: 4,
     contracts: 1,
-    visits: 2,
+    visits: 1,
     billing_cases: 1
   });
 });
@@ -541,6 +523,7 @@ test("P3-F14: an extension appends one approved amendment and changes only an un
     expectedRevision: 3
   }));
   const contractId = converted.body.contract.contractId;
+  await addLegacyCollection(converted, ACTOR);
   const [delivery, returnVisit] = converted.body.visits;
   const before = await query(
     `SELECT service_visit_id::text AS visit_id, visit_number::int AS visit_number,

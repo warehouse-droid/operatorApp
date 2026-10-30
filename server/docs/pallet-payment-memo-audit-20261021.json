@@ -1,0 +1,56 @@
+{
+  "observedDate": "2026-10-21",
+  "purpose": "Read-only access check before developing historical payment/deposit memo normalization for pallet refunds.",
+  "integrationRole": {
+    "id": 1067,
+    "identitySource": "Existing verified integration setup in pallet-saved-search-503-setup.txt",
+    "permissionRowsInspected": 51,
+    "permissionQueryComplete": true,
+    "present": { "Sales Order": "Edit", "Credit Memo": "Edit", "Customers": "View", "REST Web Services": "Full" },
+    "absent": ["Customer Payment", "Customer Deposit", "Customer Refund", "Invoice", "Deposit Application"]
+  },
+  "checks": {
+    "suiteqlPaymentDepositRefundRows": 0,
+    "visibleTransactionTypes": ["CustCred", "Estimate", "InvAdjst", "InvTrnfr", "ItemRcpt", "ItemShip", "PurchOrd", "RtnAuth", "SalesOrd", "TrnfrOrd", "VendAuth"],
+    "restCollections": {
+      "customerPayment": { "httpStatus": 200, "totalResults": 0 },
+      "customerDeposit": { "httpStatus": 200, "totalResults": 0 },
+      "customerRefund": { "httpStatus": 200, "totalResults": 0 },
+      "invoice": { "httpStatus": 200, "totalResults": 0 }
+    },
+    "historicalMemosInspected": 0,
+    "netsuiteFinancialRecordsChanged": false,
+    "netsuitePermissionsChanged": false,
+    "testWorkloadsStarted": false
+  },
+  "nextDataAccessStep": "Grant the integration role View access to the five absent transaction permissions, or supply an authorized transaction saved-search CSV export of historical payments, deposits and refunds.",
+  "provisionalNormalization": {
+    "status": "User examples only; not validated against historical data or implemented in refund calculation.",
+    "examples": [
+      { "memo": "SOBXXXX(4570)", "paymentMethod": "VISA", "cardLastFour": "4570", "display": "VISA ****4570" },
+      { "memo": "SOBXXXX / 4570", "paymentMethod": "VISA", "cardLastFour": "4570", "display": "VISA ****4570" }
+    ],
+    "constraints": [
+      "Preserve original memos; normalize into separate parsed values.",
+      "Use the structured payment method and actual transaction links; memo text does not establish funding or SO/invoice identity.",
+      "Keep last four digits as text to preserve leading zeros.",
+      "Do not select arbitrary four-digit numbers, order suffixes, dates, amounts or phone suffixes.",
+      "Flag missing, conflicting or multiple card candidates for review.",
+      "Retain original payment/deposit IDs; brand plus last four digits is not a unique card identifier.",
+      "Trace customer deposits through Deposit Applications and count the original funds once."
+    ]
+  },
+  "step3Record": {
+    "name": "Pallet Refund Allocation",
+    "id": "customrecord_pallet_refund_alloc",
+    "fields": [
+      { "label": "Original Allocation", "id": "custrecord_pra_allocation", "type": "List/Record", "listRecord": "Pallet Payment Allocation" },
+      { "label": "Customer Refund", "id": "custrecord_pra_refund", "type": "List/Record", "listRecord": "Transaction" },
+      { "label": "Credit Memo", "id": "custrecord_pra_creditmemo", "type": "List/Record", "listRecord": "Transaction" },
+      { "label": "Return Reference", "id": "custrecord_pra_return_ref", "type": "Free-Form Text" },
+      { "label": "Pallet Quantity", "id": "custrecord_pra_qty", "type": "Integer Number" },
+      { "label": "Pallet Refund Amount", "id": "custrecord_pra_amount", "type": "Currency" },
+      { "label": "Status", "id": "custrecord_pra_status", "type": "Free-Form Text", "scriptValues": ["PENDING", "COMPLETED", "REVERSED"] }
+    ]
+  }
+}

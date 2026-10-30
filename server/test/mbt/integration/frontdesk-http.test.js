@@ -326,6 +326,14 @@ test("P3-F13 HTTP: quote commands bind server actor, pricing adapters, and idemp
   assert.equal(Object.hasOwn(calls[0].input, "clientDisplayTotals"), false);
   assert.equal(typeof calls[0].pricing.resolveDistance, "function");
   assert.equal(typeof calls[0].pricing.resolveTaxPolicy, "function");
+  const edited = await request(`/api/mbt/frontdesk/quotes/${QUOTE_ID}`, {
+    actor: "frontdesk", method: "POST", body: { ...body, quoteId: CONTRACT_ID, expectedRevision: 2 },
+    idempotencyKey: "p3-frontdesk-http-edit"
+  });
+  assert.equal(edited.response.status, 201, JSON.stringify(edited.payload));
+  assert.equal(calls.at(-1).input.quoteId, QUOTE_ID);
+  assert.equal(calls.at(-1).input.expectedRevision, 2);
+  assert.equal(calls.at(-1).input.actor.operatorId, ACTORS.frontdesk.id);
 });
 
 test("MBT Front Desk HTTP: customer-charge preview and confirmation are private server-owned commands", async () => {

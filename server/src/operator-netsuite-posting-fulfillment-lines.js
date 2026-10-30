@@ -1,5 +1,6 @@
 // @ts-check
 import { isCompletedNetSuitePostingOrder } from './netsuite-fulfillable-items.js';
+import { isSqftPostingUnit, netSuitePostingQuantity } from './operator-netsuite-posting-quantity.js';
 
 /** @param {string} message @returns {never} */
 function changed(message) {
@@ -38,6 +39,13 @@ function openFulfillableLine(line) {
   return Boolean(line && line.canFulfill !== false && !line.lineClosed && Number(line.remainingQuantity) > 0);
 }
 
+/** @param {Record<string,any>} snapshot @param {Record<string,any>} line */
+function assertDeferredQuantityUnit(snapshot, line) {
+  if (snapshot.quantityCheckDeferred === true && (!isSqftPostingUnit(snapshot.salesUom) || !isSqftPostingUnit(line.unit))) {
+    changed('The deferred SQFT check has missing or conflicting Sales Order unit evidence.');
+  }
+}
+
 /** @param {Record<string,any>} step @param {Record<string,any>} item @param {Record<string,any>|undefined} line */
 function assertSelectedLine(step, item, line) {
   if (!line || !openFulfillableLine(line)) {
@@ -52,7 +60,28 @@ function assertSelectedLine(step, item, line) {
         || (snapshot.itemId && Number(snapshot.itemId) !== Number(line.itemId))) {
       changed('A selected Sales Order line identity changed.');
     }
+    assertDeferredQuantityUnit(snapshot, line);
   }
+}
+
+/** A durable marker retains the missing quantity check even if either gate is
+ * disabled after admission. This is called only before a safe native fallback.
+ * @param {Record<string,any>} step @param {Record<string,any>} payload @param {Record<string,any>|null} source */
+export function prepareDeferredSalesOrderNativePayload(step, payload, source) {
+  const deferred = (step.lineSnapshot || []).filter((/** @type {any} */ line) => line.quantityCheckDeferred === true);
+  if (!deferred.length) { return payload; }
+  const lines = currentLines(source, step);
+  const items = payload.item.items.map((/** @type {any} */ item) => {
+    if (!item.itemReceive || !deferred.some((/** @type {any} */ line) => Number(line.orderLine) === Number(item.orderLine))) { return item; }
+    const line = lines.get(Number(item.orderLine));
+    assertSelectedLine(step, item, line);
+    const quantity = netSuitePostingQuantity(item.quantity, line.remainingQuantity, line.unit);
+    if (!Number.isFinite(quantity) || quantity <= 0 || quantity > Number(line.remainingQuantity)) {
+      changed('The selected SQFT quantity exceeds the current remaining quantity.');
+    }
+    return { ...item, quantity };
+  });
+  return { ...payload, item: { ...payload.item, items } };
 }
 
 /** Keep selected values exact; remove only unavailable deselection rows from the

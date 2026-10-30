@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {query,withTransaction} from './db.js';
 import {inventoryError,inventoryId,inventoryYards,assertInventoryYard,quantitySnapshot,countSheetCommand} from './inventory-workflow-domain.js';
 import {packedInventorySnapshot} from './inventory-packed-stock.js';
+import {countSheetAdjustments} from './count-sheet-adjustments.js';
 
 const header=`SELECT s.*,o.display_name AS owner_name,
  (SELECT count(*)::int FROM inventory_count_sheet_items WHERE sheet_id=s.id) AS total,
@@ -82,22 +83,41 @@ async function saveLine(sheet,actor,input) {
     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$5::numeric-($9::numeric-$12::numeric),$11,$12,$9::numeric-$12::numeric,clock_timestamp())
     ON CONFLICT(sheet_id,attempt,item_id) DO UPDATE SET quantity=EXCLUDED.quantity,unit=EXCLUDED.unit,values=EXCLUDED.values,
     conversions=EXCLUDED.conversions,system_on_hand=EXCLUDED.system_on_hand,system_available=EXCLUDED.system_available,
-    variance=EXCLUDED.variance,inventory_synced_at=EXCLUDED.inventory_synced_at,packed_qty=EXCLUDED.packed_qty,
+    variance=EXCLUDED.variance+inventory_count_sheet_counts.adjusting,inventory_synced_at=EXCLUDED.inventory_synced_at,packed_qty=EXCLUDED.packed_qty,
     actual_on_hand=EXCLUDED.actual_on_hand,packed_snapshot_at=EXCLUDED.packed_snapshot_at,comparison_basis='confirmation',confirmed_at=now()`,
   [sheet.id,sheet.attempt,item.item_id,actor.id,count.quantity,count.unit,JSON.stringify(count.values),JSON.stringify(count.conversions),item.quantity_on_hand,item.quantity_available,item.synced_at,packed.quantity]);
   await event(sheet,actor,'line',{itemId:Number(item.item_id),quantity:count.quantity});
 }
+async function adjustCounts(sheet,actor,input) {
+  if(!['in_progress','submitted'].includes(sheet.status)) {throw inventoryError('Only active or submitted counts can be adjusted.',409);}
+  const adjustments=countSheetAdjustments(input.adjustments);
+  for(const {itemId,adjusting} of adjustments) {
+    const result=await query(`UPDATE inventory_count_sheet_counts c SET adjusting=$4,
+      variance=COALESCE(c.quantity-c.actual_on_hand+$4::numeric,c.variance)
+      WHERE c.sheet_id=$1 AND c.attempt=$2 AND c.item_id=$3
+      AND EXISTS(SELECT 1 FROM inventory_count_sheet_items si WHERE si.sheet_id=c.sheet_id AND si.item_id=c.item_id)`,
+    [sheet.id,sheet.attempt,itemId,adjusting]);
+    if(!result.rowCount) {throw inventoryError('Only counted SKUs assigned to this sheet can be adjusted.');}
+  }
+  await event(sheet,actor,'adjust',{adjustments});
+}
+async function releaseForRecount(sheet,actor,action) {
+  const allowed=action==='reset' ? sheet.status==='in_progress' : ['submitted','cancelled'].includes(sheet.status);
+  if(!allowed) {throw inventoryError('The sheet is no longer in a state that can be reset or re-opened.',409);}
+  const removed=await query('DELETE FROM inventory_count_sheet_counts WHERE sheet_id=$1',[sheet.id]);
+  await query("UPDATE inventory_count_sheets SET status='available',owner_id=NULL,submitted_at=NULL,attempt=attempt+1 WHERE id=$1",[sheet.id]);
+  await event(sheet,actor,action,{previousOwner:sheet.owner_id,discardedCounts:removed.rowCount});
+}
 async function managementCommand(sheet,actor,action,input) {
   revision(sheet,input);
+  if(action==='adjust') {return adjustCounts(sheet,actor,input);}
+  if(action==='reset' || action==='reopen') {return releaseForRecount(sheet,actor,action);}
   if(['submitted','cancelled'].includes(sheet.status)) {throw inventoryError('Completed sheets cannot be changed.',409);}
   if(action==='edit') {
     if(sheet.status!=='available') {throw inventoryError('Only available sheets can be edited.',409);}
     const ids=await itemIds(sheet.location_id,input.itemIds);
     await replaceItems(sheet.id,ids);
     await query('UPDATE inventory_count_sheets SET title=$2 WHERE id=$1',[sheet.id,title(input)]);
-  } else if(action==='reset') {
-    if(sheet.status!=='in_progress') {throw inventoryError('Only an in-progress sheet can be reset.',409);}
-    await query("UPDATE inventory_count_sheets SET status='available',owner_id=NULL,attempt=attempt+1 WHERE id=$1",[sheet.id]);
   } else if(action==='cancel') {await query("UPDATE inventory_count_sheets SET status='cancelled' WHERE id=$1",[sheet.id]);}
   else {throw inventoryError('Invalid management action.');}
   await event(sheet,actor,action,{previousOwner:sheet.owner_id});

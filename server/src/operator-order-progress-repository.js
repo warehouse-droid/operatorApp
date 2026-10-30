@@ -4,13 +4,20 @@ import { query } from "./db.js";
 /** @param {any} value */
 const text = (/** @type {any} */ value) => String(value ?? "").trim();
 /** @param {any} line */
+function operatorCargoLine(line) {
+  // NetSuite may fulfill accounting rows without any goods being packed or loaded.
+  // Keep unknown and inactive cargo as evidence; exclude only known non-cargo rows.
+  const accountingType = /^(othcharge|discount|markup|subtotal|description|payment|service)$/iu.test(text(line.item_type));
+  return !accountingType && !/^(delivery charge|sales credit)/iu.test(text(line.sku || line.item_name));
+}
+/** @param {any} line */
 export function operatorLineHasPacking(line) {
-  return line.confirmed === true || Boolean(line.confirmed_at) || ["packed_pallet_qty", "packed_layer_qty",
-    "packed_section_qty", "packed_piece_qty", "packed_sales_qty"].some((/** @type {any} */ field) => Number(line[field] || 0) > 0);
+  return operatorCargoLine(line) && (line.confirmed === true || Boolean(line.confirmed_at) || ["packed_pallet_qty", "packed_layer_qty",
+    "packed_section_qty", "packed_piece_qty", "packed_sales_qty"].some((/** @type {any} */ field) => Number(line[field] || 0) > 0));
 }
 /** @param {any} header @param {any[]} lines */
 export function operatorProgressStatus(header, lines) {
-  if (lines.some((/** @type {any} */ line) => Number(line.loaded_qty || 0) > 0)
+  if (lines.some((/** @type {any} */ line) => operatorCargoLine(line) && Number(line.loaded_qty || 0) > 0)
       || header.loaded_at || [header.operator_status, header.outbound_operator_status, header.local_yard_order_status]
         .some((/** @type {any} */ value) => /^(loaded|partial_loaded|fulfilled|shipped|received|complete|completed)$/iu.test(text(value)))) { return "loaded"; }
   if (lines.some(operatorLineHasPacking)

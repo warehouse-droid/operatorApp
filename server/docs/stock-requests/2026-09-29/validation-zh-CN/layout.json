@@ -1,0 +1,264 @@
+{
+  "pages": 28,
+  "screenshots": 29,
+  "layout": [
+    {
+      "page": 1,
+      "id": "start",
+      "title": "库存申请",
+      "bodyBottom": 951,
+      "footerTop": 1065,
+      "remaining": 106,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 2,
+      "id": "contents",
+      "title": "选择正确的申请流程",
+      "bodyBottom": 1025,
+      "footerTop": 1065,
+      "remaining": 32,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 3,
+      "id": "navigation",
+      "title": "打开申请并查找待办事项",
+      "bodyBottom": 1009,
+      "footerTop": 1065,
+      "remaining": 48,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 4,
+      "id": "regular-create",
+      "title": "提交常规库存申请",
+      "bodyBottom": 1051,
+      "footerTop": 1065,
+      "remaining": 7,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 5,
+      "id": "regular-rules",
+      "title": "理解自动审批规则",
+      "bodyBottom": 1035,
+      "footerTop": 1065,
+      "remaining": 23,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 6,
+      "id": "regular-safety",
+      "title": "查看审核原因和每行安全库存",
+      "bodyBottom": 1031,
+      "footerTop": 1065,
+      "remaining": 26,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 7,
+      "id": "regular-decisions",
+      "title": "审批明细并管理优先补货",
+      "bodyBottom": 1041,
+      "footerTop": 1065,
+      "remaining": 16,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 8,
+      "id": "regular-location",
+      "title": "关联 SO 并确认更改地点",
+      "bodyBottom": 1001,
+      "footerTop": 1065,
+      "remaining": 56,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 9,
+      "id": "regular-transfer",
+      "title": "哪些情况会生成调货单",
+      "bodyBottom": 1039,
+      "footerTop": 1065,
+      "remaining": 18,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 10,
+      "id": "regular-expiry",
+      "title": "等待、重试及查询处理结果",
+      "bodyBottom": 864,
+      "footerTop": 1065,
+      "remaining": 193,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 11,
+      "id": "pickup-search",
+      "title": "SCM 打开转换窗口并添加商品",
+      "bodyBottom": 967,
+      "footerTop": 1065,
+      "remaining": 90,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 12,
+      "id": "pickup-quantities",
+      "title": "核对最终数量和托盘数量",
+      "bodyBottom": 1033,
+      "footerTop": 1065,
+      "remaining": 24,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 13,
+      "id": "pickup-confirm",
+      "title": "确认生成 TO 并检查结果",
+      "bodyBottom": 1029,
+      "footerTop": 1065,
+      "remaining": 28,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 14,
+      "id": "special-header",
+      "title": "新建特殊商品询价",
+      "bodyBottom": 1045,
+      "footerTop": 1065,
+      "remaining": 12,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 15,
+      "id": "special-items",
+      "title": "填写商品、价格并提交询价",
+      "bodyBottom": 871,
+      "footerTop": 1065,
+      "remaining": 186,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 16,
+      "id": "special-quote",
+      "title": "预览报价及包装数量",
+      "bodyBottom": 962,
+      "footerTop": 1065,
+      "remaining": 95,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 17,
+      "id": "special-check",
+      "title": "记录供应商供货回复",
+      "bodyBottom": 1044,
+      "footerTop": 1065,
+      "remaining": 13,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 18,
+      "id": "special-decision",
+      "title": "记录客户决定",
+      "bodyBottom": 957,
+      "footerTop": 1065,
+      "remaining": 100,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 19,
+      "id": "special-so-account",
+      "title": "准备 SO 客户账户及交付信息",
+      "bodyBottom": 918,
+      "footerTop": 1065,
+      "remaining": 139,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 20,
+      "id": "special-so-create",
+      "title": "先保存草稿，再创建或关联 SO",
+      "bodyBottom": 1055,
+      "footerTop": 1065,
+      "remaining": 2,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 21,
+      "id": "special-po",
+      "title": "审核并创建 PO",
+      "bodyBottom": 1025,
+      "footerTop": 1065,
+      "remaining": 32,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 22,
+      "id": "special-readiness",
+      "title": "检查 PO 批准状态和备货状态",
+      "bodyBottom": 1049,
+      "footerTop": 1065,
+      "remaining": 8,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 23,
+      "id": "special-fulfillment",
+      "title": "更新送货资料或完成供应商自取",
+      "bodyBottom": 990,
+      "footerTop": 1065,
+      "remaining": 68,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 24,
+      "id": "special-adjustment",
+      "title": "申请和审核订单调整",
+      "bodyBottom": 950,
+      "footerTop": 1065,
+      "remaining": 107,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 25,
+      "id": "special-close",
+      "title": "关闭申请并保留记录",
+      "bodyBottom": 935,
+      "footerTop": 1065,
+      "remaining": 122,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 26,
+      "id": "statuses",
+      "title": "理解阶段、队列及提醒",
+      "bodyBottom": 1042,
+      "footerTop": 1065,
+      "remaining": 15,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 27,
+      "id": "troubleshooting",
+      "title": "常见问题处理",
+      "bodyBottom": 951,
+      "footerTop": 1065,
+      "remaining": 106,
+      "horizontalOverflow": false
+    },
+    {
+      "page": 28,
+      "id": "quick-reference",
+      "title": "日常核对清单和术语",
+      "bodyBottom": 889,
+      "footerTop": 1065,
+      "remaining": 168,
+      "horizontalOverflow": false
+    }
+  ],
+  "brokenImages": [],
+  "brokenLinks": [],
+  "externalDependencies": [],
+  "errors": [],
+  "external": [],
+  "overflows": []
+}

@@ -7,7 +7,7 @@ import { chromium, expect } from '@playwright/test';
 let browser;
 let capture = 0;
 const out = 'test-artifacts/special-workflow-review/stock-updates-20261002/browser';
-before(async () => { await mkdir(out, { recursive: true }); browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--no-sandbox'] }); });
+before(async () => { await mkdir(out, { recursive: true }); browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] }); });
 after(async () => browser?.close());
 async function fixture(audience, width = 1440, configure = () => {}) {
   const context = await browser.newContext({ viewport: { width, height: 1000 }, serviceWorkers: 'block' });
@@ -145,13 +145,13 @@ test('SCM treats accepted Low inventory as ready and shows the combined PO refer
     Object.assign(record.lines[0], { salesDecision: 'accepted', supplyStatus: 'low_inventory' });
   });
   try {
-    await expect(page.locator('[name=ready]')).toHaveValue('true');
+    await expect(page.locator('[name=supplyStatus]')).toHaveValue('low_inventory');
     await expect(page.locator('[name=eta]')).toBeDisabled();
     await expect(page.locator('.stock-request-card')).toContainText('PO-TEST / SN1401999');
     await expect(page.locator('.special-planning-documents')).toContainText('PO-TEST / SN1401999');
     await expect(page.getByRole('button', { name: 'Preview PO', exact: true })).toHaveCount(1);
     await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
     await expect.poll(() => state.posts.length).toBe(1);
-    assert.equal(state.posts[0].body.lines[0].ready, true); assert.deepEqual(state.errors, []);
+    assert.equal(state.posts[0].body.lines[0].supplyStatus, 'low_inventory'); assert.deepEqual(state.errors, []);
   } finally { await context.close(); }
 });

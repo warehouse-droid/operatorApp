@@ -34,7 +34,7 @@
     async function reopen() {
       if (!preview?.allowed || !reason.trim()) { throw new Error("Enter a reason before reopening."); }
       const refs = preview.orders.map((/** @type {any} */ order) => order.orderRef).join(", ");
-      if (!window.confirm(`Unpack and reopen ${refs}? Local packing and loading will be reset. ${preview.retainedPhotoCount} existing images and the order history will be retained.`)) { return; }
+      if (!window.confirm(`Confirm local reopen of ${refs}? Local packing, loading and fulfillment progress will be reset. ${preview.retainedPhotoCount} existing images and the order history will be retained.`)) { return; }
       if (!retry || retry.reason !== reason.trim()) {
         retry = { requestId: window.crypto.randomUUID(), expectedStateHash: preview.stateHash, reason: reason.trim() };
       }
@@ -66,7 +66,7 @@
       render() {
         return `<section class="panel" data-operator-order-reopen>
           <div class="section-heading"><div><h2>Order Reopen</h2>
-            <p class="muted">Reopen an order locally in Operator and Dispatch, including an unfulfilled order billed in NetSuite. Packing, loading and preparing ownership reset; NetSuite billing, existing images and history are retained.</p></div></div>
+            <p class="muted">Reopen an order locally in Operator and Dispatch. Packing, loading, fulfillment progress and preparing ownership reset. Existing images and history are retained. NetSuite is not checked or changed.</p></div></div>
           <form data-form="operator-order-reopen-search" class="actions">
             <label>Order number <input name="search" data-reopen-search minlength="2" maxlength="500" required value="${escape(search)}" placeholder="SOA08801 or SOA08800+SOA08801" /></label>
             <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Working…" : "Search"}</button>
@@ -83,7 +83,7 @@
             <p>${Number(preview.retainedPhotoCount)} existing images will be retained and remain available in Operator.</p>
             ${preview.blockers.map((/** @type {any} */ blocker) => `<div class="notice warning">${escape(blocker.message)}</div>`).join("")}
             ${preview.allowed ? `<label>Reason <textarea data-reopen-reason maxlength="500" rows="3" ${busy ? "disabled" : ""}>${escape(reason)}</textarea></label>
-              <div class="actions"><button class="danger" type="button" data-reopen-action="confirm" ${busy ? "disabled" : ""}>Unpack &amp; Reopen</button></div>` : ""}
+              <div class="actions"><button class="danger" type="button" data-reopen-action="confirm" ${busy ? "disabled" : ""}>Confirm reopen</button></div>` : ""}
           </section>` : ""}
         </section>`;
       }

@@ -1,0 +1,11 @@
+[
+  "netsuite-ifir-posting-restlet.js",
+  "src/config.js",
+  "src/netsuite.js",
+  "src/netsuite-ifir-posting-client.js",
+  "src/netsuite-ifir-posting-policy.js",
+  "src/operator-netsuite-posting-domain.js",
+  "src/operator-netsuite-posting-targets.js",
+  "src/operator-netsuite-posting-fulfillment-lines.js",
+  "src/operator-netsuite-posting-netsuite-adapter.js"
+]

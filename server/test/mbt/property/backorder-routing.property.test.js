@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import fc from 'fast-check';
 import {normalizeSpecialCaseDraft} from '../../../src/special-stock-request-domain.js';
-const draft=lines=>({storeLocationId:1,inquiryDate:'2099-01-01',customerName:'',vendorName:'TEST vendor',fulfillmentMethod:'yard_pickup',lines});
+const draft=lines=>({storeLocationId:1,inquiryDate:'2099-01-01',customerName:'TEST Backorder Customer',vendorName:'TEST vendor',fulfillmentMethod:'yard_pickup',lines});
 const material=(yard,vendor,index)=>({regularItemId:900000+index,regularItemCode:'TEST-'+index,brand:'TEST vendor '+vendor,regularVendorId:vendor,destinationLocationId:yard,productName:'Material '+index,quantity:index+1,rate:0,uom:'EA',requiredDate:'2099-02-01'});
 test('Backorder routing normalization preserves independently selected yards, vendors and item identity',()=>{
   fc.assert(fc.property(fc.array(fc.tuple(fc.constantFrom(1,28,15,26),fc.integer({min:1,max:1e6})),{minLength:1,maxLength:25}),routes=>{

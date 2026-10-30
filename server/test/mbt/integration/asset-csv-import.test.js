@@ -247,7 +247,7 @@ test("P3-F11 CSV boundaries: role, closed gate, hash, ownership, expiry, and cha
     await assert.rejects(
       () => previewImport({
         ...previewInput("ROLE"),
-        actor: { operatorId: "asset-csv-dispatcher", roles: ["dispatcher"] }
+        actor: { operatorId: "asset-csv-dispatcher", roles: ["operator"] }
       }),
       (error) => error?.status === 403 && error?.code === "MBT_ADMIN_REQUIRED"
     );

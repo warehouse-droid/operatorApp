@@ -1,0 +1,67 @@
+import {spawnSync} from "node:child_process";
+import {readFileSync,writeFileSync,existsSync,mkdirSync,cpSync,symlinkSync,rmSync} from "node:fs";
+import {ESLint} from "eslint";
+import {scanUnifiedDiff} from "../test/support/scan-diff-secrets.mjs";
+const files=JSON.parse(readFileSync("tools/backorder-add-items-files.json","utf8")).filter(f=>f.endsWith(".js"));
+const baseline="/app/test-artifacts/mbr-aggregate-baseline",typeRoot="/tmp/mbr-aggregate-types";
+const mbtLint=new ESLint({overrideConfigFile:true,overrideConfig:[{files:["**/*.js"],rules:{eqeqeq:"error","no-unreachable":"error","no-unused-vars":["error",{argsIgnorePattern:"^_"}],"prefer-const":"error"}}]});
+const browserLint=new ESLint({overrideConfigFile:true,overrideConfig:[{files:["public/**/*.js"],
+  languageOptions:{ecmaVersion:"latest",sourceType:"module",globals:{URLSearchParams:"readonly",URL:"readonly",setTimeout:"readonly",clearTimeout:"readonly",localStorage:"readonly",sessionStorage:"readonly",navigator:"readonly",console:"readonly",structuredClone:"readonly",window:"readonly",document:"readonly",crypto:"readonly",fetch:"readonly",globalThis:"readonly"}},
+  rules:{eqeqeq:"error","no-undef":"error","no-unreachable":"error","no-constant-condition":"error","no-unused-vars":["error",{argsIgnorePattern:"^_"}],"no-var":"error","prefer-const":"error"}}]});
+function difference(before,after,key) {
+  const counts=new Map();for (const m of before) counts.set(key(m),(counts.get(key(m))||0)+1);
+  return after.filter(m=>{const k=key(m),n=counts.get(k)||0;if(n){counts.set(k,n-1);return false;}return true;});
+}
+const lint=[];
+const complexityChecker=new ESLint({overrideConfigFile:true,overrideConfig:[{files:["**/*.js"],rules:{complexity:["error",30]}}]});
+const complexity=(await complexityChecker.lintFiles(['public/backorder-add-items.js'])).flatMap(row=>row.messages);
+
+mkdirSync(baseline,{recursive:true});cpSync('/baseline-source',baseline,{recursive:true});
+const changes={};
+for (const file of files) {
+  const before=existsSync(`${baseline}/${file}`)?readFileSync(`${baseline}/${file}`,'utf8'):'';
+  const target=`/tmp/mbr-aggregate-before`;writeFileSync(target,before);
+  const diff=spawnSync('diff',['-U0',target,file],{encoding:'utf8'}).stdout;
+  const lines=[];for(const match of diff.matchAll(/^@@ .*? \+(\d+)(?:,(\d+))? @@/gm)) {
+    for(let i=0;i<Number(match[2] ?? 1);i++) lines.push(Number(match[1])+i);
+  }
+  changes[file]=lines;
+}
+writeFileSync('test-artifacts/mbr-aggregate-changed-lines.json',JSON.stringify(changes));
+const secretFindings=[];
+for(const [file,lines] of Object.entries(changes)) {
+  const source=readFileSync(file,"utf8").split("\n");
+  const diff=`+++ b/${file}\n`+lines.map(n=>`@@ -0,0 +${n},1 @@\n+${source[n-1]}`).join("\n");
+  secretFindings.push(...scanUnifiedDiff(diff));
+}
+for (const file of files) {
+  const syntax=spawnSync(process.execPath,["--check",file],{encoding:"utf8"});if(syntax.status) throw new Error(syntax.stderr);
+
+  const checker=file.startsWith("public/") ? browserLint : mbtLint;
+  const current=(await checker.lintFiles([file]))[0].messages;
+  const before=existsSync(`${baseline}/${file}`) ? (await checker.lintText(readFileSync(`${baseline}/${file}`,"utf8"),{filePath:file}))[0].messages : [];
+  lint.push(...difference(before,current,m=>`${m.ruleId}:${m.message}`).map(m=>({file,line:m.line,message:m.message})));
+}
+const roots=files;
+mkdirSync(typeRoot,{recursive:true});cpSync("src",`${typeRoot}/src`,{recursive:true});cpSync("public",`${typeRoot}/public`,{recursive:true});
+cpSync("package.json",`${typeRoot}/package.json`);symlinkSync("/app/node_modules",`${typeRoot}/node_modules`);
+if (existsSync(`${baseline}/src`)) cpSync(`${baseline}/src`,`${typeRoot}/src`,{recursive:true});
+if (existsSync(`${baseline}/public`)) cpSync(`${baseline}/public`,`${typeRoot}/public`,{recursive:true});
+const options={allowJs:true,checkJs:false,noEmit:true,strict:true,skipLibCheck:true,noUncheckedIndexedAccess:true,
+  exactOptionalPropertyTypes:true,noImplicitReturns:true,target:"ES2023",module:"NodeNext",moduleResolution:"NodeNext",types:["node"],typeRoots:["/app/node_modules/@types"]};
+function types(before) {
+  const root=before ? typeRoot : "/app",config=`/tmp/mbr-aggregate-${before ? "before" : "after"}.json`;
+  writeFileSync(config,JSON.stringify({compilerOptions:options,files:roots.filter(f=>!before || existsSync(`${baseline}/${f}`)).map(f=>`${root}/${f}`)}));
+  const result=spawnSync(process.execPath,["node_modules/typescript/lib/tsc.js","--project",config,"--pretty","false"],{encoding:"utf8",maxBuffer:32*1024*1024});
+  if (result.error || result.signal) throw new Error(`Type checker failed: ${result.error || result.signal}`);
+  return (result.stdout+result.stderr).split("\n").filter(l=>/error TS\d+/u.test(l)).map(line=>{
+    const match=line.match(/^(.*?)\((\d+),\d+\): error (TS\d+): (.*)$/u);
+    return match ? {file:match[1].replace(`${root}/`,"").replace(/^(?:\.\.\/)+tmp\/mbr-aggregate-types\//u,""),line:Number(match[2]),code:match[3],message:match[4]} : {file:"compiler",message:line};
+  }).filter(d=>roots.includes(d.file) || d.file==="compiler");
+}
+try {
+  const before=types(true),after=types(false),introduced=difference(before,after,m=>`${m.file}:${m.code}:${m.message}`);
+  const report={syntaxFiles:files.length,newLintErrors:lint,newTypeErrors:introduced,baselineTypeErrors:before.length,complexityErrors:complexity,secretFindings};
+  writeFileSync("test-artifacts/mbr-aggregate-static.json",JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));
+  if (lint.length || introduced.length || complexity.length || secretFindings.length) process.exitCode=1;
+} finally {rmSync(typeRoot,{recursive:true,force:true});}

@@ -86,18 +86,28 @@ export function sumActiveLinkedQuantities({ poAllocations = [], toAllocations = 
   return { linkedPo, linkedDirectTo };
 }
 
+/** @param {Record<string, any>} input @param {string} label @param {number} conversion */
+function linkedSalesQuantities(input, label, conversion) {
+  const normalized = quantitySet(input, label);
+  const pieceSales = quantity(normalized.pieces * conversion, `${label} converted PCS`);
+  // PCS and stored sales describe the same supply. A larger sales total may
+  // also include other packages, so retain it without adding PCS twice.
+  return { ...normalized, sales: Math.max(normalized.sales, pieceSales) };
+}
+
 /**
- * @param {{required?: Record<string, any>, linkedPo?: Record<string, any>, linkedDirectTo?: Record<string, any>}} input
+ * @param {{required?: Record<string, any>, linkedPo?: Record<string, any>, linkedDirectTo?: Record<string, any>, pieceSalesConversion?: number}} input
  */
-export function projectOperatorLinkedQuantities({ required = {}, linkedPo = {}, linkedDirectTo = {} } = {}) {
+export function projectOperatorLinkedQuantities({ required = {}, linkedPo = {}, linkedDirectTo = {}, pieceSalesConversion = 0 } = {}) {
   const original = quantitySet(required, "Dispatch target");
-  const po = quantitySet(linkedPo, "Link PO");
-  const directTo = quantitySet(linkedDirectTo, "Direct Link TO");
+  const conversion = original.sales > EPSILON ? quantity(pieceSalesConversion, "PCS conversion") : 0;
+  const po = linkedSalesQuantities(linkedPo, "Link PO", conversion);
+  const directTo = linkedSalesQuantities(linkedDirectTo, "Direct Link TO", conversion);
   const linkedTotal = add(po, directTo);
   const errors = [];
   const operatorRequired = emptyQuantitySet();
   for (const unit of UNITS) {
-    if (linkedTotal[unit] > original[unit] + EPSILON) {
+    if ((unit !== "pieces" || conversion === 0) && linkedTotal[unit] > original[unit] + EPSILON) {
       errors.push({
         code: "LINKED_QUANTITY_EXCEEDS_TARGET",
         unit,
@@ -120,6 +130,15 @@ export function projectOperatorLinkedQuantities({ required = {}, linkedPo = {}, 
     blocked: errors.length > 0,
     errors
   };
+}
+
+/** @param {Record<string, any>} line */
+function linePieceSalesConversion(line) {
+  if (quantity(line.quantity, "Dispatch target sales quantity") <= EPSILON) {return 0;}
+  const conversion = quantity(line.to_pcs, "PCS conversion");
+  if (conversion > 0) {return conversion;}
+  const unit = String(line.unit || "").trim().toUpperCase();
+  return ["EACH", "EA", "PC", "PCS", "PIECE", "PIECES"].includes(unit) ? 1 : 0;
 }
 
 /** @param {QuantitySet} original @param {QuantitySet} po @param {QuantitySet} directTo @param {QuantitySet} total @param {QuantitySet} residual */
@@ -151,14 +170,14 @@ export function applyOperatorLinkedQuantityProjection(line, linked = {}) {
       sales: line?.quantity
     },
     linkedPo: linked.linkedPo || {},
-    linkedDirectTo: linked.linkedDirectTo || {}
+    linkedDirectTo: linked.linkedDirectTo || {},
+    pieceSalesConversion: linePieceSalesConversion(line)
   });
   const { original, linkedPo, linkedDirectTo, linkedTotal, operatorRequired } = projection;
-  // A sales-only item's manual pallet annotation is descriptive. Its basis
-  // must not change when allocating the last sales unit reduces the residual to zero.
-  const salesOnly = original.sales > EPSILON
-    && ![line.to_plt, line.to_lyr, line.to_sec, line.to_pcs].some((value) => Number(value || 0) > EPSILON);
-  const noYardLoadRequired = salesOnly ? operatorRequired.sales <= EPSILON : projection.noYardLoadRequired;
+  // Packing annotations cannot recreate yard work after links consume the
+  // sales quantity. Keep the physical-only legacy basis when no sales exist.
+  const noYardLoadRequired = original.sales > EPSILON
+    ? operatorRequired.sales <= EPSILON : projection.noYardLoadRequired;
   return {
     ...line,
     original_pallet_qty: original.pallets,

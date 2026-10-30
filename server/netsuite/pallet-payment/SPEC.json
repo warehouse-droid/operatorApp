@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "scope": "NetSuite reporting ledger, not payment processing or a concurrent refund authorization service",
+  "specApproval": "Business rules confirmed in conversation; executable spec approval not obtained (autonomous run)",
+  "tier": 3,
+  "setup": "New isolated SuiteScript bundle and node:test harness only. No application changes, commits, financial writes, new runtime dependencies, or production deployment. Reuse installed test-image dev tools if available. All tests run in disposable bounded containers through the retention runner.",
+  "scenarios": [
+    "Cash 200 or 220, VISA 800, six pallets at net 40 and 13 percent tax => cash five at 40, VISA one at 45.20.",
+    "Multiple cash receipts combine within one invoice before flooring; amounts applied to other invoices and unapplied funds are excluded.",
+    "Different invoice lines, currencies, subsidiaries, payment methods, and last fours cannot lend funds to each other; original source IDs remain recorded.",
+    "Cash excludes tax; all other methods include actual line tax. Missing tax, fractional pallets, discounts, nonuniform per-unit amounts and unsupported transaction sources fail review.",
+    "Historical memo delimiters include parentheses, full-width parentheses, slash, plus, ideographic comma and hash after a real SO/invoice/credit/payment reference. Leading zeros survive. Order numbers, dates, money, phone numbers, conflicts and bare four-digit strings never become a card ID.",
+    "Missing/ambiguous card evidence marks the customer unverified. Original transaction memos are never rewritten.",
+    "Pure pallet credit plus exact applied Customer Refund amount can produce deterministic FIFO refund allocations with matching method/card/currency/subsidiary/rate and source before the credit date.",
+    "Mixed goods credits require explicit manual pallet refund allocations. Credits used on account, unmatched credits and incomplete historical provenance remain under review.",
+    "Pending manual allocation reserves once; completion replaces pending with refunded. Repeated reconciliation produces the same quantities and external IDs. Reversed entries do not consume pallets.",
+    "Manual allocations validate quantity, amount, credit limit, source scope and actual refund application; duplicate references, excess consumption and wrong-card refunds fail review.",
+    "Deposit Application traces to the original Customer Deposit, does not double count it, and checks source capacity. Unsupported deposit linkage fails review.",
+    "Customer physical balance from customsearch503 must equal invoice pallet quantity minus credit quantity before verified publication. Refund deductions are never subtracted again from that already-net physical search.",
+    "Dry run performs no custom-record writes. Only the two designated custom record types may be written; no financial record saves or deletes.",
+    "Only the designated single Map/Reduce deployment writes. Invalidate cached rows before rebuilding, reject changed source snapshots, stable external IDs prevent retry duplicates, and obsolete rows remain unverified.",
+    "Scheduled report has an explicit as-of time and is not a live reservation lock. A refund must be confirmed in NetSuite; a posted record alone is not proof of processor settlement."
+  ],
+  "additionalScenarios": [
+    "Historical pallet credit already used against invoices can be manually marked APPLIED, with original funding selected and actual credit-application capacity verified; this consumes the refunded/settled counter without inventing a cash/card refund.",
+    "Consolidated invoice lines retain their own Sales Order and payments received after a historical return cannot finance that return.",
+    "Disposable development-only tools: TypeScript 5.9.3 (JS checks), ESLint 9.39.1 (complexity/lint), c8 10.1.3 (coverage), fast-check 4.3.0 (generated invariants). No dependencies are installed in the application or uploaded to NetSuite."
+  ],
+  "uploadHeaderCorrection": {
+    "tier": 1,
+    "scope": "Comment formatting correction only; retain SuiteScript 2.1 and all existing calculation and persistence behavior.",
+    "acceptance": "All five upload files declare exactly one NApiVersion value of 2.1 on its own line inside a JSDoc block. Only ppa_rebuild_mr.js declares NScriptType MapReduceScript. NetSuite tag values extend to the next line break, so the closing comment delimiter must be on a separate line.",
+    "reference": "https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/bridgehead_4387808259.html",
+    "setup": "Add a source-header regression check to the existing isolated suite and replace the download package. Reuse existing disposable tooling; no new dependencies, application edits, NetSuite writes or deployment."
+  },
+  "repeatedUploadDiagnostic": {
+    "status": "Superseded: user confirmed successful v2 upload and native preview. The local CRLF diagnostic passed 48 acceptance tests but was not delivered or deployed; its temporary source helpers were removed.",
+    "scope": "The user still reports an upload rejection after v2. Root cause remains unconfirmed; local checks are not NetSuite native validation.",
+    "acceptance": "Export the five unchanged scripts as UTF-8 without BOM using CRLF. Normalizing CRLF back to LF must reproduce every source byte. Run the existing acceptance suite against the exported files. A separate zero-dependency Map/Reduce upload check returns an empty input list.",
+    "setup": "Use Node standard-library tooling and the existing bounded disposable runner. Provide a distinct v3 download and individual diagnostic file. No financial record changes, NetSuite uploads or deployment are performed by these local steps."
+  },
+  "failureModel": {
+    "doubleDeduction": "transition, repeat and duplicate-event tests",
+    "wrongCard": "memo adversarial/property tests and exact method/card matching",
+    "overAllocation": "integer arithmetic, property tests, source/applied capacity checks",
+    "partialWrite": "fault-injected persistence boundary tests and invalidation",
+    "staleOrConcurrent": "single deployment, source recheck, cached-report limitation and dry-run first",
+    "historicalGaps": "unverified review output and physical search reconciliation",
+    "secrets": "no credentials in bundle; only read-only live diagnostics"
+  },
+  "v3Extension": {
+    "spec": "AUTOMATION-SPEC.json",
+    "scope": "User-requested transaction-triggered refresh, truthful completion logs, full historical cash-credit quantity handling, and Cash summary grouping. Queue mutations are the sole addition to the original custom-record write allowlist."
+  }
+}

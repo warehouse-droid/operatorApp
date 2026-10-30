@@ -150,6 +150,28 @@ function processorHarness({ steps, find, transform, fetchById, finalize } = {}) 
   return { state, calls, processor };
 }
 
+test('IFIR response finalizes using the returned saved number without another record read', async () => {
+  const harness = processorHarness({ transform: target => ({ id: 8001, record: remoteRecord(target) }),
+    fetchById: async () => { assert.fail('Successful RESTlet response must avoid the extra GET'); } });
+  const result = await harness.processor.process('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  assert.equal(result.status, 'completed');
+  assert.equal(harness.calls.fetch, 0);
+  assert.equal(harness.calls.transform, 1);
+  assert.equal(result.steps[0].netSuiteTransactionRef, 'IF8001');
+});
+
+test('IFIR returned quantity mismatch retains recovery without native reposting', async () => {
+  const harness = processorHarness({ transform: target => {
+    const record = remoteRecord(target); record.item.items[0].quantity = 99;
+    return { id: 8001, record };
+  } });
+  const result = await harness.processor.process('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  assert.equal(result.status, 'attention');
+  assert.equal(harness.calls.transform, 1);
+  assert.equal(harness.calls.fetch, 0);
+  assert.equal(harness.calls.finalize, 0);
+});
+
 test("P5/P6 a verified external-ID hit is recovered without transform and finalizes once", async () => {
   const harness = processorHarness({ find: (targetStep) => remoteRecord(targetStep) });
   const completed = await harness.processor.process("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");

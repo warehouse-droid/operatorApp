@@ -1,0 +1,87 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "tools": {
+    "node": "v20.20.2",
+    "fast-check": "4.9.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "c8": "12.0.0"
+  },
+  "source": {
+    "src/direct-po-allocation-receipt.js": "f5134384364520a9ef279a1ac848c338a97301eb9f092c6a4a7fa570707cafde",
+    "src/direct-po-auto-receipt.js": "6cc3b1fbb38b4a66806829efde346ce2e2212c3d7d2c1ac14cca404fc9fb459f",
+    "src/direct-po-auto-receipt-domain.js": "5a55ca1f43381cdfd25f80d62b0464f6128b81fdd83220ba46c21500b093bc2a",
+    "src/operator-netsuite-posting-domain.js": "b6d8d2a29383180f4169e98167e2d557f90eb6fe370e06c0fddaac12a431477e",
+    "src/operator-netsuite-posting-netsuite-adapter.js": "068ecbe29f90cc84f22964586708a57009f1e7174cf19bfe06e20f93ffc204cb",
+    "src/operator-netsuite-posting-finalizer.js": "8fbaefe767aa8dca3898d1da486ed61353d746f27f510135e5bf62153c529f5a",
+    "src/receiving-repository.js": "fd35cbf34d2be103ba330fa06787a84e6634abe48a34d034daa99c40d853d6b9",
+    "migrations/314_partial_linked_po_receipts.sql": "71aa400e9b0e9a9ad33a8e631e9d527618d459bce3af0ee7e23ba92bde52c4ba"
+  },
+  "tests": {
+    "tests": 275,
+    "pass": 247,
+    "fail": 28,
+    "newFailures": [],
+    "baselineFailures": "partial-linked-posting-baseline.json",
+    "newTests": 22
+  },
+  "reverseOrder": {
+    "tests": 275,
+    "pass": 247,
+    "fail": 28
+  },
+  "changedLineCoverage": {
+    "covered": 169,
+    "total": 169,
+    "misses": []
+  },
+  "types": {
+    "before": 109,
+    "after": 109,
+    "new": []
+  },
+  "lint": {
+    "before": 4,
+    "after": 4,
+    "new": []
+  },
+  "secretFindings": [],
+  "complexityFindings": [],
+  "mutants": [
+    {
+      "name": "whole-line-receipt",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "receipt-inflated",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "drop-all-selected-lines",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "ignore-cancelled-allocation",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "repeat-allocation-consumption",
+      "killed": true,
+      "propertyOnlyKilled": false
+    }
+  ],
+  "property": {
+    "seed": 20261027,
+    "numRuns": 120
+  },
+  "knownLimits": [
+    "28 pre-existing failures are retained, rather than changing unrelated split/receiving behavior.",
+    "Properties test quantities; database evidence and ownership are covered by integration and concurrency tests.",
+    "Changed-line coverage is enforced; branch-level percentages were not retained.",
+    "No dependencies added. No git commit created."
+  ]
+}

@@ -10,9 +10,23 @@ const methods = {vendor_pickup:'Customer pickup at vendor yard',yard_pickup:'Pic
 /** @param {string} method */
 export const specialFulfillmentLabel = method => methods[method] || 'Not selected';
 /** @param {CaseDetail} detail */
+export function specialSalesOrderFulfilled(detail) {
+  return Boolean(detail.salesOrderFulfilledAt) || [detail.salesOrderStatus,detail.salesOrderFulfillmentStatus]
+    .some(status=>/^(?:fully fulfilled|fulfilled|fully billed|billed|pending billing)$/i.test(String(status || '').replace(/^Sales Order\s*:\s*/i,'')));
+}
+/** @param {CaseDetail} detail */
+export function specialFulfillmentMethods(detail) {
+  const arrived = detail.workflowKind !== 'backorder' && Boolean(detail.purchaseOrderReceivedAt || detail.purchaseOrderDropoffAt
+    || /^(?:fully[_ ]?)?received$/i.test(detail.purchaseOrderReceiptStatus || ''));
+  return Object.entries(methods).filter(([method]) => !arrived || method !== 'vendor_pickup');
+}
+/** @param {CaseDetail} detail */
 export function canEditSpecialFulfillment(detail) {
-  return detail.closeStatus==='active' && !detail.operationallyComplete && !['closed','completed'].includes(detail.stage)
-    && !detail.dispatchPlanning?.anyPlanned && !detail.dispatchPlanned && !['planned','in_progress','completed'].includes(detail.handoff?.status);
+  const plannedBackorder = detail.workflowKind === 'backorder'
+    && (detail.dispatchPlanning?.anyPlanned || detail.dispatchPlanned || detail.handoff?.status === 'planned');
+  return detail.closeStatus==='active' && !detail.operationallyComplete && !specialSalesOrderFulfilled(detail) && !['closed','completed'].includes(detail.stage)
+    && !plannedBackorder && !detail.fulfillmentExecutionStarted
+    && (detail.workflowKind !== 'backorder' && detail.handoff?.route === 'via_yard' || !['in_progress','completed'].includes(detail.handoff?.status));
 }
 /** @param {CaseDetail} detail */
 export function canEditSpecialHeader(detail) {
@@ -44,9 +58,10 @@ export function specialFulfillmentEditor(detail, {before='',after=''} = {}) {
   const deliveryFeeRate = savedSpecialDeliveryFee(detail);
   return `<form class="stock-request-form special-summary-form" data-special-fulfillment-form ${header ? 'data-special-header-form' : ''}>
     ${header ? `<input type="hidden" name="expectedRevision" value="${escape(detail.revision)}"><p class="stock-request-error" data-special-header-conflict hidden>This request changed. Your header entries are kept. Reload the header before saving.</p>` : ''}
-    ${summary(`<span class="special-summary-delivery"><small>Delivery method</small><select name="fulfillmentMethod" aria-label="Delivery method" required>${Object.entries(methods).map(([value,label])=>`<option value="${value}" ${draft.fulfillmentMethod===value?'selected':''}>${label}</option>`).join('')}</select>
+    ${summary(`<span class="special-summary-delivery"><small>Delivery method</small><select name="fulfillmentMethod" aria-label="Delivery method" required>${specialFulfillmentMethods(detail).map(([value,label])=>`<option value="${value}" ${draft.fulfillmentMethod===value?'selected':''}>${label}</option>`).join('')}</select>
       <button type="submit" class="primary">${header ? 'Save header' : 'Save'}</button></span>`)}
-    ${header ? '' : '<p class="stock-request-muted">Delivery method can change after SO and PO linking and PO reference updates. SCM and Dispatch are alerted when the method changes. Yard pickup uses the inquired MBBS yard.</p>'}
+    ${header ? '' : '<p class="stock-request-muted">Delivery method can change during Dispatch arrangement, including after SO and PO linking and PO reference updates. SCM and Dispatch are alerted to review the arrangements when the method changes. Yard pickup uses the inquired MBBS yard.</p>'}
+    ${specialFulfillmentMethods(detail).length===2 ? '<p class="stock-request-muted">The PO has arrived. Choose Pickup at inquired yard or Delivery.</p>' : ''}
     ${header ? `<div class="special-request-notes"><label><span>Note</span><textarea name="remarks" rows="4" maxlength="8000">\n${escape(detail.remarks)}</textarea></label>${specialSalesInternalRemarkField(detail)}</div><button type="button" data-special-sales-action="reload-header" hidden>Reload header</button>` : ''}
     ${pending?`<p class="stock-request-error">Delivery update incomplete. Edit the header and save again, or retry the saved change. ${escape(detail.fulfillmentChange.error)}</p>
       <div class="stock-request-actions"><button type="button" data-special-sales-action="retry-delivery">Retry saved change</button>

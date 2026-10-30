@@ -1,6 +1,7 @@
 // @ts-check
 
 import { query } from "../db.js";
+import { MBT_AGGREGATE_LBS_PER_YARD } from "./aggregate-density.js";
 import { executeMbtCommand } from "./command-repository.js";
 import { MbtError } from "./errors.js";
 import {
@@ -106,7 +107,7 @@ function publicItem(row) {
     systemOwned: row.system_owned === true,
     itemType: String(row.item_type),
     chargeBasis: String(row.charge_basis),
-    densityLbsPerYard: row.density_lbs_per_yard === null ? null : Number(row.density_lbs_per_yard),
+    densityLbsPerYard: row.item_type === "aggregate" ? MBT_AGGREGATE_LBS_PER_YARD : null,
     rentalPeriodDays: row.rental_period_days === null ? null : Number(row.rental_period_days),
     category: String(row.category),
     priceMode: String(row.pricing_mode),

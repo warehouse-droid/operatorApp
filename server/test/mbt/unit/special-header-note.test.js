@@ -16,14 +16,18 @@ test('header Note rejects invalid types, control characters and length overflow 
     assert.throws(() => normalizeSpecialHeaderNote(value), { status: 400, code: 'SPECIAL_HEADER_NOTE_INVALID' });
   }
 });
-test('header editing uses before-order, closure, review and planning guards', () => {
+test('header editing uses before-order, closure, review and execution guards', () => {
   assert.equal(canEditSpecialHeader(active), true);
   for (const patch of [{ closeStatus: 'closed' }, { status: 'cancelled' }, { operationallyComplete: true },
     { salesOrderId: 42 }, { purchaseOrderId: 43 }, { salesOrderSkipped: true }, { purchaseOrderSkipped: true },
     { salesOrderOperationStatus: 'creating' }, { purchaseOrderOperationStatus: 'attention' }, { salesOrderSubmissionStartedAt: '2099-01-01' },
     { quantityReviewPending: true }, { fulfillmentChange: { status: 'applying' } }, { attention: true },
-    { dispatchPlanning: { anyPlanned: true } }, { dispatchPlanned: true }, { handoff: { status: 'in_progress' } }]) {
+    { fulfillmentExecutionStarted: true }, { handoff: { status: 'in_progress' } }]) {
     assert.equal(canEditSpecialHeader({ ...active, ...patch }), false, JSON.stringify(patch));
+  }
+  for (const patch of [{dispatchPlanning:{anyPlanned:true}},{dispatchPlanned:true},{handoff:{status:'planned'}}]) {
+    assert.equal(canEditSpecialHeader({...active,...patch}),true);
+    assert.equal(canEditSpecialHeader({...active,...patch,workflowKind:'backorder'}),false);
   }
 });
 test('header renders an always-visible escaped Note and one shared Save header without an Edit note button', () => {

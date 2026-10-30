@@ -1,0 +1,9 @@
+[
+  "src/mbt/bin-order-workflow-editing.js",
+  "src/mbt/bin-order-workflow-unlink.js",
+  "src/mbt/bin-order-workflow-service.js",
+  "src/mbt/bin-order-workflow-read.js",
+  "src/mbt/bin-order-workflow-planning.js",
+  "public/bin-order-workflow-ui.js",
+  "public/mbt-planning.html"
+]

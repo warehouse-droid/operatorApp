@@ -39,6 +39,7 @@
   function paint() {
     if(!actor) {return;}
     paintBadge();
+    if(window.MBBSOSNotifications?.allowsRole(audience)===false) {if(dialog) {removeDialog();}return;}
     const otherDialog=[...document.querySelectorAll('dialog[open],[role="dialog"][aria-modal="true"]')]
       .some(node=>node.getClientRects().length>0 && window.getComputedStyle(node).visibility!=='hidden');
     if(document.hidden || dialog || otherDialog) {return;}
@@ -79,13 +80,13 @@
     for(const row of rows) {
       if((seen[row.id] || 0)>=row.revision || (row.id===displayed?.currentRequestId && row.revision<=(displayed.currentRequestRevision || 0))) {continue;}
       void window.MBBSOSNotifications?.notify({id:noticeId(row),title:noticeTitle(row),body:`${row.requestRef} · ${noticeMessage(row)}`,
-        url:`/${audience}/delivery-requests?request=${row.id}`,session});
+        url:`/${audience}/delivery-requests?request=${row.id}`,role:audience,session});
     }
   }
   function show(row) {
     const ownGeneration=generation;
     previousFocus=document.activeElement;
-    const modal=document.createElement('dialog');dialog=modal;modal.className='delivery-request-dialog';modal.dataset.osNotificationId=noticeId(row);modal.setAttribute('aria-labelledby','delivery-request-alert-title');
+    const modal=document.createElement('dialog');dialog=modal;modal.className='delivery-request-dialog';modal.dataset.osNotificationId=noticeId(row);modal.dataset.notificationRole=audience;modal.setAttribute('aria-labelledby','delivery-request-alert-title');
     const title=document.createElement('h2');title.id='delivery-request-alert-title';title.textContent=noticeTitle(row);
     const reference=document.createElement('p');reference.textContent=row.requestRef;
     const message=document.createElement('p');message.textContent=noticeMessage(row);
@@ -176,6 +177,7 @@
   new MutationObserver(paint).observe(document.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open','aria-modal','hidden','style','class']});
   window.addEventListener('storage',()=>void checkSession());
   window.addEventListener('mbbs-auth-operator-changed',()=>void checkSession(true));
+  window.addEventListener('mbbs-notification-preferences-changed',()=>{if(actor) {notifyRows();paint();}});
   window.addEventListener('focus',()=>void checkSession(true));
   document.addEventListener('visibilitychange',()=>{if(!document.hidden) {void checkSession(true);}});
   window.addEventListener('pagehide',stop);

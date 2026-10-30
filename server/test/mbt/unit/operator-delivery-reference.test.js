@@ -25,7 +25,7 @@ test("L3 partial/cancelled allocations and physical-only manual requirements rem
   assert.equal(physical.no_yard_load_required, false);
   assert.equal(physical.pallet_qty, 20);
   const converted = applyOperatorLinkedQuantityProjection({ ...specialLine, to_plt: 116.6 }, { linkedPo: { sales: 2332 } });
-  assert.equal(converted.no_yard_load_required, false);
+  assert.equal(converted.no_yard_load_required, true);
   assert.equal(converted.operator_required_pallet_qty, 20);
   const over = applyOperatorLinkedQuantityProjection(specialLine, { linkedPo: { sales: 2333 } });
   assert.equal(over.linked_quantity_blocked, true);

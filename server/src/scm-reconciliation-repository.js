@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { AGGREGATE_SOURCE_FILTER, aggregateNightlySchedule } from './aggregate-reconciliation.js';
 import { query, withTransaction } from "./db.js";
 import {
   allocateReconciliationProgress,
@@ -465,7 +466,10 @@ export function verifyScmIfIrWebhookSignature({
 }
 
 function mapSettings(row = {}) {
-  return {
+  const settings = {
+    aggregateNightlyEnabled: row.aggregate_nightly_enabled === true,
+    aggregateNightlyTime: row.aggregate_nightly_time || '21:30',
+    aggregateNightlyLastRun: row.aggregate_nightly_last_run || null,
     nightlyEnabled: row.nightly_enabled === true,
     nightlyTime: row.nightly_time || "21:30",
     timeZone: row.time_zone || "America/Toronto",
@@ -478,24 +482,39 @@ function mapSettings(row = {}) {
     soInitialDryRunApproved: Boolean(row.so_initial_dry_run_approved_at),
     soInitialDryRunApprovedAt: row.so_initial_dry_run_approved_at || null,
     soInitialDryRunApprovedBy: row.so_initial_dry_run_approved_by || "",
-    initialBackfillModifiedSince: row.initial_backfill_modified_since || "2026-01-01",
+    initialBackfillModifiedSince: dateValue(row.initial_backfill_modified_since)?.slice(0, 10) || "2026-01-01",
     lastNightlyLocalDate: row.last_nightly_local_date || null,
     updatedBy: row.updated_by || "",
     updatedAt: row.updated_at || null
   };
+  return { ...settings, aggregateNightlySchedule: aggregateNightlySchedule(settings, settings.aggregateNightlyLastRun) };
 }
 
 export async function getScmReconciliationSettings() {
   const result = await query(
-    `SELECT *
-       FROM scm_reconciliation_settings
+    `SELECT settings.*, (SELECT json_build_object('id', run.id, 'status', run.status,
+              'scheduledLocalDate', run.scheduled_local_date::text,
+              'completedAt', run.completed_at, 'error', run.error)
+           FROM scm_reconciliation_runs run
+          WHERE run.source_filter = 'pending_fulfillment_aggregate' AND run.trigger_source = 'nightly'
+          ORDER BY run.scheduled_local_date DESC NULLS LAST, run.id DESC LIMIT 1) AS aggregate_nightly_last_run
+       FROM scm_reconciliation_settings settings
       WHERE singleton_id = 1`
   );
   return mapSettings(result.rows[0]);
 }
 
 export async function updateScmReconciliationSettings(patch = {}, actor = "") {
+  return withTransaction(async () => {
+  await query('SELECT singleton_id FROM scm_reconciliation_settings WHERE singleton_id=1 FOR UPDATE');
   const current = await getScmReconciliationSettings();
+  const aggregateNightlyTime = text(patch.aggregateNightlyTime ?? current.aggregateNightlyTime);
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(aggregateNightlyTime)) {
+    throw Object.assign(new Error('Aggregate nightly time must use HH:MM.'), { status: 400 });
+  }
+  if (patch.aggregateNightlyEnabled !== undefined && typeof patch.aggregateNightlyEnabled !== 'boolean') {
+    throw Object.assign(new Error('Aggregate nightly enabled must be true or false.'), { status: 400 });
+  }
   const nightlyTime = text(patch.nightlyTime ?? patch.nightly_time ?? current.nightlyTime);
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(nightlyTime)) {
     throw Object.assign(new Error("Nightly reconciliation time must use HH:MM."), { status: 400 });
@@ -512,13 +531,15 @@ export async function updateScmReconciliationSettings(patch = {}, actor = "") {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(modifiedSince)) {
     throw Object.assign(new Error("Initial backfill date must use YYYY-MM-DD."), { status: 400 });
   }
-  const result = await query(
+  await query(
     `UPDATE scm_reconciliation_settings
         SET nightly_enabled = $1,
             nightly_time = $2,
             time_zone = $3,
             initial_backfill_modified_since = $4::date,
             updated_by = $5,
+            aggregate_nightly_enabled = $6,
+            aggregate_nightly_time = $7,
             updated_at = now()
       WHERE singleton_id = 1
       RETURNING *`,
@@ -527,10 +548,13 @@ export async function updateScmReconciliationSettings(patch = {}, actor = "") {
       nightlyTime,
       timeZone,
       modifiedSince,
-      text(actor) || null
+      text(actor) || null,
+      patch.aggregateNightlyEnabled ?? current.aggregateNightlyEnabled,
+      aggregateNightlyTime
     ]
   );
-  return mapSettings(result.rows[0]);
+  return getScmReconciliationSettings();
+  });
 }
 
 export async function getScmReconciliationPreference(operatorId) {
@@ -577,6 +601,8 @@ function mapRun(row = {}) {
   return {
     id: Number(row.id),
     runKey: row.run_key || "",
+    sourceFilter: row.source_filter || '',
+    scheduledLocalDate: dateValue(row.scheduled_local_date)?.slice(0, 10) || null,
     triggerSource: row.trigger_source || "",
     scope: row.scope_kind || "all",
     soOrderType: normalizeSalesOrderReconciliationType(
@@ -955,6 +981,8 @@ export async function createScmReconciliationRun({
   triggerSource = "manual",
   scope = "all",
   soOrderType = "all",
+  sourceFilter = '',
+  scheduledLocalDate = null,
   targetOrderKind = null,
   targetOrderId = null,
   targetOrderRef = "",
@@ -963,6 +991,13 @@ export async function createScmReconciliationRun({
   applyUnambiguous = false,
   requestedBy = ""
 } = {}) {
+  if (sourceFilter && (sourceFilter !== AGGREGATE_SOURCE_FILTER || scope !== 'SO')) {
+    throw Object.assign(new Error('Invalid reconciliation source filter.'), { status: 400 });
+  }
+  if (sourceFilter && triggerSource === 'nightly'
+      && (!/^\d{4}-\d{2}-\d{2}$/.test(scheduledLocalDate || '') || dateValue(scheduledLocalDate)?.slice(0, 10) !== scheduledLocalDate)) {
+    throw Object.assign(new Error('Aggregate nightly reconciliation requires a valid schedule date.'), { status: 400 });
+  }
   const cleanScope = ["all", "SO", "PO", "TO", "order_family"].includes(scope) ? scope : "all";
   const kind = ["SO", "PO", "TO"].includes(text(targetOrderKind).toUpperCase())
     ? text(targetOrderKind).toUpperCase()
@@ -1007,8 +1042,8 @@ export async function createScmReconciliationRun({
         `INSERT INTO scm_reconciliation_runs (
            run_key, trigger_source, scope_kind, so_order_type_filter, target_order_kind,
            target_order_netsuite_id, target_order_ref, dry_run,
-           apply_unambiguous, include_terminal_orders, status, requested_by
-         ) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9, $10, 'queued', $11)
+           apply_unambiguous, include_terminal_orders, status, requested_by, source_filter, scheduled_local_date
+         ) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9, $10, 'queued', $11, $12, $13::date)
          RETURNING *`,
         [
           runKey,
@@ -1021,7 +1056,9 @@ export async function createScmReconciliationRun({
           bool(dryRun),
           bool(applyUnambiguous),
           bool(includeTerminalOrders),
-          text(requestedBy) || null
+          text(requestedBy) || null,
+          sourceFilter,
+          scheduledLocalDate
         ]
       );
       return mapRun(result.rows[0]);
@@ -1149,7 +1186,7 @@ export async function finishScmReconciliationRun(runId, {
         );
       }
     }
-    if (row?.status === "succeeded" && row.trigger_source === "nightly") {
+    if (row?.status === "succeeded" && row.trigger_source === "nightly" && !row.source_filter) {
       await query(
         `UPDATE scm_reconciliation_settings
             SET last_nightly_local_date = GREATEST(
@@ -6309,6 +6346,28 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
   if (!sourceRows.length) return [];
   const kinds = [...new Set(sourceRows.map((row) => text(row.orderKind).toUpperCase()).filter((kind) => ["PO", "TO"].includes(kind)))];
   if (!kinds.length) return reviewOnly ? [] : sourceRows;
+  const groupRefs = sourceRows
+    .filter((row) => text(row.orderKind).toUpperCase() === "PO")
+    .map((row) => text(row.orderRef).toLowerCase())
+    .filter(Boolean);
+  const groupMembersResult = groupRefs.length
+    ? await query(
+      `SELECT lower(group_header.group_ref) AS group_ref,
+              member.order_ref
+         FROM scm_schedule_groups group_header
+         JOIN scm_schedule_group_members member ON member.group_id = group_header.id
+        WHERE group_header.status = 'active'
+          AND lower(group_header.group_ref) = ANY($1::text[])
+        ORDER BY group_header.group_ref, member.id`,
+      [[...new Set(groupRefs)]]
+    )
+    : { rows: [] };
+  const sourceIds = [...new Set(sourceRows.map((row) => Number(row.sourceId))
+    .filter((id) => Number.isSafeInteger(id) && id > 0))];
+  const refs = [...new Set([
+    ...sourceRows.flatMap((row) => [row.orderRef, row.sourceRef]),
+    ...groupMembersResult.rows.map((member) => member.order_ref)
+  ].map((ref) => text(ref).toLowerCase()).filter(Boolean))];
   const statesResult = await query(
     `SELECT state.*,
             COALESCE((
@@ -6327,8 +6386,19 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
                AND review.status = 'open'
             ), '[]'::jsonb) AS review_cases
        FROM scm_reconciliation_order_state state
-      WHERE state.order_kind = ANY($1::text[])`,
-    [kinds]
+      WHERE state.order_kind = ANY($1::text[])
+        AND (
+          state.source_order_netsuite_id = ANY($2::bigint[])
+          OR lower(btrim(state.source_order_ref)) = ANY($3::text[])
+          OR EXISTS (
+            SELECT 1 FROM jsonb_object_keys(CASE
+              WHEN jsonb_typeof(state.quantity_summary->'targets') = 'object'
+                THEN state.quantity_summary->'targets'
+              ELSE '{}'::jsonb END) target_ref
+             WHERE lower(btrim(target_ref)) = ANY($3::text[])
+          )
+        )`,
+    [kinds, sourceIds, refs]
   );
   const states = statesResult.rows;
   const direct = new Map(states.map((state) => [
@@ -6346,22 +6416,6 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       target: targets[state.source_order_ref] || null
     });
   }
-  const groupRefs = sourceRows
-    .filter((row) => text(row.orderKind).toUpperCase() === "PO")
-    .map((row) => text(row.orderRef).toLowerCase())
-    .filter(Boolean);
-  const groupMembersResult = groupRefs.length
-    ? await query(
-      `SELECT lower(group_header.group_ref) AS group_ref,
-              member.order_ref
-         FROM scm_schedule_groups group_header
-         JOIN scm_schedule_group_members member ON member.group_id = group_header.id
-        WHERE group_header.status = 'active'
-          AND lower(group_header.group_ref) = ANY($1::text[])
-        ORDER BY group_header.group_ref, member.id`,
-      [[...new Set(groupRefs)]]
-    )
-    : { rows: [] };
   const groupMatches = new Map();
   for (const member of groupMembersResult.rows) {
     const matchedMember = byTarget.get(`PO:${text(member.order_ref).toLowerCase()}`) || {

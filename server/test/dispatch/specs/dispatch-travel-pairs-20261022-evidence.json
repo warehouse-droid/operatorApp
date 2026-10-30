@@ -1,0 +1,43 @@
+{
+  "passed": true,
+  "at": "2026-10-22T18:42:36.573Z",
+  "sourceHashes": {
+    "public/dispatch.js": "cda1a6ba59bb6c6433dbe9df57921528249b1f1474fb88d10a426d17727408a9",
+    "public/dispatch.html": "a9b0aee656cb7858ba0513b0c137490b667cbf15d711be5308fc1b9e566f027d"
+  },
+  "newFailures": 0,
+  "regression": {
+    "tests": 80,
+    "pass": 79,
+    "fail": 1,
+    "failures": [
+      "DP-33 frontend: active CO projection retains every current relationship pickup"
+    ]
+  },
+  "baseline": {
+    "tests": 32,
+    "pass": 31,
+    "fail": 1,
+    "failures": [
+      "DP-33 frontend: active CO projection retains every current relationship pickup"
+    ]
+  },
+  "focusedTests": 11,
+  "syntax": "passed",
+  "lint": "passed",
+  "files": [
+    "test/dispatch/frontend/dispatch-travel-pairs.test.js",
+    "test/dispatch/frontend/dispatch-start-travel-boundary.test.js",
+    "test/dispatch/frontend/dispatch-planner-performance.contract.test.js",
+    "test/dispatch/frontend/dispatch-actual-arrival-repair.test.js",
+    "test/dispatch/frontend/dispatch-required-pickups.test.js"
+  ],
+  "red": {
+    "tests": 10,
+    "pass": 3,
+    "fail": 7
+  },
+  "scope": "Actual UI visit, travel matching, card, preview, and timing-detail functions; separate stops preserved.",
+  "limits": "No full browser layout run; no backend route or saved plan changes.",
+  "node": "v20.20.2"
+}

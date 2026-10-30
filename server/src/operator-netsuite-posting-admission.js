@@ -33,6 +33,10 @@ export function createOperatorNetSuitePostingAdmission({
       await assertLocalCompletionAllowed(resolution);
       return { mode: "local_only", reason: "transfer_background_owned", policy: null, resolution };
     }
+    if (resolution.netSuitePostingOwner === "sales_load_background") {
+      await assertLocalCompletionAllowed(resolution);
+      return { mode: "local_only", reason: "sales_load_background_owned", policy: null, resolution };
+    }
     if (resolution.netSuitePostingOwner === "driver_completion") {
       await assertLocalCompletionAllowed(resolution);
       return {

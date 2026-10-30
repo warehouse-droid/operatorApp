@@ -58,6 +58,19 @@ function setup({ combine = false, failPart = null, uncertain = false } = {}) {
   return { wrapped: createLocationAwareIFAdapter({ adapter, repository }), adapter, repository, records, calls,
     plan: () => structuredClone(plan) };
 }
+
+test('IFIR split parts consume saved responses and return verified aggregate without repeated GETs', async () => {
+  const env = setup(), nativeTransform = env.adapter.transform;
+  env.adapter.transform = async target => {
+    const result = await nativeTransform(target);
+    return { ...result, record: env.records.get(result.id) };
+  };
+  env.adapter.fetchById = async () => { assert.fail('Fresh part must use returned evidence'); };
+  const result = await env.wrapped.transform(step);
+  assert.equal(result.record.fulfillmentParts.length, 2);
+  assert.equal(result.record.tranId, 'IF101, IF102');
+  assert.equal(env.wrapped.verify(step, result.record).id, 101);
+});
 test('P1 accepted mixed locations create exactly one IF', async () => {
   const env = setup({ combine: true });
   const result = await env.wrapped.transform(step);

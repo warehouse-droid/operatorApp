@@ -1,0 +1,84 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import {chromium,expect} from '@playwright/test';
+import {app} from '../../../src/server.js';
+import {config} from '../../../src/config.js';
+import {query,closeDb} from '../../../src/db.js';
+import {updateOperatorPassword,loginOperator} from '../../../src/auth-repository.js';
+import {transportFixture,transportInput} from '../support/bin-transport-fixtures.js';
+import {saveTransportTrip} from '../../../src/mbt/bin-transport-service.js';
+import {writeFileSync} from 'node:fs';
+import {withBrowserCoverageSources} from '../support/browser-source-coverage.js';
+after(closeDb);
+test('Transport browser: four tabs, toolbar route editor, quantity progress, saved draggable trip and no per-card buttons', {timeout:90000},async()=>{
+  const f=await transportFixture();
+  await saveTransportTrip(await transportInput(f,[{lineKey:'loose-1',quantity:'1.25'}]));
+  await updateOperatorPassword(f.actor.operatorId,'transport-browser-password');
+  const token=(await loginOperator(f.actor.operatorId,'transport-browser-password')).token;
+  config.mbt.enabled=true;config.mbtPhase3.binDispatchEnabled=true;config.dispatch.driverOrientedPlanning=true;
+  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key IN ('mbt_enabled','mbt_bin_dispatch')");
+  const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});let browser;
+  try {
+    browser=await chromium.launch({headless:true,executablePath:'/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell',args:['--no-sandbox','--disable-dev-shm-usage']});
+    const context=await browser.newContext({viewport:{width:1500,height:1000}});context.setDefaultTimeout(12000);
+    await context.addInitScript(({token,f})=>{
+      localStorage.setItem('mbbs.staff.token',token);localStorage.setItem('mbbs.dispatch.planDate',f.planDate);
+      sessionStorage.setItem('mbbs.dispatch.sessionId',f.editLease.sessionId);
+      sessionStorage.setItem('mbbs.dispatch.editLease.v1',JSON.stringify({planDate:f.planDate,sessionId:f.editLease.sessionId,
+        editLeaseToken:f.editLease.token,expiresAt:new Date(Date.now()+600000).toISOString()}));
+    },{token,f});
+    const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
+    await page.coverage.startJSCoverage({resetOnNavigation:false});
+    await page.goto(`http://127.0.0.1:${server.address().port}/mbt/planning?planDate=${f.planDate}`);
+    await expect.poll(()=>page.evaluate(()=>isDispatchPlanEditor())).toBe(true);
+    const tabs=page.locator('.order-type-tabs');
+    await expect(tabs.getByRole('button')).toHaveText(['Delivery','Exchange','Collection','MBR/Agg']);
+    for (const label of ['MBR/Agg','Delivery','Exchange','Collection','MBR/Agg','Delivery','MBR/Agg']) {
+      await tabs.getByRole('button',{name:label,exact:true}).click();
+      await expect(tabs.getByRole('button')).toHaveText(['Delivery','Exchange','Collection','MBR/Agg']);
+      await expect(tabs.locator('button.active')).toHaveText(label);
+      await page.evaluate(()=>renderDispatchOrderPoolPatch());
+      await expect(tabs.getByRole('button')).toHaveText(['Delivery','Exchange','Collection','MBR/Agg']);
+    }
+    const source=page.locator(`[data-order="transport-source:${f.sourceRef}"]`).first();
+    await expect(source).toBeVisible();await expect(source.locator('button')).toHaveCount(0);
+    await source.click();await page.locator('.selected-order-actions').getByRole('button',{name:'Plan transport',exact:true}).click();
+    const dialog=page.getByRole('dialog',{name:'Plan transport'});
+    await dialog.getByRole('searchbox',{name:'Search bins'}).fill(f.assetCode);
+    await expect(dialog.locator('[name="assetId"] option:not([value=""])')).toHaveCount(1);
+    await expect(dialog).toContainText('Remaining');await expect(dialog).toContainText('1.25');
+    await expect(dialog.locator('input[type="time"]')).toHaveCount(0);
+    await dialog.locator('[name="assetId"]').selectOption(f.assetId);
+    await dialog.locator('[data-line-key="loose-1"]').fill('0.5');
+    await dialog.locator('[data-line-key="machine-2"]').fill('0');
+    await dialog.locator('[name="pickupYard"]').selectOption({label:'12441'});
+    await dialog.locator('[name="returnYard"]').selectOption({label:'150'});
+    await dialog.locator('[name="returnKind"]').selectOption('delivery');
+    await dialog.locator('[name="deliveryVisitId"]').selectOption(f.part.visitId);
+    await dialog.locator('[name="weightLbs"]').fill('6000');
+    await dialog.getByRole('button',{name:'Save route',exact:true}).click();await expect(dialog).toHaveCount(0);
+    await expect(page.locator('.order-list')).toContainText(`${f.sourceRef} · Trip 2`);
+    const saved=(await query('SELECT * FROM mbt_transport_trips WHERE source_key=$1 ORDER BY trip_number',[f.sourceRef.toLowerCase()])).rows;
+    assert.equal(saved.length,2);assert.equal(saved[1].allocations[0].quantity,'0.5');
+    assert.equal(saved[1].route.returnDestination.visitId,f.part.visitId);
+    const card=page.locator(`[data-order="${saved[1].trip_id}"]`).first();
+    await expect(card).toHaveAttribute('draggable','true');
+    const load=page.locator(`[data-load-card="${f.binLoadIds[0]}"]`);
+    await card.dragTo(load.locator('.stop-list'));
+    await expect(load.locator('.stop-card[data-stop]')).toHaveCount(4);
+    await expect(load.locator('[data-bin-physical-visit]')).toHaveCount(1);
+    const committed=await page.evaluate(async()=>{await saveCurrentPlanNow();return {dirty:localPlanDirty,notice:routeNotice};});
+    assert.equal(committed.dirty,false,committed.notice);
+    assert.equal((await query('SELECT dispatch_load_id FROM mbt_service_visits WHERE service_visit_id=$1',[f.part.visitId])).rows[0].dispatch_load_id,f.binLoadIds[0]);
+    const physical=await page.evaluate(id=>{
+      const actual=trucks.flatMap(t=>t.loads).find(l=>l.id===id);
+      const cargo=actual.stops.find(s=>s.actionCode==='cargo_pickup_1');
+      const pickup=actual.stops.find(s=>s.actionCode==='collect_empty_bin');
+      const same={...actual,stops:[pickup,{...cargo,planningAddress:pickup.planningAddress,location:pickup.location,yardCode:pickup.yardCode},...actual.stops.slice(2)]};
+      return MbbsBinPlanning.physicalVisits(same,[]).map(v=>v.entries.map(e=>e.stop.actionCode));
+    },f.binLoadIds[0]);
+    assert.deepEqual(physical[0],['collect_empty_bin','cargo_pickup_1']);
+    assert.deepEqual(errors,[]);
+    writeFileSync('test-artifacts/transport-browser-v8.json',JSON.stringify(await withBrowserCoverageSources(page,await page.coverage.stopJSCoverage())));
+  } finally {await browser?.close();await new Promise(resolve=>server.close(resolve));}
+});

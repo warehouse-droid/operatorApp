@@ -62,5 +62,12 @@
   "additionalCriteria": [
     "Consolidated TO loading must also remain local and use the background queue, without synchronous NetSuite source lookup.",
     "Ordinary transfer posting commands record a null Driver completion identity; linked SO commands retain their completion identity and checks."
-  ]
+  ],
+  "deploymentAuthorization": {
+    "requestedBy": "User follow-up: deploy",
+    "plan": "Apply the eight-file scoped patch to the captured live app image, validate the exact candidate with isolated disposable tests, preserve the live image for rollback, and restart only the app after checking active operations.",
+    "verification": "Compare all runtime file hashes and effective configuration, check local and public health plus authenticated route protection, and confirm test resource teardown and production dependency health.",
+    "schemaChanges": false,
+    "releaseDirectory": "server/deployments/transfer-yard-posting-20261021"
+  }
 }

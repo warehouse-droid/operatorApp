@@ -167,9 +167,9 @@ async function seedAllocatedGroup() {
     groupRef, JSON.stringify(staleGroup)
   ]);
   const reloaded = await reconcileDispatchPlanGlobalOrderDefinitions(saved);
-  assert.deepEqual(dispatchRequiredPickupVisitLocations(reloaded.orders[0], reloaded), ["2967", vendor]);
-  assert.equal(materializeDispatchPickupVisits(reloaded, { allowLegacyPassthrough: true }).conflicts[0]?.code,
-    "DISPATCH_PICKUP_ORDER_MISSING", "fixture must reproduce the false requirement after global refresh");
+  assert.deepEqual(dispatchRequiredPickupVisitLocations(reloaded.orders[0], reloaded), [vendor]);
+  assert.deepEqual(materializeDispatchPickupVisits(reloaded, { allowLegacyPassthrough: true }).conflicts,
+    [], "sales-unit authority must reject the stale packing-based source-yard requirement even before save hydration");
   return { saved, groupRef, vendor };
 }
 

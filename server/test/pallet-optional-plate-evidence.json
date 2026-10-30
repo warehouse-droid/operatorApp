@@ -1,0 +1,91 @@
+{
+  "feature": "Vehicle plate optional for pallet-only returns",
+  "specApproval": "not obtained (autonomous run)",
+  "spec": "test/pallet-optional-plate-spec.json",
+  "reproduce": "sudo env DISPATCH_SOURCE_RUNTIME=\"$PWD/server/deployments/pallet-optional-plate-20261026/candidate\" bash docker/run-pallet-optional-plate-checks.sh",
+  "initialRed": {
+    "failed": 5,
+    "passedExistingBehavior": 2,
+    "failure": "Blank pallet plates failed with Vehicle plate is required; UI also blocked before photo validation."
+  },
+  "finalValidation": {
+    "passed": true,
+    "acceptance": 7,
+    "regressions": 207,
+    "mutantsKilled": 5,
+    "changedBackendStatementsCovered": 3,
+    "uiRenderAndValidation": true,
+    "sourceHashes": {
+      "src/return-repository.js": "1788c34624347bfad2c54c9dff13c35fe2d84b1b15367418db14d693e209d5a4",
+      "src/return-batch-ra-domain.js": "344715c5c752f56c08552ab0c9dd4038933f94109fcd417ef567e63294277bfc",
+      "public/operator.js": "5f55008313159e503ccbfec50f2526377f3fc4a0d440187d13e199202cc1350b",
+      "public/operator.html": "6818bb63e6678fc22e6c21ada002058173faf7da270b2051cb12008d971e2106"
+    }
+  },
+  "mapping": {
+    "P1": "Three omitted/empty/whitespace integration cases: verified CM and idempotent replay",
+    "P2": "Supplied plate normalization and 32-character limit integration case",
+    "P3": "Stock/combined plate rejection integration case; pallet photo and stock plate UI case; 207 existing return regressions",
+    "P4": "Real review renderer and validation functions in VM: optional label and blank-plate acceptance",
+    "P5": "Blank-plate CM memo assertion; empty-label mutation killed"
+  },
+  "limits": [
+    "NetSuite requests used the existing synthetic boundary fixture; no live customer return or Credit Memo was created.",
+    "All return unit/integration regression files and stock-return draft insertion were run; unrelated repository suites were not rerun.",
+    "Changed backend statements were checked with c8; UI render/validation were executed in VM. No full legacy-module typecheck or whole-file coverage percentage is claimed.",
+    "Existing return property tests ran in the regression suite; mutation results are attributed to the acceptance suite, not property-only tests."
+  ],
+  "dependenciesAdded": 0,
+  "deployment": {
+    "deployedAt": "2026-10-26T22:13:06Z",
+    "image": "mbbs-operator-app:pallet-optional-plate-20261026",
+    "imageId": "sha256:5d27bcf481a9f43cf7f71ea90cdf6ff6393a9885a16ce31f57f686c544028242",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "required": false
+    }
+  },
+  "liveVerification": {
+    "sourceHashesVerified": true,
+    "healthy": true
+  },
+  "cleanup": {
+    "verifiedAt": "2026-10-26T22:14:40.201830+00:00",
+    "running": [
+      {
+        "name": "mbbs-operator-app-app-1",
+        "status": "Up About a minute (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-webhook-worker-1",
+        "status": "Up 7 days"
+      },
+      {
+        "name": "mbbs-operator-app-ollama-1",
+        "status": "Up 8 weeks (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-db-1",
+        "status": "Up 2 months (healthy)"
+      }
+    ],
+    "allContainers": [
+      "mbbs-operator-app-app-1",
+      "mbbs-operator-app-webhook-worker-1",
+      "mbbs-operator-app-ollama-1",
+      "mbbs-operator-app-db-1"
+    ],
+    "nonProductionContainers": [],
+    "disposableVolumes": [],
+    "disposableNetworks": [],
+    "remainingTestRuns": [],
+    "health": {
+      "status": 200,
+      "ok": true
+    },
+    "operatorHttpStatus": 200,
+    "newAssetVersionServed": true
+  }
+}

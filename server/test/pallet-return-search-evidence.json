@@ -1,0 +1,286 @@
+{
+  "feature": "Concurrent pallet balance checks, compact customer matches, and SO timing logs",
+  "updatedAt": "2026-10-29T17:52:42.596983+00:00",
+  "spec": "server/test/pallet-return-search-spec.json (revision2 supersedes the rejected header query)",
+  "specApproval": "not obtained (autonomous run)",
+  "deploymentAuthorization": "User explicitly requested deploy.",
+  "deployment": {
+    "deployedAt": "2026-10-29T17:51:29Z",
+    "image": "mbbs-operator-app:pallet-return-search-20261029",
+    "imageId": "sha256:a97031afb70c7c574d2a824119521188ca6dfdc67a0053046129d0143bab16ac",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "required": false
+    }
+  },
+  "validation": {
+    "passed": true,
+    "specApproval": "not obtained (autonomous run)",
+    "baselineTestsPassed": 266,
+    "finalTestsPassed": 282,
+    "redTests": [
+      "P1 linked credits start while the fresh report is pending, preserving the final reservation",
+      "O2 successful SO searches record reference, mode and elapsed time only"
+    ],
+    "baselineFailures": [],
+    "newFailures": [],
+    "mutantsKilled": 5,
+    "changedCoverage": {
+      "src/return-repository.js": {
+        "measured": 38,
+        "uncovered": []
+      }
+    },
+    "lint": {
+      "baseline": 100,
+      "final": 100,
+      "new": 0
+    },
+    "versions": {
+      "node": "v20.20.2"
+    },
+    "sourceHashes": {
+      "src/return-repository.js": "0b7a47ccfaedd57d744c50feea436cf9875f573c3cbb5969441de1ecc9bc6f05",
+      "public/operator.css": "a0ca43f8bd6590140a8b176da9c1b25cf3835833277b343d0b82c3a40e15209b",
+      "public/operator.html": "a2e45f62f57b11f3d2c4d34f3d4bdba64c23459c905bbdf237fb8ca5b7aa635b"
+    }
+  },
+  "latestReleasePreservation": {
+    "passed": true,
+    "testsPassed": 25,
+    "purpose": "Preserve the intervening stock-exchange release in the shared return repository.",
+    "sourceHashes": {
+      "src/return-repository.js": "0b7a47ccfaedd57d744c50feea436cf9875f573c3cbb5969441de1ecc9bc6f05",
+      "public/operator.css": "a0ca43f8bd6590140a8b176da9c1b25cf3835833277b343d0b82c3a40e15209b",
+      "public/operator.html": "a2e45f62f57b11f3d2c4d34f3d4bdba64c23459c905bbdf237fb8ca5b7aa635b"
+    }
+  },
+  "toolVersions": {
+    "node": "20.20.2",
+    "c8": "12.0.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "fast-check": "4.9.0",
+    "@playwright/test": "1.62.1"
+  },
+  "reproduce": "sudo -n env DISPATCH_SOURCE_RUNTIME=/home/ubuntu/apps/operatorApp/server/deployments/pallet-return-search-20261029/candidate bash docker/run-pallet-return-search-checks.sh",
+  "patch": "server/deployments/pallet-return-search-20261029/release.patch",
+  "liveTimings": {
+    "before": [
+      {
+        "at": "2026-10-29T17:02:50.820Z",
+        "phase": "before",
+        "code": "SOM07260",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 4572,
+        "requests": [
+          {
+            "category": "other-read",
+            "status": 200,
+            "elapsedMs": 670
+          },
+          {
+            "category": "order-lines",
+            "status": 200,
+            "elapsedMs": 599
+          },
+          {
+            "category": "other-query",
+            "status": 200,
+            "elapsedMs": 504
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "elapsedMs": 492
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "elapsedMs": 1956
+          }
+        ]
+      },
+      {
+        "at": "2026-10-29T17:02:54.850Z",
+        "phase": "before",
+        "code": "SOB122269",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 4029,
+        "requests": [
+          {
+            "category": "order-lines",
+            "status": 200,
+            "elapsedMs": 541
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "elapsedMs": 1229
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "elapsedMs": 1216
+          },
+          {
+            "category": "linked-credits",
+            "status": 200,
+            "elapsedMs": 855
+          }
+        ]
+      },
+      {
+        "at": "2026-10-29T17:02:57.764Z",
+        "phase": "before",
+        "code": "SOB123589",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 2914,
+        "requests": [
+          {
+            "category": "order-lines",
+            "status": 200,
+            "elapsedMs": 514
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "elapsedMs": 800
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "elapsedMs": 1498
+          }
+        ]
+      }
+    ],
+    "after": [
+      {
+        "at": "2026-10-29T17:52:02.596Z",
+        "phase": "after",
+        "code": "SOM07260",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 5955,
+        "requests": [
+          {
+            "category": "other-read",
+            "status": 200,
+            "startedAfterMs": 61,
+            "elapsedMs": 829
+          },
+          {
+            "category": "order-lines",
+            "status": 200,
+            "startedAfterMs": 934,
+            "elapsedMs": 568
+          },
+          {
+            "category": "other-query",
+            "status": 200,
+            "startedAfterMs": 1529,
+            "elapsedMs": 901
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "startedAfterMs": 2441,
+            "elapsedMs": 469
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "startedAfterMs": 2921,
+            "elapsedMs": 2998
+          }
+        ]
+      },
+      {
+        "at": "2026-10-29T17:52:05.685Z",
+        "phase": "after",
+        "code": "SOB122269",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 3088,
+        "requests": [
+          {
+            "category": "order-lines",
+            "status": 200,
+            "startedAfterMs": 20,
+            "elapsedMs": 527
+          },
+          {
+            "category": "linked-credits",
+            "status": 200,
+            "startedAfterMs": 571,
+            "elapsedMs": 481
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "startedAfterMs": 597,
+            "elapsedMs": 903
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "startedAfterMs": 1511,
+            "elapsedMs": 1548
+          }
+        ]
+      },
+      {
+        "at": "2026-10-29T17:52:08.002Z",
+        "phase": "after",
+        "code": "SOB123589",
+        "mode": "complete-pallet-lookup",
+        "elapsedMs": 2317,
+        "requests": [
+          {
+            "category": "order-lines",
+            "status": 200,
+            "startedAfterMs": 13,
+            "elapsedMs": 531
+          },
+          {
+            "category": "credit-identities",
+            "status": 200,
+            "startedAfterMs": 566,
+            "elapsedMs": 481
+          },
+          {
+            "category": "saved-search",
+            "status": 200,
+            "startedAfterMs": 1069,
+            "elapsedMs": 1227
+          }
+        ]
+      }
+    ]
+  },
+  "scenarioEvidence": {
+    "P1": "Blocked-report integration test proves linked credits start without waiting for the report; serializing the reads is killed by that test.",
+    "P2/P3": "Fresh report, customer locking, over-return, deleted/unindexed credit, partial RA credit, and generated observed-credit reservation tests pass.",
+    "P4": "Linked-credit errors fail closed; swallowing those failures is killed by the regression test.",
+    "U1": "Chromium checks 1, 3 and 25 customer results at 390, 1024 and 1366 pixels; cards are 44\u2013140 pixels high, top-aligned, scrollable and selectable. Original single tablet/desktop card measured 666 pixels.",
+    "O2": "SO timing test verifies exactly event, orderRef, mode and durationMs; no customer/contact/credential fields."
+  },
+  "cleanup": {
+    "testContainers": 0,
+    "testVolumes": 0,
+    "testNetworks": 0,
+    "dockerPsAndPsA": "Only the four production containers remain.",
+    "generatedTestArtifacts": "Every complete/interrupted run used the unique retention-run directory and automatic teardown/deletion.",
+    "productionHealth": "GET /health returned HTTP 200 with ok=true."
+  },
+  "limitations": [
+    "The reported exact 20-second lookup could not be identified from the previous logs; the three baseline searches were about 2.9\u20134.6 seconds.",
+    "The optimization removes sequential linked-credit waiting for customers with previous return authorizations; NetSuite latency still varies.",
+    "Header-only and ID/header query experiments were slower and were discarded; the original SO query is preserved.",
+    "The full return subsystem was tested, not unrelated application suites. Types were checked for the changed functions with declared external boundaries.",
+    "The changed JS file has 100 pre-existing lint findings; no findings were added. Changed executable line coverage has no uncovered lines; whole legacy-file coverage thresholds were not substituted for this check.",
+    "No dependencies changed, so a new dependency/license audit was unnecessary. No git commits or resets were made.",
+    "Live diagnostics block NetSuite business writes and use a read-only local database transaction; no returns were submitted."
+  ]
+}

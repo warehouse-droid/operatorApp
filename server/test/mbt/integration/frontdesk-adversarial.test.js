@@ -366,7 +366,7 @@ test("P3-F13 adversarial: successful conversion hooks execute inside the local t
   });
   assert.deepEqual(calls, [
     `contract:${result.body.contract.contractId}`,
-    "visits:2"
+    "visits:1"
   ]);
 });
 
@@ -466,8 +466,8 @@ test("P3-F13/F14 variants: nullable canonical fields and optional timeline evide
   assert.equal(sparseTimeline.visits[0].displayName, "delivery");
   assert.equal(sparseTimeline.visits[0].actualStartedAt, "2037-08-03T12:05:00.000Z");
   assert.equal(sparseTimeline.visits[0].actualCompletedAt, "2037-08-03T12:35:00.000Z");
-  assert.equal(sparseTimeline.visits[1].scheduledStartAt, null);
-  assert.equal(sparseTimeline.visits[1].scheduledEndAt, null);
+  assert.equal(sparseTimeline.visits[0].scheduledStartAt, null);
+  assert.equal(sparseTimeline.visits[0].scheduledEndAt, null);
 
   await extendFrontdeskContract(frontdeskCommand("optional-extension", ACTOR, {
     contractId,

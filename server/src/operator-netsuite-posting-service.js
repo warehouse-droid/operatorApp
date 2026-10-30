@@ -149,7 +149,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         remoteMayExist = true;
         const transactionId = Number(transformed?.id);
         if (Number.isSafeInteger(transactionId) && transactionId > 0) {
-          record = await telemetry.context({ stage: "verification" }, () => telemetry.time({ operation: "posting.verification" }, () => adapter.fetchById(step, transactionId)));
+          record = transformed.record ?? await telemetry.context({ stage: "verification" }, () => telemetry.time({ operation: "posting.verification" }, () => adapter.fetchById(step, transactionId)));
           if (!record) {
             throw Object.assign(new Error("NetSuite transform succeeded but the created record could not be read."), {
               code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED",

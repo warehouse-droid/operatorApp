@@ -451,9 +451,17 @@ function serializeDependency(row = {}, lines = []) {
   };
 }
 
-async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", includeCancelled = false } = {}) {
+async function loadDependencies({ salesOrderRef = "", transferOrderRef = "", orderRefs = null, includeCancelled = false } = {}) {
   const params = [];
   const clauses = [];
+  if (Array.isArray(orderRefs)) {
+    const refs = [...new Set(orderRefs.map(text).filter(Boolean))];
+    if (!refs.length) {return [];}
+    params.push(refs);
+    clauses.push(`(d.dispatch_target_ref = ANY($${params.length}::text[])
+      OR d.sales_order_ref = ANY($${params.length}::text[])
+      OR d.transfer_order_ref = ANY($${params.length}::text[]))`);
+  }
   if (salesOrderRef) {
     params.push(text(salesOrderRef));
     clauses.push(`(d.dispatch_target_ref = $${params.length} OR d.sales_order_ref = $${params.length})`);
@@ -1374,9 +1382,14 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
   };
 }
 
-async function salesOrderShortageRows(salesOrderId = null) {
+async function salesOrderShortageRows(salesOrderId = null, orderRefs = null) {
   const params = [isNetSuiteSandboxEnvironment()];
-  const orderClause = salesOrderId ? `AND o.netsuite_id = $${params.push(Number(salesOrderId))}` : "";
+  let orderClause = salesOrderId ? `AND o.netsuite_id = $${params.push(Number(salesOrderId))}` : "";
+  if (Array.isArray(orderRefs)) {
+    const refs = [...new Set(orderRefs.map(text).filter(Boolean))];
+    if (!refs.length) {return [];}
+    orderClause += ` AND o.tranid = ANY($${params.push(refs)}::text[])`;
+  }
   const result = await query(
     `WITH allocated AS (
        SELECT dl.sales_line_id, SUM(dl.allocated_quantity) AS allocated_quantity
@@ -1399,6 +1412,7 @@ async function salesOrderShortageRows(salesOrderId = null) {
                 FROM dispatch_effective_order_completion_events completion
                WHERE completion.order_kind = 'SO'
                  AND lower(btrim(completion.order_ref)) = lower(btrim(o.tranid))
+                 ${Array.isArray(orderRefs) ? "OFFSET 0" : ""}
             ) AS dispatch_completed,
             GREATEST(
               COALESCE(o.status_updated_at, '-infinity'::timestamptz),
@@ -4578,8 +4592,12 @@ export async function cancelOrderDependency(
 }
 
 export async function enrichDispatchOrdersWithDependencies(orders = []) {
-  const dependencies = await loadDependencies();
-  const shortageRows = await salesOrderShortageRows().catch(() => []);
+  if (!orders.length) {return [];}
+  const orderRefs = [...new Set(orders.flatMap(dispatchOrderRefs))];
+  const [dependencies, shortageRows] = await Promise.all([
+    loadDependencies({ orderRefs }),
+    salesOrderShortageRows(null, orderRefs).catch(() => [])
+  ]);
   const uncoveredBySales = new Map();
   for (const row of shortageRows) {
     if (number(row.unresolved_quantity) <= EPSILON) continue;

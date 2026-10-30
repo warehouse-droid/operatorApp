@@ -1,0 +1,8 @@
+{
+ "specApproval":"not obtained (autonomous run); user explicitly states SOM06812 should be 1 Yard",
+ "tier":3,
+ "acceptance":["Require the exact original native sales webhook, immutable command and shipped IF156257 to agree on item, source line, location and 1 Yard before correction.","Correct local order and packed quantity from raw 1.3 to native 1; finalize the existing IF without creating another NetSuite record.","Preserve original immutable request, photos, operator and payload; audit why its old base quantity differs.","Rehearsal rolls back all order, command, audit and load changes; repeated apply is idempotent.","Verify the actual Operator order response is released and local loaded quantity is 1 Yard."],
+ "knownLimits":["General query-unit conversion requires NetSuite Lists Units read access, currently denied with 403. Do not claim a general conversion fix from this scoped repair."],
+ "failureModel":{"wrong quantity":"native original webhook and IF agree; exact negative tests","duplicate load":"single transaction, advisory/row locks, exact one-load verification","partial correction":"transaction rollback rehearsal","historical drift":"immutable input comparison"},
+ "setup":{"newDependencies":[],"migrations":[],"gitCommits":false}
+}

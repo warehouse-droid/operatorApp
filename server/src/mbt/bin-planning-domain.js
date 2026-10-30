@@ -104,21 +104,37 @@ export function sequenceBinVisit(stops, visitId, direction) {
   return groups.flatMap(group => group.stops);
 }
 
-/** @param {any[]} routes */
-export function assertBinRouteCapacity(routes) {
+/** @param {any[]} routes @param {any[]} [warnings] */
+export function assertBinRouteCapacity(routes, warnings = []) {
   for (const route of routes) {
     const aboard = new Map();
+    const estimatedAssets = new Set();
     for (const movement of [...(route.initial || []).map((/** @type {any} */ item) => ({ ...item, delta: 1 })), ...route.movements]) {
       applyMovement(aboard, movement);
+      if (movement.delta === -1 || !movement.estimated) {estimatedAssets.delete(movement.assetId);}
+      else {estimatedAssets.add(movement.assetId);}
       const weightLbs = [...aboard.values()].reduce((sum, weight) => sum + weight, 0);
-      if (aboard.size > route.slotCapacity || weightLbs > route.capacityLbs) {
-        throw conflict("MBT_BIN_CAPACITY_EXCEEDED", "The BIN route exceeds the truck's capacity.", {
-          truckId: route.truckId, requiredSlots: aboard.size, weightLbs
+      if (aboard.size > route.slotCapacity) {
+        throw conflict("MBT_BIN_CAPACITY_EXCEEDED", `The BIN route exceeds the truck's bin-slot capacity: ${aboard.size} bins for ${route.slotCapacity} slots.`, {
+          truckId: route.truckId, requiredSlots: aboard.size, slotCapacity: route.slotCapacity, weightLbs
         });
       }
+      if (weightLbs > route.capacityLbs) {warnings.push(truckWeightWarning(route, movement, weightLbs, estimatedAssets.size > 0));}
     }
   }
   return true;
+}
+
+/** @param {any} route @param {any} movement @param {number} weightLbs @param {boolean} estimated */
+function truckWeightWarning(route, movement, weightLbs, estimated) {
+  const format=(/** @type {number} */ value)=>Number(value).toLocaleString('en-CA',{maximumFractionDigits:3});
+  const context=[route.truckPlate || route.truckId,movement.loadName].filter(Boolean).join(' · ');
+  const reference=movement.reference || movement.assetCode || 'BIN';
+  const action=movement.displayName || movement.actionCode || 'onboard';
+  const excessLbs=weightLbs-route.capacityLbs;
+  return {code:'MBT_BIN_WEIGHT_WARNING',truckId:route.truckId,loadId:movement.loadId,visitId:movement.visitId,
+    actionCode:movement.actionCode,reference,assetId:movement.assetId,weightLbs,capacityLbs:route.capacityLbs,excessLbs,estimated,
+    message:`${context}: ${reference} at ${action} — ${format(weightLbs)} lb onboard exceeds truck capacity ${format(route.capacityLbs)} lb by ${format(excessLbs)} lb.${estimated?' Estimated using the bin payload limit; collection weight is not recorded.':''}`};
 }
 
 /** @param {Map<string, number>} aboard @param {any} movement */

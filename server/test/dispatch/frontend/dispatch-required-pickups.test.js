@@ -67,6 +67,8 @@ export function planner(planOrders, stops = []) {
     "pullExistingStop", "cleanupOrphanPickupStops", "syncPickupStops", "sequenceWarningsForStops"
   ];
   const dependencies = {
+    currentPlan: { id: "isolated-replay" },
+    currentPlanDate: "2098-10-28",
     trucks,
     orderById,
     stopOrder: (entry) => orderById(entry.orderId),

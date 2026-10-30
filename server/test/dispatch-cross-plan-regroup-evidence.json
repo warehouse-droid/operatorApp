@@ -1,0 +1,102 @@
+{
+  "passed": true,
+  "node": "v20.20.2",
+  "sourceHash": "4073fbcf191b32db66b3f0afee1ea5e9fcce8447e10f05c33d8dbd32a14acf63",
+  "focused": {
+    "name": "focused",
+    "status": 0,
+    "passed": 8,
+    "failed": 0,
+    "failures": []
+  },
+  "baseline": {
+    "name": "baseline-regressions",
+    "status": 1,
+    "passed": 20,
+    "failed": 2,
+    "failures": [
+      "SO, PO, TO, and CO splits are global definitions while their date assignment remains independent",
+      "grouped CO and CO-of-group are global without hiding the source-order lifecycle"
+    ]
+  },
+  "regressions": {
+    "name": "candidate-regressions",
+    "status": 1,
+    "passed": 20,
+    "failed": 2,
+    "failures": [
+      "SO, PO, TO, and CO splits are global definitions while their date assignment remains independent",
+      "grouped CO and CO-of-group are global without hiding the source-order lifecycle"
+    ]
+  },
+  "mutations": [
+    {
+      "mutation": "baseline",
+      "propertyOnly": false,
+      "killed": true
+    },
+    {
+      "mutation": "baseline",
+      "propertyOnly": true,
+      "killed": true
+    },
+    {
+      "mutation": "active_owner_overwrite",
+      "propertyOnly": false,
+      "killed": true
+    },
+    {
+      "mutation": "active_owner_overwrite",
+      "propertyOnly": true,
+      "killed": true
+    },
+    {
+      "mutation": "stale_assigned_restore",
+      "propertyOnly": false,
+      "killed": true
+    },
+    {
+      "mutation": "stale_assigned_restore",
+      "propertyOnly": true,
+      "killed": true
+    }
+  ],
+  "reordered": {
+    "name": "reordered",
+    "status": 0,
+    "passed": 8,
+    "failed": 0,
+    "failures": []
+  },
+  "lint": 0,
+  "syntax": 0,
+  "secrets": 0,
+  "changedLinesCovered": [
+    309,
+    325,
+    335,
+    344,
+    345,
+    346,
+    1699
+  ],
+  "propertyCases": 36,
+  "limitations": [
+    "Full application suite not run; complete affected lifecycle suites compared against baseline.",
+    "Existing repository type configuration excludes this JavaScript file from checked types.",
+    "No browser UI changed; real HTTP save path exercised with synthetic records."
+  ],
+  "specApproval": "not obtained (autonomous run)",
+  "riskTier": 3,
+  "reproduce": "bash docker/run-dispatch-regroup-tests.sh",
+  "baselineSourceHash": "ea1803dc4d9d7cc389800bf2b29e231f9e69f5f24f4919ebbb36bd9cab2bd28d",
+  "liveObservation": {
+    "reference": "GOA-10979-10980",
+    "sourcePlan": 371,
+    "targetPlan": 372,
+    "targetDate": "2026-10-29",
+    "targetRevision": 12,
+    "recoverySnapshot": 21337,
+    "productionWrites": false
+  }
+}

@@ -1,0 +1,198 @@
+[
+  {
+    "page": 1,
+    "id": "start",
+    "section": "User manual",
+    "title": "Stock requests",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 2,
+    "id": "contents",
+    "section": "Start here",
+    "title": "Find the right workflow",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 3,
+    "id": "navigation",
+    "section": "Start here",
+    "title": "Open requests and find your work",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 4,
+    "id": "regular-create",
+    "section": "Regular \u00b7 Sales",
+    "title": "Submit a regular stock request",
+    "audience": "Sales"
+  },
+  {
+    "page": 5,
+    "id": "regular-rules",
+    "section": "Regular \u00b7 Approval",
+    "title": "Understand automatic approval",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 6,
+    "id": "regular-safety",
+    "section": "Regular \u00b7 SCM",
+    "title": "Review the reason and safety stock",
+    "audience": "SCM"
+  },
+  {
+    "page": 7,
+    "id": "regular-decisions",
+    "section": "Regular \u00b7 SCM",
+    "title": "Decide lines and manage replenishment",
+    "audience": "SCM"
+  },
+  {
+    "page": 8,
+    "id": "regular-location",
+    "section": "Regular \u00b7 Sales",
+    "title": "Link an SO and confirm a location change",
+    "audience": "Sales"
+  },
+  {
+    "page": 9,
+    "id": "regular-transfer",
+    "section": "Regular \u00b7 Sales",
+    "title": "When the app creates Transfer Orders",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 10,
+    "id": "regular-expiry",
+    "section": "Regular \u00b7 Follow-up",
+    "title": "Wait, retry and read the saved result",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 11,
+    "id": "pickup-search",
+    "section": "Regular \u00b7 Stocking",
+    "title": "SCM opens conversion and adds items",
+    "audience": "SCM"
+  },
+  {
+    "page": 12,
+    "id": "pickup-quantities",
+    "section": "Regular \u00b7 Stocking",
+    "title": "Check final quantities and pallets",
+    "audience": "SCM"
+  },
+  {
+    "page": 13,
+    "id": "pickup-confirm",
+    "section": "Regular \u00b7 Stocking",
+    "title": "Confirm TO creation and check the result",
+    "audience": "SCM + Sales"
+  },
+  {
+    "page": 14,
+    "id": "special-header",
+    "section": "Special \u00b7 Sales",
+    "title": "Open a special case",
+    "audience": "Sales"
+  },
+  {
+    "page": 15,
+    "id": "special-items",
+    "section": "Special \u00b7 Sales",
+    "title": "Describe, price and submit the items",
+    "audience": "Sales"
+  },
+  {
+    "page": 16,
+    "id": "special-quote",
+    "section": "Special \u00b7 Sales + SCM",
+    "title": "Preview the quote and packing quantities",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 17,
+    "id": "special-check",
+    "section": "Special \u00b7 SCM",
+    "title": "Record the vendor stock check",
+    "audience": "SCM"
+  },
+  {
+    "page": 18,
+    "id": "special-decision",
+    "section": "Special \u00b7 Sales",
+    "title": "Record the customer\u2019s decision",
+    "audience": "Sales"
+  },
+  {
+    "page": 19,
+    "id": "special-so-account",
+    "section": "Special \u00b7 Sales",
+    "title": "Prepare the SO account and fulfillment",
+    "audience": "Sales"
+  },
+  {
+    "page": 20,
+    "id": "special-so-create",
+    "section": "Special \u00b7 Sales",
+    "title": "Save the draft, then create or link the SO",
+    "audience": "Sales"
+  },
+  {
+    "page": 21,
+    "id": "special-po",
+    "section": "Special \u00b7 SCM",
+    "title": "Review and create the PO",
+    "audience": "SCM"
+  },
+  {
+    "page": 22,
+    "id": "special-readiness",
+    "section": "Special \u00b7 SCM",
+    "title": "Check PO approval and stock readiness",
+    "audience": "SCM"
+  },
+  {
+    "page": 23,
+    "id": "special-fulfillment",
+    "section": "Special \u00b7 Fulfillment",
+    "title": "Update delivery or complete vendor pickup",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 24,
+    "id": "special-adjustment",
+    "section": "Special \u00b7 Changes",
+    "title": "Request and review an order adjustment",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 25,
+    "id": "special-close",
+    "section": "Special \u00b7 Closure",
+    "title": "Close a case and keep the record",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 26,
+    "id": "statuses",
+    "section": "Reference",
+    "title": "Read stages, queues and alerts",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 27,
+    "id": "troubleshooting",
+    "section": "Reference",
+    "title": "Resolve common problems",
+    "audience": "Sales + SCM"
+  },
+  {
+    "page": 28,
+    "id": "quick-reference",
+    "section": "Reference",
+    "title": "Daily checklist and terminology",
+    "audience": "Sales + SCM"
+  }
+]

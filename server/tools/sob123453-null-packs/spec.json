@@ -1,0 +1,26 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user explicitly authorized updating and checking SOB123453",
+  "scope": "Clear existing zero pack columns on SOB123453 and release the already-written REST SO pack normalization over the current live image.",
+  "acceptance": [
+    "Only the 16 zero PLT/SEC/LYR/PCS fields on existing NetSuite order 1091569 (SOB123453, MBBS-SPECIAL-SO:348) become null.",
+    "The positive counts 4 LYR and 1, 2, 1 PLT remain exact; all eight line identities, quantities, prices, discounts, tax and order total stay unchanged.",
+    "A freshly rendered NetSuite picking ticket contains blank cells for cleared fields.",
+    "Direct, estimate-transform and discounted REST SO creation normalize missing, blank and numeric zero pack counts to explicit null before posting; positive counts remain exact.",
+    "Invalid pack values reject before any write; normalization does not mutate the caller's payload or change any unrelated fields.",
+    "Release changes only the three SO transport functions and adds the existing shared pack helper; preserve runtime configuration, all other live source, worker and database containers."
+  ],
+  "failureModel": {
+    "wrong order or concurrent edit": "fixed identity checks, pre-write readback matching audited snapshot, existing line-key-only PATCH",
+    "unexpected financial or line changes": "compare every unrelated line field plus order financial/status fields after write",
+    "null not persisted or PDF prints zeros": "NetSuite REST readback plus freshly rendered ticket inspection",
+    "future orders still contain zero": "transport regression tests and semantic mutants against exact release candidate",
+    "unrelated workspace edits deployed": "capture current live source, copy only reviewed function bodies, verify full source tree and runtime configuration"
+  },
+  "setup": {
+    "dependencies": "Existing Node, node:test, fast-check, c8, TypeScript, ESLint and disposable test image; optional temporary PDF parser only for inspecting NetSuite's rendered ticket.",
+    "git": "No reset, commit, or changes to pre-existing edits.",
+    "tests": "Use docker/run-dispatch-source-tests.sh over standard isolated Compose with mbbs-tests.slice and unique MBBS_TEST_ARTIFACT_DIR. Register teardown before launch, remove all generated artifacts, verify docker ps and docker ps -a.",
+    "production": "User-authorized scoped update only on SOB123453; app-only image overlay with automatic rollback and preserved configuration. Retain operational before/after audit and concise validation evidence."
+  }
+}

@@ -11,6 +11,7 @@ const users={},out=process.env.BACKORDER_BROWSER_OUTPUT || 'test-artifacts/backo
 let browser,server,base;
 before(async()=>{
   assert.equal(process.env.MBT_TEST_ISOLATED,'1');mkdirSync(out,{recursive:true});
+  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");
   await query("INSERT INTO inventory_items(item_id,item_name,display_name,stock_unit,vendor,vendor_id) VALUES($1,'TEST-ENHANCE-A','Enhanced A','EA','TEST Vendor Alpha',331),($2,'TEST-ENHANCE-B','Enhanced B','BAG','TEST Vendor Beta',332)",[sku,other]);
   server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));base='http://127.0.0.1:'+server.address().port;
   for(const role of ['sales','scm']){
@@ -36,7 +37,7 @@ test('Backorder composer has conditional delivery, three-column inputs, paired n
     await expect(p.locator('[data-regular-field="deliveryAddress"]')).toBeHidden();
     await expect(p.locator('[data-sales-stock-field="rate"],[data-sales-stock-field="discountPercent"]')).toHaveCount(0);
     await p.locator('[data-regular-field="fulfillmentMethod"]').selectOption('mbt_delivery');await expect(p.locator('[data-regular-field="deliveryAddress"]')).toBeVisible();
-    for(const [name,value] of Object.entries({deliveryAddress:'123 TEST delivery',deliveryDate:'2099-02-10',windowStart:'09:00',windowEnd:'12:00',deliveryInstructions:'TEST use side entrance',salesInternalRemark:'TEST private note'}))await p.locator(`[data-regular-field="${name}"]`).fill(value);
+    for(const [name,value] of Object.entries({customerName:'TEST Backorder Customer',deliveryAddress:'123 TEST delivery',deliveryDate:'2099-02-10',windowStart:'09:00',windowEnd:'12:00',deliveryInstructions:'TEST use side entrance',salesInternalRemark:'TEST private note'}))await p.locator(`[data-regular-field="${name}"]`).fill(value);
     await p.locator('[data-sales-stock-remarks]').fill('TEST request remark');
     const notes=await p.locator('[data-regular-field="salesInternalRemark"],[data-sales-stock-remarks]').evaluateAll(rows=>rows.map(r=>({x:r.getBoundingClientRect().x,y:r.getBoundingClientRect().y,width:r.getBoundingClientRect().width})));
     assert.equal(notes[0].y,notes[1].y);assert.notEqual(notes[0].x,notes[1].x);assert.ok(Math.abs(notes[0].width-notes[1].width)<1);
@@ -50,10 +51,19 @@ test('Backorder composer has conditional delivery, three-column inputs, paired n
     await p.screenshot({path:out+'/composer.png',fullPage:true});const creation=p.waitForResponse(r=>r.url().endsWith('/api/sales/stock-requests')&&r.request().method()==='POST');await p.locator('[data-sales-stock-form] button[type="submit"]').click();const created=await creation;assert.equal(created.status(),201);const id=(await created.json()).id;await expect(p.locator('[data-backorder-detail]')).toHaveAttribute('data-backorder-id',String(id));
     const d=await api('sales','/api/sales/stock-requests/'+id);
     assert.deepEqual(d.lines.map(l=>[l.vendorName,l.destinationLocationId,l.originalRate]),[['TEST Vendor Alpha',1,null],['TEST Vendor Beta',28,null]]);assert.equal(d.salesInternalRemark,'TEST private note');assert.equal(d.remarks,'TEST request remark');assert.equal(d.windowStart,'09:00');assert.equal(d.windowEnd,'12:00');assert.equal(d.deliveryInstructions,'TEST use side entrance');
+    const note=p.locator('[data-backorder-sales-note]');await expect(note).toBeVisible();await expect(note).toContainText('TEST private note');
+    await expect(p.locator('[data-action="header"]')).toBeHidden();
     await expect(p.locator('[data-backorder-document="quote.pdf"]')).toHaveCount(0);
     await p.getByText('Edit request header',{exact:true}).click();const header=p.locator('[data-backorder-form][data-action="header"]');await header.locator('[name="remarks"]').fill('TEST changed remark');await header.locator('[name="fulfillmentMethod"]').selectOption('yard_pickup');await expect(header.locator('[name="deliveryAddress"]')).toBeHidden();await expect(header.locator('[name="remarks"]')).toHaveValue('TEST changed remark');await header.locator('[name="fulfillmentMethod"]').selectOption('mbt_delivery');await expect(header.locator('[name="deliveryAddress"]')).toHaveValue('123 TEST delivery');
+    const revisedNote='TEST revised <b>private</b> note\nSales follow-up';await header.locator('[name="salesInternalRemark"]').fill(revisedNote);
+    const headerSaved=p.waitForResponse(r=>r.url().endsWith(`/stock-requests/${id}/backorder/header`)&&r.request().method()==='POST');
+    await header.getByRole('button',{name:'Save request header',exact:true}).click();assert.equal((await headerSaved).status(),200);
+    await expect(note).toBeVisible();assert.equal(await note.locator('.special-sales-internal-remark-content').textContent(),revisedNote);await expect(note.locator('b')).toHaveCount(0);
+    assert.equal(await note.locator('.special-sales-internal-remark-content').evaluate(el=>getComputedStyle(el).whiteSpace),'pre-wrap');
     await p.getByText('Edit request material',{exact:true}).first().click();const edit=p.locator('[data-backorder-form][data-action$="/edit"]').first();await expect(edit.locator('[name="rate"],[name="discountPercent"]')).toHaveCount(0);await edit.locator('[name="vendorName"]').fill('TEST Updated vendor');await edit.locator('[name="destinationLocationId"]').selectOption('28');await edit.locator('button').click();await expect(p.locator('[data-backorder-line]').first()).toContainText('TEST Updated vendor');
     await p.reload();await expect(p.locator('[data-backorder-line]').first()).toContainText('TEST Updated vendor');const updated=await api('sales','/api/sales/stock-requests/'+id);assert.deepEqual(updated.lines.map(l=>l.destinationLocationId),[28,28]);assert.equal(updated.lines[1].vendorName,'TEST Vendor Beta');
+    await expect(note).toBeVisible();assert.equal(await note.locator('.special-sales-internal-remark-content').textContent(),revisedNote);
+    assert.equal(Object.hasOwn(await api('scm','/api/scm/stock-requests/'+id),'salesInternalRemark'),false);
     await p.setViewportSize({width:480,height:900});await p.getByText('Edit request header',{exact:true}).click();assert.ok(await header.evaluate(el=>el.getBoundingClientRect().right<=document.documentElement.clientWidth));await p.screenshot({path:out+'/mobile.png',fullPage:true});assert.deepEqual(f.errors,[]);
   }finally{await f.close();}
 });
@@ -62,10 +72,11 @@ test('SCM shows the vendor and receiving yard for each line even when the vendor
     VALUES($1,1,'3445',125.5,87.25,33.5,now()),($1,28,'2967',999,998,997,now()),($2,28,'2967',0,0,0,now())
     ON CONFLICT(item_id,location_id) DO UPDATE SET quantity_on_hand=EXCLUDED.quantity_on_hand,
       quantity_available=EXCLUDED.quantity_available,quantity_on_order=EXCLUDED.quantity_on_order,synced_at=EXCLUDED.synced_at`,[sku,other]);
-  const d=await api('sales','/api/sales/stock-requests',{deliveryMethod:'backorder',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:2,destinationLocationId:1},{itemId:other,salesQty:3,destinationLocationId:28}]});
+  const d=await api('sales','/api/sales/stock-requests',{deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',salesInternalRemark:'TEST Sales-only note',lines:[{itemId:sku,salesQty:2,destinationLocationId:1},{itemId:other,salesQty:3,destinationLocationId:28}]});
   assert.deepEqual(d.lines.map(line=>[line.stockEvidence.onHand,line.stockEvidence.available,line.stockEvidence.onOrder]),[[125.5,87.25,33.5],[0,0,0]]);
   const f=await pageFor('scm',d.id);try{
     const p=f.page;await expect(p.locator('[data-backorder-line]')).toHaveCount(2);
+    await expect(p.locator('[data-backorder-sales-note]')).toHaveCount(0);await expect(p.locator('[data-backorder-detail]')).not.toContainText('TEST Sales-only note');
     for(const [index,vendor] of ['331','332'].entries()){const line=p.locator('[data-backorder-line]').nth(index);await expect(line.locator('[name="vendorId"]')).toHaveValue(vendor);await expect(line).toContainText(index?'TEST Vendor Beta':'TEST Vendor Alpha');await expect(line).toContainText(index?'2967':'3445');}
     await expect(p.locator('[data-backorder-line]').first().locator('.backorder-material-stock')).toContainText('125.5 EA');
     await expect(p.locator('[data-backorder-line]').first().locator('.backorder-material-stock')).toContainText('87.25 EA');
@@ -82,6 +93,8 @@ test('SCM shows the vendor and receiving yard for each line even when the vendor
     await expect(review.locator('[name="availabilityMode"]')).toBeVisible();await expect(review.locator('[name="availableDate"]')).toBeVisible();
     await review.locator('[name="availabilityMode"]').selectOption('dated');await review.locator('[name="availableDate"]').fill('2099-02-10');
     await review.locator('button').click();await expect(p.locator('[data-backorder-line]').first()).toContainText('ETA 2099-02-10');
+    await expect(review).toBeHidden();
+    await p.locator('[data-backorder-line]').first().getByRole('button',{name:'Edit material review',exact:true}).click();
     await review.locator('[name="supplyStatus"]').selectOption('in_stock');
     await expect(review.locator('[name="availabilityMode"]')).toBeHidden();await expect(review.locator('[name="availableDate"]')).toBeHidden();
     for(let i=0;i<2;i++){

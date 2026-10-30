@@ -12,16 +12,16 @@ const attach=(d,ref='SOM-ARRIVAL-TEST')=>f.action(d,'sales','already-ordered/sal
 const alerts=async role=>(await f.http(role||'sales','/api/sales/stock-requests/alerts')).body;
 const received=id=>f.query("UPDATE purchase_orders SET status_text='Fully Received' WHERE netsuite_id=$1",[id]);
 const acknowledge=(d,key)=>f.http('sales',`/api/sales/stock-requests/${d.id}/decisions/read`,{eventId:d.manualDecisionEventId,arrivalKey:key});
-test('SO reference replaces quotation without reopening Completed and appears in both arrival-filtered queues',async()=>{
+test('SO reference replaces quotation and tracks order progress in both arrival-filtered queues',async()=>{
   const p=await po();let d=await f.ordered(await f.create(1),0,{poNumber:p.ref});
   d=await f.action(d,'sales','quotation/link',{quotationNumber:'QUOTE-KEEP-HISTORY'});
   const revision=d.revision;d=await attach(d,'  SOM-ARRIVAL-TEST  ');
   assert.equal(d.alreadyOrderedSalesOrderRef,'SOM-ARRIVAL-TEST');assert.equal(d.estimateNumber,'QUOTE-KEEP-HISTORY');
-  assert.equal(d.revision,revision+1);assert.equal(d.stage,'completed');assert.equal(d.statusSummary.status,'completed');
+  assert.equal(d.revision,revision+1);assert.equal(d.stage,'completed');assert.equal(d.statusSummary.status,'in_progress');
   assert.deepEqual(d.statusSummary.waitingReasons,['arrival']);assert.equal(d.salesOrderId,null);
   assert(d.events.some(e=>e.eventType==='backorder_already_ordered_so_attached'));
   for(const role of ['sales','scm']){
-    const response=await f.http(role,`/api/${role}/stock-requests?unifiedStatus=completed&waitingReason=arrival&search=${d.requestRef}`);
+    const response=await f.http(role,`/api/${role}/stock-requests?unifiedStatus=in_progress&waitingReason=arrival&search=${d.requestRef}`);
     assert.equal(response.status,200);assert.equal(response.body.requests.length,1);assert.equal(response.body.requests[0].id,d.id);
   }
   assert.equal((await f.query('SELECT stage FROM special_stock_workflow_stages WHERE request_id=$1',[d.id])).rows[0].stage,'completed');

@@ -1,0 +1,282 @@
+{
+  "scope": "User-authorized SOB123453 zero-pack update and deployed REST SO creation prevention release.",
+  "specApproval": "not obtained (autonomous run)",
+  "spec": "tools/sob123453-null-packs/spec.json",
+  "liveOrder": {
+    "order": "SOB123453",
+    "internalId": 1091569,
+    "status": "updated and readback verified",
+    "zeroFieldsCleared": 16,
+    "linesChanged": 5,
+    "positivePackCountsPreserved": true,
+    "allEightLineIdentitiesAndOtherLineFieldsPreserved": true,
+    "financialHeadersPreserved": true,
+    "totalBefore": 3059.42,
+    "totalAfter": 3059.42,
+    "audit": "/app/data/operational-audit/sob123453-null-packs-20261026"
+  },
+  "pickingTicket": {
+    "before": {
+      "order": "SOB123453",
+      "phase": "before",
+      "pdfSha256": "331d6b6abb42bd44f8f54d49dc451da1e4667c1b7a744c752fb8e88fda8dae18",
+      "pdfBytes": 1093749,
+      "printedZeroPackFields": 16,
+      "rows": [
+        {
+          "row": 1,
+          "PLT": "0",
+          "SEC": "0",
+          "LYR": "4",
+          "PCS": "0"
+        },
+        {
+          "row": 2,
+          "PLT": "1",
+          "SEC": "0",
+          "LYR": "0",
+          "PCS": "0"
+        },
+        {
+          "row": 3,
+          "PLT": "2",
+          "SEC": "0",
+          "LYR": "0",
+          "PCS": "0"
+        },
+        {
+          "row": 4,
+          "PLT": "1",
+          "SEC": "0",
+          "LYR": "0",
+          "PCS": "0"
+        },
+        {
+          "row": 5,
+          "PLT": "0",
+          "SEC": "0",
+          "LYR": "0",
+          "PCS": "0"
+        }
+      ]
+    },
+    "after": {
+      "order": "SOB123453",
+      "phase": "after",
+      "pdfSha256": "8019f80b6d18c866280bd68e160d0f13c8b162a5a8cfe0cf83f3a056c3f76430",
+      "pdfBytes": 1093729,
+      "printedZeroPackFields": 0,
+      "rows": [
+        {
+          "row": 1,
+          "PLT": "",
+          "SEC": "",
+          "LYR": "4",
+          "PCS": ""
+        },
+        {
+          "row": 2,
+          "PLT": "1",
+          "SEC": "",
+          "LYR": "",
+          "PCS": ""
+        },
+        {
+          "row": 3,
+          "PLT": "2",
+          "SEC": "",
+          "LYR": "",
+          "PCS": ""
+        },
+        {
+          "row": 4,
+          "PLT": "1",
+          "SEC": "",
+          "LYR": "",
+          "PCS": ""
+        },
+        {
+          "row": 5,
+          "PLT": "",
+          "SEC": "",
+          "LYR": "",
+          "PCS": ""
+        }
+      ]
+    },
+    "inspection": "Actual BFO PDF content streams, embedded Unicode maps, and pack-column coordinates; temporary PDFs removed."
+  },
+  "verification": {
+    "passed": true,
+    "tests": {
+      "tests": 49,
+      "pass": 49,
+      "fail": 0,
+      "skipped": 0
+    },
+    "suites": [
+      "test/mbt/unit/sales-order-pack-transport.test.js",
+      "test/mbt/unit/special-workflow-rest-orders.test.js",
+      "test/mbt/unit/special-so-unitless-verification.test.js",
+      "test/mbt/unit/special-so-creation-confirmation.test.js",
+      "test/mbt/unit/special-stock-request-netsuite.red.test.js",
+      "test/mbt/unit/regular-waitlist-netsuite.test.js"
+    ],
+    "syntax": "passed",
+    "lint": "0 errors/warnings",
+    "helperTypes": "0 errors",
+    "mutation": [
+      {
+        "name": "zero preserved",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "positive lost",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "negative accepted",
+        "killed": true,
+        "propertyKilled": null
+      },
+      {
+        "name": "section overwritten",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "discount transport bypass",
+        "killed": true,
+        "propertyKilled": true
+      }
+    ],
+    "propertyRuns": 250,
+    "suiteHealth": "Same suites passed in reverse file order",
+    "versions": {
+      "node": "v20.20.2",
+      "fast-check": "4.9.0",
+      "c8": "12.0.0",
+      "typescript": "7.0.2",
+      "eslint": "10.8.0"
+    },
+    "sourceHashes": {
+      "src/netsuite.js": "f19a26e0376557b22333627b88a673e527c65eb71d494603562c4f50e660984c",
+      "public/order-pack-quantities.js": "cbca5b7bd9fa75fa3a8a98f469e70804d10cab9c39486e35df1fdba857bd8403"
+    },
+    "candidateTreeHash": "ac116d3166de59a8cc45e0fddc947183117b492508d441785293da483e10e329",
+    "changedLineCoverage": {
+      "src/netsuite.js": {
+        "covered": 13,
+        "total": 13
+      },
+      "public/order-pack-quantities.js": {
+        "covered": 17,
+        "total": 17
+      }
+    },
+    "specApproval": "not obtained (autonomous run)",
+    "red": "7 failures on captured live source: discounted paths failed value assertions; direct paths lacked injectable boundaries and failed before network access",
+    "limits": [
+      "Repository-wide suites and legacy netsuite.js type checking not run; six affected SO suites and focused helper types were checked.",
+      "Only REST SO creation is deployed; the pre-existing broader UI, storage and SuiteScript null-pack work is outside this release."
+    ],
+    "cleanup": "Disposable runner removed test container, volumes, network and temporary artifacts; production health passed."
+  },
+  "imageCheck": {
+    "passed": true,
+    "imageId": "sha256:7b482fb66efed1ab4526f28c1d337b6b1403b7ac9a267513a6587abcb27d0228",
+    "runtimeFilesVerified": 1502,
+    "packagesPreserved": true,
+    "serverImport": true,
+    "soTransport": true
+  },
+  "reproduce": [
+    "sudo -n bash docker/run-sales-order-pack-checks.sh",
+    "sudo -n bash docker/run-sales-order-pack-image-check.sh"
+  ],
+  "specToTests": {
+    "zeroAndBlankSOFields": "sales-order-pack-transport.test.js: four transport cases, 250 seeded property cases",
+    "positiveQuantitiesAndFinancialInvariants": "full-payload equality and caller immutability in transport tests; five existing SO pricing/creation/unit/waitlist suites",
+    "invalidValues": "all four creation paths reject adversarial values before queueing or posting",
+    "existingOrder": "order-update.mjs fixed-order guards and NetSuite before/after readback",
+    "ticketBlanks": "inspect-ticket.py: before 16 printed zeros, after 0 with four preserved positive counts",
+    "releaseIsolation": "full 1502-file image comparison, unchanged package hashes, runtime config preservation check"
+  },
+  "complexity": "Existing shared helper, 25 lines; three targeted transport functions. No new production algorithm or dependency.",
+  "supplyChain": {
+    "dependenciesChanged": false,
+    "dependencyAudit": "skipped: dependencies unchanged",
+    "sourceFilesScanned": 9,
+    "secretPatternMatches": 0,
+    "productionCapabilityChanges": "No new networking, filesystem, subprocess or environment access in the application delta."
+  },
+  "deployment": {
+    "status": "deployed and healthy",
+    "image": "mbbs-operator-app:sob123453-null-packs-20261026",
+    "automaticReview": "Initial deployment was blocked pending explicit approval. The user subsequently approved deployment and it succeeded.",
+    "rollback": "Captured prior image, app-only overlay, automatic rollback on failed verification.",
+    "authorization": "User explicitly approved deployment: deploy",
+    "result": {
+      "deployed": true,
+      "at": "2026-10-26T17:58:25.203933+00:00",
+      "imageId": "sha256:7b482fb66efed1ab4526f28c1d337b6b1403b7ac9a267513a6587abcb27d0228",
+      "files": [
+        "src/netsuite.js",
+        "public/order-pack-quantities.js"
+      ],
+      "configurationPreserved": true,
+      "dependenciesUnchanged": true,
+      "runtimeFilesVerified": 1502
+    }
+  },
+  "cleanup": {
+    "dockerPsAndPsA": "Exactly four production containers; healthy app/database/ollama and running webhook worker.",
+    "testContainersVolumesNetworks": "Removed by registered teardown",
+    "generatedTestArtifactsAndPDFs": "Removed by disposable retention runners",
+    "productionHealth": "HTTP 200, ok=true",
+    "retained": "Concise source evidence and operational/rollback records only."
+  },
+  "inAppPreviewCache": {
+    "order": "SOB123453",
+    "requestId": 348,
+    "refreshed": true,
+    "cacheReadbackVerified": true,
+    "before": [
+      {
+        "requestId": "348",
+        "kind": "sales_order",
+        "audience": "sales",
+        "filename": "Sales-Order_SOB123453.pdf",
+        "snapshotHash": "9586b50280c534884a2983bc9d8315fbc45d3a74c73c0848fdc62c439802ffb2",
+        "pdfHash": "0e042353c1839e5dfd91937f6b338f0c2552b73c93daae99276bfca1c1eb5c61",
+        "bytes": 1095964,
+        "generatedAt": "2026-10-26T17:29:48.521Z"
+      }
+    ],
+    "generated": [
+      {
+        "audience": "sales",
+        "filename": "Sales-Order_SOB123453.pdf",
+        "pdfHash": "d50e85bc3d7a5337bca4ac5655c51733d8b878b15aea9659f4b71af7f00974a6",
+        "bytes": 1095946,
+        "generatedAt": "2026-10-26T18:04:13.993Z"
+      }
+    ],
+    "audiences": [
+      "sales"
+    ],
+    "verifiedAt": "2026-10-26T18:04:19.126Z",
+    "pdfInspection": {
+      "zeroPackFieldsPrinted": 0,
+      "positivePackCounts": [
+        "4 LYR",
+        "1 PLT",
+        "2 PLT",
+        "1 PLT"
+      ],
+      "temporaryPdfRemoved": true
+    }
+  }
+}

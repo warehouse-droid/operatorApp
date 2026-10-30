@@ -13,7 +13,7 @@
   function fields(composer) {
     if(composer.workflowVersion !== 2)return '';
     return `<div class="stock-request-line-fields regular-stock-fields">
-      ${composer.deliveryMethod==='waitlist'?window.RegularWaitlist.customerFields(composer):`<label><span>${t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" value="${esc(composer.customerName)}" /></label>`}
+      ${composer.deliveryMethod==='waitlist'?window.RegularWaitlist.customerFields(composer):`<label><span>${composer.deliveryMethod==='backorder'?t('Customer name *','客户名称 *'):t('Customer (optional)','客户（选填）')}</span><input data-regular-field="customerName" maxlength="200" ${composer.deliveryMethod==='backorder'?'required':''} value="${esc(composer.customerName)}" /></label>`}
       <label><span>${t('Type','类型')} *</span><select data-regular-field="deliveryMethod" required><option value="">${t('Select…','请选择…')}</option><option value="pickup" ${composer.deliveryMethod==='pickup'?'selected':''}>${t('Pickup','自取')}</option><option value="delivery" ${composer.deliveryMethod==='delivery'?'selected':''}>${t('Delivery','送货')}</option><option value="stocking" ${composer.deliveryMethod==='stocking'?'selected':''}>${t('Stocking','备货')}</option><option value="backorder" ${composer.deliveryMethod==='backorder'?'selected':''}>${t('Backorder','欠货')}</option><option value="waitlist" ${composer.deliveryMethod==='waitlist'?'selected':''}>${t('Waitlist','候补')}</option></select></label>
       ${composer.deliveryMethod==='stocking'?`<label><span>${t('Stocking type','备货类型')}</span><select data-regular-field="stockingType"><option value="transfer" ${composer.stockingType!=='purchase'?'selected':''}>${t('Transfer','调货')}</option><option value="purchase" ${composer.stockingType==='purchase'?'selected':''}>${t('Purchase','采购')}</option></select></label>`:''}
       ${composer.deliveryMethod==='delivery'?`<label><span>${t('Expected arrival date','预计到达日期')} *</span><input data-regular-field="arrivalDate" autocomplete="off" required placeholder="YYYY-MM-DD" value="${esc(composer.arrivalDate)}" /></label>
@@ -56,6 +56,7 @@
       <span><small>${t('Minimum lead time at submission','提交时最短提前时间')}</small><strong>${stocking(request)?t('SCM review required','须 SCM 审核'):a.leadTimeApplies===false?t('No minimum lead time','无需最短提前时间'):`${number(a.leadHours)} ${t('hours','小时')}`}</strong></span>
       ${r.approvalExpiresAt&&!r.handoffStatus&&!stocking(request)?`<span><small>${t('Approval valid until','批准有效期至')}</small><strong>${esc(window.MBBS_I18N?.displayDateTime?.(r.approvalExpiresAt)||r.approvalExpiresAt)}</strong></span>`:''}
       ${r.salesOrderRef?`<span><small>SO</small><strong>${esc(r.salesOrderRef)}</strong></span>`:''}
+      ${r.deliveryMethod==='pickup'&&r.salesOrderProgress?`<span><small>${t('SO status','SO 状态')}</small><strong>${esc(r.salesOrderProgress.statusText)}</strong></span><span><small>${t('Last checked','上次检查')}</small><strong>${esc(/** @type {any} */(window).MBBS_I18N?.displayDateTime?.(r.salesOrderProgress.checkedAt)||r.salesOrderProgress.checkedAt)}</strong></span>`:''}
     </div>${(!a.automatic||stocking(request))&&reasons.length?`<section class="stock-request-notice regular-stock-review-reasons"><strong>${t('Why SCM review is required','需要 SCM 审核的原因')}</strong><ul>${reasons.map(reason=>`<li>${esc(reason)}</li>`).join('')}</ul></section>`:''}
     ${approvalExpired(request)?`<p class="stock-request-notice stock-request-error">${t('Approval expired. Re-raise for a fresh review or close the request.','批准已过期。请重新提交以重新审核，或关闭申请。')}</p>`:''}
     ${r.handoffError?`<p class="stock-request-notice stock-request-error">${esc(r.handoffError)}</p>`:''}`;
@@ -113,6 +114,10 @@
       ${state.completedAt?`<small>${t('Completed','完成时间')}: ${esc(window.MBBS_I18N?.displayDateTime?.(state.completedAt)||state.completedAt)}</small>`:''}</section>`;
   }
   async function normalize(composer,root) {
+    if(composer?.deliveryMethod==='backorder') {
+      composer.customerName=String(composer.customerName || '').trim();
+      if(!composer.customerName)throw new Error(t('Customer name is required.','请填写客户名称。'));
+    }
     if(composer?.deliveryMethod==='waitlist'&&!composer.customerId)throw new Error('Select an existing customer from the list.');
     if(composer?.deliveryMethod!=='delivery'||!composer.arrivalDate||!composer.arrivalTime)return;
     const {arrivalDate,arrivalTime}=composer;

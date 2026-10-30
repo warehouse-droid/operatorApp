@@ -105,7 +105,7 @@ test('manual SO without a transaction date saves its link day once', () => isola
 
 test('Backorder transfer checks use the linked SO placement date even when the check is submitted later', () => isolated(async () => {
   await query("INSERT INTO inventory_items(item_id,item_name,display_name,stock_unit,vendor,vendor_id) VALUES(8899221,'TEST-TRANSFER-REG','TEST material','EA','TEST Vendor',8899200)");
-  let d = await submitBackorderRequest({ destinationLocationId: 1, vendorName: 'TEST Vendor', vendorId: 8899200, fulfillmentMethod: 'yard_pickup',
+  let d = await submitBackorderRequest({ customerName: 'TEST Backorder Customer', destinationLocationId: 1, vendorName: 'TEST Vendor', vendorId: 8899200, fulfillmentMethod: 'yard_pickup',
     lines: [{ itemId: 8899221, salesQty: 2, quantityMode: 'direct', requiredDate: '2099-02-01' }] }, { operatorId: context.operatorId, authorizedDestinationLocationIds: [1] });
   const action = (role, name, input) => runBackorderAction(d.id, name, { expectedRevision: d.revision, ...input }, { ...context, audience: role });
   d = await action('scm', `lines/${d.lines[0].id}/response`, response);

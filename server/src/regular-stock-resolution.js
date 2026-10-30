@@ -57,6 +57,7 @@ export async function resolveRegularStockRequest(id,input,context) {
     if(row.regular_details?.deliveryMethod==='backorder')throw regularError('Use the Backorder case actions for this request.','BACKORDER_WORKFLOW_ONLY');
     const request=await getScmStockRequest(requestId);
     const line=stockingActionLine(/** @type {{lines:{id:number,status:string,itemName:string,resolution?:import('../tools/regular-stock-resolution-globals.js').RegularResolutionReply|null}[]}} */ (request),input.lineId,'REGULAR_RESOLUTION_INVALID');
+    if(!line)throw regularError('Material not found.','REGULAR_RESOLUTION_INVALID',400);
     const saved=line.resolution;
     if (saved) {
       if(saved.purchaseOrderRef.toUpperCase()!==reply.purchaseOrderRef.toUpperCase()||saved.eta!==reply.eta) {
@@ -80,5 +81,47 @@ export async function resolveRegularStockRequest(id,input,context) {
       regular_details=regular_details||$3::jsonb,updated_at=now() WHERE id=$1`,[requestId,event.id,JSON.stringify({stockingLines,...(request.lines.length===1?{resolution}:{})})]);
     await refreshStockingReplyStatus(requestId);
     return {request:await getScmStockRequest(requestId),changed:true};
+  });
+}
+
+/** SCM's manual confirmation of sufficient stock at the destination; no stock movement.
+ * @param {number|string} id @param {{lineIds?:unknown[],expectedRevision?:unknown}} input @param {{operatorId:string}} context */
+export async function completeRegularStockFromYard(id,input,context) {
+  const requestId=Number(id),revision=Number(input.expectedRevision);
+  const lineIds=[...new Set((Array.isArray(input.lineIds)?input.lineIds:[]).map(Number))];
+  if(!Number.isSafeInteger(requestId)||requestId<=0||!Number.isSafeInteger(revision)||revision<1
+    ||!lineIds.length||lineIds.length>100||lineIds.some(value=>!Number.isSafeInteger(value)||value<=0))
+    throw regularError('Select valid material lines and a current request revision.','REGULAR_STOCK_INVALID',400);
+  return withTransaction(async()=>{
+    await lockPurchaseStock();
+    const row=(await query('SELECT * FROM sales_stock_requests WHERE id=$1 FOR UPDATE',[requestId])).rows[0];
+    if(!row||row.request_type!=='regular')throw regularError('Regular Stocking request not found.','REGULAR_NOT_FOUND',404);
+    if(Number(row.revision)!==revision)throw regularError('This request changed. Reload and try again.','STOCK_REQUEST_REVISION_CONFLICT');
+    const request=await getScmStockRequest(requestId);
+    const selected=lineIds.map(lineId=>{
+      const line=stockingActionLine(/** @type {{lines:{id:number,status:string,itemName:string}[]}} */ (request),lineId,'REGULAR_STOCK_INVALID');
+      if(!line)throw regularError('Material not found.','REGULAR_STOCK_INVALID',400);
+      return line;
+    });
+    for(const line of selected)await requireUncommitted(request,line);
+    const yardStock={destinationLocationId:request.destinationLocationId,destinationName:request.destinationName,
+      completedAt:new Date().toISOString(),completedBy:context.operatorId};
+    const stockingLines={...request.regular.stockingLines};
+    let eventId;
+    for(const line of selected){
+      await query(`UPDATE sales_stock_request_lines SET status='closed',regular_decision='stock',decision_reason=$2,
+        decided_by=$3,decided_at=now(),updated_at=now() WHERE id=$1`,
+        [line.id,`Stock available at destination yard ${request.destinationName}. No purchase required.`,context.operatorId]);
+      stockingLines[line.id]={...stockingLines[line.id],yardStock,replyStatus:null};
+      eventId=(await query(`INSERT INTO sales_stock_request_events(request_id,request_line_id,event_type,actor_id,details)
+        VALUES($1,$2,'regular_manual_decision',$3,$4::jsonb) RETURNING id`,
+        [requestId,line.id,context.operatorId,JSON.stringify({decision:'yard_stock',lineId:line.id,itemName:line.itemName,...yardStock})])).rows[0].id;
+    }
+    await query(`UPDATE sales_stock_requests SET status=CASE WHEN EXISTS(SELECT 1 FROM sales_stock_request_lines
+      WHERE request_id=$1 AND status NOT IN ('closed','rejected','cancelled','received','fulfilled')) THEN 'active' ELSE 'completed' END,
+      revision=revision+1,first_scm_decision_at=COALESCE(first_scm_decision_at,now()),manual_decision_event_id=$2,
+      regular_details=regular_details||$3::jsonb,updated_at=now() WHERE id=$1`,[requestId,eventId,JSON.stringify({stockingLines})]);
+    await refreshStockingReplyStatus(requestId);
+    return getScmStockRequest(requestId);
   });
 }

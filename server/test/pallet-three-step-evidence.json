@@ -1,0 +1,35 @@
+{
+  "passed": true,
+  "tests": 20,
+  "flow": [
+    "Lookup: barcode camera, sales order number or customer search in three equal columns",
+    "Input: pallet quantity, optional vehicle plate and optional note",
+    "Confirmation: review entered information and optionally capture photo proof"
+  ],
+  "viewports": [
+    390,
+    1024,
+    1366
+  ],
+  "browserCoverage": [
+    "typing focus and stale searches",
+    "barcode camera and Zebra/manual lookup",
+    "editable quantity and plus/minus controls",
+    "optional plate and proof",
+    "back navigation preserves input and photos",
+    "floating warnings and minimum 15px text"
+  ],
+  "deployment": {
+    "deployedAt": "2026-10-26T23:38:49Z",
+    "image": "mbbs-operator-app:pallet-three-step-20261026",
+    "imageId": "sha256:d4665bd6cf588e3dd7bd72db13a123b9062466b601ca60d861aefe30d0cbe7a0",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "required": false
+    }
+  },
+  "servedAssetsVerified": true,
+  "testCleanup": "Disposable runner removed all generated artifacts and test containers/networks; docker ps and docker ps -a verified."
+}

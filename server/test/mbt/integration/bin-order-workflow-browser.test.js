@@ -1,3 +1,4 @@
+import {withBrowserCoverageSources} from "../support/browser-source-coverage.js";
 import assert from "node:assert/strict";
 import test,{after} from "node:test";
 import crypto from "node:crypto";
@@ -18,6 +19,9 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     customer_site_profile_id,site_snapshot,pricing_snapshot) SELECT $1,contract_id,1,bin_type_id,
     customer_site_profile_id,site_snapshot,pricing_snapshot FROM mbt_contracts WHERE contract_id=$2`,[lineId,f.contractId]);
   await query("UPDATE mbt_service_visits SET service_line_id=$1 WHERE contract_id=$2",[lineId,f.contractId]);
+  await query(`UPDATE mbt_service_visits SET customer_snapshot=jsonb_build_object('displayName',$2::text),
+    site_snapshot=site_snapshot || jsonb_build_object('addressLine1',$3::text) WHERE service_visit_id=$1`,
+    [f.frontVisitId,'LongCustomerName'.repeat(20),'LongCustomerAddress'.repeat(20)]);
   const order=await getBinOrderWorkflow(f.frontVisitId);
   await query("UPDATE operators SET roles=ARRAY['dispatcher','mbt_frontdesk'] WHERE id=$1",[f.actor.operatorId]);
   await updateOperatorPassword(f.actor.operatorId,"bin-workflow-test-password");
@@ -50,17 +54,36 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     await page.goto(`${origin}/mbt/planning?planDate=${f.planDate}`);
     await expect.poll(()=>page.evaluate(()=>isDispatchPlanEditor())).toBe(true);
     const card=page.locator(`.order-card[data-order="${order.reference}"]`);
-    await expect(card.getByRole("button",{name:"Configure delivery"})).toBeVisible();
-    await card.getByRole("button",{name:"Configure delivery"}).click();
-    const dialog=page.getByRole("dialog",{name:`Configure ${order.reference}`});
+    await expect(card).toBeVisible();
+    await expect(card).toContainText('LongCustomerName'.repeat(20));
+    await expect(card).toContainText('LongCustomerAddress'.repeat(20));
+    await expect(card.locator('button,select,input')).toHaveCount(0);
+    await card.click();
+    const actions=page.locator('[data-dispatch-order-actions]');
+    await expect(actions.getByRole('button',{name:'Assign to selected load'})).toHaveCount(0);
+    await actions.getByRole('button',{name:'Plan delivery',exact:true}).click();
+    const dialog=page.getByRole("dialog",{name:`Plan ${order.reference}`});
+    await expect(dialog.locator('input[type="datetime-local"]')).toHaveCount(0);
+    await expect(dialog).toContainText('Order window');
+    await dialog.getByRole('searchbox',{name:'Search bins'}).fill(f.assetCode);
+    await expect(dialog.locator('[name="deliveryAssetId"] option:not([value=""])')).toHaveCount(1);
     await dialog.locator('[name="deliveryAssetId"]').selectOption(f.assetId);
     await expect(dialog.locator("[data-source]")).not.toContainText("undefined");
     await expect(dialog.locator("[data-source]")).not.toContainText("Unknown");
     await page.screenshot({path:"test-artifacts/bin-workflow-configure.png",fullPage:true});
-    await dialog.getByRole("button",{name:"Save workflow",exact:true}).click();
+    await dialog.getByRole("button",{name:"Save route",exact:true}).click();
     await expect(dialog).toHaveCount(0);
     await expect(card).toHaveCount(1);
     await expect(card).toContainText(f.assetCode);
+    await expect(page.getByRole('button',{name:'Change time window',exact:true})).toHaveCount(0);
+    for (const width of [1600,1024,768]) {
+      await page.setViewportSize({width,height:1000});
+      const sizes=await card.evaluate(el=>({card:el.getBoundingClientRect().right,
+        pool:el.closest('[data-dispatch-order-pool]').getBoundingClientRect().right,scroll:el.scrollWidth,width:el.clientWidth}));
+      assert.ok(sizes.card<=sizes.pool+1,JSON.stringify(sizes));
+      assert.ok(sizes.scroll<=sizes.width+1,JSON.stringify(sizes));
+    }
+    await page.setViewportSize({width:1600,height:1000});
     const load=page.locator(`[data-load-card="${f.binLoadIds[0]}"]`);
     await card.dragTo(load.locator(".stop-list"));
     await expect(load.locator(".stop-card[data-stop]")).toHaveCount(2);
@@ -92,6 +115,7 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     await query("UPDATE mbt_service_visits SET service_line_id=$1 WHERE contract_id=$2",[receivingLine,receiving.contractId]);
     const dumpId=crypto.randomUUID(),materialId=crypto.randomUUID();
     await query("INSERT INTO mbt_materials(material_id,material_code,display_name,created_by,updated_by) VALUES ($1,$2,'Browser fill','test','test')",[materialId,materialId]);
+    await query("UPDATE mbt_contract_service_lines SET pricing_snapshot=pricing_snapshot || $2::jsonb WHERE service_line_id=$1",[collectionLine,JSON.stringify({materialId})]);
     await query(`INSERT INTO mbt_dump_sites(dump_site_id,dump_site_code,display_name,address_line_1,created_by,updated_by)
       VALUES ($1,$2,'Browser dump','500 Dump Road','test','test')`,[dumpId,dumpId]);
     await query(`INSERT INTO mbt_dump_site_materials(dump_site_material_id,dump_site_id,material_id,accepted,created_by,updated_by)
@@ -101,23 +125,30 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     await openWorkflow(c.successorVisitId);
     const collectionDialog=page.getByRole("dialog");
     await expect(collectionDialog).toContainText(c.assetCode);
-    await collectionDialog.locator('[name="dumpChoice"]').selectOption(`${dumpId}|${materialId}`);
+    await expect(collectionDialog.locator('[data-order-material]')).toContainText("Browser fill");
+    await expect(collectionDialog.locator('[name="materialId"], [name="dumpChoice"]')).toHaveCount(0);
+    await collectionDialog.locator('[name="dumpSiteId"]').selectOption(dumpId);
     const yard=await collectionDialog.locator('[name="yardId"] option').last().getAttribute("value");
     await collectionDialog.locator('[name="yardId"]').selectOption(yard);
-    await collectionDialog.getByRole("button",{name:"Save workflow",exact:true}).click();
+    await expect(collectionDialog.locator('[data-cargo-preview] li').first()).toContainText('100 Test Route');
+    await collectionDialog.getByRole("button",{name:"Save route",exact:true}).click();
     await expect(collectionDialog).toHaveCount(0);
     await openWorkflow(c.successorVisitId);
     await expect(collectionDialog.locator('[name="yardId"]')).toHaveValue(yard);
-    await expect(collectionDialog.locator('[name="dumpChoice"]')).toHaveValue(`${dumpId}|${materialId}`);
+    await expect(collectionDialog.locator('[name="dumpSiteId"]')).toHaveValue(dumpId);
     await collectionDialog.locator('[name="destinationKind"]').selectOption("delivery");
+    await expect(collectionDialog.getByLabel("Receiving delivery order")).toBeVisible();
+    await expect(collectionDialog.locator('[name="nextOrderId"] option').first()).toHaveText("Choose receiving order");
+    const receivingOrder=await getBinOrderWorkflow(receiving.frontVisitId);
+    await expect(collectionDialog.locator(`[name="nextOrderId"] option[value="${receiving.frontVisitId}"]`)).toContainText(receivingOrder.reference);
     await collectionDialog.locator('[name="nextOrderId"]').selectOption(receiving.frontVisitId);
-    await collectionDialog.getByRole("button",{name:"Save workflow",exact:true}).click();
+    await collectionDialog.getByRole("button",{name:"Save route",exact:true}).click();
     await expect(collectionDialog).toHaveCount(0);
     await openWorkflow(receiving.frontVisitId);
     await expect(page.getByRole("dialog").locator('[name="deliveryAssetId"]')).toHaveValue(c.assetId);
     await expect(page.getByRole("dialog").locator("[data-source]")).toContainText("After dumping:");
-    await page.getByRole("dialog").getByRole("button",{name:"Save workflow",exact:true}).click();
-    await expect(page.getByRole("dialog").getByRole("alert")).toContainText("linked to another rental");
+    await expect(page.getByRole("dialog").locator('[name="deliveryAssetId"]')).toBeDisabled();
+    await expect(page.getByRole("dialog")).toContainText("linked to another rental");
     await expect(page.getByRole("dialog").locator('[name="deliveryAssetId"]')).toHaveValue(c.assetId);
     await page.getByRole("dialog").getByRole("button",{name:"Close workflow"}).click();
     const exchangeId=crypto.randomUUID();
@@ -128,6 +159,16 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
       customer_site_profile_id,bin_type_id,$3,scheduled_start_at,scheduled_end_at,
       customer_snapshot,site_snapshot,service_snapshot,'test','test' FROM mbt_service_visits WHERE service_visit_id=$4`,
     [exchangeId,`browser-${exchangeId}`,c.assetId,c.frontVisitId]);
+    await query("UPDATE mbt_service_visits SET bin_type_id='00000000-0000-4000-8000-000000000020' WHERE service_visit_id=$1",[exchangeId]);
+    await openWorkflow(exchangeId);
+    const sizeChangeDialog=page.getByRole("dialog");
+    await expect(sizeChangeDialog.locator('[name="sequence"]')).toHaveValue("delivery_first");
+    await expect(sizeChangeDialog.locator('[name="sequence"] option[value="collection_first"]')).toHaveJSProperty("disabled",true);
+    await expect(sizeChangeDialog.locator('[name="reuse"] option[value="same_bin"]')).toHaveJSProperty("disabled",true);
+    await expect(sizeChangeDialog.locator('[data-delivery-bin]')).toBeVisible();
+    await expect(sizeChangeDialog.locator('[data-sequence-help]')).toContainText("different size or type");
+    await sizeChangeDialog.getByRole("button",{name:"Close workflow"}).click();
+    await query("UPDATE mbt_service_visits SET bin_type_id=$2 WHERE service_visit_id=$1",[exchangeId,c.binTypeId]);
     await openWorkflow(exchangeId);
     const exchangeDialog=page.getByRole("dialog");
     await exchangeDialog.locator('[name="sequence"]').selectOption("collection_first");
@@ -135,21 +176,52 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     await expect(exchangeDialog.locator("[data-delivery-bin]")).toBeHidden();
     await expect(exchangeDialog.locator("[data-destination]")).toBeHidden();
     await expect(exchangeDialog.locator("[data-sequence-help]")).toContainText("same Toronto calendar day");
-    await exchangeDialog.locator('[name="dumpChoice"]').selectOption(`${dumpId}|${materialId}`);
+    await exchangeDialog.locator('[name="dumpSiteId"]').selectOption(dumpId);
     await page.screenshot({path:"test-artifacts/bin-workflow-exchange-configure.png",fullPage:true});
-    await exchangeDialog.getByRole("button",{name:"Save workflow",exact:true}).click();
+    await exchangeDialog.getByRole("button",{name:"Save route",exact:true}).click();
     await expect(exchangeDialog).toHaveCount(0);
     const exchange=await getBinOrderWorkflow(exchangeId);
     assert.equal(exchange.parts.length,2);
     assert.ok(exchange.parts.every(p=>p.assetId===c.assetId));
     assert.match(exchange.parts.find(p=>p.role==="delivery").reference,/X-1D$/);
+    // An independent exchange can be reconfigured; the preceding one is linked
+    // to another rental and intentionally locks its workflow controls.
+    const independent=await planningFixture(4403),independentLine=crypto.randomUUID(),independentExchange=crypto.randomUUID();
+    await query(`INSERT INTO mbt_contract_service_lines(service_line_id,contract_id,line_number,bin_type_id,customer_site_profile_id,site_snapshot,pricing_snapshot)
+      SELECT $1,contract_id,1,bin_type_id,customer_site_profile_id,site_snapshot,pricing_snapshot || $3::jsonb FROM mbt_contracts WHERE contract_id=$2`,
+    [independentLine,independent.contractId,JSON.stringify({materialId})]);
+    await query('UPDATE mbt_service_visits SET service_line_id=$1 WHERE contract_id=$2',[independentLine,independent.contractId]);
+    await withTransaction(()=>recordAssetMovement({query,ambientTransaction:true},{assetId:independent.assetId,movementType:'deliver_bin_expected',
+      afterStatus:'at_customer',afterLocation:{kind:'customer_site',reference:'100 Test Route',customerSiteProfileId:independent.siteProfileId},
+      contractId:independent.contractId,visitId:independent.frontVisitId,source:'workflow-browser',actorType:'system',actorId:'test',occurredAt:`${independent.planDate}T10:00:00Z`}));
+    await query("UPDATE mbt_service_visits SET status='completed',actual_completed_at=$2 WHERE service_visit_id=$1",[independent.frontVisitId,`${independent.planDate}T10:00:00Z`]);
+    await query('UPDATE mbt_bin_rental_numbers SET current_asset_id=$2 WHERE service_line_id=$1',[independentLine,independent.assetId]);
+    await query(`INSERT INTO mbt_service_visits(service_visit_id,contract_id,service_line_id,visit_number,visit_reference,
+      service_template_version_id,service_action,status,customer_site_profile_id,bin_type_id,expected_asset_id,
+      scheduled_start_at,scheduled_end_at,customer_snapshot,site_snapshot,service_snapshot,created_by,updated_by)
+      SELECT $1,contract_id,service_line_id,50,$2,service_template_version_id,'exchange_bin','ready',customer_site_profile_id,
+      bin_type_id,$3,scheduled_start_at,scheduled_end_at,customer_snapshot,site_snapshot,service_snapshot,'test','test'
+      FROM mbt_service_visits WHERE service_visit_id=$4`,[independentExchange,`preview-${independentExchange}`,independent.assetId,independent.frontVisitId]);
+    await openWorkflow(independentExchange);
+    await page.getByRole('dialog').locator('[name="sequence"]').selectOption('collection_first');
+    await page.getByRole('dialog').locator('[name="reuse"]').selectOption('same_bin');
+    await page.getByRole('dialog').locator('[name="dumpSiteId"]').selectOption(dumpId);
+    await page.getByRole('dialog').getByRole('button',{name:'Save route',exact:true}).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await openWorkflow(independentExchange);
+    await page.getByRole('dialog').locator('[name="reuse"]').selectOption('different_bin');
+    await page.getByRole('dialog').locator('[name="deliveryAssetId"]').selectOption(receiving.assetId);
+    await expect(page.getByRole('dialog').locator('[data-cargo-preview]')).toContainText('Pick up empty bin');
+    await page.getByRole('dialog').getByRole('button',{name:'Close workflow'}).click();
     await checkpointCoverage();
     await page.reload();
+    await page.locator('.order-type-tabs').getByRole('button',{name:'Exchange',exact:true}).click();
     const exchangeDelivery=exchange.parts.find(p=>p.role==="delivery");
     const replacement=page.locator(`.order-card[data-order="${exchangeDelivery.reference}"]`);
     await expect(replacement).toBeVisible();
     await expect(replacement).toContainText("After dumping:");
-    await replacement.getByRole("button",{name:"Details",exact:true}).click();
+    await replacement.click();
+    await page.locator('[data-dispatch-order-actions]').getByRole('button',{name:'Details',exact:true}).click();
     const details=page.locator(".bin-visit-details");
     await expect(details).toContainText(exchangeDelivery.reference);
     await expect(details).toContainText("Required steps");
@@ -212,8 +284,8 @@ test("browser: dispatcher configures a readable BIN delivery, assigns it and ret
     await expect(preview.locator("[data-bin-asset-role]")).toHaveCount(1);
     await preview.screenshot({path:"test-artifacts/bin-workflow-driver-summary.png"});
     assert.deepEqual(errors,[]);
-    await writeFile("test-artifacts/workflow-browser-v8.json",JSON.stringify([
-      ...coverage,...await page.coverage.stopJSCoverage(),...await driverPage.coverage.stopJSCoverage()]));
+    await writeFile("test-artifacts/workflow-browser-v8.json",JSON.stringify(await withBrowserCoverageSources(page,[
+      ...coverage,...await page.coverage.stopJSCoverage(),...await driverPage.coverage.stopJSCoverage()])));
     await driverContext.close();
     await context.close();
   } finally {

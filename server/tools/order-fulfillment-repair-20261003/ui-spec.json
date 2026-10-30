@@ -1,0 +1,19 @@
+{
+  "specApproval": "not obtained (autonomous run); user asked to resolve the review screen lock and photo-confirmation error",
+  "scope": "Operator browser only; preserve server review holds and posting verification",
+  "acceptance": [
+    "A load or receipt held for review displays the existing transaction and a Continue with other orders button in the main screen.",
+    "Leaving a reviewed pickup returns to scanning; leaving receiving returns to the order list; durable per-order journals remain available.",
+    "A reviewed order cannot resubmit or open its camera while held. Operators can work on unrelated orders.",
+    "Leaving an in-progress submission clears only that screen's busy state and timer. A late response cannot change a newer order or overwrite its result.",
+    "After a definitive failed posting command, a new attempt gets a new request ID so retaken photos cannot collide with the previous confirmation. Uncertain and attention commands retain their IDs.",
+    "Production release changes only Operator browser assets over the current live image and preserves other services and configuration."
+  ],
+  "failureModel": {
+    "duplicate posting": "Keep server claims and browser journal; block same-order submit; regression tests",
+    "late asynchronous overwrite": "Capture request/order identity and reject stale callbacks; adversarial race tests",
+    "lost photo evidence": "Keep outbox data and original action IDs; rotate only after authoritative failed result",
+    "unrelated deployment regression": "Live capture, narrow image overlay, candidate checks and served-asset hash verification"
+  },
+  "setup": {"newDependencies": [], "gitCommits": false, "tools": ["Existing Node/espree tests", "existing Playwright image", "Docker image overlay"]}
+}

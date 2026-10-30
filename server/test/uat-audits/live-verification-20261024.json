@@ -1,0 +1,90 @@
+{
+  "checkedAt": "2026-10-24T05:42:56.844Z",
+  "readOnly": true,
+  "tariffs": [
+    {
+      "item_code": "ASPHALT",
+      "amount_minor": "30000",
+      "currency": "CAD",
+      "pricing_basis": "per_quantity",
+      "unit_of_measure": "BIN"
+    },
+    {
+      "item_code": "CONCRETE",
+      "amount_minor": "30000",
+      "currency": "CAD",
+      "pricing_basis": "per_quantity",
+      "unit_of_measure": "BIN"
+    },
+    {
+      "item_code": "DUMPGARBAGE",
+      "amount_minor": "12000",
+      "currency": "CAD",
+      "pricing_basis": "per_weight",
+      "unit_of_measure": "TONNE"
+    },
+    {
+      "item_code": "SOIL",
+      "amount_minor": "30000",
+      "currency": "CAD",
+      "pricing_basis": "per_quantity",
+      "unit_of_measure": "BIN"
+    }
+  ],
+  "deposits": [
+    {
+      "rate_card_code": "14YDBIN",
+      "item_code": null,
+      "rental_items": [
+        "14YD"
+      ],
+      "rule_code": "garbage_bin_deposit",
+      "fixed_amount_minor": "50000",
+      "currency": "CAD",
+      "active": true
+    },
+    {
+      "rate_card_code": "20YDBIN",
+      "item_code": null,
+      "rental_items": [
+        "20YD"
+      ],
+      "rule_code": "garbage_bin_deposit",
+      "fixed_amount_minor": "50000",
+      "currency": "CAD",
+      "active": true
+    }
+  ],
+  "bins": [
+    {
+      "type_code": "14YD",
+      "maximum_payload_kg": 27215,
+      "active": true
+    },
+    {
+      "type_code": "20YD",
+      "maximum_payload_kg": null,
+      "active": true
+    }
+  ],
+  "dumpSites": [
+    {
+      "dump_site_code": "3445",
+      "display_name": "3445",
+      "active": true
+    }
+  ],
+  "truck": [
+    {
+      "id": "79",
+      "capacity_lbs": "48000.00"
+    }
+  ],
+  "image": "mbbs-operator-app:bin-weight-warning-20261024",
+  "sourceCheckedAt": "2026-10-24T05:34:35.658Z",
+  "sourceHashes": {
+    "src": "6269e726f2b1f5a2047f2ef1f2809b2e7a8d20d3c3b21b8796fa19e2e13f8234",
+    "public": "892442a12cf27207ba3465cb8e6bba761b8332a8d794d5ada77a346180a49b2f",
+    "migrations": "799bd4e6d99b9bfa64a82add14284a31d8a962dbf07213b019a079946f1291ff"
+  }
+}

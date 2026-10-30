@@ -17,7 +17,8 @@ function installStyles() {
   }
 }
 
-function previewDialog(title, trigger) {
+export function previewDialog(title, trigger) {
+  installStyles();
   const dialog = document.createElement('dialog');
   dialog.className = 'special-document-dialog'; dialog.setAttribute('aria-label', title);
   dialog.innerHTML = `<header><h2>${escape(title)}</h2><div><a data-document-download hidden>Download PDF</a><button type="button" data-document-close autofocus>Close</button></div></header><div class="special-document-body" aria-live="polite">Loading preview…</div>`;

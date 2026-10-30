@@ -163,7 +163,7 @@ test("MBT Front Desk multi-bin: one accepted quote materializes independent read
   assert.equal(converted.status, 201);
   assert.equal(converted.body.schemaVersion, "mbt-frontdesk-conversion-v2");
   assert.equal(converted.body.serviceLines.length, 2);
-  assert.equal(converted.body.visits.length, 4);
+  assert.equal(converted.body.visits.length, 2);
   assert.equal(converted.body.billingCases.length, 2);
   assert.deepEqual(converted.body.serviceLines.map((line) => ({
     lineNumber: line.lineNumber,
@@ -191,8 +191,7 @@ test("MBT Front Desk multi-bin: one accepted quote materializes independent read
       status: visit.status,
       predecessor: visit.predecessorVisitId
     })), [
-      { action: "delivery", status: "ready", predecessor: null },
-      { action: "return_bin", status: "tentative", predecessor: visits[0].visitId }
+      { action: "delivery", status: "ready", predecessor: null }
     ]);
   }
   const visitMaterials = await query(
@@ -205,9 +204,7 @@ test("MBT Front Desk multi-bin: one accepted quote materializes independent read
   );
   assert.deepEqual(visitMaterials.rows, [
     { service_action: "delivery", material_code: null },
-    { service_action: "return_bin", material_code: fixture.dumpItemCode },
     { service_action: "delivery", material_code: null },
-    { service_action: "return_bin", material_code: fixture.dumpItemCode }
   ]);
   const retainedBilling = await query(
     `SELECT service_visit_id::text

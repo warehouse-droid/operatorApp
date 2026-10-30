@@ -46,6 +46,7 @@
       ${scm&&!request.regular?.resolution?`<div class="stock-request-actions"><button data-scm-stock-action="refresh-evidence" type="button" ${options.busy?'disabled':''}>${t('Refresh stock evidence','刷新库存数据')}</button></div>`:!scm&&!request.firstScmDecisionAt&&pending?`<div class="stock-request-actions"><button data-sales-stock-action="edit" type="button">${t('Edit request','编辑申请')}</button><button class="danger" data-sales-stock-action="cancel" type="button">${t('Cancel request','取消申请')}</button></div>`:''}
       ${window.RegularStockReply?.panel(request,scm?'scm':'sales',null,options.busy,options.operatorId,{showButton:false})||''}
       <div class="stock-request-lines">${request.lines.map(item=>line(request,item,scm,options)).join('')}</div>
+      ${!scm ? options.addItemsButton || '' : ''}
       ${(request.events||[]).length?`<section class="stock-request-section"><h3>${t('Updates','更新记录')}</h3>${request.events.slice(0,12).map(event=>`<p>${esc(({request_submitted:t('Request submitted','申请已提交'),regular_manual_review:t('SCM review required','须 SCM 审核'),regular_manual_decision:t('SCM decision recorded','SCM 审核结果已保存'),regular_purchase_released:t('Remaining demand released','剩余需求已释放')})[event.eventType]||t('Request updated','申请已更新'))} · ${esc(event.actorName)} · ${esc(window.MBBS_I18N?.displayDateTime?.(event.createdAt)||event.createdAt)}</p>`).join('')}</section>`:''}`;
   }
   window.RegularPurchaseUI={purchase,stock,detail,rounded};

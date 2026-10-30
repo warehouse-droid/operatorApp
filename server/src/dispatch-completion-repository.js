@@ -139,13 +139,40 @@ export async function listDispatchOrderCompletionStatuses(requests) {
     }
   }
   if (unique.size === 0) return [];
+  // Match dispatch_order_completion_status, but filter before ranking history.
+  // OFFSET 0 keeps each effective-event lookup parameterized by the requested
+  // identity; otherwise PostgreSQL can expand and join the entire event view.
+  // The shared effective-event view retains reopen/identity corrections, and
+  // the shared priority function retains the canonical evidence ordering.
   const result = await query(
     `WITH requested AS (
        SELECT upper(btrim(item->>'orderKind')) AS order_kind,
               btrim(item->>'orderRef') AS order_ref
          FROM jsonb_array_elements($1::jsonb) item
+     ), ranked AS (
+       SELECT event.*,
+              row_number() OVER (
+                PARTITION BY event.order_kind, lower(btrim(event.order_ref))
+                ORDER BY dispatch_completion_evidence_priority(event.completion_evidence_type),
+                         event.dispatch_completed_at DESC, event.id DESC
+              ) AS completion_rank
+         FROM requested
+         CROSS JOIN LATERAL (
+           SELECT candidate.*
+             FROM dispatch_effective_order_completion_events candidate
+            WHERE candidate.order_kind = requested.order_kind
+              AND lower(btrim(candidate.order_ref)) = lower(btrim(requested.order_ref))
+            OFFSET 0
+         ) event
+        WHERE NOT (event.order_kind = 'PO' AND EXISTS (
+          SELECT 1 FROM dispatch_order_completion_events corrected
+           WHERE corrected.order_kind = 'VRMA'
+             AND lower(btrim(corrected.order_ref)) = lower(btrim(event.order_ref))
+             AND corrected.completion_evidence_type = event.completion_evidence_type
+             AND corrected.completion_evidence_id = event.completion_evidence_id
+        ))
      )
-     SELECT completion.completion_event_id,
+     SELECT completion.id AS completion_event_id,
             completion.order_kind,
             completion.order_ref,
             completion.dispatch_completion_status,
@@ -158,10 +185,8 @@ export async function listDispatchOrderCompletionStatuses(requests) {
             completion.actor_type,
             completion.actor_id,
             completion.reason
-       FROM requested
-       JOIN dispatch_order_completion_status completion
-         ON completion.order_kind = requested.order_kind
-        AND lower(btrim(completion.order_ref)) = lower(btrim(requested.order_ref))
+       FROM ranked completion
+      WHERE completion.completion_rank = 1
       ORDER BY completion.order_kind, lower(btrim(completion.order_ref))`,
     [JSON.stringify([...unique.values()])]
   );

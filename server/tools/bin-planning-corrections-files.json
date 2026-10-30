@@ -1,0 +1,15 @@
+[
+  "src/mbt/customer-charge-request-service.js",
+  "src/mbt/frontdesk-service.js",
+  "src/mbt/bin-order-window-service.js",
+  "src/mbt/bin-order-workflow-service.js",
+  "src/mbt/bin-planning-read.js",
+  "public/mbt-frontdesk.js",
+  "public/mbt-frontdesk.html",
+  "public/bin-order-workflow-ui.js",
+  "public/mbt-planning.js",
+  "public/mbt-planning.html",
+  "public/bin-order-workflow.css",
+  "public/dispatch.js",
+  "src/mbt/rate-card-configuration-service.js"
+]

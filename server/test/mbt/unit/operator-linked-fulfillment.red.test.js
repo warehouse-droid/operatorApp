@@ -141,7 +141,7 @@ test("L5 Delivery SO loading is local-only even when the old Delivery Prep IF ga
       transactionType: "IF",
       canonicalLocationId: 15,
       localOnly: false,
-      netSuitePostingOwner: "driver_completion",
+      netSuitePostingOwner: "sales_load_background",
       localOrderKeys: ["delivery_prep:sales_order:101"],
       localOperation: { kind: "delivery_prep_load", orderId: "101", orderType: "sales_order" }
     }),
@@ -152,12 +152,12 @@ test("L5 Delivery SO loading is local-only even when the old Delivery Prep IF ga
   });
   const result = await admit({ functionKey: "delivery_prep", orderId: "101" });
   assert.equal(result.mode, "local_only");
-  assert.equal(result.reason, "driver_completion_owned");
+  assert.equal(result.reason, "sales_load_background_owned");
   assert.equal(policyReads, 0);
   assert.equal(commandCreates, 0);
 });
 
-test("L5/L12 Delivery SO and TO posting requires Driver completion", async () => {
+test("L5/L12 Delivery SO loading owns IF queueing; pickup and TO retain their posting owners", async () => {
   const orders = new Map([
     ["101", {
       netsuite_id: 101,
@@ -191,7 +191,7 @@ test("L5/L12 Delivery SO and TO posting requires Driver completion", async () =>
   const delivery = await resolve({ functionKey: "delivery_prep", orderId: 101, deferTargets: true });
   const pickup = await resolve({ functionKey: "customer_pickup", orderId: 102, deferTargets: true });
   const transfer = await resolve({ functionKey: "delivery_prep", orderId: 201, deferTargets: true });
-  assert.equal(delivery.netSuitePostingOwner, "driver_completion");
+  assert.equal(delivery.netSuitePostingOwner, "sales_load_background");
   assert.equal(pickup.netSuitePostingOwner, "operator");
   assert.equal(transfer.netSuitePostingOwner, "transfer_background");
 });

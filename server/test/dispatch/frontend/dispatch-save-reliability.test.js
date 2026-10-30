@@ -19,14 +19,15 @@ function subject(names, overrides = {}) {
     persistDispatchPendingRequest: async () => {},
     pendingOperatorAlertRefs: new Set(), pendingTargetedOrderRefreshRefs: new Set(),
     ensureDispatchPlanEditor: () => true, hasDispatchEditLeaseCredentials: () => true,
-    render: () => {}, reportDispatchSaveError: () => {}, autosaveDebug: () => {}, shortHash: value => value,
+    render: () => {}, renderDispatchNoticePatch: () => {}, loadExecutedOrderReviews: async () => false,
+    reportDispatchSaveError: () => {}, autosaveDebug: () => {}, shortHash: value => value,
     clearStoredDispatchEditLease: () => {}, leaveDispatchEditMode: () => {}, isDispatchHistoryEditMode: () => false,
     dispatchLeaseRequestPayload: () => ({}), dispatchPlannerSnapshotState: 'ready',
     shouldUseDispatchIncrementalSave: () => false, stablePlanHashPayload: () => 'hash', planSummary: () => ({}),
     displayDate: value => String(value),
     ...overrides
   });
-  for (const name of [...['dispatchFrozenSaveFetch', 'preserveMbtReadOnlyLoads', 'isMbtPlanningLoad', 'confirmedPlanNotice', 'googleRouteRefreshStatusText'].filter(name => declarations.some(n => n.id?.name === name)), ...names]) {
+  for (const name of [...['dispatchFrozenSaveFetch', 'preserveMbtReadOnlyLoads', 'isMbtPlanningLoad', 'confirmedPlanNotice', 'googleRouteRefreshStatusText', 'recoverDispatchSourceDraft'].filter(name => declarations.some(n => n.id?.name === name)), ...names]) {
     const node = declarations.find(n => n.type === 'FunctionDeclaration' && n.id.name === name);
     assert.ok(node, `missing implementation: ${name}`);
     // Preserve character offsets as well as line numbers for precise V8 ranges.

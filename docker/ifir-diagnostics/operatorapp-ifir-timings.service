@@ -1,0 +1,27 @@
+[Unit]
+Description=Retain IF/IR posting wait diagnostics
+After=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=docker nogroup
+WorkingDirectory=/home/ubuntu/apps/operatorApp
+ExecStart=/usr/bin/python3 -B /home/ubuntu/apps/operatorApp/docker/ifir-diagnostics/timings.py collect
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+CPUQuota=10%
+MemoryMax=128M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/operatorapp-operations/ifir-timings
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[
+  "src/transfer-order-posting-domain.js",
+  "src/transfer-order-posting-link-domain.js",
+  "src/transfer-order-posting-repository.js",
+  "src/transfer-order-posting-service.js",
+  "public/mbt-gates.js"
+]

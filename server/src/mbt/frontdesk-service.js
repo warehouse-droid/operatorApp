@@ -4,12 +4,15 @@ import crypto from "node:crypto";
 
 import { query } from "../db.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "../dispatch-fleet-status.js";
+import { readOverdueBins, isBinOverdue } from './frontdesk-bin-overdue.js';
+import { readBinDumpCharges, captureCollectionPricing, exchangeCollectionPricing } from './bin-dump-charge.js';
 import { assertFrontdeskBinDelivered } from "./frontdesk-bin-readiness.js";
 import { createDispatchCustomOrder } from "../dispatch-custom-order-repository.js";
 import { executeMbtCommand } from "./command-repository.js";
 import {
   persistPreparedFrontdeskInitialCharge,
-  prepareFrontdeskInitialCharge
+  prepareFrontdeskInitialCharge,
+  listFrontdeskContractChargeRequests
 } from "./customer-charge-request-service.js";
 import { MbtError } from "./errors.js";
 import { calculateDistanceBandChargeMinor } from "./distance-band-pricing.js";
@@ -323,6 +326,8 @@ function publicVisit(row) {
   return {
     visitId: String(row.service_visit_id),
     serviceLineId: row.service_line_id ? String(row.service_line_id) : null,
+    planningAssigned: Boolean(row.dispatch_plan_id),
+    parentOrderId: row.parent_order_id || row.service_snapshot?.binWorkflow?.orderId || null,
     visitNumber: Number(row.visit_number),
     visitReference: String(row.visit_reference),
     displayReference: visitDisplayReference(row),
@@ -330,10 +335,10 @@ function publicVisit(row) {
     displayName: String(row.service_snapshot?.displayName || row.service_action),
     status: String(row.status),
     predecessorVisitId: row.predecessor_visit_id ? String(row.predecessor_visit_id) : null,
-    scheduledStartAt: row.scheduled_start_at ? databaseIso(row.scheduled_start_at) : null,
-    scheduledEndAt: row.scheduled_end_at ? databaseIso(row.scheduled_end_at) : null,
-    actualStartedAt: row.actual_started_at ? databaseIso(row.actual_started_at) : null,
-    actualCompletedAt: row.actual_completed_at ? databaseIso(row.actual_completed_at) : null,
+    scheduledStartAt: nullableDatabaseIso(row.scheduled_start_at),
+    scheduledEndAt: nullableDatabaseIso(row.scheduled_end_at),
+    actualStartedAt: nullableDatabaseIso(row.actual_started_at),
+    actualCompletedAt: nullableDatabaseIso(row.actual_completed_at),
     revision: Number(row.revision)
   };
 }
@@ -358,6 +363,7 @@ function publicServiceLine(row) {
       binAvailableForService:Boolean(row.bin_available),currentBin:row.current_asset_code
         ? {assetId:String(row.current_asset_id),assetCode:row.current_asset_code} : null,
       recoveryPending:Boolean(row.recovery_pending),pendingCollections:row.pending_collections || []} : {}),
+    overdue: isBinOverdue({status: row.status, plannedReturnAt: row.planned_return_at, binAvailableForService: row.bin_available}),
     contractId: String(row.contract_id),
     lineNumber: Number(row.line_number),
     binTypeId: String(row.bin_type_id),
@@ -498,6 +504,12 @@ export async function searchFrontdeskCustomers(input) {
  *
  * @param {{actor: {operatorId?: unknown, roles?: readonly unknown[]}}} input
  */
+export async function getFrontdeskOverdueBins(input) {
+  assertFrontdeskActor(input.actor);
+  return readOverdueBins();
+}
+
+/** @param {{actor: {operatorId?: unknown, roles?: readonly unknown[]}}} input */
 export async function getFrontdeskConfiguration(input) {
   assertFrontdeskActor(input.actor);
   const [binResult, deliveryResult, dumpResult, surchargeResult, serviceResult] = await Promise.all([
@@ -721,7 +733,7 @@ export async function createFrontdeskDeliveryOrder(input) {
  * behind the existing contract-timeline endpoint, so Front Desk never loads a
  * cross-customer operational history into an autocomplete result.
  *
- * @param {{actor: {operatorId?: unknown, roles?: readonly unknown[]}, customerNetsuiteId: unknown, limit?: unknown}} input
+ * @param {{actor: {operatorId?: unknown, roles?: readonly unknown[]}, customerNetsuiteId: unknown, limit?: unknown, summary?: boolean}} input
  */
 export async function getFrontdeskCustomerContracts(input) {
   assertFrontdeskActor(input.actor);
@@ -733,7 +745,7 @@ export async function getFrontdeskCustomerContracts(input) {
     ? Math.min(100, Math.max(1, Number(input.limit)))
     : 50;
   const contracts = await query(
-    `SELECT c.*,
+    `SELECT ${input.summary === true ? 'c.contract_id,c.contract_number,c.status,c.revision' : 'c.*'},
             count(line.service_line_id)::int AS service_line_count,
             count(*) FILTER (WHERE line.status NOT IN ('closed', 'cancelled'))::int AS open_service_line_count
        FROM mbt_contracts c
@@ -749,11 +761,42 @@ export async function getFrontdeskCustomerContracts(input) {
     schemaVersion: "mbt-frontdesk-customer-contracts-v1",
     customerNetsuiteId,
     items: contracts.rows.map((/** @type {any} */ row) => ({
-      ...publicContract(row),
+      ...(input.summary === true ? { contractId: String(row.contract_id), contractNumber: String(row.contract_number),
+        status: String(row.status), revision: Number(row.revision) } : publicContract(row)),
       serviceLineCount: Number(row.service_line_count),
       openServiceLineCount: Number(row.open_service_line_count)
     }))
   };
+}
+
+// Both pricing paths replace a draft only after its locked revision is checked.
+const DRAFT_QUOTE_UPDATE_SQL = `ON CONFLICT (quote_id) DO UPDATE SET
+  customer_site_profile_id=EXCLUDED.customer_site_profile_id,
+  service_template_version_id=EXCLUDED.service_template_version_id,
+  rate_card_version_id=EXCLUDED.rate_card_version_id,bin_type_id=EXCLUDED.bin_type_id,
+  distance_snapshot_id=EXCLUDED.distance_snapshot_id,deposit_rule_id=EXCLUDED.deposit_rule_id,
+  proposed_delivery_at=EXCLUDED.proposed_delivery_at,proposed_return_at=EXCLUDED.proposed_return_at,
+  customer_snapshot=EXCLUDED.customer_snapshot,site_snapshot=EXCLUDED.site_snapshot,
+  pricing_snapshot=EXCLUDED.pricing_snapshot,deposit_required_minor=EXCLUDED.deposit_required_minor,
+  currency=EXCLUDED.currency,revision=mbt_quotes.revision+1,
+  updated_by=EXCLUDED.updated_by,updated_at=now()
+  WHERE mbt_quotes.status='draft'`;
+
+/** @param {string} quoteId @param {number|null} expectedRevision @param {string} customerId @param {string} actorId */
+async function prepareDraftQuoteEdit(quoteId, expectedRevision, customerId, actorId) {
+  const before = publicQuote(await selectedQuote(quoteId));
+  if (before.status !== 'draft') {
+    throw failure(409, "MBT_FRONTDESK_QUOTE_STATE_CONFLICT", "Only a draft quote can be edited.");
+  }
+  if (before.revision !== expectedRevision) {
+    throw failure(409, "MBT_STALE_REVISION", "The quote changed. Refresh and try again.");
+  }
+  if (before.customerNetsuiteId !== customerId) {
+    throw failure(409, "MBT_FRONTDESK_QUOTE_CUSTOMER_CONFLICT", "Keep the quote's original customer.");
+  }
+  await query(`UPDATE mbt_frontdesk_charge_requests SET status='cancelled',revision=revision+1,
+    updated_by=$2,updated_at=now() WHERE source_quote_id=$1 AND status='draft'`,[quoteId,actorId]);
+  return before;
 }
 
 /** @param {string} quoteId */
@@ -1442,6 +1485,42 @@ function fixedQuoteAttachedAggregate(calculation, chargeRequestId) {
   };
 }
 
+/** @param {Record<string, any> | null} before */
+function draftQuoteIdentity(before) {
+  const quoteId = before?.quoteId || crypto.randomUUID();
+  return { quoteId, quoteNumber: before?.quoteNumber || publicNumber("MBT-Q", quoteId) };
+}
+
+/** @param {Record<string, any>} input */
+function draftQuoteResult(input) {
+  const { quote, before, chargeRequest, reason } = input;
+  const state = chargeRequest ? { quote, chargeRequest } : quote;
+  return {
+    status: before ? 200 : 201,
+    body: chargeRequest
+      ? { schemaVersion: "mbt-frontdesk-quote-v2", quote, chargeRequest }
+      : { schemaVersion: "mbt-frontdesk-quote-v1", quote },
+    audit: {
+      action: before ? "mbt.frontdesk.quote.updated" : "mbt.frontdesk.quote.created",
+      entityType: "mbt_quote",
+      entityId: quote.quoteId,
+      beforeState: before || { quoteId: quote.quoteId, exists: false },
+      afterState: state,
+      reason,
+      revisionBefore: before?.revision || 1,
+      revisionAfter: quote.revision,
+      source: "frontdesk_local"
+    }
+  };
+}
+
+/** @param {string} contentCode @param {Record<string, any>} evidence */
+function fixedQuoteDepositEvidence(contentCode, evidence) {
+  return contentCode === "garbage"
+    ? { depositRuleId: evidence.depositRuleId, depositRateCardVersionId: evidence.depositRateCardVersionId }
+    : { depositRuleId: null, depositRateCardVersionId: null };
+}
+
 /**
  * Build the new fixed-price initial-bin quote while preserving the existing
  * operational quote/contract lifecycle and route snapshots.
@@ -1481,8 +1560,7 @@ async function createFixedPriceInitialQuoteMutation(input) {
   if (!binRate) {
     throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The initial fixed-price quote has no bin rate evidence.");
   }
-  const quoteId = crypto.randomUUID();
-  const quoteNumber = publicNumber("MBT-Q", quoteId);
+  const { quoteId, quoteNumber } = draftQuoteIdentity(input.before);
   const attachedAggregate = fixedQuoteAttachedAggregate(calculation, prepared.chargeRequestId);
   const displayLines = calculation.lines.map((priceLine) => ({
     ...priceLine,
@@ -1527,9 +1605,7 @@ async function createFixedPriceInitialQuoteMutation(input) {
     },
     lines: displayLines,
     depositRequiredMinor: calculation.requiredDepositMinor,
-    depositRuleId: line.contentCode === "garbage"
-      ? binRate.itemEvidence.depositRuleId
-      : null,
+    ...fixedQuoteDepositEvidence(line.contentCode, binRate.itemEvidence),
     ...(attachedAggregate ? { attachedAggregate } : {})
   };
   const pricingSnapshot = {
@@ -1610,11 +1686,14 @@ async function createFixedPriceInitialQuoteMutation(input) {
        $6::uuid, $7::uuid, $8::uuid, $9::uuid, 'draft',
        $10::timestamptz, $11::timestamptz, $12::jsonb,
        $13::jsonb, $14::jsonb, $15, $16, $17, $17
-     ) RETURNING *`,
+     ) ${DRAFT_QUOTE_UPDATE_SQL} RETURNING *`,
     [
       quoteId, quoteNumber, input.customerNetsuiteId, line.siteProfileId,
       input.serviceTemplateVersionId, input.rateCardVersionId, line.binTypeId,
-      distance.distanceSnapshotId, linePricing.depositRuleId,
+      distance.distanceSnapshotId,
+      // The legacy header link belongs to the workflow rate version. Item-owned
+      // deposits retain their actual rule/version in line and charge evidence.
+      linePricing.depositRateCardVersionId === input.rateCardVersionId ? linePricing.depositRuleId : null,
       line.proposedDeliveryAt, line.proposedReturnAt,
       JSON.stringify(input.canonicalCustomer), JSON.stringify(line.siteSnapshot),
       JSON.stringify(pricingSnapshot), calculation.requiredDepositMinor,
@@ -1623,21 +1702,7 @@ async function createFixedPriceInitialQuoteMutation(input) {
   );
   const chargeRequest = await persistPreparedFrontdeskInitialCharge(prepared, quoteId);
   const quote = publicQuote({ ...inserted.rows[0], bin_type_code: selectedBin.type_code });
-  return {
-    status: 201,
-    body: { schemaVersion: "mbt-frontdesk-quote-v2", quote, chargeRequest },
-    audit: {
-      action: "mbt.frontdesk.quote.created",
-      entityType: "mbt_quote",
-      entityId: quoteId,
-      beforeState: { quoteId, exists: false },
-      afterState: { quote, chargeRequest },
-      reason: input.reason,
-      revisionBefore: 1,
-      revisionAfter: 1,
-      source: "frontdesk_local"
-    }
-  };
+  return draftQuoteResult({ quote, chargeRequest, before: input.before, reason: input.reason });
 }
 
 /** @param {unknown} value */
@@ -1712,6 +1777,8 @@ function quotePricingResolvers(options, fixedChargeMode) {
 export async function createFrontdeskQuote(input, options = {}) {
   const actor = /** @type {any} */ (input.actor);
   assertFrontdeskActor(actor);
+  const editingQuoteId = input.quoteId === undefined ? null : requiredUuid(input.quoteId, "Quote ID");
+  const expectedRevision = editingQuoteId ? positiveRevision(input.expectedRevision) : null;
   const customerNetsuiteId = frontdeskCustomerNetsuiteId(input.customerNetsuiteId);
   const serviceTemplateVersionId = requiredUuid(input.serviceTemplateVersionId, "Service template version ID");
   const rateCardVersionId = requiredUuid(input.rateCardVersionId, "Rate card version ID");
@@ -1729,6 +1796,7 @@ export async function createFrontdeskQuote(input, options = {}) {
   const reason = requiredText(input.reason, "Audit reason");
   const { resolveDistance, resolveTaxPolicy } = quotePricingResolvers(options, fixedChargeMode);
   const payload = {
+    ...(editingQuoteId ? { quoteId: editingQuoteId, expectedRevision } : {}),
     customerNetsuiteId,
     serviceTemplateVersionId,
     rateCardVersionId,
@@ -1751,13 +1819,15 @@ export async function createFrontdeskQuote(input, options = {}) {
   };
   return executeMbtCommand({
     actor,
-    commandName: "mbt.frontdesk.quote.create",
+    commandName: editingQuoteId ? "mbt.frontdesk.quote.update" : "mbt.frontdesk.quote.create",
     idempotencyKey: requiredText(input.idempotencyKey, "Idempotency key"),
     payload,
     correlationId: requiredText(input.correlationId, "Correlation ID"),
     requestId: requiredText(input.requestId, "Request ID"),
     // eslint-disable-next-line complexity -- Atomic quote orchestration keeps all pricing evidence in one command transaction.
     mutation: async () => {
+      const before = editingQuoteId
+        ? await prepareDraftQuoteEdit(editingQuoteId, expectedRevision, customerNetsuiteId, String(actor.operatorId)) : null;
       const selected = await query(
         `SELECT c.netsuite_id::text AS customer_netsuite_id,
                 c.entity_number, c.legal_name, c.display_name,
@@ -1910,6 +1980,7 @@ export async function createFrontdeskQuote(input, options = {}) {
           throw failure(422, "MBT_FRONTDESK_CONFIGURATION_INVALID", "The fixed-price bin configuration is missing.");
         }
         return createFixedPriceInitialQuoteMutation({
+          before,
           actor,
           customerNetsuiteId,
           rateCardVersionId,
@@ -2048,8 +2119,7 @@ export async function createFrontdeskQuote(input, options = {}) {
         line.depositRuleId = deposit.depositRuleId;
       }
 
-      const quoteId = crypto.randomUUID();
-      const quoteNumber = publicNumber("MBT-Q", quoteId);
+      const { quoteId, quoteNumber } = draftQuoteIdentity(before);
       const primaryTax = requiredArrayEntry(taxPolicies, 0, "Primary tax evidence");
       const primaryDistance = requiredArrayEntry(distanceEvidence, 0, "Primary distance evidence");
       const primarySite = requiredArrayEntry(serviceLinesWithSites, 0, "Primary service site");
@@ -2136,7 +2206,7 @@ export async function createFrontdeskQuote(input, options = {}) {
            $10::timestamptz, $11::timestamptz, $12::jsonb,
            $13::jsonb, $14::jsonb, $15, $16, $17, $17
          )
-         RETURNING *`,
+         ${DRAFT_QUOTE_UPDATE_SQL} RETURNING *`,
         [
           quoteId,
           quoteNumber,
@@ -2158,21 +2228,7 @@ export async function createFrontdeskQuote(input, options = {}) {
         ]
       );
       const quote = publicQuote({ ...inserted.rows[0], bin_type_code: configuration.bin_type_code });
-      return {
-        status: 201,
-        body: { schemaVersion: "mbt-frontdesk-quote-v1", quote },
-        audit: {
-          action: "mbt.frontdesk.quote.created",
-          entityType: "mbt_quote",
-          entityId: quoteId,
-          beforeState: { quoteId, exists: false },
-          afterState: quote,
-          reason,
-          revisionBefore: 1,
-          revisionAfter: 1,
-          source: "frontdesk_local"
-        }
-      };
+      return draftQuoteResult({ quote, before, reason });
     }
   });
 }
@@ -2732,8 +2788,8 @@ function physicalBinReferencePrefix(multiLine, contractNumber, lineNumber) {
 
 /**
  * Materialize one physical-bin line without changing its contract siblings.
- * Every line owns a delivery and dependent collection chain, making the ready
- * delivery leg safe for the existing Dispatch read model to consume.
+ * Each line owns a delivery. Its expected return date is a reminder until
+ * Front Desk explicitly requests collection.
  *
  * @param {object} input
  * @param {string} input.contractId
@@ -2753,14 +2809,14 @@ function physicalBinReferencePrefix(multiLine, contractNumber, lineNumber) {
 async function materializeContractServiceLine(input) {
   const serviceLineId = crypto.randomUUID();
   const deliveryVisitId = crypto.randomUUID();
-  const returnVisitId = crypto.randomUUID();
+
   const referencePrefix = physicalBinReferencePrefix(
     input.multiLine,
     input.contractNumber,
     input.line.lineNumber
   );
   const deliveryVisitReference = `${referencePrefix}-V1`;
-  const returnVisitReference = `${referencePrefix}-V2`;
+
   const deliveryAt = input.line.proposedDeliveryAt;
   const returnAt = input.line.proposedReturnAt;
   const linePricing = jsonObject(input.line.pricing, "Quote service line pricing");
@@ -2818,47 +2874,14 @@ async function materializeContractServiceLine(input) {
     ...(linePricing.attachedAggregate ? { attachedAggregate: linePricing.attachedAggregate } : {}),
     predecessorVisitId: null,
     dependencyKind: "none",
-    dependentReturnVisitId: returnVisitId,
-    dependentReturnVisitRevision: 1,
+
+    collectionOnRequest: true,
     mandatoryStops: deliveryRoute({
       visitReference: deliveryVisitReference,
       siteProfileId: input.line.siteProfileId,
       yard: input.routeInputs.yard,
       templateSteps: input.routeInputs.templateSteps
     })
-  };
-  const returnService = {
-    schemaVersion: "mbt-bin-service-snapshot-v1",
-    displayName: "Return bin",
-    serviceAction: "return_bin",
-    serviceLineId,
-    lineNumber: input.line.lineNumber,
-    serviceTemplateVersionId: String(input.quoteRow.service_template_version_id),
-    templateVersionId: input.routeInputs.templateVersionId,
-    templateRevision: input.routeInputs.templateRevision,
-    rateCardVersionId: String(input.quoteRow.rate_card_version_id),
-    binItemCode,
-    binTypeId: input.line.binTypeId,
-    dumpItemCode,
-    materialId,
-    estimatedWeightKg,
-    estimatedTonnes: estimatedWeightKg ? (estimatedWeightKg / 1000).toFixed(3) : null,
-    predecessorVisitId: deliveryVisitId,
-    dependencyKind: "predecessor_completed",
-    mandatoryStops: [
-      {
-        stopId: `${returnVisitReference}-S1`, sequence: 1,
-        actionCode: "pickup_bin", stopKind: "pickup", locationRole: "customer_site",
-        yardId: null, yardCode: null,
-        siteProfileId: input.line.siteProfileId, assetId: null
-      },
-      {
-        stopId: `${returnVisitReference}-S2`, sequence: 2,
-        actionCode: "return_bin", stopKind: "drop", locationRole: "return_yard",
-        yardId: input.routeInputs.yard.yardId, yardCode: input.routeInputs.yard.yardCode,
-        siteProfileId: null, assetId: null
-      }
-    ]
   };
   const deliveryRow = await insertServiceVisit({
     visitId: deliveryVisitId, contractId: input.contractId,
@@ -2869,17 +2892,6 @@ async function materializeContractServiceLine(input) {
     binTypeId: input.line.binTypeId, materialId: null, serviceLineId, predecessorVisitId: null,
     scheduledStartAt: deliveryAt, scheduledEndAt: new Date(deliveryAt.getTime() + FOUR_HOURS_MS),
     customer: input.customer, site: input.line.siteSnapshot, service: deliveryService,
-    billingOwnership: input.billingOwnership, actorId: input.actorId
-  });
-  const returnRow = await insertServiceVisit({
-    visitId: returnVisitId, contractId: input.contractId,
-    visitNumber: input.visitNumberStart + 1, visitReference: returnVisitReference,
-    templateVersionId: String(input.quoteRow.service_template_version_id),
-    serviceAction: "return_bin", status: "tentative",
-    siteProfileId: input.line.siteProfileId,
-    binTypeId: input.line.binTypeId, materialId, serviceLineId, predecessorVisitId: deliveryVisitId,
-    scheduledStartAt: returnAt, scheduledEndAt: new Date(returnAt.getTime() + FOUR_HOURS_MS),
-    customer: input.customer, site: input.line.siteSnapshot, service: returnService,
     billingOwnership: input.billingOwnership, actorId: input.actorId
   });
   await insertVisitSteps({
@@ -2899,23 +2911,10 @@ async function materializeContractServiceLine(input) {
     ],
     evidence: input.routeInputs.templateEvidence
   });
-  await insertVisitSteps({
-    visitId: returnVisitId,
-    steps: [
-      {
-        sequence: 0, actionCode: "pickup_bin", displayName: `Pickup ${binTypeCode} bin`,
-        locationRole: "customer_site", required: true, completionBlocking: true, templateStepId: null
-      },
-      {
-        sequence: 1, actionCode: "return_bin", displayName: `Return ${binTypeCode} bin`,
-        locationRole: "return_yard", required: true, completionBlocking: true, templateStepId: null
-      }
-    ]
-  });
   await copyQuoteDistanceToVisit(lineDistanceEvidence(input.routeInputs.distance, linePricing), deliveryVisitId);
   return {
     serviceLine: publicServiceLine({ ...insertedLine.rows[0], bin_type_code: binTypeCode }),
-    visits: [publicVisit(deliveryRow), publicVisit(returnRow)]
+    visits: [publicVisit(deliveryRow)]
   };
 }
 
@@ -3371,14 +3370,14 @@ export async function convertFrontdeskQuote(input, hooks = {}) {
         });
       }
       const deliveryAt = new Date(quoteRow.proposed_delivery_at);
-      const returnAt = new Date(quoteRow.proposed_return_at);
       const contractId = crypto.randomUUID();
       const deliveryVisitId = crypto.randomUUID();
-      const returnVisitId = crypto.randomUUID();
+
       const billingCaseId = crypto.randomUUID();
       const contractNumber = publicNumber("MBT-C", contractId);
       const deliveryVisitReference = `${contractNumber}-V1`;
-      const returnVisitReference = `${contractNumber}-V2`;
+      const returnAt = new Date(quoteRow.proposed_return_at);
+
       const routeInputs = await conversionRouteInputs(quoteRow);
       const terms = {
         rentalCalendarDays,
@@ -3461,53 +3460,14 @@ export async function convertFrontdeskQuote(input, hooks = {}) {
         binTypeId: String(quoteRow.bin_type_id),
         predecessorVisitId: null,
         dependencyKind: "none",
-        dependentReturnVisitId: returnVisitId,
-        dependentReturnVisitRevision: 1,
+
+    collectionOnRequest: true,
         mandatoryStops: deliveryRoute({
           visitReference: deliveryVisitReference,
           siteProfileId: String(quoteRow.customer_site_profile_id),
           yard: routeInputs.yard,
           templateSteps: routeInputs.templateSteps
         })
-      };
-      const returnService = {
-        schemaVersion: "mbt-bin-service-snapshot-v1",
-        displayName: "Return bin",
-        serviceAction: "return_bin",
-        serviceLineId,
-        lineNumber: 1,
-        serviceCode: "return_bin",
-        serviceTemplateVersionId: String(quoteRow.service_template_version_id),
-        templateVersionId: routeInputs.templateVersionId,
-        templateRevision: routeInputs.templateRevision,
-        rateCardVersionId: String(quoteRow.rate_card_version_id),
-        binTypeId: String(quoteRow.bin_type_id),
-        predecessorVisitId: deliveryVisitId,
-        dependencyKind: "predecessor_completed",
-        mandatoryStops: [
-          {
-            stopId: `${returnVisitReference}-S1`,
-            sequence: 1,
-            actionCode: "pickup_bin",
-            stopKind: "pickup",
-            locationRole: "customer_site",
-            yardId: null,
-            yardCode: null,
-            siteProfileId: String(quoteRow.customer_site_profile_id),
-            assetId: null
-          },
-          {
-            stopId: `${returnVisitReference}-S2`,
-            sequence: 2,
-            actionCode: "return_bin",
-            stopKind: "drop",
-            locationRole: "return_yard",
-            yardId: routeInputs.yard.yardId,
-            yardCode: routeInputs.yard.yardCode,
-            siteProfileId: null,
-            assetId: null
-          }
-        ]
       };
       const deliveryRow = await insertServiceVisit({
         visitId: deliveryVisitId,
@@ -3526,26 +3486,6 @@ export async function convertFrontdeskQuote(input, hooks = {}) {
         customer,
         site,
         service: deliveryService,
-        billingOwnership,
-        actorId: String(actor.operatorId)
-      });
-      const returnRow = await insertServiceVisit({
-        visitId: returnVisitId,
-        contractId,
-        visitNumber: 2,
-        visitReference: returnVisitReference,
-        templateVersionId: String(quoteRow.service_template_version_id),
-        serviceAction: "return_bin",
-        status: "tentative",
-        siteProfileId: String(quoteRow.customer_site_profile_id),
-        binTypeId: String(quoteRow.bin_type_id),
-        serviceLineId,
-        predecessorVisitId: deliveryVisitId,
-        scheduledStartAt: returnAt,
-        scheduledEndAt: new Date(returnAt.getTime() + FOUR_HOURS_MS),
-        customer,
-        site,
-        service: returnService,
         billingOwnership,
         actorId: String(actor.operatorId)
       });
@@ -3573,32 +3513,9 @@ export async function convertFrontdeskQuote(input, hooks = {}) {
         ],
         evidence: routeInputs.templateEvidence
       });
-      await insertVisitSteps({
-        visitId: returnVisitId,
-        steps: [
-          {
-            sequence: 0,
-            actionCode: "pickup_bin",
-            displayName: `Pickup ${String(quoteRow.bin_type_code)} bin`,
-            locationRole: "customer_site",
-            required: true,
-            completionBlocking: true,
-            templateStepId: null
-          },
-          {
-            sequence: 1,
-            actionCode: "return_bin",
-            displayName: `Return ${String(quoteRow.bin_type_code)} bin`,
-            locationRole: "return_yard",
-            required: true,
-            completionBlocking: true,
-            templateStepId: null
-          }
-        ]
-      });
       await copyQuoteDistanceToVisit(routeInputs.distance, deliveryVisitId);
       if (typeof hooks.afterVisitsInsert === "function") {
-        await hooks.afterVisitsInsert({ contractId, visits: [deliveryVisitId, returnVisitId] });
+        await hooks.afterVisitsInsert({ contractId, visits: [deliveryVisitId] });
       }
       const billingCase = await query(
         `INSERT INTO mbt_billing_cases (
@@ -3626,7 +3543,7 @@ export async function convertFrontdeskQuote(input, hooks = {}) {
         [quoteId, String(actor.operatorId)]
       );
       const contract = publicContract(insertedContract.rows[0]);
-      const visits = [publicVisit(deliveryRow), publicVisit(returnRow)];
+      const visits = [publicVisit(deliveryRow)];
       const serviceLines = [publicServiceLine({
         ...insertedServiceLine.rows[0],
         bin_type_code: String(quoteRow.bin_type_code || "")
@@ -3687,12 +3604,13 @@ export async function getFrontdeskContractTimeline(input) {
   if (!contractResult.rowCount) {
     throw failure(404, "MBT_FRONTDESK_CONTRACT_NOT_FOUND", "The Front Desk contract was not found.");
   }
-  const [visitResult, amendmentResult, billingResult, serviceLineResult, lineEventResult] = await Promise.all([
+  const [visitResult, amendmentResult, billingResult, serviceLineResult, lineEventResult, charges, dumpCharges] = await Promise.all([
     query(
       `SELECT v.*,COALESCE(p.display_reference,o.display_reference) AS display_reference
         FROM mbt_service_visits v LEFT JOIN mbt_bin_orders o ON o.order_id=v.service_visit_id
         LEFT JOIN mbt_bin_order_parts p ON p.visit_id=v.service_visit_id
         WHERE v.contract_id = $1::uuid
+          AND COALESCE(v.service_snapshot->>'withdrawnAutomaticCollection','false') <> 'true'
         ORDER BY v.visit_number, v.service_visit_id`,
       [contractId]
     ),
@@ -3714,8 +3632,12 @@ export async function getFrontdeskContractTimeline(input) {
     query(
       `SELECT line.*, bin.type_code AS bin_type_code,r.rental_number::text,r.current_asset_id,
           a.asset_code AS current_asset_code,r.recovery_pending,
-          (latest.status='completed' OR (delivery.status='completed' AND s.location_kind='customer_site'
-            AND s.customer_site_profile_id=line.customer_site_profile_id)) AS bin_available,
+          (((latest.status='completed' OR delivery.status='completed')
+              AND s.location_kind='customer_site' AND s.customer_site_profile_id=line.customer_site_profile_id)
+            OR (r.current_asset_id IS NULL AND latest.status='completed' AND NOT EXISTS(
+              SELECT 1 FROM mbt_service_visits work JOIN mbt_visit_steps step USING(service_visit_id)
+              WHERE work.service_line_id=line.service_line_id AND work.visit_number>latest.visit_number
+                AND step.action_code IN ('pickup_bin','pickup_loaded_bin') AND step.status='completed'))) AS bin_available,
           (SELECT COALESCE(jsonb_agg(jsonb_build_object('reference',p.display_reference,'assetCode',ba.asset_code,'status',v.status)
             ORDER BY o.exchange_number),'[]'::jsonb)
            FROM mbt_bin_order_parts p JOIN mbt_bin_orders o ON o.order_id=p.order_id
@@ -3742,7 +3664,9 @@ export async function getFrontdeskContractTimeline(input) {
         WHERE event.contract_id = $1::uuid
         ORDER BY event.created_at, event.service_line_event_id`,
       [contractId]
-    )
+    ),
+    listFrontdeskContractChargeRequests({actor: input.actor, contractId}),
+    readBinDumpCharges(contractId)
   ]);
   return {
     schemaVersion: "mbt-frontdesk-contract-v1",
@@ -3761,6 +3685,8 @@ export async function getFrontdeskContractTimeline(input) {
       actorOperatorId: String(row.actor_operator_id),
       createdAt: databaseIso(row.created_at)
     })),
+    chargeRequests: charges.items,
+    dumpCharges,
     billingCases: billingResult.rows.map((/** @type {any} */ row) => ({
       billingCaseId: String(row.billing_case_id),
       caseType: String(row.case_type),
@@ -3768,6 +3694,28 @@ export async function getFrontdeskContractTimeline(input) {
       revision: Number(row.revision)
     }))
   };
+}
+
+/** @param {string} contractId @param {any} beforeContract @param {any} contractRow @param {any} returnRow @param {Date} startAt @param {Date} endAt */
+function extensionSnapshots(contractId,beforeContract,contractRow,returnRow,startAt,endAt) {
+      const beforeSnapshot = {
+        contractId,
+        contractRevision: beforeContract.revision,
+        returnVisitId: returnRow ? String(returnRow.service_visit_id) : null,
+        returnVisitRevision: returnRow ? Number(returnRow.revision) : null,
+        returnWindow: {
+          startAt: nullableDatabaseIso(returnRow?.scheduled_start_at || contractRow.planned_return_at),
+          endAt: nullableDatabaseIso(returnRow?.scheduled_end_at)
+        }
+      };
+      const afterSnapshot = {
+        contractId,
+        contractRevision: beforeContract.revision + 1,
+        returnVisitId: returnRow ? String(returnRow.service_visit_id) : null,
+        returnVisitRevision: returnRow ? Number(returnRow.revision) + 1 : null,
+        returnWindow: { startAt: iso(startAt), endAt: iso(endAt) }
+      };
+  return {beforeSnapshot,afterSnapshot};
 }
 
 /** @param {Record<string, any>} contract */
@@ -3845,11 +3793,11 @@ export async function extendFrontdeskContract(input) {
         [contractId, defaultServiceLineId]
       );
       const deliveryRow = visitsResult.rows.find((/** @type {any} */ row) => row.service_action === "delivery");
-      const returnRow = [...visitsResult.rows].reverse().find((/** @type {any} */ row) => row.service_action === "return_bin");
-      if (!deliveryRow || !returnRow) {
+      const returnRow = await lockReturnVisitForLine(defaultServiceLineId);
+      if (!deliveryRow) {
         throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The contract delivery and return visit chain is incomplete.");
       }
-      if (!isUnassignedReturnEditable(returnRow)) {
+      if (returnRow && !isUnassignedReturnEditable(returnRow)) {
         throw failure(409, "MBT_FRONTDESK_RETURN_STARTED", "A return visit that has started cannot be extended.");
       }
       if (deliveryRow.scheduled_start_at && startAt <= new Date(deliveryRow.scheduled_start_at)) {
@@ -3863,23 +3811,7 @@ export async function extendFrontdeskContract(input) {
       );
       const amendmentNumber = Number(amendmentNumberResult.rows[0].next_number);
       const amendmentId = crypto.randomUUID();
-      const beforeSnapshot = {
-        contractId,
-        contractRevision: beforeContract.revision,
-        returnVisitId: String(returnRow.service_visit_id),
-        returnVisitRevision: Number(returnRow.revision),
-        returnWindow: {
-          startAt: returnRow.scheduled_start_at ? databaseIso(returnRow.scheduled_start_at) : null,
-          endAt: returnRow.scheduled_end_at ? databaseIso(returnRow.scheduled_end_at) : null
-        }
-      };
-      const afterSnapshot = {
-        contractId,
-        contractRevision: beforeContract.revision + 1,
-        returnVisitId: String(returnRow.service_visit_id),
-        returnVisitRevision: Number(returnRow.revision) + 1,
-        returnWindow: { startAt: iso(startAt), endAt: iso(endAt) }
-      };
+      const {beforeSnapshot,afterSnapshot} = extensionSnapshots(contractId,beforeContract,contractRow,returnRow,startAt,endAt);
       const amendmentResult = await query(
         `INSERT INTO mbt_contract_amendments (
            amendment_id, contract_id, amendment_number,
@@ -3904,7 +3836,7 @@ export async function extendFrontdeskContract(input) {
           String(actor.operatorId)
         ]
       );
-      const updatedReturn = await query(
+      const updatedReturn = returnRow ? await query(
         `UPDATE mbt_service_visits
             SET scheduled_start_at = $2::timestamptz,
                 scheduled_end_at = $3::timestamptz,
@@ -3920,7 +3852,7 @@ export async function extendFrontdeskContract(input) {
           amendmentId,
           String(actor.operatorId)
         ]
-      );
+      ) : null;
       const updatedContract = await query(
         `UPDATE mbt_contracts
             SET planned_return_at = $2::timestamptz,
@@ -3939,7 +3871,7 @@ export async function extendFrontdeskContract(input) {
       );
       const afterContract = publicContract(updatedContract.rows[0]);
       const amendment = publicAmendment(amendmentResult.rows[0]);
-      const returnVisit = publicVisit(updatedReturn.rows[0]);
+      const returnVisit = updatedReturn ? publicVisit(updatedReturn.rows[0]) : null;
       return {
         status: 200,
         body: {
@@ -3954,7 +3886,7 @@ export async function extendFrontdeskContract(input) {
           entityId: contractId,
           beforeState: {
             contract: beforeContract,
-            returnVisit: publicVisit(returnRow)
+            returnVisit: returnRow ? publicVisit(returnRow) : null
           },
           afterState: {
             contract: afterContract,
@@ -4015,14 +3947,14 @@ async function lockContractServiceLine(contractId, serviceLineId, expectedRevisi
 async function lockReturnVisitForLine(serviceLineId) {
   const result = await query(
     `SELECT * FROM mbt_service_visits
-      WHERE service_line_id = $1::uuid AND service_action = 'return_bin'
+      WHERE service_line_id = $1::uuid AND service_action = 'return_bin' AND status <> 'cancelled'
       ORDER BY visit_number DESC, service_visit_id DESC
       LIMIT 1
       FOR UPDATE`,
     [serviceLineId]
   );
   if (!result.rowCount) {
-    throw failure(422, "MBT_FRONTDESK_CONTRACT_INCOMPLETE", "The physical-bin line has no pending collection visit.");
+    return null;
   }
   if (!isUnassignedReturnEditable(result.rows[0])) {
     throw failure(409, "MBT_FRONTDESK_RETURN_STARTED", "A collection visit that has started cannot be changed.");
@@ -4035,6 +3967,51 @@ async function lockReturnVisitForLine(serviceLineId) {
     throw failure(409,"MBT_FRONTDESK_RETURN_STARTED","The collection has assigned or issued BIN parts. Resolve those instructions in Bin Planning first.");
   }
   return result.rows[0];
+}
+
+/** Create the final collection only inside the explicit, serialized Front Desk command.
+ * @param {any} locked @param {Date} startAt @param {Date} endAt @param {string} actorId
+ */
+async function createRequestedCollection(locked, startAt, endAt, actorId) {
+  const { lineRow: line, contractRow: contract } = locked;
+  const placements = await query(`SELECT * FROM mbt_service_visits
+    WHERE service_line_id=$1 AND service_action IN ('delivery','exchange_bin') AND status<>'cancelled'
+    ORDER BY visit_number DESC LIMIT 1 FOR UPDATE`, [line.service_line_id]);
+  const placement = placements.rows[0];
+  const initial = (await query(`SELECT * FROM mbt_service_visits
+    WHERE service_line_id=$1 AND service_action='delivery' ORDER BY visit_number LIMIT 1`, [line.service_line_id])).rows[0];
+  const yard = initial.service_snapshot.mandatoryStops?.find((/** @type {any} */ s) => s.yardId);
+  if (!yard) { throw failure(422, 'MBT_FRONTDESK_CONTRACT_INCOMPLETE', 'The delivery has no return yard. Review its route before requesting collection.'); }
+  const visitId = crypto.randomUUID();
+  const number = Number((await query('SELECT COALESCE(max(visit_number),0)+1 AS n FROM mbt_service_visits WHERE contract_id=$1', [contract.contract_id])).rows[0].n);
+  const reference = `${contract.contract_number}-L${line.line_number}-C${number}`;
+  const service = {
+    schemaVersion: 'mbt-bin-service-snapshot-v1', displayName: 'Collect bin', serviceAction: 'return_bin',
+    serviceLineId: line.service_line_id, lineNumber: line.line_number,
+    binTypeId: line.bin_type_id, binItemCode: line.bin_item_code,
+    contentCode: line.pricing_snapshot?.contentCode,
+    chargeRequestId: line.pricing_snapshot?.chargeRequestId,
+    collectionRequestedBy: actorId, collectionRequestedAt: new Date().toISOString(),
+    predecessorVisitId: placement.service_visit_id, dependencyKind: 'predecessor_completed',
+    mandatoryStops: [
+      { stopId: `${reference}-S1`, sequence: 1, actionCode: 'pickup_bin', stopKind: 'pickup',
+        locationRole: 'customer_site', siteProfileId: line.customer_site_profile_id, assetId: null },
+      { stopId: `${reference}-S2`, sequence: 2, actionCode: 'return_bin', stopKind: 'drop',
+        locationRole: 'return_yard', yardId: yard.yardId, yardCode: yard.yardCode, assetId: null }
+    ]
+  };
+  const visit = await insertServiceVisit({ visitId, contractId: contract.contract_id, visitNumber: number,
+    visitReference: reference, templateVersionId: placement.service_template_version_id,
+    serviceAction: 'return_bin', status: placement.status === 'completed' ? 'ready' : 'tentative',
+    siteProfileId: line.customer_site_profile_id, binTypeId: line.bin_type_id, materialId: null,
+    serviceLineId: line.service_line_id, predecessorVisitId: placement.service_visit_id,
+    scheduledStartAt: startAt, scheduledEndAt: endAt, customer: initial.customer_snapshot,
+    site: line.site_snapshot, service, billingOwnership: initial.billing_ownership, actorId });
+  await insertVisitSteps({ visitId, steps: [
+    { sequence: 0, actionCode: 'pickup_bin', displayName: 'Collect bin', locationRole: 'customer_site', templateStepId: null },
+    { sequence: 1, actionCode: 'return_bin', displayName: 'Return bin', locationRole: 'return_yard', templateStepId: null }
+  ] });
+  return visit;
 }
 
 /** @param {Record<string, any>} visit */
@@ -4089,6 +4066,36 @@ async function updateContractLineScheduleRollup(contractId, actorId) {
   );
 }
 
+/** @param {Record<string, any>} input */
+export async function rescheduleFrontdeskDelivery(input) {
+  const actor = input.actor;
+  assertFrontdeskActor(actor);
+  const contractId = requiredUuid(input.contractId, 'Contract ID');
+  const serviceLineId = requiredUuid(input.serviceLineId, 'Service line ID');
+  const expectedRevision = positiveRevision(input.expectedRevision);
+  const reason = String(input.reason || '').trim() || 'Front Desk changed the requested delivery time';
+  const { binRequestedWindow, updateUnplannedBinDeliveryWindow } = await import('./bin-order-window-service.js');
+  const window = await binRequestedWindow(input.deliveryWindow);
+  return executeMbtCommand({ actor, commandName: 'mbt.frontdesk.delivery_window',
+    idempotencyKey: requiredText(input.idempotencyKey, 'Idempotency key'),
+    correlationId: requiredText(input.correlationId, 'Correlation ID'), requestId: requiredText(input.requestId, 'Request ID'),
+    payload: { contractId, serviceLineId, expectedRevision, window, reason }, mutation: async () => {
+      const locked = await lockContractServiceLine(contractId, serviceLineId, expectedRevision);
+      if (locked.lineRow.planned_return_at && new Date(window.startAt) >= new Date(locked.lineRow.planned_return_at)) {
+        throw failure(400, 'MBT_FRONTDESK_INPUT_INVALID', 'Delivery must precede the expected return date. Extend that date first.');
+      }
+      const delivery = (await query(`SELECT service_visit_id FROM mbt_service_visits
+        WHERE service_line_id=$1 AND service_action='delivery' AND status<>'cancelled' ORDER BY visit_number LIMIT 1`, [serviceLineId])).rows[0];
+      if (!delivery) { throw failure(422, 'MBT_FRONTDESK_CONTRACT_INCOMPLETE', 'This line has no delivery order.'); }
+      await updateUnplannedBinDeliveryWindow(delivery.service_visit_id, window, String(actor.operatorId));
+      return { status: 200, body: { contractId, serviceLineId, window }, audit: {
+        action: 'mbt.frontdesk.delivery_window_changed', entityType: 'mbt_contract_service_line', entityId: serviceLineId,
+        beforeState: locked.serviceLine, afterState: { window }, revisionBefore: expectedRevision,
+        revisionAfter: expectedRevision + 1, reason, source: 'frontdesk_local'
+      } };
+    } });
+}
+
 /**
  * Extend exactly one physical bin's future collection; sibling lines and their
  * ready Dispatch legs remain untouched.
@@ -4123,7 +4130,7 @@ export async function extendFrontdeskServiceLine(input) {
       const amendmentNumber = await nextContractAmendmentNumber(contractId);
       const before = {
         serviceLine: locked.serviceLine,
-        returnVisit: publicVisit(returnVisit)
+        returnVisit: returnVisit ? publicVisit(returnVisit) : null
       };
       const afterWindow = { startAt: iso(startAt), endAt: iso(endAt) };
       const amendmentResult = await query(
@@ -4140,14 +4147,14 @@ export async function extendFrontdeskServiceLine(input) {
           iso(startAt), String(actor.operatorId)
         ]
       );
-      const updatedVisit = await query(
+      const updatedVisit = returnVisit ? await query(
         `UPDATE mbt_service_visits
             SET scheduled_start_at = $2::timestamptz, scheduled_end_at = $3::timestamptz,
                 amendment_id = $4::uuid, revision = revision + 1,
                 updated_by = $5, updated_at = now()
           WHERE service_visit_id = $1::uuid RETURNING *`,
         [returnVisit.service_visit_id, iso(startAt), iso(endAt), amendmentId, String(actor.operatorId)]
-      );
+      ) : null;
       const updatedLine = await query(
         `UPDATE mbt_contract_service_lines
             SET planned_return_at = $2::timestamptz, revision = revision + 1,
@@ -4159,10 +4166,10 @@ export async function extendFrontdeskServiceLine(input) {
       const serviceLine = publicServiceLine({ ...updatedLine.rows[0], bin_type_code: locked.lineRow.bin_type_code });
       const result = {
         contract: publicContract(updatedContract.rows[0]), serviceLine,
-        amendment: publicAmendment(amendmentResult.rows[0]), returnVisit: publicVisit(updatedVisit.rows[0])
+        amendment: publicAmendment(amendmentResult.rows[0]), returnVisit: updatedVisit ? publicVisit(updatedVisit.rows[0]) : null
       };
       await insertServiceLineEvent({
-        serviceLineId, contractId, visitId: String(returnVisit.service_visit_id), eventType: "extension",
+        serviceLineId, contractId, visitId: returnVisit ? String(returnVisit.service_visit_id) : null, eventType: "extension",
         before, after: result, reason, actorId: String(actor.operatorId)
       });
       return {
@@ -4260,6 +4267,9 @@ async function recordFreeExchangeWaiver(input) {
   });
 }
 
+/** @param {any} visit @param {Date} end */
+function exchangeConflictsWithCollection(visit,end) { return Boolean(visit?.scheduled_start_at) && new Date(visit.scheduled_start_at) <= end; }
+
 /**
  * Insert an exchange between a physical delivery and its future collection.
  * A size change is intentionally customer-confirmation-required until Front
@@ -4340,7 +4350,7 @@ export async function exchangeFrontdeskServiceLine(input) {
       }
       const deliveryVisit = deliveryResult.rows[0];
       const returnVisit = await lockReturnVisitForLine(serviceLineId);
-      if (returnVisit.scheduled_start_at && new Date(returnVisit.scheduled_start_at) <= endAt) {
+      if (exchangeConflictsWithCollection(returnVisit, endAt)) {
         throw failure(409, "MBT_FRONTDESK_RETURN_CONFLICT", "The pending collection must follow the exchange window.");
       }
       const maxVisitNumber = await query(
@@ -4352,11 +4362,11 @@ export async function exchangeFrontdeskServiceLine(input) {
       const exchangeVisitNumber = Number(maxVisitNumber.rows[0].max_number) + 1;
       const exchangeReference = `${String(locked.contractRow.contract_number)}-L${locked.serviceLine.lineNumber}-X${exchangeVisitNumber}`;
       const route = exchangeRouteFromDelivery(deliveryVisit);
-      const oldReturnSnapshot = jsonObject(returnVisit.service_snapshot, "Return service snapshot");
+      const oldReturnSnapshot = jsonObject(returnVisit?.service_snapshot || {}, "Return service snapshot");
       const before = {
         serviceLine: locked.serviceLine,
         deliveryVisit: publicVisit(deliveryVisit),
-        returnVisit: publicVisit(returnVisit)
+        returnVisit: returnVisit ? publicVisit(returnVisit) : null
       };
       const amendmentId = crypto.randomUUID();
       const amendmentNumber = await nextContractAmendmentNumber(contractId);
@@ -4368,6 +4378,7 @@ export async function exchangeFrontdeskServiceLine(input) {
         attachedAggregate
       );
       const customerConfirmation = exchangeCustomerConfirmation(sizeChanged, locked.lineRow);
+      const collectionPricing = await exchangeCollectionPricing(contractId, sourceChargeRequestId);
       const amendmentResult = await query(
         `INSERT INTO mbt_contract_amendments (
            amendment_id, contract_id, amendment_number, amendment_type, status,
@@ -4377,18 +4388,18 @@ export async function exchangeFrontdeskServiceLine(input) {
            $5, $6::jsonb, $7::jsonb, $8::timestamptz, now(), $9, $9, $9)
          RETURNING *`,
         [
-          amendmentId, contractId, amendmentNumber, locked.contractRow.rate_card_version_id,
+          amendmentId, contractId, amendmentNumber, collectionPricing.rateCardVersionId,
           reason, JSON.stringify(before), JSON.stringify({ incomingBinTypeId, exchangeVisitId, chargeMode, waiver }),
           iso(startAt), String(actor.operatorId)
         ]
       );
-      await query(
+      if (returnVisit) { await query(
         `UPDATE mbt_service_visits
             SET predecessor_visit_id = NULL, visit_number = $2, status = 'tentative',
                 revision = revision + 1, updated_by = $3, updated_at = now()
           WHERE service_visit_id = $1::uuid`,
         [returnVisit.service_visit_id, exchangeVisitNumber + 1, String(actor.operatorId)]
-      );
+      ); }
       const exchangeSnapshot = {
         schemaVersion: "mbt-bin-service-snapshot-v1",
         displayName: sizeChanged ? "Bin size exchange" : "Bin exchange",
@@ -4396,7 +4407,7 @@ export async function exchangeFrontdeskServiceLine(input) {
         predecessorVisitId: String(deliveryVisit.service_visit_id), dependencyKind: "predecessor_completed",
         binItemCode: String(incomingType.rows[0].local_item_code),
         binTypeId: incomingBinTypeId, mandatoryStops: route,
-        customerConfirmationRequired: sizeChanged, chargeMode, waiver,
+        customerConfirmationRequired: sizeChanged, chargeMode, waiver, collectionPricing,
         ...chargeSnapshot
       };
       const exchangeVisit = await insertServiceVisit({
@@ -4425,7 +4436,7 @@ export async function exchangeFrontdeskServiceLine(input) {
           { sequence: 2, actionCode: "return_replaced_bin", displayName: "Return replaced bin", locationRole: "return_yard", templateStepId: null }
         ]
       });
-      const updatedReturn = await query(
+      const updatedReturn = returnVisit ? await query(
         `UPDATE mbt_service_visits
             SET predecessor_visit_id = $2::uuid, bin_type_id = $3::uuid,
                 amendment_id = $4::uuid, service_snapshot = $5::jsonb,
@@ -4441,7 +4452,7 @@ export async function exchangeFrontdeskServiceLine(input) {
           }),
           String(actor.operatorId)
         ]
-      );
+      ) : null;
       const updatedLine = await query(
         `UPDATE mbt_contract_service_lines
             SET bin_type_id = $2::uuid,
@@ -4467,7 +4478,7 @@ export async function exchangeFrontdeskServiceLine(input) {
       const result = {
         contract: publicContract(updatedContract.rows[0]), serviceLine,
         amendment: publicAmendment(amendmentResult.rows[0]), exchangeVisit: publicVisit(exchangeVisit),
-        returnVisit: publicVisit(updatedReturn.rows[0])
+        returnVisit: updatedReturn ? publicVisit(updatedReturn.rows[0]) : null
       };
       await insertServiceLineEvent({
         serviceLineId, contractId, visitId: exchangeVisitId, eventType: "exchange",
@@ -4520,24 +4531,27 @@ export async function collectFrontdeskServiceLine(input) {
     mutation: async () => {
       const locked = await lockContractServiceLine(contractId, serviceLineId, expectedRevision);
       await assertFrontdeskBinDelivered(serviceLineId, { lock: true });
-      const returnVisit = await lockReturnVisitForLine(serviceLineId);
+      const existingReturn = await lockReturnVisitForLine(serviceLineId);
       if (locked.lineRow.planned_delivery_at && startAt <= new Date(locked.lineRow.planned_delivery_at)) {
         throw failure(400, "MBT_FRONTDESK_INPUT_INVALID", "The collection window must follow the delivery date.");
       }
-      const before = { serviceLine: locked.serviceLine, returnVisit: publicVisit(returnVisit) };
+      const before = { serviceLine: locked.serviceLine, returnVisit: existingReturn ? publicVisit(existingReturn) : null };
+      const returnVisit = existingReturn || await createRequestedCollection(locked, startAt, endAt, String(actor.operatorId));
+      const collectionPricing = returnVisit.service_snapshot.collectionPricing || await captureCollectionPricing(contractId);
       const updatedVisit = await query(
         `UPDATE mbt_service_visits
             SET scheduled_start_at = $2::timestamptz, scheduled_end_at = $3::timestamptz,
+                service_snapshot = service_snapshot || jsonb_build_object('collectionRequestedBy',$4::text,'collectionPricing',$5::jsonb),
                 revision = revision + 1, updated_by = $4, updated_at = now()
           WHERE service_visit_id = $1::uuid RETURNING *`,
-        [returnVisit.service_visit_id, iso(startAt), iso(endAt), String(actor.operatorId)]
+        [returnVisit.service_visit_id, iso(startAt), iso(endAt), String(actor.operatorId), JSON.stringify(collectionPricing)]
       );
       const updatedLine = await query(
         `UPDATE mbt_contract_service_lines
-            SET status = 'return_due', planned_return_at = $2::timestamptz,
-                revision = revision + 1, updated_by = $3, updated_at = now()
+            SET status = 'return_due',
+                revision = revision + 1, updated_by = $2, updated_at = now()
           WHERE service_line_id = $1::uuid RETURNING *`,
-        [serviceLineId, iso(startAt), String(actor.operatorId)]
+        [serviceLineId, String(actor.operatorId)]
       );
       const updatedContract = await updateContractLineScheduleRollup(contractId, String(actor.operatorId));
       const serviceLine = publicServiceLine({ ...updatedLine.rows[0], bin_type_code: locked.lineRow.bin_type_code });

@@ -103,6 +103,25 @@ function stripPoItemProjection(item = {}) {
 }
 
 /**
+ * @typedef {{poPickupManifest?: Array<{location?: string}>, directPickupManifest?: Array<{location?: string}>,
+ * pickupLocations?: string[], items?: object[], childOrderDetails?: PoProjectionOrder[]}} PoProjectionOrder
+ * @param {PoProjectionOrder} order
+ */
+export function stripDispatchPoAllocationProjection(order = {}) {
+  const next = clone(order) || {};
+  const previous = (order.poPickupManifest || []).map(entry => entry.location);
+  const retained = [...nativePickupLocations(order),
+    ...(order.directPickupManifest || []).map(entry => entry.location)];
+  next.pickupLocations = (order.pickupLocations || []).filter(location =>
+    !previous.some(candidate => scmDependencyLocationsMatch(candidate, location))
+    || retained.some(candidate => scmDependencyLocationsMatch(candidate, location)));
+  next.items = (order.items || []).map(stripPoItemProjection);
+  next.childOrderDetails = (order.childOrderDetails || []).map(stripDispatchPoAllocationProjection);
+  delete next.poPickupManifest;
+  return next;
+}
+
+/**
  * Remove values that are projections of mutable PO/TO relationships. Native
  * source locations and plan-owned group/split structure deliberately survive.
  */

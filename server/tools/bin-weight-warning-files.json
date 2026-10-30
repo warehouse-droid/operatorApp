@@ -1,0 +1,10 @@
+[
+  "src/mbt/bin-planning-domain.js",
+  "src/mbt/bin-planning-capacity.js",
+  "src/mbt/bin-planning-read.js",
+  "src/mbt/bin-transport-planning.js",
+  "src/mbt/bin-dispatch-service.js",
+  "public/mbt-planning.js",
+  "public/dispatch.js",
+  "public/mbt-planning.html"
+]

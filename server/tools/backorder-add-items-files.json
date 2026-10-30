@@ -1,0 +1,8 @@
+[
+  "public/backorder-add-items.js",
+  "public/backorder-stock-requests.js",
+  "public/sales-stock-requests.js",
+  "public/sales-stock-requests.html",
+  "src/backorder-request-service.js",
+  "src/special-stock-request-domain.js"
+]

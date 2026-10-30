@@ -1,5 +1,7 @@
 // @ts-check
 
+import { MBT_AGGREGATE_LBS_PER_YARD } from "./aggregate-density.js";
+
 import crypto from "node:crypto";
 
 import { config } from "../config.js";
@@ -150,14 +152,14 @@ function normalizeLocalItem(raw) {
   if (!CHARGE_BASES[itemType]?.has(chargeBasis)) {
     return invalidLocalItem();
   }
-  const densityLbsPerYard = input.densityLbsPerYard === undefined || input.densityLbsPerYard === null
+  const suppliedDensity = input.densityLbsPerYard === undefined || input.densityLbsPerYard === null
     ? null
     : Number(input.densityLbsPerYard);
-  if ((itemType === "aggregate"
-      && (!Number.isSafeInteger(densityLbsPerYard) || Number(densityLbsPerYard) < 1))
-      || (itemType !== "aggregate" && densityLbsPerYard !== null)) {
+  if (suppliedDensity !== null && (itemType !== "aggregate"
+      || !Number.isSafeInteger(suppliedDensity) || suppliedDensity < 1)) {
     return invalidLocalItem();
   }
+  const densityLbsPerYard = itemType === "aggregate" ? MBT_AGGREGATE_LBS_PER_YARD : null;
   const binTypeCode = input.binTypeCode === undefined || input.binTypeCode === null
     ? null
     : normalizedCode(input.binTypeCode, /^[A-Z0-9][A-Z0-9_-]{0,31}$/, invalidLocalItem);
@@ -254,6 +256,13 @@ function coordinate(value, minimum, maximum, invalid) {
   return text;
 }
 
+/** @param {unknown} value */
+function normalizedDumpSiteCode(value) {
+  return normalizedCode(value, /^[A-Z0-9][A-Z0-9_-]{0,63}$/u, () => invalidMaster(
+    "Dump-site code must start with a letter or number and contain only letters, numbers, underscores or hyphens (up to 64 characters)."
+  ));
+}
+
 /** @param {unknown} value @param {() => never} invalid */
 function dumpSiteItemAcceptances(value, invalid) {
   if (!Array.isArray(value) || value.length === 0 || value.length > 100) {
@@ -340,9 +349,11 @@ function normalizeDumpSite(raw) {
     : normalizedCode(rawItemCode, /^[A-Z][A-Z0-9_]{0,63}$/, invalid);
   const openingHours = input.openingHours === undefined
     ? null
-    : dumpSiteOpeningHours(input.openingHours, invalid);
+    : dumpSiteOpeningHours(input.openingHours, () => invalidMaster(
+      "The dump-site row is invalid: opening hours must use unique days and a closing time after opening."
+    ));
   return {
-    dumpSiteCode: normalizedCode(input.dumpSiteCode, /^[A-Z][A-Z0-9_]{0,63}$/, invalid),
+    dumpSiteCode: normalizedDumpSiteCode(input.dumpSiteCode),
     displayName: boundedText(input.displayName, 160, false, invalid),
     addressLine1: boundedText(input.addressLine1, 500, true, invalid),
     addressLine2: boundedText(input.addressLine2, 500, true, invalid),
@@ -1460,10 +1471,9 @@ export async function setLocalMasterDataActive(input) {
   if (!["local_items", "dump_sites"].includes(resource) || typeof input.active !== "boolean") {
     return invalidMaster("A supported local record and active state are required.");
   }
-  const entityId = masterIdentity(
-    input.entityId,
-    resource === "local_items" ? "Local item code" : "Dump-site code"
-  );
+  const entityId = resource === "dump_sites"
+    ? normalizedDumpSiteCode(input.entityId)
+    : masterIdentity(input.entityId, "Local item code");
   const expectedRevision = requiredMasterRevision(input.expectedRevision);
   const reason = `${input.active ? "Activated" : "Inactivated"} ${resource === "local_items" ? "local item" : "dump site"} from MBT configuration`;
   await assertMasterDataEnabled(input.actor);
@@ -1546,10 +1556,9 @@ export async function deleteLocalMasterDataEntity(input) {
   if (!["local_items", "dump_sites"].includes(resource)) {
     return invalidMaster("A deletable local record is required.");
   }
-  const entityId = masterIdentity(
-    input.entityId,
-    resource === "local_items" ? "Local item code" : "Dump-site code"
-  );
+  const entityId = resource === "dump_sites"
+    ? normalizedDumpSiteCode(input.entityId)
+    : masterIdentity(input.entityId, "Local item code");
   const expectedRevision = requiredMasterRevision(input.expectedRevision);
   const reason = `Deleted unused ${resource === "local_items" ? "local item" : "dump site"} from MBT configuration`;
   await assertMasterDataEnabled(input.actor);

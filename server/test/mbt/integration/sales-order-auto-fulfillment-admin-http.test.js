@@ -85,6 +85,11 @@ async function seedHistoricalCompletion() {
      ) RETURNING id`,
     [orderRef, `SO-IF-HTTP-JOB-${RUN_ID}`]
   );
+  // This Admin test exercises a retained pre-cutover candidate. New Driver
+  // completions deliberately have no automatic IF candidate after migration 301.
+  const legacyId=crypto.randomUUID();
+  await query(`INSERT INTO dispatch_sales_order_if_candidates(id,completion_event_id,dispatch_order_ref,external_id,status)
+    VALUES($1,$2,$3,$4,'historical')`,[legacyId,event.rows[0].id,orderRef,`MBBS-SOIF-${legacyId}`]);
   return { orderRef, completionEventId: String(event.rows[0].id) };
 }
 

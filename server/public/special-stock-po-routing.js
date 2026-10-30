@@ -9,13 +9,20 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, c => escaped[c] 
 /** @param {string[]} values @param {string} current */
 const options = (values,current) => values.map(value => `<option value="${escape(value)}" ${value === current ? 'selected' : ''}>${escape(value)}</option>`).join('');
 
-/** @param {any} detail @param {{ref:string,order?:any,error?:string}|null} entry */
-export function specialPoRoutingHtml(detail, entry) {
+/** @param {any} detail @param {{ref:string,order?:any,error?:string,splits?:any[]}|null} entry @param {{backorder?:boolean}} [options] */
+export function specialPoRoutingHtml(detail, entry, {backorder=false} = {}) {
   if (!detail.purchaseOrderId || !detail.purchaseOrderRef || ['closed','completed'].includes(detail.stage)
       || detail.closeStatus === 'closure_pending' || detail.quantityReviewPending) return '';
   const order = entry && entry.ref === detail.purchaseOrderRef ? entry.order : null;
+  const child = Boolean(detail.purchaseOrderSplitId);
+  const prefix = backorder ? 'backorder' : 'special';
+  const selector = entry && entry.ref === detail.purchaseOrderRef && (entry.splits?.length || child)
+    ? `<form data-${prefix}-po-split-form class="stock-request-actions"><label><span>Attach PO to this request</span>
+      <select name="purchaseOrderSplitId" aria-label="Attached PO"><option value="">Whole PO · ${escape(detail.purchaseOrderRef)}</option>
+      ${(entry.splits || []).map(split=>`<option value="${escape(split.id)}" ${Number(split.id)===detail.purchaseOrderSplitId ? 'selected' : ''}>${escape(split.ref)}</option>`).join('')}</select></label>
+      <button type="submit">Attach selected PO</button></form><p>${child ? 'Routing changes apply only to the attached child PO.' : 'Select a child when this request needs only part of the source PO.'}</p>` : '';
   if (!order) return `<section class="stock-request-section special-po-routing"><h3>PO split and routing</h3>
-    <p role="status">${escape(entry?.error || 'Loading PO routing…')}</p>${entry?.error ? '<button type="button" data-special-scm-action="reload-po-routing">Retry PO routing</button>' : ''}</section>`;
+    ${selector}<p role="status">${escape(entry?.error || 'Loading PO routing…')}</p>${entry?.error ? `<button type="button" ${backorder ? 'data-backorder-po-reload' : 'data-special-scm-action="reload-po-routing"'}>Retry PO routing</button>` : ''}</section>`;
   const scm = order.scm || {};
   const remarkOverride = String(scm.remarkOverride || '');
   const remark = remarkOverride || String(scm.netSuiteMemo || '');
@@ -24,20 +31,20 @@ export function specialPoRoutingHtml(detail, entry) {
   const yards = [...new Set((order.vendorYardOptions || []).map(/** @param {{yard?:unknown}} option */ option => String(option.yard || '').trim()).filter(Boolean))];
   if (pickup && yards.length && !yards.includes(pickup)) yards.unshift(pickup);
   const status = scm.status || 'Queued';
-  return `<section class="stock-request-section special-po-routing"><h3>PO split and routing · ${escape(detail.purchaseOrderRef)}</h3>
-    <form class="scm-mini-panel" data-special-po-routing-form>
+  return `<section class="stock-request-section special-po-routing"><h3>PO split and routing · ${escape(child ? detail.purchaseOrderTargetRef : detail.purchaseOrderRef)}</h3>${selector}
+    <form class="scm-mini-panel" data-${prefix}-po-routing-form>
     <fieldset ${locked ? 'disabled' : ''}><div class="scm-mini-grid">
     <div class="scm-mini-row scm-mini-routing-row">
       <label class="scm-mini-method-field"><span>Method</span><select name="method" data-scm-field="method">${options(methods,scm.method || 'MBT')}</select></label>
       <label class="scm-mini-status-field"><span>Status</span>${statuses.includes(status) ? `<select name="status" data-scm-field="status">${options(statuses,status)}</select>` : `<input value="${escape(status)}" readonly />`}</label>
       <label class="scm-pickup-yard-field"><span>Pickup Yard</span>${yards.length ? `<select name="pickupPoint" data-scm-field="pickupPoint">${options(yards,pickup || yards[0])}</select>` : `<input value="${escape(pickup || order.address || 'Use NetSuite address')}" readonly />`}</label>
       <label class="checkbox-line scm-mini-special-field"><input name="isSpecialOrder" data-scm-field="isSpecialOrder" type="checkbox" ${scm.isSpecialOrder ? 'checked' : ''} /><span>Sp.O</span></label>
-      <label class="scm-mini-reference-field"><span>Packing Slip / Ref</span><input name="packingSlipRef" data-scm-field="packingSlipRef" maxlength="120" value="${escape(scm.packingSlipRef || detail.purchaseOrderReference || '')}" /></label>
+      <label class="scm-mini-reference-field"><span>Packing Slip / Ref</span><input name="packingSlipRef" ${child ? 'readonly' : 'data-scm-field="packingSlipRef"'} maxlength="120" value="${escape(child ? detail.purchaseOrderTargetRef : scm.packingSlipRef || detail.purchaseOrderReference || '')}" />${child ? '<small>Rename this child in PO Split.</small>' : ''}</label>
     </div>
     <div class="scm-mini-row scm-mini-notes-row">
       <label><span>Destination Override</span><select name="dropoffPoint" data-scm-field="dropoffPoint"><option value="">${escape(order.destinationYard || detail.storeName || 'NetSuite line destinations')} (NetSuite)</option>${options(destinations,scm.dropoffPoint || '')}</select></label>
       <label class="scm-remark-field"><span>Remark</span><textarea name="remarkOverride" data-scm-field="remarkOverride" data-scm-remark-value="${escape(remark)}" data-scm-remark-override="${escape(remarkOverride)}" rows="2" maxlength="2000">${escape(remark)}</textarea><small>Clear to use the PO remark. Shared with PO / TO Schedule.</small></label>
-      <label class="scm-note-field"><span>Note</span><textarea name="notes" data-scm-field="notes" rows="2" maxlength="4000">${escape(order.netSuiteNote ?? scm.notes ?? order.notes ?? '')}</textarea><small>Saved to the NetSuite PO.</small></label>
+      <label class="scm-note-field"><span>Note</span><textarea name="notes" data-scm-field="notes" rows="2" maxlength="4000">${escape(child ? scm.notes || '' : order.netSuiteNote ?? scm.notes ?? order.notes ?? '')}</textarea><small>${child ? 'Saved to this child PO.' : 'Saved to the NetSuite PO.'}</small></label>
       <div class="scm-mini-actions"><button type="submit">Save Schedule</button></div>
     </div></div></fieldset></form>${locked ? '<p>This split is locked. Unplan or unlink it in PO Split before editing.</p>' : ''}</section>`;
 }
@@ -47,6 +54,7 @@ export function specialPoRoutingPatch(form, order) {
   if (!order || order.scmSplitLocked === true) throw new Error('Load an editable PO before saving its routing.');
   /** @type {Record<string, unknown>} */
   const patch = {orderKind:'PO',expectedUpdatedAt:order.scm?.updatedAt || null};
+  if (order.isScmSplit) patch.expectedSplitRevision = order.scmSplitRevision;
   for (const field of form.querySelectorAll('[data-scm-field]')) {
     if (!(field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) || field.disabled) continue;
     const name = field.dataset.scmField;

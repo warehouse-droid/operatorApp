@@ -1,7 +1,8 @@
 import { query } from "./db.js";
 
 // The immutable Control correction authorizes local work; a client flag or an
-// Open header alone does not. Current physical evidence always ends the exception.
+// Open header alone does not. Only historical IF records captured by that
+// correction are superseded; new physical evidence ends the exception.
 /** @param {unknown} alias */
 export function locallyReopenedSalesOrderSql(alias) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(String(alias || ""))) {
@@ -11,8 +12,8 @@ export function locallyReopenedSalesOrderSql(alias) {
     SELECT 1 FROM sales_orders reopened
      WHERE reopened.netsuite_id = ${alias}.netsuite_id
        AND reopened.netsuite_active = true AND reopened.netsuite_missing_at IS NULL
-       AND upper(COALESCE(reopened.status, '')) NOT IN ('F','H','C')
-       AND COALESCE(reopened.status_text, '') !~* '(pending billing|fulfilled|closed|cancelled|canceled)'
+       AND upper(COALESCE(reopened.status, '')) NOT IN ('H','C')
+       AND COALESCE(reopened.status_text, '') !~* '(closed|cancelled|canceled)'
        AND lower(COALESCE(reopened.operator_status, '')) IN ('open','preparing','confirmed','packed')
        AND lower(COALESCE(reopened.local_yard_order_status, 'Open')) IN ('open','preparing','confirmed','packed')
        AND lower(COALESCE(reopened.fulfillment_status, 'not_fulfilled')) IN ('','open','not_fulfilled')
@@ -24,7 +25,13 @@ export function locallyReopenedSalesOrderSql(alias) {
            OR COALESCE(line.fulfilled_pallet_qty,0)>0 OR COALESCE(line.fulfilled_layer_qty,0)>0
            OR COALESCE(line.fulfilled_section_qty,0)>0 OR COALESCE(line.fulfilled_piece_qty,0)>0))
        AND NOT EXISTS (SELECT 1 FROM delivery_fulfillment_records fulfillment
-         WHERE fulfillment.order_id=reopened.netsuite_id AND fulfillment.item_fulfillment_id IS NOT NULL)
+         WHERE fulfillment.order_id=reopened.netsuite_id AND fulfillment.item_fulfillment_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM operator_order_reopens correction
+             WHERE correction.order_keys @> ARRAY['sales_order:' || reopened.netsuite_id::text]
+               AND correction.before_state @> jsonb_build_array(jsonb_build_object(
+                 'kind', 'sales_order', 'id', reopened.netsuite_id::text,
+                 'fulfillments', jsonb_build_array(jsonb_build_object(
+                   'id', fulfillment.id::text, 'item_fulfillment_id', fulfillment.item_fulfillment_id::text))))))
   )`;
 }
 

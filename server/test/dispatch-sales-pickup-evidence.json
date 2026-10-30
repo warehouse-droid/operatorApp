@@ -1,0 +1,692 @@
+{
+  "sourceHashes": {
+    "src/dispatch-load-assignment.js": "4fc097ab13bfeed4d29cea98ac77d44771aa10149e49a20e64fc2eacea801f4c",
+    "src/driver-repository.js": "6748ac737967d2ee3d1644dd533f0724eb8930f47ef60da48bc097a22db777dd",
+    "public/dispatch.js": "f0af5380690ad23c9f2aee30111a96f5fdea2a28c8306f68832d963b680cd48d",
+    "public/dispatch.html": "f1d1489d9fa0a44e6c9ebf618a0c8a8cbef831a70e8f4322524c50680e0d0a66",
+    "public/mbt-planning.html": "de34f3a9a6fc14f9f68fb8411a5296c140ab6b8194b8ca8290d409366551e538",
+    "src/operator-linked-quantity-domain.js": "f6e0b509996366fc85ac9d96d142c107c2f055a7e64ffe573190ff6a9d618bee",
+    "src/delivery-repository.js": "3002a7052ba4163df1ab93097567a527358e926948fceefa3005a74d6423f535",
+    "public/operator.js": "ed314542c569a4bcf43e70fa63f2aa0be043220a8eef3ac0731f3d9f99df4c60",
+    "public/operator.html": "de7c5ef4a5af5a026e87f72665a853dfd25fee1076087063a448d5fee62df4f5"
+  },
+  "toolchain": {
+    "node": "v20.20.2",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "c8": "12.0.0",
+    "fast-check": "4.9.0",
+    "pg": "8.21.0"
+  },
+  "steps": [
+    {
+      "name": "baseline-regression",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 25",
+        "\u2139 pass 25",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 5",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 6",
+        "\u2139 pass 6",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 9",
+        "\u2139 pass 9",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 1",
+        "\u2139 fail 3",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 2",
+        "\u2139 pass 2",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 16",
+        "\u2139 pass 16",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 14",
+        "\u2139 pass 14",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 2",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 2",
+        "\u2139 pass 2",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 10",
+        "\u2139 pass 9",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 5",
+        "\u2139 fail 2",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 8/25 file(s): test/dispatch/frontend/dispatch-repeat-pickup-visits.red.test.js, test/dispatch/integration/dispatch-required-pickups-save.test.js, src/dispatch-driver-order-harness.js, test/mbt/unit/operator-delivery-reference.test.js, src/dispatch-pickup-override-harness.js, test/dispatch/unit/dispatch-repeat-pickup-visits.red.test.js, src/dispatch-load-assignment-harness.js, test/mbt/integration/operator-linked-quantity-repository.red.test.js"
+      ]
+    },
+    {
+      "name": "candidate-suite",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 25",
+        "\u2139 pass 25",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 5",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 6",
+        "\u2139 pass 6",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 9",
+        "\u2139 pass 9",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 2",
+        "\u2139 pass 2",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 16",
+        "\u2139 pass 16",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 14",
+        "\u2139 pass 14",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 2",
+        "\u2139 pass 2",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 10",
+        "\u2139 pass 9",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 1",
+        "\u2139 pass 0",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 5",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 8",
+        "\u2139 pass 8",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 5/27 file(s): test/dispatch/frontend/dispatch-repeat-pickup-visits.red.test.js, src/dispatch-driver-order-harness.js, src/dispatch-pickup-override-harness.js, test/dispatch/unit/dispatch-repeat-pickup-visits.red.test.js, src/dispatch-load-assignment-harness.js"
+      ]
+    },
+    {
+      "name": "baseline-types",
+      "status": 1,
+      "summaries": []
+    },
+    {
+      "name": "candidate-types",
+      "status": 1,
+      "summaries": []
+    },
+    {
+      "name": "ignore-sales-0",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 1",
+        "\u2139 fail 4",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 1/4 file(s): test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "ignore-sales-0-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "ignore-sales-1",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 1",
+        "\u2139 fail 4",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 1/4 file(s): test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "ignore-sales-1-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "ignore-sales-2",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 1",
+        "\u2139 fail 4",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 1/4 file(s): test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "ignore-sales-2-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "skip-recorded-cargo-guard",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 3",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 5",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 1/4 file(s): test/dispatch/integration/gob122647-empty-pickup.test.js"
+      ]
+    },
+    {
+      "name": "skip-recorded-cargo-guard-properties",
+      "status": 0,
+      "summaries": [
+        "# tests 5",
+        "# pass 2",
+        "# fail 0",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "operator-ignore-sales-authority",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 0",
+        "\u2139 fail 3",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 5",
+        "\u2139 fail 2",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 3/4 file(s): test/mbt/unit/operator-delivery-reference.test.js, test/mbt/integration/operator-linked-quantity-repository.red.test.js, test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "operator-ignore-sales-authority-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "operator-server-revive-zero",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 5",
+        "\u2139 fail 2",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 2/4 file(s): test/mbt/integration/operator-linked-quantity-repository.red.test.js, test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "operator-server-revive-zero-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "operator-browser-revive-zero",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 5",
+        "\u2139 fail 2",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 2/4 file(s): test/mbt/integration/operator-linked-quantity-repository.red.test.js, test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "operator-browser-revive-zero-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "operator-ignore-po",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 0",
+        "\u2139 fail 3",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 1",
+        "\u2139 fail 6",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 3/4 file(s): test/mbt/unit/operator-delivery-reference.test.js, test/mbt/integration/operator-linked-quantity-repository.red.test.js, test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "operator-ignore-po-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "operator-ignore-direct-to",
+      "status": 1,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 3",
+        "\u2139 fail 4",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 4",
+        "\u2139 fail 1",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run failed in 2/4 file(s): test/mbt/integration/operator-linked-quantity-repository.red.test.js, test/dispatch/unit/sales-pickup-authority.test.js"
+      ]
+    },
+    {
+      "name": "operator-ignore-direct-to-properties",
+      "status": 1,
+      "summaries": [
+        "# tests 5",
+        "# pass 1",
+        "# fail 1",
+        "# skipped 3"
+      ]
+    },
+    {
+      "name": "focused-repeat",
+      "status": 0,
+      "summaries": [
+        "\u2139 tests 4",
+        "\u2139 pass 4",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 3",
+        "\u2139 pass 3",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 7",
+        "\u2139 pass 7",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "\u2139 tests 5",
+        "\u2139 pass 5",
+        "\u2139 fail 0",
+        "\u2139 skipped 0",
+        "Isolated sales-pickup-authority run passed: 4 file(s), 19 test(s)."
+      ]
+    }
+  ],
+  "mutations": [
+    {
+      "name": "ignore-sales-0",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "ignore-sales-1",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "ignore-sales-2",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "skip-recorded-cargo-guard",
+      "killed": true,
+      "propertyKilled": false
+    },
+    {
+      "name": "operator-ignore-sales-authority",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "operator-server-revive-zero",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "operator-browser-revive-zero",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "operator-ignore-po",
+      "killed": true,
+      "propertyKilled": true
+    },
+    {
+      "name": "operator-ignore-direct-to",
+      "killed": true,
+      "propertyKilled": true
+    }
+  ],
+  "regression": {
+    "baselineFailures": [
+      "\u2716 RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped orders",
+      "\u2716 incremental group save refreshes full PO allocations after the global definition is reloaded",
+      "\u2716 incremental group save refreshes partial PO allocations after the global definition is reloaded",
+      "\u2716 incremental group save refreshes cancelled PO allocations after the global definition is reloaded",
+      "\u2716 src/dispatch-driver-order-harness.js",
+      "\u2716 L3 partial/cancelled allocations and physical-only manual requirements remain packable",
+      "\u2716 src/dispatch-pickup-override-harness.js",
+      "\u2716 RP-05 active travel protects its destination while allowing work after it",
+      "\u2716 src/dispatch-load-assignment-harness.js",
+      "\u2716 Operator 200 sales units: 100 PO plus 100 direct TO leaves no yard work",
+      "\u2716 Operator 200 sales units: 200 PO leaves no yard work"
+    ],
+    "candidateFailures": [
+      "\u2716 RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped orders",
+      "\u2716 src/dispatch-driver-order-harness.js",
+      "\u2716 src/dispatch-pickup-override-harness.js",
+      "\u2716 RP-05 active travel protects its destination while allowing work after it",
+      "\u2716 src/dispatch-load-assignment-harness.js"
+    ],
+    "baselineErrors": [
+      "ReferenceError: isMbtPlanningLoad is not defined",
+      "ReferenceError: retainedDirectPickupManifest is not defined"
+    ],
+    "candidateErrors": [
+      "ReferenceError: isMbtPlanningLoad is not defined",
+      "ReferenceError: retainedDirectPickupManifest is not defined"
+    ],
+    "newFailures": []
+  },
+  "static": {
+    "newTypeErrors": [],
+    "newLintFindings": [],
+    "syntax": [
+      {
+        "file": "src/dispatch-load-assignment.js",
+        "status": 0
+      },
+      {
+        "file": "src/driver-repository.js",
+        "status": 0
+      },
+      {
+        "file": "public/dispatch.js",
+        "status": 0
+      },
+      {
+        "file": "src/operator-linked-quantity-domain.js",
+        "status": 0
+      },
+      {
+        "file": "src/delivery-repository.js",
+        "status": 0
+      },
+      {
+        "file": "public/operator.js",
+        "status": 0
+      }
+    ],
+    "secrets": []
+  },
+  "changedLineCoverage": {
+    "covered": 63,
+    "total": 63,
+    "uncovered": [],
+    "note": "V8 coverage; production function extraction preserves filenames and source offsets via compileFunction."
+  },
+  "passed": true,
+  "runtimeBaseImage": "sha256:0670989f074400b63b53d2af17969265bce018fc274830b79a4427b0b7acf263"
+}

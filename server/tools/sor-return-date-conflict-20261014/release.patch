@@ -1,0 +1,35 @@
+--- a/src/server.js
++++ b/src/server.js
+@@ -3249,8 +3249,12 @@
+   const visit = (order) => {
+     const ref = String(order?.id || "").trim();
+     if (!ref) return;
+-    const explicitParent = String(order?.originalOrderId || order?.parentOrderRef || "").trim();
+-    const inferredParent = String(order?.type || "").trim().toUpperCase() !== "CUSTOM" && /-S\d+$/i.test(ref)
++    const customOrder = String(order?.type || "").trim().toUpperCase() === "CUSTOM"
++      || order?.customOrder === true
++      || String(order?.sourceTable || "").trim().toLowerCase() === "dispatch_custom_orders";
++    // A linked return or re-attempt owns its own route, independently of its source.
++    const explicitParent = customOrder ? "" : String(order?.originalOrderId || order?.parentOrderRef || "").trim();
++    const inferredParent = !customOrder && /-S\d+$/i.test(ref)
+       ? ref.replace(/-S\d+$/i, "")
+       : "";
+     const parent = explicitParent || inferredParent;
+--- a/src/dispatch-planner-v2-repository.js
++++ b/src/dispatch-planner-v2-repository.js
+@@ -437,13 +437,13 @@
+ }
+ 
+ function splitParentRef(order = {}, orderReference = "") {
+-  const explicitParent = text(order?.originalOrderId || order?.parentOrderRef);
+-  if (explicitParent) {return explicitParent;}
+   if (
+     text(order?.type).toUpperCase() === "CUSTOM"
+     || order?.customOrder === true
+     || text(order?.sourceTable).toLowerCase() === "dispatch_custom_orders"
+   ) {return "";}
++  const explicitParent = text(order?.originalOrderId || order?.parentOrderRef);
++  if (explicitParent) {return explicitParent;}
+   const ref = text(orderReference || order?.id || order?.orderId || order?.orderRef);
+   return /-S\d+$/iu.test(ref) ? ref.replace(/-S\d+$/iu, "") : "";
+ }

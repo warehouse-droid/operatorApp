@@ -3,6 +3,7 @@
 import {
   OPERATOR_NETSUITE_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
+  OPERATOR_NETSUITE_EXCHANGE_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS,
   OPERATOR_NETSUITE_YARDS
 } from "../operator-netsuite-posting-policy.js";
@@ -12,6 +13,17 @@ import {
  * and NetSuite posting remain deployment-owned boundaries.
  */
 export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
+  Object.freeze({
+    flagKey: "netsuite_ifir_posting_restlet",
+    label: "IR/IF posting via RESTlet",
+    description: "Use the new IR/IF posting flow, which returns the transaction number and verification details in its response. Turn off to use the original posting flow. Existing yard posting gates still apply.",
+    environmentProperty: "ifirPostingReady",
+    requiresIfirPostingReadiness: true,
+    independent: true,
+    configuredDefault: false,
+    locked: false,
+    lockReason: null
+  }),
   Object.freeze({
     flagKey: "sor_rental_workflow",
     label: "SOR rental workflow",
@@ -97,7 +109,7 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
     locked: false,
     lockReason: null
   }),
-  ...[...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
+  ...[...OPERATOR_NETSUITE_EXCHANGE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_GATE_DEFINITIONS, ...OPERATOR_NETSUITE_RETURN_GATE_DEFINITIONS,
     ...OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS].map((definition) => Object.freeze({
     ...definition,
     environmentProperty: "netSuiteDirectAccessEnabled",
@@ -105,8 +117,8 @@ export const MBT_ADMIN_GATE_DEFINITIONS = Object.freeze([
   })),
   ...OPERATOR_NETSUITE_YARDS.map((yard) => Object.freeze({
     flagKey: `dispatch_netsuite_sales_order_if_${yard.yardCode}`,
-    label: `${yard.yardCode} completed Delivery SO → IF`,
-    description: `After an accepted Driver customer drop or audited manual Dispatch completion from yard ${yard.yardCode}, create one verified Sales Order Item Fulfillment for the conserved Operator residual plus completed direct PO/TO supply.`,
+    label: `${yard.yardCode} Operator loaded Delivery SO → IF`,
+    description: `Queue a Sales Order Item Fulfillment for the exact lines and quantities loaded by Operator at yard ${yard.yardCode}. Driver completion is delivery evidence only.`,
     transactionType: "IF",
     locationId: yard.locationId,
     yardCode: yard.yardCode,
@@ -204,6 +216,9 @@ export const MBT_ADMIN_WRITABLE_GATE_KEYS = Object.freeze(
 
 /** @param {Record<string, unknown>} definition @param {Record<string, unknown>} environment */
 function environmentAllows(definition, environment) {
+  if (definition.requiresIfirPostingReadiness === true) {
+    return environment.ifirPostingReady === true;
+  }
   if (definition.requiresNetSuiteDirectAccess === true) {
     return environment.netSuiteDirectAccessEnabled === true;
   }

@@ -1,0 +1,358 @@
+{
+  "passed": true,
+  "stages": [
+    {
+      "name": "syntax-special-stock-line-details.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-special-stock-line-fields.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-special-stock-request-domain.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-special-stock-request-netsuite.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-special-stock-adjustment-adapter.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-special-stock-rest-orders.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-netsuite-order-pdf.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-netsuite.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-netsuite-field-sales-restlet.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-netsuite-smart-scm-picking-ticket-restlet.js",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-test-foundation.mjs",
+      "exitCode": 0
+    },
+    {
+      "name": "syntax-run-baseline-harnesses.mjs",
+      "exitCode": 0
+    },
+    {
+      "name": "packing-lint",
+      "exitCode": 0
+    },
+    {
+      "name": "pdf-lint",
+      "exitCode": 0
+    },
+    {
+      "name": "focused-types",
+      "exitCode": 0
+    },
+    {
+      "name": "focused-coverage",
+      "exitCode": 1
+    },
+    {
+      "name": "reversed-focused",
+      "exitCode": 1
+    },
+    {
+      "name": "retry-click-mutant",
+      "exitCode": 1
+    },
+    {
+      "name": "mutation-baseline-sales-order-null-packs.test.js",
+      "exitCode": 1
+    },
+    {
+      "name": "mutant-0",
+      "exitCode": 1
+    },
+    {
+      "name": "property-mutant-0",
+      "exitCode": 1
+    },
+    {
+      "name": "mutant-1",
+      "exitCode": 1
+    },
+    {
+      "name": "property-mutant-1",
+      "exitCode": 1
+    },
+    {
+      "name": "mutant-2",
+      "exitCode": 1
+    },
+    {
+      "name": "property-mutant-2",
+      "exitCode": 1
+    },
+    {
+      "name": "mutant-3",
+      "exitCode": 1
+    },
+    {
+      "name": "mutation-baseline-delivery-estb-pdf.test.js",
+      "exitCode": 0
+    },
+    {
+      "name": "mutant-4",
+      "exitCode": 1
+    },
+    {
+      "name": "property-mutant-4",
+      "exitCode": 1
+    },
+    {
+      "name": "mutant-5",
+      "exitCode": 1
+    }
+  ],
+  "mutations": [
+    {
+      "name": "retry handler does not reload",
+      "killed": true,
+      "newFailures": [
+        "Backorder routing retries failures and ignores late responses after switching requests"
+      ],
+      "propertyKilled": null
+    },
+    {
+      "name": "blank becomes zero",
+      "killed": true,
+      "newFailures": [
+        "direct, waitlist and quote conversion SO transports preserve positive counts and serialize all other packs as null",
+        "discounted direct and estimate SO transports explicitly send null for every empty pack field",
+        "empty or zero pack input 0 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 1 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 2 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 3 is null in requests, additional lines and NetSuite columns",
+        "normalization is idempotent, retains sublist metadata and rejects invalid values before transport",
+        "pack edits can clear values to null and empty/legacy zero values render blank",
+        "property: independent positive packing quantities survive without modifying SO pricing or input"
+      ],
+      "propertyKilled": true
+    },
+    {
+      "name": "zero remains zero",
+      "killed": true,
+      "newFailures": [
+        "discounted direct and estimate SO transports explicitly send null for every empty pack field",
+        "empty or zero pack input 4 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 5 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 6 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 7 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 8 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 9 is null in requests, additional lines and NetSuite columns",
+        "pack edits can clear values to null and empty/legacy zero values render blank",
+        "property: independent positive packing quantities survive without modifying SO pricing or input"
+      ],
+      "propertyKilled": true
+    },
+    {
+      "name": "positive fraction truncated",
+      "killed": true,
+      "newFailures": [
+        "direct, waitlist and quote conversion SO transports preserve positive counts and serialize all other packs as null",
+        "discounted direct and estimate SO transports explicitly send null for every empty pack field",
+        "normalization is idempotent, retains sublist metadata and rejects invalid values before transport",
+        "property: independent positive packing quantities survive without modifying SO pricing or input"
+      ],
+      "propertyKilled": true
+    },
+    {
+      "name": "request blanks default to zero",
+      "killed": true,
+      "newFailures": [
+        "empty or zero pack input 0 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 1 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 2 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 3 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 4 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 5 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 6 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 7 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 8 is null in requests, additional lines and NetSuite columns",
+        "empty or zero pack input 9 is null in requests, additional lines and NetSuite columns"
+      ],
+      "propertyKilled": null
+    },
+    {
+      "name": "wrong estimate PDF action",
+      "killed": true,
+      "newFailures": [
+        "configured quotation PDF transport uses the estimate action and preserves the original bytes",
+        "estimate PDF client rejects another action or ID, bad content, and unsupported remote quotation actions",
+        "property: estimate PDF client verifies identity and preserves the exact native bytes"
+      ],
+      "propertyKilled": true
+    },
+    {
+      "name": "wrong PDF identity accepted",
+      "killed": true,
+      "newFailures": [
+        "estimate PDF client rejects another action or ID, bad content, and unsupported remote quotation actions"
+      ],
+      "propertyKilled": null
+    }
+  ],
+  "sourceHashes": {
+    "public/special-stock-line-details.js": "1958953315dff0753a490ded4a16f3404efd6798da267777436e5902b38d2d25",
+    "public/special-stock-line-fields.js": "75f40984f018b1b451a8376718075b2e09057327bcf8de591edd8f518459e62e",
+    "src/special-stock-request-domain.js": "3c3cb94fe2d2e2faffa2b9fe176e7f750f3633edabef6718f68987a45bdf84d7",
+    "src/special-stock-request-netsuite.js": "5957b8ad548d636110345fbda7eed1804cfb95979dedc1745b6da2bf9e0a36ad",
+    "src/special-stock-adjustment-adapter.js": "718d644cbf1b0f9afff46396b0b6e663feb61e44bebfbfc6b3e838119573537b",
+    "src/special-stock-rest-orders.js": "372f7470498bdb2bee914f681b54aeb7413b2a1b373d45108fb8e2c29e50e216",
+    "src/netsuite-order-pdf.js": "258232c51eb8ecad8a19afc5ca26d050603e17de18c72fc097b0ad78ffe19e15",
+    "src/netsuite.js": "be169704e83c5fa16b338d494b7cdb0b944945c4273ce9e0ddccdb8ea4d528e8",
+    "netsuite-field-sales-restlet.js": "61d0b060cf59199c561247b5086afe4a0411385ab96702f566ef0baf25fa7d1a",
+    "netsuite-smart-scm-picking-ticket-restlet.js": "649d7ba3b704b8ff7d5bef9d7404102c7989f721f28e9f9187b50091f84f6c7b"
+  },
+  "tests": {
+    "tests": 191,
+    "pass": 190,
+    "fail": 1,
+    "skipped": 0
+  },
+  "failures": [
+    "PO payloads retain existing behavior and independent purchase quantities"
+  ],
+  "integrationExitCode": 0,
+  "versions": {
+    "node": "v20.20.2",
+    "c8": "12.0.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0"
+  },
+  "coverageByFile": {
+    "netsuite-field-sales-restlet.js": {
+      "total": 248,
+      "covered": 134,
+      "skipped": 0,
+      "pct": 54.03
+    },
+    "netsuite-smart-scm-picking-ticket-restlet.js": {
+      "total": 623,
+      "covered": 457,
+      "skipped": 0,
+      "pct": 73.35
+    },
+    "public/special-stock-line-details.js": {
+      "total": 16,
+      "covered": 16,
+      "skipped": 0,
+      "pct": 100
+    },
+    "public/special-stock-line-fields.js": {
+      "total": 87,
+      "covered": 87,
+      "skipped": 0,
+      "pct": 100
+    },
+    "src/netsuite-order-pdf.js": {
+      "total": 38,
+      "covered": 38,
+      "skipped": 0,
+      "pct": 100
+    },
+    "src/netsuite.js": {
+      "total": 4147,
+      "covered": 450,
+      "skipped": 0,
+      "pct": 10.85
+    },
+    "src/special-stock-adjustment-adapter.js": {
+      "total": 157,
+      "covered": 157,
+      "skipped": 0,
+      "pct": 100
+    },
+    "src/special-stock-request-domain.js": {
+      "total": 680,
+      "covered": 663,
+      "skipped": 0,
+      "pct": 97.5
+    },
+    "src/special-stock-request-netsuite.js": {
+      "total": 186,
+      "covered": 177,
+      "skipped": 0,
+      "pct": 95.16
+    },
+    "src/special-stock-rest-orders.js": {
+      "total": 251,
+      "covered": 251,
+      "skipped": 0,
+      "pct": 100
+    }
+  },
+  "changedLineCoverage": {
+    "public/special-stock-line-details.js": {
+      "covered": 3,
+      "total": 3,
+      "uncoveredLines": []
+    },
+    "public/special-stock-line-fields.js": {
+      "covered": 5,
+      "total": 5,
+      "uncoveredLines": []
+    },
+    "src/special-stock-request-domain.js": {
+      "covered": 2,
+      "total": 2,
+      "uncoveredLines": []
+    },
+    "src/special-stock-request-netsuite.js": {
+      "covered": 3,
+      "total": 3,
+      "uncoveredLines": []
+    },
+    "src/special-stock-adjustment-adapter.js": {
+      "covered": 1,
+      "total": 1,
+      "uncoveredLines": []
+    },
+    "src/special-stock-rest-orders.js": {
+      "covered": 2,
+      "total": 2,
+      "uncoveredLines": []
+    },
+    "src/netsuite-order-pdf.js": {
+      "covered": 14,
+      "total": 14,
+      "uncoveredLines": []
+    },
+    "src/netsuite.js": {
+      "covered": 3,
+      "total": 4,
+      "uncoveredLines": [
+        1270
+      ]
+    },
+    "netsuite-field-sales-restlet.js": {
+      "covered": 8,
+      "total": 8,
+      "uncoveredLines": []
+    },
+    "netsuite-smart-scm-picking-ticket-restlet.js": {
+      "covered": 90,
+      "total": 90,
+      "uncoveredLines": []
+    }
+  }
+}

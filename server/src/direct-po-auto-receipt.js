@@ -9,6 +9,7 @@ import { operatorNetSuitePostingRuntime } from './operator-netsuite-posting-runt
 import { fetchLiveSourceFromNetSuite } from './operator-netsuite-posting-targets.js';
 import { isCompletedNetSuitePostingOrder } from './netsuite-fulfillable-items.js';
 import { buildDirectPoReceiptDraft } from './direct-po-auto-receipt-domain.js';
+import {readAllocatedPoReceiptEvidence,claimAllocatedPoReceiptEvidence} from './direct-po-allocation-receipt.js';
 
 /** @param {{fetchStatus?:Function,fetchSource?:Function}} [dependencies] */
 export function createDirectPoSourceFetcher({fetchStatus=fetchTransactionStatusFromNetSuite,fetchSource=fetchLiveSourceFromNetSuite}={}) {
@@ -40,7 +41,7 @@ export async function prepareDirectPoReceiptJob(id,{fetchSource=fetchDirectPoSou
   try {
     return await withTransaction(async()=>{
       const job=(await query(`SELECT job.*,event.completion_evidence_id,event.metadata
-        FROM dispatch_direct_po_ir_jobs job JOIN dispatch_effective_order_completion_events event ON event.id=job.completion_event_id
+        FROM dispatch_direct_po_ir_jobs job LEFT JOIN dispatch_effective_order_completion_events event ON event.id=job.completion_event_id
         WHERE job.id=$1 FOR UPDATE OF job SKIP LOCKED`,[id])).rows[0];
       if(!job){return null;}
       if(job.command_id){return {...job,command:await getOperatorNetSuitePostingCommand(job.command_id)};}
@@ -68,10 +69,23 @@ export async function prepareDirectPoReceiptJob(id,{fetchSource=fetchDirectPoSou
         LEFT JOIN purchase_order_lines parent ON parent.id=ledger.source_line_id AND parent.purchase_order_id=$3
         WHERE local.purchase_order_id=$1 AND COALESCE(local.netsuite_active,true) AND local.quantity>0
         ORDER BY local.line_id,local.id`,[order.netsuite_id,order.split_ledger_id || null,order.source_po_id])).rows;
-      const {pickups,proof}=await readDirectDeliveryProof(order,job);
+      const allocationRows=job.allocation_scoped ? await readAllocatedPoReceiptEvidence(job) : null;
+      if(allocationRows && !allocationRows.length) {
+        await query("UPDATE dispatch_direct_po_ir_jobs SET status='reconciled',last_error=NULL,result=$2::jsonb,updated_at=now() WHERE id=$1",
+          [id,JSON.stringify({reason:'allocation_already_owned'})]);
+        return {...job,status:'reconciled'};
+      }
+      const receiptQuantities=allocationRows ? await claimAllocatedPoReceiptEvidence(job,allocationRows) : undefined;
+      const {pickups,proof}=allocationRows ? {
+        pickups:allocationRows.map(row=>({driver_job_id:row.pickup_job_id})),
+        proof:{photo_data_urls:allocationRows[0].photo_data_urls}
+      } : await readDirectDeliveryProof(order,job);
       const draft=buildDirectPoReceiptDraft({requestId:job.id,order,lines,source,policy,photoRefs:proof.photo_data_urls,
-        evidence:{completionEventId:Number(job.completion_event_id),sourcePoId:Number(order.source_po_id),
-          pickupJobIds:pickups.map((/** @type {Record<string,any>} */ row)=>row.driver_job_id),deliveryJobId:job.completion_evidence_id}});
+        ...(receiptQuantities ? {receiptQuantities} : {}),
+        evidence:{...(allocationRows ? {receiptJobId:job.id,deliveryJobRecordId:Number(job.delivery_job_record_id),
+          executionEventIds:allocationRows.map(row=>Number(row.id))} : {completionEventId:Number(job.completion_event_id)}),
+          sourcePoId:Number(order.source_po_id),pickupJobIds:pickups.map((/** @type {Record<string,any>} */ row)=>row.driver_job_id),
+          deliveryJobId:allocationRows ? allocationRows[0].delivery_job_id : job.completion_evidence_id}});
       if(!draft.steps.length) {
         await query("UPDATE dispatch_direct_po_ir_jobs SET status='reconciled',last_error=NULL,result=$2::jsonb,updated_at=now() WHERE id=$1",
           [id,JSON.stringify({reason:'no_live_line_remaining',lineReconciliation:draft.lineReconciliation})]);
@@ -82,6 +96,10 @@ export async function prepareDirectPoReceiptJob(id,{fetchSource=fetchDirectPoSou
       return {...job,status:'admitted',command:created.command};
     });
   } catch(error) {
+    if(error && typeof error==='object' && 'code' in error && error.code==='OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED') {
+      await query("UPDATE dispatch_direct_po_ir_jobs SET status='discovered',last_error=$2,updated_at=now() WHERE id=$1 AND command_id IS NULL",[id,error instanceof Error?error.message:String(error)]);
+      return {id,status:'discovered'};
+    }
     await query("UPDATE dispatch_direct_po_ir_jobs SET status='attention',last_error=$2,updated_at=now() WHERE id=$1 AND command_id IS NULL",
       [id,error instanceof Error ? error.message : String(error)]);
     throw error;

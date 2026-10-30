@@ -21,13 +21,20 @@ after(async () => {
 
 async function dragCard(page, sourceCard, targetCard) {
   // Start before scrolling the destination: Dispatch timelines scroll in both axes.
-  await expect(async () => { await sourceCard.scrollIntoViewIfNeeded(); }).toPass({ timeout: 5000 });
-  const source = await sourceCard.boundingBox();
+  let source, target;
+  await expect(async () => {
+    await sourceCard.scrollIntoViewIfNeeded();
+    source = await sourceCard.boundingBox();
+    assert.ok(source, 'The drag source must be attached and visible.');
+  }).toPass({ timeout: 5000 });
   await page.mouse.move(source.x + source.width * .6, source.y + Math.min(25, source.height / 2));
   await page.mouse.down();
   await page.mouse.move(source.x + source.width * .6 + 10, source.y + 30, { steps: 5 });
-  await targetCard.scrollIntoViewIfNeeded();
-  const target = await targetCard.boundingBox();
+  await expect(async () => {
+    await targetCard.scrollIntoViewIfNeeded();
+    target = await targetCard.boundingBox();
+    assert.ok(target, 'The drop target must be attached and visible.');
+  }).toPass({ timeout: 10000 });
   await page.mouse.move(target.x + target.width * .6, target.y + Math.min(20, target.height / 2), { steps: 8 });
   await page.mouse.move(target.x + target.width * .6 + 2, target.y + Math.min(22, target.height / 2));
   await page.mouse.up();
@@ -67,14 +74,15 @@ test("browser: the complete shared Dispatch planner supports BIN timing and pres
     assert.equal(await page.locator('.bin-planning-grid, #newBinLoadButton').count(), 0);
     const pool = page.locator('[data-dispatch-order-pool]');
     await expect(pool.locator('.panel-header')).toBeVisible();
-    await expect(pool.locator('.order-type-tabs')).toContainText('BIN');
+    await expect(pool.locator('.order-type-tabs button')).toHaveText(['Delivery','Exchange','Collection','MBR/Agg']);
     const readonly = page.locator('.load-block.planning-read-only').filter({ hasText: 'Flatbed control load' });
     await expect(readonly).toContainText('Read only');
     await expect(readonly).toHaveCSS('background-color', 'rgb(238, 240, 243)');
     const before = await storedPlan(f.planId);
     const card = page.locator(`.order-card[data-order="${f.frontReference}"]`);
     await expect(card).toBeVisible();
-    await card.getByRole('button', { name: 'Details', exact: true }).click();
+    await card.click();
+    await page.locator('[data-dispatch-order-actions]').getByRole('button', { name: 'Details', exact: true }).click();
     await expect(page.getByRole('dialog')).toContainText('Required steps');
     await page.getByRole('dialog').getByRole('button', { name: 'Close', exact: true }).click();
     await page.screenshot({ path: 'test-artifacts/bin-planning-pool-ui.png', fullPage: true });
@@ -131,7 +139,10 @@ test("browser: the complete shared Dispatch planner supports BIN timing and pres
     assert.equal(await page.evaluate(id => findLoad(id).load.routeEstimate.source, f.binLoadIds[0]), 'google');
     await preview.locator('[data-action="close-load-preview"]').click();
     const secondCard = page.locator(`.order-card[data-order="${second.frontReference}"]`);
-    await secondCard.dragTo(load.locator('.stop-list'));
+    // Append explicitly: the list's center may overlap an earlier stop.
+    const lastExistingStop=load.locator('.stop-card[data-stop]').last();
+    const lastStopHeight=await lastExistingStop.evaluate(element=>element.getBoundingClientRect().height);
+    await secondCard.dragTo(lastExistingStop,{targetPosition:{x:20,y:lastStopHeight-2}});
     await expect(load.locator('.stop-card[data-stop]')).toHaveCount(4);
     await save();
     const stops = load.locator('.stop-card[data-stop]');
@@ -193,6 +204,14 @@ test("browser: the complete shared Dispatch planner supports BIN timing and pres
     await expect(page.getByRole('heading', { name: 'Dispatch Planning', exact: true })).toBeVisible();
     await expect(page.locator('.dispatch-topbar .mbt-planning-link')).toHaveText('BIN Planning');
     assert.equal(await page.locator('.order-type-tabs .mbt-planning-link').count(), 0);
+    const ordinaryTabs = page.locator('.order-type-tabs');
+    for (const type of ['PO', 'TO', 'CO', 'SO']) {
+      await ordinaryTabs.getByRole('button', { name: type, exact: true }).click();
+      await expect(ordinaryTabs.getByRole('button')).toHaveText(['SO', 'PO', 'TO', 'CO']);
+      await expect(ordinaryTabs.locator('button.active')).toHaveText(type);
+      await page.evaluate(() => renderDispatchOrderPoolPatch());
+      await expect(ordinaryTabs.getByRole('button')).toHaveText(['SO', 'PO', 'TO', 'CO']);
+    }
     await expect(page.locator('.planning-read-only').first()).toContainText('Read only');
     await expect.poll(() => page.evaluate(() => isDispatchPlanEditor())).toBe(true);
     const binsBefore = (await storedPlan(f.planId)).trucks[0].loads;
@@ -212,7 +231,9 @@ test("browser: the complete shared Dispatch planner supports BIN timing and pres
     await save();
     await expect(secondCard).toBeVisible();
     await page.getByRole('textbox', { name: 'Search orders', exact: true }).fill(f.contractNumber);
-    await expect(pool.locator('.order-card')).toHaveCount(0);
+    await expect(pool.locator('.order-card')).toHaveCount(1);
+    await expect(pool.locator('.order-card')).toHaveAttribute('data-order',f.frontReference);
+    await expect(pool.locator('.order-card')).toHaveAttribute('draggable','false');
     await page.evaluate(() => releaseDispatchEditMode());
     let releaseSlow;
     const slowGate = new Promise(resolve => { releaseSlow = resolve; });

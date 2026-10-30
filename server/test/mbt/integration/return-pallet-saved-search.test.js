@@ -4,7 +4,7 @@ import fc from 'fast-check';
 import pg from 'pg';
 import { config } from '../../../src/config.js';
 import { query, closeDb } from '../../../src/db.js';
-import { lookupReturnCustomerPalletBalance, submitReturnBatch, getReturnRecordDetail } from '../../../src/return-repository.js';
+import { lookupReturnCustomerPalletBalance, lookupReturnSalesOrder, submitReturnBatch, getReturnRecordDetail } from '../../../src/return-repository.js';
 import { fixture, submitInput, actor } from '../../support/return-batch-ra-fixture.js';
 import { palletSearchResult } from '../../support/pallet-saved-search-fixture.js';
 import { readNetSuiteRestlet } from '../../../src/netsuite.js';
@@ -90,6 +90,85 @@ test('N2 no-local-return lookup uses one report and no historical aggregate or c
   assert.equal(result.netsuiteReturned, null);
   assert.deepEqual(remote.events, ['report']);
   assert.equal(historyQueries(remote).length, 0);
+});
+
+test('P1 linked credits start while the fresh report is pending, preserving the final reservation', async t => {
+  const remote = await setup(t);
+  const result = await submit(await submitInput({ stock: false, pallet: true, quantity: 3 }), true);
+  const record = result.palletReturn;
+  remote.control.credits = [{ return_authorization_id: record.netSuiteTransactionId, transaction_id: 8801, quantity: 1 }];
+  let releaseReport;
+  const reportGate = new Promise(resolve => { releaseReport = resolve; });
+  let linkedStarted;
+  const linkedSignal = new Promise(resolve => { linkedStarted = resolve; });
+  const transport = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    if (String(url).includes('/app/site/hosting/restlet.nl')) { await reportGate; }
+    if (options.body && JSON.parse(options.body).q?.includes('return_ra_credit_lines')) { linkedStarted(); }
+    return transport(url, options);
+  });
+  const pending = lookupReturnCustomerPalletBalance(customerId);
+  let timer;
+  try {
+    await Promise.race([linkedSignal, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Linked credit read waited for the blocked report')), 1000); })]);
+  } finally {
+    clearTimeout(timer);
+    releaseReport();
+    const value = await pending;
+    assert.equal(value.localReserved, 2);
+    assert.equal(value.available, 11);
+  }
+});
+
+test('P4 linked-credit failures fail the lookup and retain the reservation', async t => {
+  await setup(t);
+  await submit(await submitInput({ stock: false, pallet: true, quantity: 3 }), true);
+  const transport = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    if (options.body && JSON.parse(options.body).q?.includes('return_ra_credit_lines')) {
+      return Response.json({ error: 'Fixture linked credit failure' }, { status: 503 });
+    }
+    return transport(url, options);
+  });
+  await assert.rejects(lookupReturnCustomerPalletBalance(customerId), /Fixture linked credit failure/);
+  assert.equal((await query("SELECT sum(pallet_quantity)::int AS n FROM return_records WHERE customer_id=$1 AND status NOT IN ('rejected','voided')", [customerId])).rows[0].n, 3);
+});
+
+test('P3 generated balances release only observed linked credits during concurrent reads', async t => {
+  const remote = await setup(t);
+  const result = await submit(await submitInput({ stock: false, pallet: true, quantity: 3 }), true);
+  let observed = true;
+  const transport = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    if (!observed && options.body && JSON.parse(options.body).q?.includes('return_pallet_credit_identity')) {
+      return Response.json({ items: [], hasMore: false });
+    }
+    return transport(url, options);
+  });
+  await fc.assert(fc.asyncProperty(fc.integer({ min: 0, max: 3 }), fc.integer({ min: -5, max: 30 }), fc.boolean(),
+    async (credited, netBalance, included) => {
+      observed = included;
+      remote.control.searchBalance = netBalance;
+      remote.control.credits = [{ return_authorization_id: result.palletReturn.netSuiteTransactionId, transaction_id: 8801, quantity: credited }];
+      const value = await lookupReturnCustomerPalletBalance(customerId);
+      const reserved = 3 - (included ? credited : 0);
+      assert.equal(value.localReserved, reserved);
+      assert.equal(value.available, Math.max(netBalance - reserved, 0));
+    }), { seed: 20261029, numRuns: 16 });
+});
+
+test('O2 successful SO searches record reference, mode and elapsed time only', async t => {
+  await setup(t);
+  const logged = [];
+  t.mock.method(console, 'info', value => { logged.push(value); });
+  await lookupReturnSalesOrder({ code: 'SOB99091700', receivingLocationId: 1,
+    includeStockReturns: false, enforceYardRestriction: false });
+  const timing = logged.map(value => JSON.parse(value)).find(value => value.event === 'return_order_lookup');
+  assert.ok(timing);
+  assert.deepEqual(Object.keys(timing).sort(), ['durationMs', 'event', 'mode', 'orderRef']);
+  assert.equal(timing.orderRef, 'SOB99091700');
+  assert.equal(timing.mode, 'pallet');
+  assert.ok(Number.isFinite(timing.durationMs) && timing.durationMs >= 0);
 });
 
 test('R1 enquiries and submit admission refresh the report instead of reusing stale success', async t => {

@@ -1,0 +1,166 @@
+{
+  "passed": true,
+  "specApproval": "not obtained (autonomous run)",
+  "command": "sudo -n bash docker/run-driver-upload-wait-checks.sh",
+  "layers": [
+    {
+      "name": "red-baseline",
+      "passed": true,
+      "exitCode": 1,
+      "counts": {
+        "tests": 16,
+        "pass": 0,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "focused",
+      "passed": true,
+      "exitCode": 0,
+      "counts": {
+        "tests": 100,
+        "pass": 100,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "reverse-order",
+      "passed": true,
+      "exitCode": 0,
+      "counts": {
+        "tests": 100,
+        "pass": 100,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    },
+    {
+      "name": "coverage",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "syntax",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "shell-syntax",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "types",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "lint",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "secrets",
+      "passed": true,
+      "exitCode": 0
+    },
+    {
+      "name": "browser",
+      "passed": true,
+      "exitCode": 0
+    }
+  ],
+  "mutations": [
+    {
+      "name": "idle-too-long",
+      "unit": "killed",
+      "property": "killed"
+    },
+    {
+      "name": "confirmation-too-long",
+      "unit": "killed",
+      "property": "killed"
+    },
+    {
+      "name": "duplicate-progress",
+      "unit": "killed",
+      "property": "killed"
+    },
+    {
+      "name": "ignore-resume",
+      "unit": "killed",
+      "property": "killed"
+    },
+    {
+      "name": "late-wake-lock-leak",
+      "unit": "killed",
+      "property": "killed"
+    }
+  ],
+  "coverage": {
+    "changedExecutableLines": 89,
+    "covered": 89,
+    "uncovered": []
+  },
+  "versions": {
+    "node": "v20.20.2",
+    "playwright": "1.62.1",
+    "fast-check": "4.9.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "c8": "12.0.0"
+  },
+  "hashes": {
+    "public/driver-upload.js": "e722925bc7767b33903b15b19f10ec766be81fc291d60424f35d7773e264b36a",
+    "public/driver.html": "bba117ab458b2f661bdd7574f8257dd1f8548f44ce41cf6e642ea40732ed1eb8",
+    "public/driver-service-worker.js": "1e5db980c8b8d52973f4fb32eb2acb02dca71d6b63259b65b256026041197bba",
+    "test/support/driver-upload-wait-fixture.mjs": "580f23ca73436e88d103048f904de7ca518827f6e39c732a316f3d48359cfd6a",
+    "test/mbt/unit/driver-upload-wait.test.js": "86d14493ba512536d8ce2ff3c74bbd5111583c6834c1d6c38610048eb8bcf9f5",
+    "test/mbt/property/driver-upload-wait.test.js": "172899fe2836c769584c63952d134c1be19dd9060dac9315d869cb29d1119c5f",
+    "tools/driver-upload-wait-checks.mjs": "c74f880361ffa72f8ffe30271158ef21cfe4fa79f5302122ab0fdd87543d239f",
+    "tools/driver-upload-wait-browser.mjs": "29671b8d987282dee5f5ea8f76cdaaa477b760b5f619e4fb29e817458aaf0e8e"
+  },
+  "browser": [
+    {
+      "browser": "chromium",
+      "version": "151.0.7922.34",
+      "mode": "confirm",
+      "elapsedMs": 16123,
+      "attempts": 2,
+      "failureStage": "confirming",
+      "samePhotoBytes": true
+    },
+    {
+      "browser": "chromium",
+      "version": "151.0.7922.34",
+      "mode": "disconnect",
+      "elapsedMs": 1023,
+      "attempts": 2,
+      "failureStage": "uploading",
+      "samePhotoBytes": true
+    },
+    {
+      "browser": "webkit",
+      "version": "26.5",
+      "mode": "confirm",
+      "elapsedMs": 16050,
+      "attempts": 2,
+      "failureStage": "confirming",
+      "samePhotoBytes": true
+    },
+    {
+      "browser": "webkit",
+      "version": "26.5",
+      "mode": "disconnect",
+      "elapsedMs": 1044,
+      "attempts": 2,
+      "failureStage": "uploading",
+      "samePhotoBytes": true
+    }
+  ]
+}

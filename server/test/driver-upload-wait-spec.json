@@ -1,0 +1,32 @@
+{
+  "task": "Driver upload stalls observed for Sety and Dao, after the October 16 fix",
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Photo upload transport only; preserve automatic recovery, retained photos, and completion/save behavior.",
+  "evidence": {
+    "Sety": "2026-10-19: all 960262 photo bytes sent; confirmation missing; browser hidden; 180000 ms timer fired 173746 ms late. This is consistent with browser suspension, not proof of why the device became hidden.",
+    "Dao": "Three uploads failed with HTTP status 0 after 55%, 77%, and 83% of bytes. Browser diagnostics cannot distinguish a radio outage, connection reset, or OS interruption. All retries succeeded."
+  },
+  "behaviors": [
+    "W1: Stop an upload after 30000 ms without new bytes, including before the first progress event; report a retryable timeout and preserve the photo.",
+    "W2: After the request body finishes, wait at most 15000 ms for storage confirmation; 100% sent is never treated as an acknowledged object.",
+    "W3: Extend the idle deadline only when transferred bytes increase. Steady slow transfers may exceed 30 seconds within the existing total budget.",
+    "W4: Set the native XHR timeout as well as a JavaScript watchdog; check expired phase deadlines on pageshow/visibilitychange so delayed timers cannot restart a stale wait.",
+    "W5: Request a screen wake lock while uploading, reacquire on return to the page, and release on success, failure, cancellation, or late acquisition. Denial, absence, or a pending request cannot block uploading.",
+    "W6: Existing reconnect retries an interrupted upload with the same photo bytes and does not resend already acknowledged photos; all existing recovery contracts remain in force.",
+    "W7: Acknowledge success only after a valid storage response; remove timers and lifecycle listeners after every outcome.",
+    "W8: Update the upload asset URL and driver shell cache so reloaded clients receive the change."
+  ],
+  "setup": {
+    "dependencies": "None added; use existing pinned Node, ESLint, TypeScript, fast-check, c8, Playwright toolchain.",
+    "git": "No commits, resets, or unrelated edits.",
+    "runner": "Custom bounded Docker harness wrapped by docker/retention/retention.py; all transient output in MBBS_TEST_ARTIFACT_DIR; teardown registered before launch.",
+    "testData": "Synthetic photos and local HTTP storage fixture only; no production database or real storage writes.",
+    "files": "Focused unit/property/browser tests, reproducible checks and deployment tool, concise evidence; production changes limited to driver-upload.js and cache/version references."
+  },
+  "contractRevision": "The old exact two-timer assertion becomes three independent deadlines (authorization, total transfer, progress idle). Its original authorization and total timeout budgets remain unchanged.",
+  "limitations": [
+    "No browser code can run while the OS has suspended it. A screen wake lock is best effort and cannot prevent app switching or repair a lost mobile connection.",
+    "No historical storage-worker request trace is available in this workspace; the physical cause of Dao's network failures remains unproven.",
+    "The whole application's unrelated suites are outside this scoped browser transport change; run all existing driver upload/recovery/reconnect unit and property suites plus real Chromium/WebKit transport checks."
+  ]
+}

@@ -1,15 +1,35 @@
 // @ts-check
 import { query } from "../db.js";
+import {readFinalCollectionHold} from "./bin-final-collection.js";
 
 /** @param {any} visit @param {any} row */
 function issuedLegacy(visit,row) {
-  return !row.part_role && (visit.dispatch_plan_id || visit.actual_started_at || ["completed","cancelled"].includes(visit.status));
+  return visit.service_snapshot?.binWorkflow?.legacy
+    || (!row.part_role && (visit.dispatch_plan_id || visit.actual_started_at || ["completed","cancelled"].includes(visit.status)));
+}
+/** @param {any} visit @param {any} row @param {any[]} dependencies */
+function workflowLinks(visit,row,dependencies) {
+  const collection=dependencies.find(d=>d.linked_delivery_visit_id===visit.service_visit_id);
+  return {linkedDeliveryVisitId:row.linked_delivery_visit_id || null,
+    linkedCollection:collection ? {visitId:collection.visit_id,reference:collection.display_reference,status:collection.visit_status} : null};
+}
+/** @param {any} row @param {any} workflow @param {any} collectionHold */
+function workflowReadiness(row,workflow,collectionHold) {
+  return {configurationRequired:!row.configuration || Boolean(workflow.needsBinSelection),
+    dispatchable:Boolean(row.part_role && !workflow.needsBinSelection && !collectionHold),
+    blockedReason:collectionHold ? collectionHold.reason : null};
+}
+/** @param {any} workflow */
+async function linkedTransport(workflow) {
+  const transport=workflow.source?.transportTripId ? (await query(`SELECT t.trip_id,t.status,s.source_ref||' · Trip '||t.trip_number AS reference
+    FROM mbt_transport_trips t JOIN mbt_transport_sources s USING(source_key) WHERE t.trip_id=$1`,[workflow.source.transportTripId])).rows[0] : null;
+  return transport ? {linkedCollection:{visitId:transport.trip_id,reference:transport.reference,status:transport.status,transport:true}} : {};
 }
 /** Keep opaque execution identities behind readable rental/job references.
  * @param {any} visit */
 export async function projectBinWorkflowCard(visit) {
   const {rows:[row]}=await query(`SELECT o.*,r.rental_number::text,r.current_asset_id,r.recovery_pending,
-      p.part_role,p.asset_id,p.display_reference AS part_reference,b.type_code,a.asset_code,s.revision AS state_revision
+      p.part_role,p.asset_id,p.linked_delivery_visit_id,p.display_reference AS part_reference,b.type_code,a.asset_code,s.revision AS state_revision
     FROM mbt_bin_orders o JOIN mbt_bin_rental_numbers r ON r.service_line_id=o.service_line_id
     JOIN mbt_bin_types b ON b.bin_type_id=$2
     LEFT JOIN mbt_bin_order_parts p ON p.order_id=o.order_id AND p.visit_id=$1
@@ -17,8 +37,9 @@ export async function projectBinWorkflowCard(visit) {
     WHERE o.order_id=$1 OR p.visit_id=$1`,[visit.service_visit_id,visit.bin_type_id]);
   if (!row) {return null;}
   if (issuedLegacy(visit,row)) {return null;}
-  const dependencies=await query(`SELECT p.display_reference,s.status,d.prerequisite_action_code,d.same_day
+  const dependencies=await query(`SELECT p.display_reference,p.visit_id,p.linked_delivery_visit_id,v.status AS visit_status,s.status,d.prerequisite_action_code,d.same_day
     FROM mbt_bin_workflow_dependencies d JOIN mbt_bin_order_parts p ON p.visit_id=d.prerequisite_visit_id
+    JOIN mbt_service_visits v ON v.service_visit_id=p.visit_id
     JOIN mbt_visit_steps s ON s.service_visit_id=p.visit_id AND s.action_code=d.prerequisite_action_code
     WHERE d.dependent_visit_id=$1`,[visit.service_visit_id]);
   const pending=await query(`SELECT p.display_reference,a.asset_code,v.status FROM mbt_bin_order_parts p
@@ -28,20 +49,27 @@ export async function projectBinWorkflowCard(visit) {
   const reference=row.part_reference || row.display_reference;
   const site=visit.site_snapshot || {},customer=visit.customer_snapshot || {};
   const workflow=visit.service_snapshot.binWorkflow || {};
+  const transport=await linkedTransport(workflow);
+  const collectionHold=await readFinalCollectionHold(row.order_kind,row.service_line_id,visit);
+  const readiness=workflowReadiness(row,workflow,collectionHold);
+  const links=transport;
   const steps=row.part_role ? visit.service_snapshot.mandatoryStops : [];
   return {id:reference,displayReference:reference,type:"BIN",serviceAction:row.order_kind,
+    blockedReason:readiness.blockedReason,
     customer:customer.displayName || customer.companyName || "BIN customer",
     address:[site.addressLine1,site.addressLine2,site.city,site.region,site.postalCode].filter(Boolean).join(", "),
     scheduledWindow:{startAt:visit.scheduled_start_at,endAt:visit.scheduled_end_at},
-    stops:steps.map((/** @type {any} */ s)=>({...s,id:s.stopId,type:s.stopKind})),
+    stops:steps.map((/** @type {any} */ s)=>({...s,id:s.stopId,type:s.stopKind,assetCode:row.asset_code})),
     workflow:{orderId:String(row.order_id),reference:row.display_reference,revision:Number(row.revision),
-      role:row.part_role,kind:row.order_kind,configurationRequired:!row.configuration,
+      role:row.part_role,kind:row.order_kind,configurationRequired:readiness.configurationRequired,collectionHold,
       source:workflow.source || null,
+      ...workflowLinks(visit,row,dependencies.rows),
+      ...links,
       sequence:workflow.sequence,currentAssetId:row.current_asset_id,
       recoveryPending:row.recovery_pending,dependencies:dependencies.rows,pendingCollections:pending.rows},
     mbt:{visitId:String(visit.service_visit_id),contractId:String(visit.contract_id),serviceLineId:String(visit.service_line_id),
       visitReference:visit.visit_reference,displayReference:reference,visitRevision:Number(visit.revision),status:visit.status,
-      binTypeId:String(visit.bin_type_id),binTypeCode:row.type_code,frontLeg:{dispatchable:Boolean(row.part_role)},
+      binTypeId:String(visit.bin_type_id),binTypeCode:row.type_code,frontLeg:{dispatchable:readiness.dispatchable},
       assetRequirements:row.asset_id ? [{reservationSlot:"outgoing",exactAssetId:String(row.asset_id),
         exactAssetCode:row.asset_code,expectedStateRevision:Number(row.state_revision)}] : [],assetChoices:[],
       truckRequirements:{truckType:"bin",minimumSlots:1,supportedBinTypeCode:row.type_code},timeline:[]}};

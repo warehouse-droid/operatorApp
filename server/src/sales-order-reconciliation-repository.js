@@ -1,3 +1,4 @@
+import { appliedSalesOrderBilledSql } from './applied-sales-order-billing.js';
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
 import { locallyReopenedSalesOrderSql, locallyReopenedSalesOrderIds } from "./local-sales-order-reopen.js";
@@ -33,6 +34,7 @@ function optionalQuantity(value) {
 
 function exactBilledSql(alias = "sales_order") {
   return `(
+    ${appliedSalesOrderBilledSql(alias)} OR
     UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
     OR UPPER(REGEXP_REPLACE(
          REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),

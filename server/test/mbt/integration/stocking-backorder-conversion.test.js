@@ -37,6 +37,17 @@ async function create(type='purchase',extra={}){
 }
 const path=d=>`/api/scm/stock-requests/${d.id}/backorder-conversion`;
 const convert=(d,extra={})=>http('scm',path(d),{expectedRevision:d.revision,fulfillmentMethod:'yard_pickup',requiredDate:'2099-10-08',...extra});
+test('Stocking stays optional-customer but conversion requires a name before changing any data',async()=>{
+  const d=await create('purchase',{customerName:''}),before=await snapshot(d.id);
+  for(const customerName of [undefined,null,'',' \t\n ','\u00a0']) {
+    const r=await convert(d,{customerName});assert.equal(r.status,400,JSON.stringify(r.body));
+    assert.equal(r.body.code,'SPECIAL_CASE_CUSTOMER_REQUIRED');assert.deepEqual(await snapshot(d.id),before);
+  }
+  const r=await convert(d,{customerName:'  New Customer  '});assert.equal(r.status,200,JSON.stringify(r.body));
+  assert.equal(r.body.customerName,'New Customer');assert.equal(r.body.regular.customerName,'New Customer');
+  const existing=await create(),saved=await convert(existing,{customerName:'Do not replace saved customer'});
+  assert.equal(saved.status,200,JSON.stringify(saved.body));assert.equal(saved.body.customerName,existing.regular.customerName);
+});
 async function snapshot(id){const tables=['sales_stock_requests','sales_stock_request_lines','sales_stock_request_events','sales_special_stock_cases','sales_special_stock_lines','sales_special_stock_events'];const result={};for(const table of tables)result[table]=(await query(`SELECT * FROM ${table} WHERE ${table==='sales_stock_requests'?'id':'request_id'}=$1 ORDER BY ${table==='sales_special_stock_cases'?'request_id':'id'}`,[id])).rows;return result;}
 
 test('SCM converts the entire Stocking Transfer or Purchase in place with original identity and audit history',async()=>{

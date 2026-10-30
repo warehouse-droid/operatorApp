@@ -44,3 +44,26 @@ test("property: a completion can never precede its prerequisite, while a later r
     assert.equal(result.late,actualDay!==completedDay);
   }),{numRuns:300,seed:20261022});
 });
+
+test("property: size changes allow only a distinct delivery-first replacement",()=>{
+  fc.assert(fc.property(fc.constantFrom("14","20","30","40"),fc.constantFrom("14","20","30","40"),
+    (oldType,newType)=>{
+      const yard={kind:"yard",id:"yard",address:"Yard"},window={startAt:"2030-07-10T12:00:00Z",endAt:"2030-07-10T15:00:00Z"};
+      const input={rentalNumber:1,kind:"exchange",exchangeNumber:1,sequence:"delivery_first",reuse:"different_bin",
+        binTypeId:newType,collectionBinTypeId:oldType,deliveryAssetId:"new",collectionAssetId:"old",source:yard,
+        site:{kind:"customer_site",id:"site",address:"Customer"},dumpSite:{kind:"dump_site",id:"dump",address:"Dump"},
+        materialId:"soil",destination:{kind:"yard",location:yard},deliveryWindow:window,collectionWindow:window};
+      const flow=buildBinOrderWorkflow(input);
+      assert.equal(flow.parts.find(p=>p.role==="collection").binTypeId,oldType);
+      assert.equal(flow.parts.find(p=>p.role==="delivery").binTypeId,newType);
+      assert.equal(flow.dependencies[0].requiresActionCode,"deliver_bin");
+      const collectFirst={...input,sequence:"collection_first"};
+      if(oldType!==newType) {
+        assert.throws(()=>buildBinOrderWorkflow(collectFirst),/delivery first/i);
+        assert.throws(()=>buildBinOrderWorkflow({...collectFirst,reuse:"same_bin",deliveryAssetId:"old"}),/different.*(size|type)/i);
+      } else {
+        assert.equal(buildBinOrderWorkflow(collectFirst).dependencies[0].requiresActionCode,"pickup_bin");
+        assert.equal(buildBinOrderWorkflow({...collectFirst,reuse:"same_bin",deliveryAssetId:"old"}).dependencies[0].requiresActionCode,"dump_bin");
+      }
+    }),{numRuns:200,seed:20261023});
+});

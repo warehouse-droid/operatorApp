@@ -124,7 +124,7 @@ test("customer-charge calculator rejects malformed aggregate and distance-band e
       ...aggregate, itemCode: `AGG_${index}`
     })) }), "MBT_CHARGE_AGGREGATE_INVALID"],
     [aggregateCharge({ aggregateLines: [null] }), "MBT_CHARGE_INPUT_INVALID"],
-    [aggregateCharge({ aggregateLines: [{ ...aggregate, itemCode: "HPB" }] }), "MBT_CHARGE_AGGREGATE_INVALID"],
+    [aggregateCharge({ aggregateLines: [{ ...aggregate, itemCode: "HPB!" }] }), "MBT_CHARGE_AGGREGATE_INVALID"],
     [aggregateCharge({ aggregateLines: [aggregate, aggregate] }), "MBT_CHARGE_AGGREGATE_INVALID"],
     [aggregateCharge({ aggregateLines: [{ ...aggregate, quantityMilliYards: 0 }] }), "MBT_CHARGE_INPUT_INVALID"],
     [aggregateCharge({ aggregateLines: [{ ...aggregate, unitAmountMinor: 0 }] }), "MBT_CHARGE_INPUT_INVALID"],

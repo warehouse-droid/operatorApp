@@ -1,0 +1,44 @@
+{
+  "recordedAt": "2026-10-24T05:50:16.172389+00:00",
+  "applicationRuntimeChanged": false,
+  "deployedSourceMatch": true,
+  "resolvedTestMaintenance": [
+    {
+      "test": "test/mbt/unit/frontdesk-pricing-adapter.test.js",
+      "initialFailure": "Regex incorrectly required pricing to be the first router option.",
+      "correction": "Inspect the pricing AST property and its server-owned route estimator regardless of object-property order.",
+      "rerun": "4/4 passed"
+    },
+    {
+      "test": "test/mbt/unit/mbt-bin-cancellation.test.js",
+      "initialFailure": "Isolated renderContract VM fixture lacked deliveryCanChange and dumpCharges.",
+      "correction": "Load the actual helper and provide the current empty state; cancelled-bin visibility assertions retained.",
+      "rerun": "6/6 passed"
+    },
+    {
+      "test": "test/mbt/integration/mbt-bin-cancellation.test.js",
+      "initialFailure": "Historical search was treated as the active pool.",
+      "correction": "Assert one active sibling in the unfiltered pool, plus cancelled/non-dispatchable history in search; all price, audit, replay and rollback assertions retained.",
+      "rerun": "10/10 passed"
+    }
+  ],
+  "newScenarioFixtureCorrection": {
+    "initialFailure": "The additional 2.5-tonne scenario reused a unique material code in the same per-file test database.",
+    "correction": "Keep the original four cases and execute the additional scenario in a separate isolated test file.",
+    "rerun": "5/5 passed"
+  },
+  "openConfigurationFinding": {
+    "item": "20YD bin type",
+    "setting": "maximum_payload_kg",
+    "currentValue": null,
+    "impact": "Plan Transport requires the actual bin payload rating before saving a route. The truck weight warning remains advisory.",
+    "action": "Configure the verified 20YD rating; no value was inferred from the 14YD rating."
+  },
+  "reproduction": {
+    "command": "DISPATCH_SOURCE_RUNTIME=/home/ubuntu/apps/operatorApp/server/deployments/bin-weight-warning-20261024/candidate DISPATCH_SOURCE_SKIP_BUILD=1 bash docker/run-mbt-uat-checks.sh",
+    "notes": "Run from repository root; bounded disposable Compose and per-file databases; logs, screenshots and database volumes removed automatically."
+  },
+  "results": "test/mbt-uat-results-20261024.csv",
+  "summary": "test/uat-audits/summary-20261024.json",
+  "cleanup": "test/uat-audits/cleanup-20261024.json"
+}

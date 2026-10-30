@@ -1,0 +1,45 @@
+{
+  "at": "2026-10-26T18:14:50.702348+00:00",
+  "passed": true,
+  "checks": 88,
+  "validation": "86 checks passed in the full run; the two remaining checks passed after correcting test fixtures (complete adjustment data and clearing all login tokens). No runtime changes followed that run.",
+  "scope": [
+    "10 Sales/SCM Special, backorder, stocking, purchase and delivery board variants",
+    "Sales/Dispatch Delivery request badges",
+    "Desktop and mobile quarter-overlap geometry, live updates, read clearing, exact accessible counts and 99+ display",
+    "Session reset and delayed responses",
+    "Per-viewer incoming-message counts, partial reads, yard scope and legacy conversation compatibility",
+    "Existing conversation, delivery workflow and queue-order regressions"
+  ],
+  "runner": "docker/run-dispatch-source-tests.sh via docker/retention/retention.py; mbbs-tests.slice with bounded Compose services",
+  "environmentNote": "Initial full-Chromium launch needed writable XDG_CONFIG_HOME and XDG_CACHE_HOME inside /tmp.",
+  "visualInspection": "Reviewed mobile Delivery request screenshot; red 12 badge centered on the card top-right corner, with no clipping.",
+  "cleanup": "Each run removed its own containers and network and its unique artifact directory; production health passed. Another active test run was not removed.",
+  "sourceHashes": {
+    "public/request-unread-badge.js": "5a2b0fb03d8f543bd6df3ea1a7fad72e55210aa06420b68204ac04830fb945da",
+    "public/request-unread-badge.css": "8840024a29d2d4f715fa32eaa5c650260a217e0bd68a12a55ae027ef138ff322",
+    "public/stock-request-conversation.js": "639596c82f2ff1a463204a1cc8fe6e976373207c20cc87fd24def34628573e69",
+    "public/delivery-requests.js": "31d44d36ce0291048eeacf5b9596879f43af0b96ece3ac83c8e1acd79607487e",
+    "public/sales-stock-requests.html": "8ea0ae1a046f4253827366585007ed43d234adee2f87adbf6c1919c2fb5a0959",
+    "public/scm-stock-requests.html": "d91d84be96af7a659996b9ff78f44f15ea405b5c74b20754675c998d93332067",
+    "public/delivery-requests.html": "915deabba27b12449bab7ac3538581fa7d7c87a0b3b1bf08f07dff10dfa63dfb",
+    "src/delivery-request-repository.js": "fc020fc71f3ce4dc813f6e6fc18cbd410ba700c021621b6138c4e876b7ca16d5"
+  },
+  "deployment": {
+    "deployed": true,
+    "at": "2026-10-26T18:17:22.827338+00:00",
+    "image": "mbbs-operator-app:request-unread-badges-20261026",
+    "imageId": "sha256:c318a8410aa31e294c50ecea9690586fb7fc35cfc3a1ce7ef86cb2b180ba4d11",
+    "healthy": true,
+    "configurationPreserved": true,
+    "dependenciesUnchanged": true,
+    "filesVerified": 8,
+    "runtimeFilesVerified": 1504,
+    "rollbackImage": "mbbs-operator-app:request-unread-badges-20261026-rollback"
+  },
+  "imageVerification": {
+    "passed": true,
+    "imageId": "sha256:c318a8410aa31e294c50ecea9690586fb7fc35cfc3a1ce7ef86cb2b180ba4d11",
+    "runtimeFiles": 1504
+  }
+}

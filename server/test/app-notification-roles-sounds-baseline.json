@@ -1,0 +1,20 @@
+{
+  "failedTests": [
+    "Wait for Transfer requires ETA, sends the date, and keeps the selection after saving"
+  ],
+  "testSourceHash": "bd51f6fa7a7ea4b4ea036b113dcf3977a199fe518a7893562348ad4ef0be2cbc",
+  "originalRuntimeHashes": {
+    "public/app-alert-sound.js": "36cb54d523fe6b1002a7bdc7133f975a1ad1cbe014aab217b8636868e7b4a4b0",
+    "public/app-notifications.js": "8b0a641743fb78b16be6f05de320724d5bb8054f089c2815a27d8d658a2a9247",
+    "public/app-sidebar.js": "fbe455766f872f7d3d0bbb296d6c190053e0d03965f3226ef6b301fda050549b",
+    "public/delivery-request-alert.js": "f649cd1472fa58a92963b3da538240973792870ab553bed78a96800ac703c009",
+    "public/regular-stock-alert.js": "44e486e9cfd5503d34948246da60ff3e9ededb6f266d11a08d9c9552f7841247",
+    "public/special-delivery-method-alert.js": "79cf91ba1f7a6fe57054d7f0f240e09d36bcd5020a77d4db22a95a137e923684",
+    "public/special-po-reference-alert.js": "42fa1d01651e7b40dc6b537e3cdc57fb4506ec17067ef6ed211913b5a7fe4103",
+    "public/sales-special-alert.js": "16a82c3497a5d265e2403adfa313b1a5c2ce09337692e51facec1411f97b192a",
+    "public/stock-request-conversation-alert.js": "90dfa97c6096671a9d5d0ab74f0aefa38292612ce2cbaec5a6858d1de4917571",
+    "public/operator.js": "59739d424d720ca3d56172ee9d714810610e3b12727412febf0f521a40e03d53",
+    "public/operator.html": "b44c21f67be7146f653c94ece6d413cfa8c694d102720c54299e5d467c4936d2"
+  },
+  "reason": "The same hidden availableDate input fails against the original notification files and the feature candidate."
+}

@@ -1,0 +1,13 @@
+[
+  "public/operator.js",
+  "public/operator.css",
+  "public/operator.html",
+  "src/return-repository.js",
+  "src/return-customer-directory.js",
+  "src/return-netsuite.js",
+  "public/operator-display-settings.js",
+  "public/return-notifications.js",
+  "src/return-notification-domain.js",
+  "public/control.js",
+  "public/control.html"
+]

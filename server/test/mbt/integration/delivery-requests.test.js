@@ -39,6 +39,40 @@ async function submit(service, patch = {}) {
 }
 const command = (row, patch = {}) => ({ expectedRevision: row.revision, operationId: crypto.randomUUID(), ...patch });
 
+test('unread messages: counts incoming replies per viewer, excludes status updates and supports partial reads',async()=>{
+  const service=await setup(),submitted=await submit(service);
+  const count=async(actor=sales,audience='sales')=>(await service.list(actor,audience)).requests.find(item=>item.id===submitted.id)?.unreadMessageCount;
+  let row=await service.act(submitted.id,'confirm',command(submitted),dispatcher,'dispatch');
+  assert.equal(await count(),0,'Approval without a message is not an unread conversation');
+  const first=await service.act(row.id,'reply',command(row,{message:'First incoming message'}),dispatcher,'dispatch');
+  row=await service.act(row.id,'reply',command(first,{message:'Second incoming message'}),dispatcher,'dispatch');
+  assert.equal(await count(),2);assert.equal(await count(dispatcher,'dispatch'),0);
+  assert.equal(await count(colleague),2,'Reading a list does not acknowledge it');
+  await service.markRead(row.id,first.revision,sales,'sales');
+  assert.equal(await count(),1);assert.equal(await count(colleague),2);
+  await service.markRead(row.id,row.revision,sales,'sales');assert.equal(await count(),0);
+  row=await service.act(row.id,'reply',command(row,{message:'Sales colleague reply'}),colleague,'sales');
+  assert.equal(await count(),0,'Messages from the same audience are not incoming');
+  assert.equal(await count(dispatcher,'dispatch'),1);
+  await service.markRead(row.id,row.revision,dispatcher,'dispatch');assert.equal(await count(dispatcher,'dispatch'),0);
+  const hidden=await service.list({...sales,yardLocationIds:[28]},'sales');assert.ok(!hidden.requests.some(item=>item.id===row.id));
+});
+test('unread messages: legacy conversation text counts consistently with the displayed history',async()=>{
+  const {service,row}=await timeChangeFixture(99);
+  const pending=await service.act(row.id,'request-time-change',command(row,{window:window({start:'13:00',end:'15:00'})}),sales,'sales');
+  const automatic=await service.act(row.id,'decline-time-change',command(pending),dispatcher,'dispatch');
+  const next=await service.act(row.id,'request-time-change',command(automatic,{window:window({start:'14:00',end:'16:00'})}),sales,'sales');
+  const reply=await service.act(row.id,'decline-time-change',command(next,{message:'Please pick another day.'}),dispatcher,'dispatch');
+  await query("UPDATE delivery_request_events SET snapshot=snapshot-'conversationMessage'-'eventAudience' WHERE request_id=$1 AND action='decline-time-change'",[row.id]);
+  await query('DELETE FROM delivery_request_reads WHERE request_id=$1 AND operator_id=$2',[row.id,sales.id]);
+  const detail=await service.get(row.id,sales,'sales');
+  const messages=detail.conversation.filter(event=>event.audience==='dispatch');
+  assert.equal(messages.filter(event=>event.revision===automatic.revision).length,0);
+  assert.equal(messages.find(event=>event.revision===reply.revision).message,'Please pick another day.');
+  const card=(await service.list(sales,'sales')).requests.find(item=>item.id===row.id);
+  assert.equal(card.unreadMessageCount,messages.length);
+});
+
 test('Dispatch counter: Sales decides the new secured window, with durable alerts, replay and planning',async()=>{
   const {service,row,ref,legacy}=await timeChangeFixture(71);
   const pending=await service.act(row.id,'request-time-change',command(row,{window:window({start:'13:00',end:'15:00'})}),sales,'sales');

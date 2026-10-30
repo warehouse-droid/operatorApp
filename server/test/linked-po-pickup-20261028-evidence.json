@@ -1,0 +1,719 @@
+{
+  "baseImage": "sha256:54df92b787133a8fd2c4da0bafaa9adf0393c7c335a097065407522b8a591f6e",
+  "files": {
+    "src/scm-dependency-plan-reconciler.js": "a0f2bd3cebc67e3a1e5c1435bdbe64b1572143bafd4af193b15eef11d2d359ed",
+    "src/dispatch-delivery-group-repository.js": "ea1803dc4d9d7cc389800bf2b29e231f9e69f5f24f4919ebbb36bd9cab2bd28d",
+    "src/dispatch-plan-order-projection.js": "d334910ba69e87b191c411e343e8556e83af2d19e6ef995bb31da7e8d99deb16",
+    "src/driver-repository.js": "3debf897fd4b6285ef296a930ed2d2f7e8893762a757a0be539ad9c3b28f26ab",
+    "src/driver-offline-repository.js": "73fb14ecf59b86cbc1fb2f23448331e5a583e3b7550d71222b4b59294d07346d",
+    "public/driver.js": "5931de6226a0d951ee15f1492b67c768f17f037ddad646a3a3ec4dbea371fe00",
+    "public/driver.html": "4ec47df143fed95a45fd346181c62c444dda1429a054badf33ee252e5df7c922",
+    "public/driver-service-worker.js": "fd49b3cf398197c68b09d02abdc93799fd4a9692ef158f562f47177bd6a64fda"
+  },
+  "changedLines": {
+    "src/scm-dependency-plan-reconciler.js": [
+      242,
+      243,
+      244,
+      245,
+      246,
+      247,
+      248,
+      249,
+      250,
+      251,
+      252,
+      253,
+      254,
+      255,
+      256,
+      257,
+      258,
+      259,
+      260,
+      261,
+      262,
+      263,
+      264,
+      265,
+      266,
+      267,
+      268,
+      269,
+      270,
+      271,
+      272,
+      273,
+      274,
+      275,
+      276,
+      277,
+      278,
+      279,
+      280,
+      281,
+      282,
+      283,
+      284,
+      290,
+      291,
+      292
+    ],
+    "src/dispatch-delivery-group-repository.js": [
+      1144,
+      1145,
+      1162,
+      1165,
+      1187,
+      1188,
+      1189,
+      1190,
+      1191,
+      1192,
+      1193,
+      1194,
+      1195,
+      1196,
+      1197,
+      1198,
+      1199,
+      1200,
+      1201,
+      1202,
+      1203,
+      1205,
+      1206,
+      1208,
+      1214,
+      1216,
+      1223
+    ],
+    "src/dispatch-plan-order-projection.js": [
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120
+    ],
+    "src/driver-repository.js": [
+      2289
+    ],
+    "src/driver-offline-repository.js": [
+      254,
+      255,
+      259,
+      260,
+      261
+    ],
+    "public/driver.js": [
+      3202,
+      3203
+    ],
+    "public/driver.html": [
+      63
+    ],
+    "public/driver-service-worker.js": [
+      10,
+      11,
+      27
+    ]
+  },
+  "verificationSources": {
+    "server/tools/linked-po-pickup-release.py": "58d373269c9a664a2f4770c092437f28f92cea6923719eca2aa9b86ed18045ef",
+    "server/tools/linked-po-pickup-source.py": "6a8f307dd6257d875071205182de42426042e28f7691f03eb047e56f61e3db76",
+    "server/tools/linked-po-pickup-repair.mjs": "73b72f49332b222a8eb5f8dd10cafaf07d6f2f6bb5daaec75f28b540894d53fe",
+    "server/tools/linked-po-pickup-live-check.mjs": "54dce6776b30556b8d2c2bad350bced3c115c6f9b3248f9f3d0491ae16f3e830",
+    "server/tools/linked-po-pickup-checks.mjs": "4c752684790240976cc6b851289584154c1758a83b3163b39a43c99b6a145824",
+    "server/tools/linked-po-pickup-files.json": "57077a8440bb9956f59cca00b0761eb348a7c36ee87914db90a6228ceeecbae2",
+    "server/test/dispatch/unit/linked-po-pickup-20261028.test.js": "2074357dbe99faec72eb7b4e075e3400c016c80b64f75d453f7341d0d6a64204",
+    "server/test/dispatch/integration/linked-po-pickup-repair-20261028.test.js": "354ba01db789cbfad4ba814ffbcf57813247ae7e1d7fb65f23f58403ff1f2261",
+    "server/test/dispatch/integration/linked-po-pickup-feed-20261028.test.js": "edeb3c3ef8c83b1ff8194fa4c31f30c7f54f918331896d7fcb81b56fe1404091",
+    "server/test/dispatch/fixtures/linked-po-pickup-history-20261028.json": "de077f8bd7c64088ff82374635c7867411c8931feaee6cffef2fa18052cdeaca",
+    "docker/run-linked-po-pickup-checks.sh": "bdbc646a06b2074637501b162d5ec8c6813949e00adf0c026ec5ad79a4e54e41"
+  },
+  "passed": true,
+  "node": "v20.20.2",
+  "tests": [
+    {
+      "file": "test/mbt/unit/scm-dependency-plan-reconciler.red.test.js",
+      "label": "baseline-test/mbt/unit/scm-dependency-plan-reconciler.red.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-group-member-po.test.js",
+      "label": "baseline-test/dispatch/unit/dispatch-group-member-po.test.js",
+      "status": 0,
+      "tests": 8,
+      "passed": 8,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/sales-pickup-authority.test.js",
+      "label": "baseline-test/dispatch/unit/sales-pickup-authority.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/linked-stop-cargo.test.js",
+      "label": "baseline-test/dispatch/unit/linked-stop-cargo.test.js",
+      "status": 0,
+      "tests": 14,
+      "passed": 14,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/historical-group-pickups.test.js",
+      "label": "baseline-test/dispatch/unit/historical-group-pickups.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-po-route-residual.red.test.js",
+      "label": "baseline-test/dispatch/unit/dispatch-po-route-residual.red.test.js",
+      "status": 0,
+      "tests": 15,
+      "passed": 15,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-driver-stop-content.test.js",
+      "label": "baseline-test/dispatch/integration/linked-driver-stop-content.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "label": "baseline-test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "status": 0,
+      "tests": 7,
+      "passed": 7,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-plan-authoritative-projection.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-plan-authoritative-projection.red.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-required-pickups-save.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-required-pickups-save.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/unit/operator-linked-pcs-sales.test.js",
+      "label": "baseline-test/mbt/unit/operator-linked-pcs-sales.test.js",
+      "status": 0,
+      "tests": 9,
+      "passed": 9,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/property/operator-linked-pcs-sales.property.test.js",
+      "label": "baseline-test/mbt/property/operator-linked-pcs-sales.property.test.js",
+      "status": 0,
+      "tests": 3,
+      "passed": 3,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/integration/operator-linked-pcs-sales.test.js",
+      "label": "baseline-test/mbt/integration/operator-linked-pcs-sales.test.js",
+      "status": 0,
+      "tests": 3,
+      "passed": 3,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-recovery-assets.test.js",
+      "label": "baseline-test/mbt/unit/driver-pwa-recovery-assets.test.js",
+      "status": 1,
+      "tests": 2,
+      "passed": 1,
+      "failures": [
+        {
+          "name": "the installed Driver shell cannot mix old DB/route code with photo recovery code",
+          "error": "'driver-upload.js must be versioned in driver.html.'"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-repair-20261028.test.js",
+      "label": "candidate-test/dispatch/integration/linked-po-pickup-repair-20261028.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/sales-pickup-authority.test.js",
+      "label": "candidate-test/dispatch/unit/sales-pickup-authority.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/unit/operator-linked-pcs-sales.test.js",
+      "label": "candidate-test/mbt/unit/operator-linked-pcs-sales.test.js",
+      "status": 0,
+      "tests": 9,
+      "passed": 9,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/integration/operator-linked-pcs-sales.test.js",
+      "label": "candidate-test/mbt/integration/operator-linked-pcs-sales.test.js",
+      "status": 0,
+      "tests": 3,
+      "passed": 3,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-plan-authoritative-projection.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-plan-authoritative-projection.red.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "label": "candidate-test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/unit/scm-dependency-plan-reconciler.red.test.js",
+      "label": "candidate-test/mbt/unit/scm-dependency-plan-reconciler.red.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/unit/driver-pwa-recovery-assets.test.js",
+      "label": "candidate-test/mbt/unit/driver-pwa-recovery-assets.test.js",
+      "status": 1,
+      "tests": 2,
+      "passed": 1,
+      "failures": [
+        {
+          "name": "the installed Driver shell cannot mix old DB/route code with photo recovery code",
+          "error": "'driver-upload.js must be versioned in driver.html.'"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "candidate-test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "status": 0,
+      "tests": 22,
+      "passed": 22,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "status": 0,
+      "tests": 7,
+      "passed": 7,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/linked-stop-cargo.test.js",
+      "label": "candidate-test/dispatch/unit/linked-stop-cargo.test.js",
+      "status": 0,
+      "tests": 14,
+      "passed": 14,
+      "failures": []
+    },
+    {
+      "file": "test/mbt/property/operator-linked-pcs-sales.property.test.js",
+      "label": "candidate-test/mbt/property/operator-linked-pcs-sales.property.test.js",
+      "status": 0,
+      "tests": 3,
+      "passed": 3,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-po-route-residual.red.test.js",
+      "label": "candidate-test/dispatch/unit/dispatch-po-route-residual.red.test.js",
+      "status": 0,
+      "tests": 15,
+      "passed": 15,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/historical-group-pickups.test.js",
+      "label": "candidate-test/dispatch/unit/historical-group-pickups.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "candidate-test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "status": 0,
+      "tests": 9,
+      "passed": 9,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-group-member-po.test.js",
+      "label": "candidate-test/dispatch/unit/dispatch-group-member-po.test.js",
+      "status": 0,
+      "tests": 8,
+      "passed": 8,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-required-pickups-save.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-required-pickups-save.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-driver-stop-content.test.js",
+      "label": "candidate-test/dispatch/integration/linked-driver-stop-content.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "mutant-skip-feed-allocation-projection",
+      "status": 1,
+      "tests": 22,
+      "passed": 18,
+      "failures": [
+        {
+          "name": "history replay: GOA-10588-10650 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n    + Set(1) {\n    - Set(2) {\n    -   '2967',\n        'TECHO BLOC Vaughan'\n      }"
+        },
+        {
+          "name": "history replay: GOA-10208-10209S1 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      [\n    +   '2967',\n        'TECHO BLOC Vaughan'\n      ]"
+        },
+        {
+          "name": "history replay: GOB-123453-123464 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n    + Set(1) {\n    - Set(2) {\n    -   '3445',\n        'TECHO BLOC Vaughan'\n      }"
+        },
+        {
+          "name": "history replay: GOM-6894S1-6895S1 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      [\n    +   '150',\n        'TECHO BLOC Vaughan'\n      ]"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "mutant-retain-cancelled-projection",
+      "status": 1,
+      "tests": 22,
+      "passed": 19,
+      "failures": [
+        {
+          "name": "history replay: GOA-10588-10650 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n    + []\n    - [\n    -   '2967'\n    - ]"
+        },
+        {
+          "name": "history replay: GOA-10208-10209S1 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    The expression evaluated to a falsy value:\n    \n      assert.ok(unlinked.items.every(i=>!i.poAllocatedSalesQty))"
+        },
+        {
+          "name": "history replay: GOB-123453-123464 retains PO sales allocations through feed rebuild and browser reload",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n    + []\n    - [\n    -   '3445'\n    - ]"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "mutant-discard-activity-protection",
+      "status": 1,
+      "tests": 9,
+      "passed": 8,
+      "failures": [
+        {
+          "name": "recorded pickup, completed prefix and active travel are protected",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected ... Lines skipped\n    \n      [\n        {\n          id: 'vendor',\n          location: 'Vendor',\n    -     orderId: 'GROUP',\n    -     orderRefs: [\n    -       'GROUP'\n    -     ],\n    -     type: 'pick'\n    -   },\n    -   {\n    -     id: 'empty',\n    -     location: '150',\n          orderId: 'GROUP',\n    ...\n          type: 'drop'\n        }\n      ]"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "mutant-retain-empty-source",
+      "status": 1,
+      "tests": 9,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "generated sales-UOM residual controls saved visits regardless of packing annotation",
+          "error": "|-\n    Property failed after 2 tests\n    { seed: 68946895, path: \"1:2\", endOnFailure: true }\n    Counterexample: [1,3,0]\n    Shrunk 1 time(s)\n    \n    Hint: Enable verbose mode in order to have the list of all failing values encountered during the run"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "mutant-prune-partial-source",
+      "status": 1,
+      "tests": 9,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "generated sales-UOM residual controls saved visits regardless of packing annotation",
+          "error": "|-\n    Property failed after 1 tests\n    { seed: 68946895, path: \"0:1:1:3:0:2:1:1:4\", endOnFailure: true }\n    Counterexample: [3,5,0]\n    Shrunk 8 time(s)\n    \n    Hint: Enable verbose mode in order to have the list of all failing values encountered during the run"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "mutant-drop-offline-po-reference",
+      "status": 1,
+      "tests": 9,
+      "passed": 8,
+      "failures": [
+        {
+          "name": "pickup PO references are scoped, unique, kept offline, and absent on delivery",
+          "error": "|-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n    + []\n    - [\n    -   'PO-ONE'\n    - ]"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "mutant-show-unsafe-po-reference",
+      "status": 1,
+      "tests": 9,
+      "passed": 8,
+      "failures": [
+        {
+          "name": "driver pickup card renders escaped linked PO references without changing SO heading",
+          "error": "|-\n    The input did not match the regular expression /&lt;img onerror=bad&gt;/. Input:\n    \n    '\\n' +\n      '    <section class=\"order-card\">\\n' +\n      '      <div>\\n' +\n      '        <h3>SO-ONE</h3>\\n' +\n      '        <p class=\"pickup-po-refs\"><strong>PO Ref:</strong> PO-ONE, <img onerror=bad></p>\\n' +\n      '      </div>\\n' +\n      '      <div class=\"item-list\">\\n' +\n      '        <div class=\"item-row\"><strong>No item detail found in local DB</strong></div>\\n' +\n      '      </div>\\n' +\n      '    </section>\\n' +\n      '  '"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "label": "restored-test/dispatch/unit/linked-po-pickup-20261028.test.js",
+      "status": 0,
+      "tests": 9,
+      "passed": 9,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "restored-test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "status": 0,
+      "tests": 22,
+      "passed": 22,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-repair-20261028.test.js",
+      "label": "restored-test/dispatch/integration/linked-po-pickup-repair-20261028.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    }
+  ],
+  "specApproval": "not obtained (autonomous run)",
+  "toolchain": {
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "c8": "12.0.0",
+    "fast-check": "4.9.0",
+    "pg": "8.21.0"
+  },
+  "types": {
+    "baseline": 3012,
+    "current": 3002,
+    "newErrors": []
+  },
+  "lint": {
+    "baseline": 19,
+    "current": 19,
+    "newErrors": []
+  },
+  "coverage": [
+    {
+      "file": "src/scm-dependency-plan-reconciler.js",
+      "total": 26,
+      "covered": 26,
+      "missing": []
+    },
+    {
+      "file": "src/dispatch-delivery-group-repository.js",
+      "total": 23,
+      "covered": 23,
+      "missing": []
+    },
+    {
+      "file": "src/dispatch-plan-order-projection.js",
+      "total": 13,
+      "covered": 13,
+      "missing": []
+    },
+    {
+      "file": "src/driver-repository.js",
+      "total": 1,
+      "covered": 1,
+      "missing": []
+    },
+    {
+      "file": "src/driver-offline-repository.js",
+      "total": 3,
+      "covered": 3,
+      "missing": []
+    },
+    {
+      "file": "public/driver.js",
+      "total": 2,
+      "covered": 2,
+      "missing": []
+    },
+    {
+      "file": "public/driver-service-worker.js",
+      "total": 3,
+      "covered": 3,
+      "missing": []
+    }
+  ],
+  "mutations": [
+    {
+      "name": "skip-feed-allocation-projection",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "history replay: GOA-10588-10650 retains PO sales allocations through feed rebuild and browser reload",
+        "history replay: GOA-10208-10209S1 retains PO sales allocations through feed rebuild and browser reload",
+        "history replay: GOB-123453-123464 retains PO sales allocations through feed rebuild and browser reload",
+        "history replay: GOM-6894S1-6895S1 retains PO sales allocations through feed rebuild and browser reload"
+      ]
+    },
+    {
+      "name": "retain-cancelled-projection",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "history replay: GOA-10588-10650 retains PO sales allocations through feed rebuild and browser reload",
+        "history replay: GOA-10208-10209S1 retains PO sales allocations through feed rebuild and browser reload",
+        "history replay: GOB-123453-123464 retains PO sales allocations through feed rebuild and browser reload"
+      ]
+    },
+    {
+      "name": "discard-activity-protection",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "recorded pickup, completed prefix and active travel are protected"
+      ]
+    },
+    {
+      "name": "retain-empty-source",
+      "killed": true,
+      "propertyAlone": true,
+      "failures": [
+        "generated sales-UOM residual controls saved visits regardless of packing annotation"
+      ]
+    },
+    {
+      "name": "prune-partial-source",
+      "killed": true,
+      "propertyAlone": true,
+      "failures": [
+        "generated sales-UOM residual controls saved visits regardless of packing annotation"
+      ]
+    },
+    {
+      "name": "drop-offline-po-reference",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "pickup PO references are scoped, unique, kept offline, and absent on delivery"
+      ]
+    },
+    {
+      "name": "show-unsafe-po-reference",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "driver pickup card renders escaped linked PO references without changing SO heading"
+      ]
+    }
+  ]
+}

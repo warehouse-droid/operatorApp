@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { parse } from "espree";
 
 import { createFrontdeskPricingAdapter } from "../../../src/mbt/frontdesk-pricing-adapter.js";
 
@@ -93,7 +94,26 @@ test("server pricing fails closed without route authority and exposes the Ontari
 test("the production MBT router is wired to the server-owned pricing adapter", () => {
   const source = fs.readFileSync(new URL("../../../src/server.js", import.meta.url), "utf8");
   assert.match(source, /import \{ createFrontdeskPricingAdapter \} from "\.\/mbt\/frontdesk-pricing-adapter\.js";/u);
-  assert.match(source, /createMbtRouter\(\{\s*frontdeskPricing:\s*createFrontdeskPricingAdapter\(\{\s*routeEstimator:/u);
-  assert.match(source, /googleMapsGateway\.estimateRoute/u);
+  // Router dependencies can be added before pricing. Inspect the actual option,
+  // rather than requiring frontdeskPricing to be the first object property.
+  const pending = [parse(source, { ecmaVersion: "latest", sourceType: "module", range: true })];
+  const calls = [];
+  while (pending.length) {
+    const node = pending.pop();
+    if (node.type === "CallExpression" && node.callee?.name === "createMbtRouter") calls.push(node);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) pending.push(...value.filter(item => item && typeof item === "object"));
+      else if (value && typeof value === "object") pending.push(value);
+    }
+  }
+  assert.equal(calls.length, 1);
+  const options = calls[0].arguments[0];
+  assert.equal(options.type, "ObjectExpression");
+  const pricing = options.properties.find(property => property.key?.name === "frontdeskPricing")?.value;
+  assert.equal(pricing?.type, "CallExpression");
+  assert.equal(pricing.callee.name, "createFrontdeskPricingAdapter");
+  const estimator = pricing.arguments[0].properties.find(property => property.key?.name === "routeEstimator")?.value;
+  assert.ok(estimator, "Pricing must receive the server-owned route estimator");
+  assert.match(source.slice(...estimator.range), /googleMapsGateway\.estimateRoute/u);
   assert.doesNotMatch(source, /app\.use\("\/api\/mbt", requireOperator, createMbtRouter\(\)\)/u);
 });

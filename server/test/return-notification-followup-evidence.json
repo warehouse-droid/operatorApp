@@ -1,0 +1,260 @@
+{
+  "scope": "Remove RA controls from the return feature gate matrix, retire eight live RA fallback flags, clarify automatic +1, verify SMS delivery and existing Google SMTP.",
+  "validation": {
+    "cmControls": {
+      "passed": true,
+      "tests": 41,
+      "browser": "CM-only controls for four yards; stock/pallet off/on updates correct gate and revision",
+      "sourceHashes": {
+        "public/mbt-gates.js": "1c94f2713073ef3f66259301f3c3c97ebcdca8ce285c76803c2ebd6905e3404d",
+        "public/control.js": "bb2ce4f500535b6ac1c04c196a4e136d9d09944f97bc0d8c1afbbddda5a561b2",
+        "public/mbt-gates.html": "7024b322e6c0544a3ddae5b638e512504db7063e51508606c4dab32a2b3d9bec",
+        "public/admin.html": "4d30ea1d9bbaa1e70c406ed7ba4347f495ac817c8578bae471ed7b0d94721719"
+      }
+    },
+    "recipientHelp": {
+      "passed": true,
+      "results": [
+        "# tests 16",
+        "Seven browser scenarios passed"
+      ],
+      "sourceHashes": {
+        "public/return-notifications.js": "13a078314a79123df1b6511c83721f8929573e69be03733488881509192a5def",
+        "public/operator.html": "7e39927d874ca37c70e34f9d7282b0f160fcc04289d40cbd5a8a2bbb85ee3fad"
+      }
+    },
+    "encryptionFocusedCheck": "Two existing settings encryption/read-back and damaged-storage tests passed; synthetic credentials only."
+  },
+  "commands": [
+    "sudo env DISPATCH_SOURCE_RUNTIME=\"$PWD/server/deployments/return-cm-controls-20261026/candidate\" bash docker/run-return-cm-controls-checks.sh",
+    "sudo env DISPATCH_SOURCE_RUNTIME=\"$PWD/server/deployments/return-recipient-help-20261026/candidate\" bash docker/run-return-recipient-help-checks.sh"
+  ],
+  "cmDeployment": {
+    "deployedAt": "2026-10-26T21:42:32Z",
+    "image": "mbbs-operator-app:return-cm-controls-20261026",
+    "imageId": "sha256:93aca9b1ff75fe4064736ff10666c994ee3e7bcb5063dfa2b63320232ba2ef3d",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "raGatesDisabled": 8,
+      "cmGatesPreserved": true,
+      "changes": [
+        {
+          "before": {
+            "flag_key": "operator_netsuite_pallet_return_ra_12441",
+            "enabled": true,
+            "revision": "2"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_pallet_return_ra_12441",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator pallet return confirmation at 12441.",
+            "revision": 3,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_pallet_return_ra_150",
+            "enabled": true,
+            "revision": "2"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_pallet_return_ra_150",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator pallet return confirmation at 150.",
+            "revision": 3,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_pallet_return_ra_2967",
+            "enabled": true,
+            "revision": "2"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_pallet_return_ra_2967",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator pallet return confirmation at 2967.",
+            "revision": 3,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_pallet_return_ra_3445",
+            "enabled": true,
+            "revision": "2"
+          },
+          "after": {
+            "flagKey": "[REDACTED]",
+            "enabled": false,
+            "description": "[REDACTED]",
+            "revision": 3,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_stock_return_ra_12441",
+            "enabled": true,
+            "revision": "4"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_stock_return_ra_12441",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator stock return confirmation at 12441.",
+            "revision": 5,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_stock_return_ra_150",
+            "enabled": true,
+            "revision": "4"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_stock_return_ra_150",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator stock return confirmation at 150.",
+            "revision": 5,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_stock_return_ra_2967",
+            "enabled": true,
+            "revision": "4"
+          },
+          "after": {
+            "flagKey": "operator_netsuite_stock_return_ra_2967",
+            "enabled": false,
+            "description": "Create a Return Authorization on Operator stock return confirmation at 2967.",
+            "revision": 5,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        },
+        {
+          "before": {
+            "flag_key": "operator_netsuite_stock_return_ra_3445",
+            "enabled": true,
+            "revision": "4"
+          },
+          "after": {
+            "flagKey": "[REDACTED]",
+            "enabled": false,
+            "description": "[REDACTED]",
+            "revision": 5,
+            "updatedBy": "system:return-cm-controls-20261026"
+          }
+        }
+      ]
+    }
+  },
+  "cmLiveVerification": {
+    "http": [
+      {
+        "path": "/health",
+        "status": 200
+      },
+      {
+        "path": "/mbt-gates.html",
+        "status": 200
+      },
+      {
+        "path": "/admin/return-automation",
+        "status": 200
+      },
+      {
+        "path": "/api/admin/return-notifications",
+        "status": 401
+      }
+    ],
+    "sourceHashesVerified": true,
+    "raFallbackDisabled": true
+  },
+  "raRetirement": {
+    "disabled": 8,
+    "cmFlagsChanged": 0,
+    "auditActor": "system:return-cm-controls-20261026",
+    "auditCorrelationId": "return-cm-controls-20261026",
+    "method": "Existing revision-guarded updateMbtFeatureFlagState commands in one transaction; all CM flag values/revisions compared before and after."
+  },
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "sender": "warehouse@mrbininc.com",
+    "authenticationVerified": true,
+    "emailSent": false,
+    "correction": "Previous readiness probe omitted config.js dotenv initialization; saved SMTP credentials were already available to the app. No SMTP settings needed changing."
+  },
+  "sms": {
+    "to": "+14168309967",
+    "from": "+13652428821",
+    "providerId": "4031a17a-280b-4ab2-b6c1-fc2ce438f429",
+    "deliveredAt": "2026-10-26T21:40:08.472Z",
+    "userConfirmed": true,
+    "earlierAttempts": "Rejected by Telnyx with 10009 malformed key; replacement full key authenticated and delivered. Encryption tests passed."
+  },
+  "recipientBehavior": "Existing server validation normalizes 10-digit Canada/US numbers to +1, accepts formatted numbers, detects email, rejects malformed/multiple recipients before provider delivery. New help text makes automatic +1 explicit.",
+  "limits": [
+    "No unrelated full repository test run. Existing feature gate/CM regressions plus notification unit/browser checks cover the changed behavior.",
+    "Browser fixture initially omitted UTF-8 encoding; corrected fixture headers to match the real app, keeping assertions unchanged.",
+    "SMS delivery does not create a synthetic return or NetSuite transaction. No customer email was sent."
+  ],
+  "recipientDeployment": {
+    "deployedAt": "2026-10-26T21:46:39Z",
+    "image": "mbbs-operator-app:return-recipient-help-20261026",
+    "imageId": "sha256:ac27fbe43c66ebc9bcb7070a4f00dbe3ea9b537b1dc179b0cb5d0ba372183286",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "required": false
+    }
+  },
+  "recipientLiveVerification": {
+    "sourceHashesVerified": true,
+    "healthy": true
+  },
+  "cleanup": {
+    "verifiedAt": "2026-10-26T21:47:44.493215+00:00",
+    "running": [
+      {
+        "name": "mbbs-operator-app-app-1",
+        "status": "Up About a minute (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-webhook-worker-1",
+        "status": "Up 7 days"
+      },
+      {
+        "name": "mbbs-operator-app-ollama-1",
+        "status": "Up 8 weeks (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-db-1",
+        "status": "Up 2 months (healthy)"
+      }
+    ],
+    "allContainers": [
+      "mbbs-operator-app-app-1",
+      "mbbs-operator-app-webhook-worker-1",
+      "mbbs-operator-app-ollama-1",
+      "mbbs-operator-app-db-1"
+    ],
+    "nonProductionContainers": [],
+    "disposableVolumes": [],
+    "disposableNetworks": [],
+    "remainingTestRuns": [],
+    "health": {
+      "status": 200,
+      "ok": true
+    },
+    "phoneHelpServed": true
+  }
+}

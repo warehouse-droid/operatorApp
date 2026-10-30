@@ -2,6 +2,8 @@ import { normalizeNetSuiteTransactionUnits } from './netsuite-transaction-units.
 import { salesOrderBillingExclusions } from './netsuite-fulfillment-exclusions.js';
 import { normalizeSalesOrderPackPayload } from '../public/order-pack-quantities.js';
 import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
+import { createIfirPostingClient } from './netsuite-ifir-posting-client.js';
+import { getIfirPostingRestletEnabled } from './netsuite-ifir-posting-policy.js';
 
 export function createBossApprovalNetSuite() {
   return createBossNetSuiteAdapter({rest:netsuiteRest,queryAll:suiteqlAll,mutate:queueNetSuiteMutation});
@@ -735,6 +737,18 @@ async function netsuiteRest(path, { method = "GET", body = null, headers = {} } 
   throw lastError;
 }
 
+export async function repairNetSuiteRecord(type,id,{method='GET',body=null,replaceItems=false}={}) {
+  const master=['customrecord240','customrecord_mrb_machine_master'].includes(type);
+  if(!['customrecord_mbr_work_order','customrecord246','customrecord247','customrecord240','customrecord_mrb_machine_master','salesOrder','vendorBill','customer'].includes(type))throw new Error('Unsupported Repair record type.');
+  if(!['GET','POST','PATCH'].includes(method)||type==='customer'&&method!=='GET')throw new Error('Unsupported Repair record operation.');
+  if(master&&method==='PATCH')throw new Error('Repair equipment masters are created here; edit existing masters in NetSuite.');
+  if(method!=='GET'&&(!config.repair?.enabled||!master&&!config.repair?.postingEnabled))throw Object.assign(new Error('Repair NetSuite posting is disabled.'),{status:409});
+  const suffix=id?`/${encodeURIComponent(String(id))}`:'';
+  const parameters=method==='GET'?'?expandSubResources=true':replaceItems?'?replace=item':'';
+  const run=()=>netsuiteRest(`/record/v1/${type}${suffix}${parameters}`,{method,body});
+  return method==='GET'?run():queueNetSuiteMutation(run);
+}
+
 export async function transformSalesOrderToItemFulfillment(orderId, payload) {
   const id = Number(orderId);
   if (!Number.isInteger(id) || id <= 0) {
@@ -746,6 +760,15 @@ export async function transformSalesOrderToItemFulfillment(orderId, payload) {
   });
   return queueNetSuiteMutation(run);
 }
+
+export const postIfirViaNetSuiteRestlet = createIfirPostingClient({
+  settings: async () => ({ enabled: await getIfirPostingRestletEnabled(),
+    quantityPolicyEnabled: config.netsuite.ifirPostingQuantityPolicyEnabled,
+    url: config.netsuite.ifirPostingRestletUrl, accountId: config.netsuite.accountId }),
+  getToken: async () => { assertNetSuiteDirectAccessEnabled(); return getAccessToken(); },
+  request: timedNetSuiteTextRequest,
+  mutate: queueNetSuiteMutation
+});
 
 export async function transformTransferOrderToItemFulfillment(orderId, payload) {
   const id = Number(orderId);
@@ -930,6 +953,24 @@ export async function fetchCreditMemoFromNetSuite(creditMemoId, { strictMissing 
     if (missingCreditMemoError(error, strictMissing)) { return null; }
     throw error;
   }
+}
+
+export async function fetchReturnRestockingFeeFromNetSuite() {
+  const rows = await suiteqlAll(`/* return_restocking_fee */
+    SELECT id,itemid,itemtype FROM item
+    WHERE itemid='Restocking Fee' AND itemtype='Discount' AND isinactive='F'`);
+  if (rows.length !== 1 || !Number.isSafeInteger(Number(rows[0].id)) || Number(rows[0].id) <= 0) {
+    throw Object.assign(new Error('The active NetSuite Restocking Fee discount item could not be verified.'), { status: 409 });
+  }
+  const { data } = await netsuiteRest(`/record/v1/discountItem/${Number(rows[0].id)}`);
+  const percent = Number(String(data?.rate ?? '').replace(/%$/, ''));
+  if (Number(data?.id) !== Number(rows[0].id) || data?.isInactive !== false
+      || data?.itemId !== 'Restocking Fee' || data?.itemType?.id !== 'Discount'
+      || data?.rate === null || data?.rate === undefined || data?.rate === ''
+      || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+    throw Object.assign(new Error('The NetSuite Restocking Fee percentage is unavailable or invalid.'), { status: 409 });
+  }
+  return { itemId: Number(data.id), percent };
 }
 
 export async function fetchCreditMemoMetadataFromNetSuite() {
@@ -2746,6 +2787,38 @@ export async function fetchDeliveryOrderDetailsFromNetSuite(orderId, locationId 
   return (result.items || []).map(normalizeOpenDeliveryLine);
 }
 
+/** @param {unknown} left @param {unknown} right */
+function assertSalesOrderUnitAgreement(left, right) {
+  if (left && right && left !== right) {
+    throw Object.assign(new Error('The Sales Order unit evidence disagrees between current NetSuite reads. Refresh before posting.'), {
+      code: 'SALES_ORDER_IF_UNIT_MAPPING_UNRESOLVED', status: 409
+    });
+  }
+}
+
+/** @param {any} units */
+function salesOrderRestUnitId(units) {
+  return String(units && typeof units === 'object' ? units.id ?? '' : units ?? '').trim();
+}
+
+/** REST may expose only the internal unit ID. The existing SuiteQL read supplies
+ * its label, with both reads checked for agreement before quantity evidence is used.
+ * @param {Record<string, any>} row @param {Record<string, any>} item */
+function salesOrderFulfillmentLineUnit(row, item) {
+  const queryUnit = String(row.unit || '').trim().toUpperCase();
+  const restUnit = String(item.unitsDisplay || item.units?.refName || '').trim().toUpperCase();
+  assertSalesOrderUnitAgreement(String(row.unit_id ?? '').trim(), salesOrderRestUnitId(item.units));
+  assertSalesOrderUnitAgreement(queryUnit, restUnit);
+  return queryUnit || restUnit;
+}
+
+/** @param {Record<string, any>} row @param {boolean} includeAllSourceLines */
+function salesOrderFulfillmentEligibility(row, includeAllSourceLines) {
+  if (!includeAllSourceLines) { return {}; }
+  return { ...(row.item_type === 'Kit' ? {kitParent:true} : {}), canFulfill: row.item_type === 'Kit'
+    ? !/^(?:f|false|no|0)$/iu.test(String(row.is_fulfillable)) : isFulfillableNetSuiteLine(row) };
+}
+
 export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
   query: readQuery = suiteql, fetchItems = fetchOperatorNetSuiteSourceItemLinesFromNetSuite,
   includeAllSourceLines = false
@@ -2765,6 +2838,7 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
            BUILTIN.DF(tl.item) AS item_name,
            i.itemtype AS item_type,
            i.isfulfillable AS is_fulfillable,
+           BUILTIN.DF(tl.units) AS unit,
            tl.quantity, tl.units AS unit_id, uom.conversionrate AS unit_conversion_rate,
            tl.quantityshiprecv AS fulfilled_quantity,
            tl.location AS location_id,
@@ -2805,15 +2879,13 @@ export async function fetchSalesOrderFulfillmentStateFromNetSuite(orderId, {
     const quantity = Math.abs(Number(row.quantity || 0));
     const fulfilledQuantity = Math.abs(Number(row.fulfilled_quantity || 0));
     const lineClosed = /^(?:t|true|yes|1)$/iu.test(String(row.line_closed || ""));
+    const unit = salesOrderFulfillmentLineUnit(row, matches[0]);
     return {
       orderLine: Number(matches[0].orderLine ?? matches[0].orderline ?? matches[0].line),
       sourceLineKey: String(row.order_line),
       itemId: Number(row.item_id),
-      ...(includeAllSourceLines ? { canFulfill: row.item_type === 'Kit'
-        ? !/^(?:f|false|no|0)$/iu.test(String(row.is_fulfillable)) : isFulfillableNetSuiteLine(row) } : {}),
-      ...(matches[0].unitsDisplay || matches[0].units?.refName ? {
-        unit: String(matches[0].unitsDisplay || matches[0].units.refName).trim().toUpperCase()
-      } : {}),
+      ...salesOrderFulfillmentEligibility(row, includeAllSourceLines),
+      ...(unit ? { unit } : {}),
       quantity: Number(quantity.toFixed(6)),
       fulfilledQuantity: Number(fulfilledQuantity.toFixed(6)),
       remainingQuantity: lineClosed ? 0 : Number(Math.max(quantity - fulfilledQuantity, 0).toFixed(6)),
@@ -3995,6 +4067,16 @@ export async function finalizeSpecialLinkedPurchaseOrderInNetSuite(input, { rest
 export async function resolveSpecialOrderUnitsFromNetSuite(lines) {
   const { resolveSpecialUnits } = await import('./special-stock-netsuite-adapter.js');
   return resolveSpecialUnits(lines, { rest: netsuiteRest, queryAll: suiteqlAll });
+}
+
+export async function listSpecialPurchaseUnitsFromNetSuite(itemId) {
+  const { listSpecialPurchaseUnits } = await import('./special-stock-purchase-units.js');
+  return listSpecialPurchaseUnits(Number(itemId), { rest: netsuiteRest, queryAll: suiteqlAll });
+}
+
+export async function resolveSpecialPurchaseUnitsFromNetSuite(lines) {
+  const { resolveSpecialPurchaseUnits } = await import('./special-stock-purchase-units.js');
+  return resolveSpecialPurchaseUnits(lines, { rest: netsuiteRest, queryAll: suiteqlAll });
 }
 
 /** @param {typeof netsuiteRest} rest @returns {import('./special-stock-purchase-order-note-adapter.js').Boundary} */

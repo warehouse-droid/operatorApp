@@ -1,0 +1,15 @@
+[
+  "src/return-notification-domain.js",
+  "src/return-notification-settings.js",
+  "src/return-notification-transport.js",
+  "src/return-notification-service.js",
+  "src/return-notification-router.js",
+  "src/server.js",
+  "public/operator.js",
+  "public/operator.html",
+  "public/operator.css",
+  "public/control.js",
+  "public/admin.html",
+  "public/return-notifications.js",
+  "migrations/311_return_customer_notifications.sql"
+]

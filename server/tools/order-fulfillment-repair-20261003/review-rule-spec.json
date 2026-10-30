@@ -1,0 +1,13 @@
+{
+  "specApproval":"not obtained (autonomous run); user explicitly clarified matching sales quantity and UOM must pass for MBBS-Special",
+  "tier":3,
+  "acceptance":[
+    "SOA09472-shaped IF with an automatically included, operator-confirmed NonInvtPart line passes when source line, item, sales quantity, sales UOM and location match the immutable admission snapshot.",
+    "Non-inventory lines stay absent from transform payloads; their confirmed evidence is persisted in the existing immutable line snapshot and input hash.",
+    "Missing, unconfirmed, wrong-item, wrong-unit, wrong-quantity, wrong-location, duplicate and unrelated extra lines remain reviewable mismatches.",
+    "An optional non-inventory line need not appear in the IF; expected inventory and kit lines remain strictly required.",
+    "The correction is scoped to SO IFs with exact stored source-line mapping; receipts and kit-component handling keep existing validation."
+  ],
+  "failureModel":{"wrong completion":"exact identity/quantity/UOM checks and adversarial tests","replay drift":"immutable hashed snapshot and persistence round trip","double transform":"preserve existing posting processor and recovery tests"},
+  "setup":{"dependencies":[],"migrations":[],"gitCommits":false}
+}

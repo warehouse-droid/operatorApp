@@ -10,12 +10,73 @@ import { availableDriverExecutionPlanDate, driverBinEvent, enabledDriverBinBound
 import { recordAssetMovement } from "../../../src/mbt/asset-service.js";
 import { getMbtBinPlanning } from "../../../src/mbt/bin-planning-read.js";
 import { assertFrontdeskBinDelivered } from "../../../src/mbt/frontdesk-bin-readiness.js";
-import { planningFixture,run as runPlanning,storedPlan } from "../support/bin-planning-fixtures.js";
+import { planningFixture,run as runPlanning,storedPlan,command as planningCommand } from "../support/bin-planning-fixtures.js";
+import {assignVisit} from '../../../src/mbt/bin-planning-service.js';
+import {stagePlanningAssignment} from '../../../src/mbt/bin-planning-assignments.js';
 import { recordBinWorkflowHandoff } from "../../../src/mbt/bin-order-workflow-handoff.js";
 import { extendFrontdeskServiceLine } from "../../../src/mbt/frontdesk-service.js";
 import { finishBinWorkflowStep } from "../../../src/mbt/bin-order-workflow-execution.js";
 import { assertBinWorkflowPlanDependencies } from "../../../src/mbt/bin-order-workflow-planning.js";
+import {getBinOrderWindow,changeBinOrderWindow} from '../../../src/mbt/bin-order-window-service.js';
+import {boundary as windowBoundary} from '../support/bin-planning-fixtures.js';
+import {getBinCargoOptions,saveBinCargo} from '../../../src/mbt/bin-cargo-service.js';
 after(closeDb);
+
+test('BIN workflow cargo: a separate replacement bin may load materials before collection while delivery still waits',async()=>{
+  const f=await fixture('cargo-separate-source',await availableDriverExecutionPlanDate());
+  const spare=await fixture('cargo-separate-replacement',await availableDriverExecutionPlanDate());
+  await atCustomer(f);
+  const otherPlan=await storedPlan(spare.planId);
+  await query('UPDATE dispatch_plan_snapshots SET trucks=trucks || $2::jsonb WHERE plan_id=$1',[f.planId,JSON.stringify([otherPlan.trucks[0]])]);
+  const second={...spare,planId:f.planId,planDate:f.planDate};
+  const id=await exchangeRoot(f),dump=await dumping(f);
+  const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:'collection_first',reuse:'different_bin',
+    deliveryAssetId:spare.assetId,...dump,destination:{kind:'yard',yardId:'00000000-0000-4000-8000-000000012441'},
+    collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T14:00:00Z`}}));
+  const delivery=configured.body.parts.find(p=>p.role==='delivery'),options=await getBinCargoOptions(delivery.visitId);
+  await saveBinCargo({...command(f),visitId:delivery.visitId,expectedRevision:options.revision,expectedVisits:options.expectedVisits,plans:[],
+    cargo:{mode:'materials',materials:[{description:'Sand',weightLbs:100,pickup:{kind:'address',address:'200 Quarry Road'},dropoff:{kind:'destination'}}]}},windowBoundary);
+  const parts=(await getBinOrderWorkflow(id)).parts;
+  const c=await assignedPart(f,parts.find(p=>p.role==='collection'));
+  const d=await assignedPart(second,parts.find(p=>p.role==='delivery'));
+  await perform(second,d.jobs[0],100);
+  await perform(second,d.jobs[1],110);
+  assert.equal((await query("SELECT status FROM mbt_visit_steps WHERE service_visit_id=$1 AND action_code='pickup_bin'",[c.part.visitId])).rows[0].status,'pending');
+  await assert.rejects(perform(second,d.jobs[2],120),/prerequisite|completed/i);
+  await perform(f,c.jobs[0],130);
+  await perform(second,d.jobs[2],140);
+  assert.equal((await getBinOrderWorkflow(id)).currentAssetId,spare.assetId);
+});
+
+test('BIN workflow cargo: reused-bin pickup must be planned after dumping, not merely its final delivery',async()=>{
+  const f=await fixture('cargo-reuse-source',await availableDriverExecutionPlanDate());await atCustomer(f);
+  const target=await fixture('cargo-reuse-target',await availableDriverExecutionPlanDate()),dump=await dumping(f);
+  const options=await getBinCargoOptions(target.frontVisitId);
+  await saveBinCargo({...command(target),expectedRevision:options.revision,expectedVisits:options.expectedVisits,plans:[],
+    cargo:{mode:'materials',materials:[{description:'Gravel',weightLbs:100,pickup:{kind:'address',address:'100 Quarry Road'},dropoff:{kind:'destination'}}]}},windowBoundary);
+  const linked=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,...dump,destination:{kind:'delivery',orderId:target.frontVisitId}}));
+  const receiving=(await getBinOrderWorkflow(target.frontVisitId)).parts[0];
+  assert.deepEqual(receiving.steps.map(s=>s.actionCode),['cargo_pickup_1','deliver_bin']);
+  const c=await assignedPart(f,linked.body.parts[0]),d=await assignedPart(f,receiving);
+  const plan=(await query('SELECT trucks FROM dispatch_plan_snapshots WHERE plan_id=$1',[f.planId])).rows[0];
+  const stops=plan.trucks.flatMap(t=>t.loads.flatMap(l=>l.stops));
+  for(const stop of stops) {
+    const minute={pickup_bin:420,dump_bin:440,cargo_pickup_1:445,deliver_bin:470}[stop.actionCode];
+    stop.timing={arrival:minute,depart:minute+10};
+  }
+  await query('UPDATE dispatch_plan_snapshots SET trucks=$2::jsonb WHERE plan_id=$1',[f.planId,JSON.stringify(plan.trucks)]);
+  await assert.rejects(assertBinWorkflowPlanDependencies(receiving.visitId),/before|after|sequence|preced|prerequisite/i);
+  stops.find(s=>s.actionCode==='cargo_pickup_1').timing={arrival:451,depart:461};
+  await query('UPDATE dispatch_plan_snapshots SET trucks=$2::jsonb WHERE plan_id=$1',[f.planId,JSON.stringify(plan.trucks)]);
+  await assertBinWorkflowPlanDependencies(receiving.visitId);
+  await perform(f,c.jobs[0],10);
+  const event=driverBinEvent(f,d.jobs[0],'job_started',20);
+  await assert.rejects(startMbtDriverBinJob({job:d.jobs[0],event,manifest:{manifestId:event.manifestId,schemaVersion:2}},
+    {capability:enabledDriverBinBoundary}),/prerequisite|completed/i);
+  await perform(f,c.jobs[1],30,dump);await perform(f,d.jobs[0],40);await perform(f,d.jobs[1],50);
+  assert.equal((await getBinOrderWorkflow(target.frontVisitId)).status,'completed');
+  assert.equal((await getBinCargoOptions(c.part.visitId)).editable,false);
+});
 
 let fixtureNumber = 0;
 async function fixture(label, planDate = binDispatchPlanDate(fixtureNumber++)) {
@@ -123,7 +184,7 @@ async function atCustomer(f) {
   await query("UPDATE mbt_bin_rental_numbers SET current_asset_id=$2 WHERE service_line_id=$1",[f.serviceLineId,f.assetId]);
 }
 
-async function dumping() {
+async function dumping(...rentals) {
   const dumpSiteId=crypto.randomUUID(),materialId=crypto.randomUUID();
   await query(`INSERT INTO mbt_materials(material_id,material_code,display_name,created_by,updated_by)
     VALUES ($1,$2,'Clean fill','test','test')`,[materialId,`MAT-${materialId}`]);
@@ -131,6 +192,7 @@ async function dumping() {
     VALUES ($1,$2,'Test dump','500 Dump Road','Toronto','ON','test','test')`,[dumpSiteId,`DP-${dumpSiteId}`]);
   await query(`INSERT INTO mbt_dump_site_materials(dump_site_material_id,dump_site_id,material_id,accepted,created_by,updated_by)
     VALUES ($1,$2,$3,true,'test','test')`,[crypto.randomUUID(),dumpSiteId,materialId]);
+  for (const f of rentals) await query("UPDATE mbt_contract_service_lines SET pricing_snapshot=pricing_snapshot || $2::jsonb WHERE service_line_id=$1",[f.serviceLineId,JSON.stringify({materialId})]);
   return {dumpSiteId,materialId};
 }
 
@@ -146,13 +208,30 @@ async function exchangeRoot(f) {
   return id;
 }
 
+test('time window: a collection-first exchange retains its same-day replacement rule atomically',async()=>{
+  const f=await fixture('window-same-day');await atCustomer(f);
+  const id=await exchangeRoot(f);
+  const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:'collection_first',reuse:'same_bin',
+    collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T13:00:00Z`},
+    deliveryWindow:{startAt:`${f.planDate}T13:00:00Z`,endAt:`${f.planDate}T14:00:00Z`},...await dumping(f)}));
+  const visitId=configured.body.parts.find(p=>p.role==='delivery').visitId;
+  const options=await getBinOrderWindow(visitId);
+  const tomorrow=new Date(`${f.planDate}T12:00:00Z`);tomorrow.setUTCDate(tomorrow.getUTCDate()+1);
+  const bad={startAt:tomorrow.toISOString(),endAt:new Date(tomorrow.getTime()+3600000).toISOString()};
+  await assert.rejects(changeBinOrderWindow({...command(f),...options,visitId,window:bad},windowBoundary),/Front Desk/);
+  assert.deepEqual(await getBinOrderWindow(visitId),options);
+  const good={startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T15:00:00Z`};
+  await assert.rejects(changeBinOrderWindow({...command(f),...options,visitId,window:good},windowBoundary),/Front Desk/);
+  assert.deepEqual(await getBinOrderWindow(visitId),options);
+});
+
 test("BIN workflow: a same-bin exchange can reserve both connected parts without moving the physical bin", async () => {
   const f=await fixture("same-bin-claims",await availableDriverExecutionPlanDate());
   await atCustomer(f);
   const id=await exchangeRoot(f);
   const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"same_bin",
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T13:00:00Z`},
-    deliveryWindow:{startAt:`${f.planDate}T13:00:00Z`,endAt:`${f.planDate}T14:00:00Z`},...await dumping()}));
+    deliveryWindow:{startAt:`${f.planDate}T13:00:00Z`,endAt:`${f.planDate}T14:00:00Z`},...await dumping(f)}));
   const collection=configured.body.parts.find(p=>p.role==="collection");
   const delivery=configured.body.parts.find(p=>p.role==="delivery");
   assert.match(collection.reference,/X-1C$/);
@@ -192,7 +271,7 @@ async function perform(f, job, sequence, extra = {}) {
 test("BIN workflow: same-bin pickup, dump and redelivery retain truck custody and one billable exchange", async () => {
   const f=await fixture("same-bin-execution",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const id=await exchangeRoot(f),dump=await dumping();
+  const id=await exchangeRoot(f),dump=await dumping(f);
   const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"same_bin",
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T13:00:00Z`},
     deliveryWindow:{startAt:`${f.planDate}T13:00:00Z`,endAt:`${f.planDate}T14:00:00Z`},...dump}));
@@ -215,7 +294,7 @@ test("BIN workflow: same-bin pickup, dump and redelivery retain truck custody an
 test("BIN workflow: final collection dumps and returns to the selected approved yard", async () => {
   const f=await fixture("final-return",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const dump=await dumping();
+  const dump=await dumping(f);
   const yard=(await query("SELECT yard_id FROM mbt_yards WHERE active AND yard_id<>$1 LIMIT 1",
     ["00000000-0000-4000-8000-000000012441"])).rows[0];
   assert.ok(yard);
@@ -236,7 +315,7 @@ test("BIN workflow: final collection feeds the next rental's delivery once with 
   const f=await fixture("reuse-source",await availableDriverExecutionPlanDate());
   const next=await fixture("reuse-next",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const dump=await dumping();
+  const dump=await dumping(f);
   const result=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,
     collectionWindow:{startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T16:00:00Z`},
     destination:{kind:"delivery",orderId:next.frontVisitId,deliveryWindow:{
@@ -265,7 +344,7 @@ test("BIN workflow: multiple open exchanges retain all old bins and final closur
   const b=await fixture("spare-b",await availableDriverExecutionPlanDate());
   const c=await fixture("spare-c",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const dump=await dumping(),yardId="00000000-0000-4000-8000-000000012441";
+  const dump=await dumping(f),yardId="00000000-0000-4000-8000-000000012441";
   const collections=[];
   let sequence=200;
   for (const [oldBin,newBin] of [[f,b],[b,c]]) {
@@ -301,21 +380,19 @@ test("BIN workflow: multiple open exchanges retain all old bins and final closur
   assert.equal(done.currentAssetId,null);
 });
 
-test("BIN workflow: drafts can be edited, Toronto windows are explicit, and issued instructions stay frozen", async () => {
+test("BIN workflow: draft routes can be edited while order windows and issued instructions stay frozen", async () => {
   const f=await fixture("draft-edit",await availableDriverExecutionPlanDate());
   const first=await configureBinOrderWorkflow(command(f));
   const date=f.planDate;
   const changed=await configureBinOrderWorkflow(command(f,{expectedRevision:first.body.revision,
     deliveryWindow:{startLocal:`${date}T09:00`,endLocal:`${date}T11:00`}}));
   assert.equal(changed.body.parts[0].visitId,first.body.parts[0].visitId);
-  const local=new Intl.DateTimeFormat("en-GB",{timeZone:"America/Toronto",hour:"2-digit",minute:"2-digit"})
-    .format(new Date(changed.body.parts[0].window.startAt));
-  assert.equal(local,"09:00");
+  assert.deepEqual(changed.body.parts[0].window,first.body.parts[0].window);
   await assignedPart(f,changed.body.parts[0]);
   await assert.rejects(configureBinOrderWorkflow(command(f,{expectedRevision:changed.body.revision})),/unassigned|unplan|issued/i);
 });
 
-test("BIN workflow: planning pool exposes required configuration and both independently assignable parts", async () => {
+test("BIN workflow: planning pool exposes configured delivery and a visible final collection waiting for it", async () => {
   const f=await fixture("pool",await availableDriverExecutionPlanDate());
   const before=await getMbtBinPlanning({planDate:f.planDate,search:f.contractNumber},{capability:enabledDriverBinBoundary});
   assert.equal(before.pool.items.length,2);
@@ -325,13 +402,16 @@ test("BIN workflow: planning pool exposes required configuration and both indepe
     assetAssignments:[{assetId:f.assetId,reservationSlot:"outgoing",expectedStateRevision:1}]},
     {capability:enabledDriverBinBoundary,planning:true}),/Configure this BIN order/i);
   const d=await configureBinOrderWorkflow(command(f));
-  const dump=await dumping();
+  const dump=await dumping(f);
   const c=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,
     collectionWindow:{startAt:`${f.planDate}T18:00:00Z`,endAt:`${f.planDate}T20:00:00Z`},
     destination:{kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"},...dump}));
   const after=await getMbtBinPlanning({planDate:f.planDate,search:f.contractNumber},{capability:enabledDriverBinBoundary});
   assert.equal(after.pool.items.length,2);
-  assert.ok(after.pool.items.every(item=>item.mbt.frontLeg.dispatchable));
+  assert.equal(after.pool.items.find(item=>item.mbt.visitId===d.body.parts[0].visitId).mbt.frontLeg.dispatchable,true);
+  const waiting=after.pool.items.find(item=>item.mbt.visitId===c.body.parts[0].visitId);
+  assert.equal(waiting.mbt.frontLeg.dispatchable,false);
+  assert.deepEqual(waiting.workflow.collectionHold.references,[d.body.parts[0].reference]);
   assert.equal(c.body.parts[0].assetId,d.body.parts[0].assetId);
   assert.equal((await query("SELECT prerequisite_visit_id FROM mbt_bin_workflow_dependencies WHERE dependent_visit_id=$1",[c.body.parts[0].visitId])).rows[0].prerequisite_visit_id,d.body.parts[0].visitId);
 });
@@ -352,14 +432,14 @@ test("BIN workflow: simultaneous configuration commits once and unrelated rental
 test("BIN workflow: the real planner confirms a same-bin route with one slot and rejects reversed dependencies", async () => {
   const f=await attachRental(await planningFixture(4500));
   await atCustomer(f);
-  const id=await exchangeRoot(f),dump=await dumping();
+  const id=await exchangeRoot(f),dump=await dumping(f);
   const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"same_bin",
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T13:00:00Z`},
     deliveryWindow:{startAt:`${f.planDate}T13:00:00Z`,endAt:`${f.planDate}T14:00:00Z`},...dump}));
   const c=configured.body.parts.find(p=>p.role==="collection"),d=configured.body.parts.find(p=>p.role==="delivery");
   await runPlanning(f,"assign",{visitId:c.visitId,expectedVisitRevision:c.revision,assetAssignments:[]});
-  await runPlanning(f,"assign",{visitId:d.visitId,expectedVisitRevision:d.revision,assetAssignments:[]});
   const before=await storedPlan(f.planId);
+  assert.deepEqual([...new Set(before.trucks[0].loads[0].stops.map(s=>s.mbt.visitId))],[c.visitId,d.visitId]);
   const revision=Number((await query("SELECT revision FROM mbt_service_visits WHERE service_visit_id=$1",[d.visitId])).rows[0].revision);
   await assert.rejects(runPlanning(f,"sequence",{visitId:d.visitId,expectedVisitRevision:revision,direction:-1}),/aboard|follow|route/i);
   assert.equal((await storedPlan(f.planId)).revision,before.revision);
@@ -393,7 +473,7 @@ test("BIN workflow: a draft final collection follows a newly planned replacement
   const f=await fixture("retarget-final",await availableDriverExecutionPlanDate());
   const spare=await fixture("retarget-spare",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const dump=await dumping(),destination={kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"};
+  const dump=await dumping(f),destination={kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"};
   const final=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,destination,...dump,
     collectionWindow:{startAt:`${f.planDate}T18:00:00Z`,endAt:`${f.planDate}T20:00:00Z`}}));
   const id=await exchangeRoot(f);
@@ -444,7 +524,7 @@ test("BIN workflow: different-bin collection-first allows replacement before the
   await query("UPDATE dispatch_plan_snapshots SET trucks=trucks || $2::jsonb WHERE plan_id=$1",
     [f.planId,JSON.stringify([otherPlan.trucks[0]])]);
   const second={...spare,planId:f.planId,planDate:f.planDate};
-  const id=await exchangeRoot(f),dump=await dumping();
+  const id=await exchangeRoot(f),dump=await dumping(f);
   const configured=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"different_bin",
     deliveryAssetId:spare.assetId,...dump,destination:{kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"},
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T14:00:00Z`}}));
@@ -466,7 +546,7 @@ test("BIN workflow: different-bin collection-first allows replacement before the
 test("BIN workflow: a late actual replacement is accepted and creates a durable same-day exception",async()=>{
   const f=await fixture("late-actual",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const id=await exchangeRoot(f),dump=await dumping();
+  const id=await exchangeRoot(f),dump=await dumping(f);
   const result=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"same_bin",...dump,
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T14:00:00Z`}}));
   const c=await assignedPart(f,result.body.parts.find(p=>p.role==="collection"));
@@ -504,7 +584,7 @@ test("BIN workflow: failure after parent completion rolls back custody, claims a
 test("BIN workflow: parent extensions update draft final collection but cannot rewrite assigned work",async()=>{
   const f=await fixture("extension",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const configured=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,...await dumping(),
+  const configured=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,...await dumping(f),
     collectionWindow:{startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T16:00:00Z`},
     destination:{kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"}}));
   await query("UPDATE mbt_service_visits SET scheduled_start_at=$2,scheduled_end_at=$3 WHERE service_visit_id=$1",
@@ -532,13 +612,16 @@ test("BIN workflow: parent extensions update draft final collection but cannot r
 test("BIN workflow: invalid role, time, dump acceptance and immutable references fail without partial orders",async()=>{
   const f=await fixture("hostile",await availableDriverExecutionPlanDate());
   await assert.rejects(configureBinOrderWorkflow(command(f,{actor:{operatorId:"driver",roles:["driver"]}})),/access/i);
-  await assert.rejects(configureBinOrderWorkflow(command(f,{deliveryWindow:{startLocal:"bad",endLocal:"bad"}})),/Toronto/i);
-  await assert.rejects(configureBinOrderWorkflow(command(f,{deliveryWindow:{startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T12:00:00Z`}})),/later finish/i);
+  const ordered=(await query('SELECT scheduled_start_at,scheduled_end_at FROM mbt_service_visits WHERE service_visit_id=$1',[f.frontVisitId])).rows[0];
+  await query('UPDATE mbt_service_visits SET scheduled_start_at=NULL,scheduled_end_at=NULL WHERE service_visit_id=$1',[f.frontVisitId]);
+  await assert.rejects(configureBinOrderWorkflow(command(f)),/valid start/);
+  await query('UPDATE mbt_service_visits SET scheduled_start_at=$2,scheduled_end_at=$3 WHERE service_visit_id=$1',
+    [f.frontVisitId,ordered.scheduled_start_at,ordered.scheduled_end_at]);
   await assert.rejects(query("UPDATE mbt_bin_rental_numbers SET rental_number=DEFAULT WHERE service_line_id=$1",[f.serviceLineId]),/immutable/i);
   await assert.rejects(query("UPDATE mbt_bin_orders SET display_reference='BIN99999D' WHERE order_id=$1",[f.frontVisitId]),/immutable/i);
   assert.equal((await getBinOrderWorkflow(f.frontVisitId)).parts.length,0);
   await atCustomer(f);
-  const dump=await dumping(),options=await getBinOrderWorkflowOptions(f.successorVisitId);
+  const dump=await dumping(f),options=await getBinOrderWorkflowOptions(f.successorVisitId);
   assert.equal(options.collectionAssetId,f.assetId);
   const c=command(f,{visitId:f.successorVisitId,...dump,
     collectionWindow:{startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T16:00:00Z`},
@@ -568,7 +651,7 @@ test("BIN workflow: an empty bin aboard the truck skips pickup, and a legacy dum
   const assigned=await assignedPart(f,onboard.body.parts[0]);
   await perform(f,assigned.jobs[0],450);
   assert.equal((await getBinOrderWorkflow(f.frontVisitId)).status,"completed");
-  const legacy=await fixture("at-dump",await availableDriverExecutionPlanDate()),dump=await dumping();
+  const legacy=await fixture("at-dump",await availableDriverExecutionPlanDate()),dump=await dumping(legacy);
   await withTransaction(()=>recordAssetMovement({query,ambientTransaction:true},{assetId:legacy.assetId,movementType:"dump_bin_expected",
     afterStatus:"at_dump",afterLocation:{kind:"dump_site",dumpSiteId:dump.dumpSiteId,reference:"500 Dump Road"},
     source:"workflow-test",actorType:"system",actorId:"test",occurredAt:`${legacy.planDate}T10:00:00Z`}));
@@ -580,35 +663,47 @@ test("BIN workflow: an empty bin aboard the truck skips pickup, and a legacy dum
   assert.equal((await getBinOrderWorkflow(legacy.frontVisitId)).status,"completed");
 });
 
-test("BIN workflow: tomorrow's collection can be planned ahead but waits for the delivery plan to be released",async()=>{
+test("BIN workflow: an existing advanced collection still waits for its delivery plan to be released",async()=>{
   const first=await attachRental(await planningFixture(4504));
   const second=await attachRental(await planningFixture(4505));
   const delivery=await configureBinOrderWorkflow(command(first));
-  const collection=await configureBinOrderWorkflow(command(first,{visitId:first.successorVisitId,...await dumping(),
+  const collection=await configureBinOrderWorkflow(command(first,{visitId:first.successorVisitId,...await dumping(first),
     collectionWindow:{startAt:`${second.planDate}T12:00:00Z`,endAt:`${second.planDate}T14:00:00Z`},
     destination:{kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"}}));
   const d=delivery.body.parts[0],c=collection.body.parts[0];
   await runPlanning(first,"assign",{visitId:d.visitId,expectedVisitRevision:d.revision,assetAssignments:[]});
-  await runPlanning(second,"assign",{visitId:c.visitId,expectedVisitRevision:c.revision,assetAssignments:[]});
+  // Historical assignment predating the final-collection planner hold. Preserve
+  // its release rules; new MBT planner assignments are covered by the hold tests.
+  const assetState=(await query('SELECT revision FROM mbt_bin_asset_state WHERE asset_id=$1',[c.assetId])).rows[0];
+  const historical=await planningCommand(second,"assign",{visitId:c.visitId,expectedVisitRevision:c.revision,
+    assetAssignments:[{reservationSlot:'outgoing',assetId:c.assetId,expectedStateRevision:Number(assetState.revision)}]});
+  await withTransaction(async()=>{
+    await assignMbtBinFrontLeg(historical,{...windowBoundary,planning:true});
+    await stagePlanningAssignment(c.visitId,await storedPlan(second.planId),historical,false);
+  });
   await assert.rejects(runPlanning(second,"confirm"),/Release the prerequisite/i);
   await runPlanning(first,"confirm");
   await runPlanning(second,"confirm");
   assert.equal((await query("SELECT count(*)::int AS n FROM mbt_bin_planning_assignments WHERE service_visit_id=$1 AND released_at IS NOT NULL",[c.visitId])).rows[0].n,1);
 });
 
-test("BIN workflow: a dumped bin remains aboard the same truck for the next customer's delivery tomorrow",async()=>{
+test("BIN workflow: an existing overnight route retains the dumped bin aboard the same truck for tomorrow's delivery",async()=>{
   const first=await attachRental(await planningFixture(4510));
   const next=await attachRental(await planningFixture(4511));
   await atCustomer(first);
   const truck=(await storedPlan(first.planId)).trucks[0];
   await query("UPDATE dispatch_plan_snapshots SET trucks=trucks || $2::jsonb WHERE plan_id=$1",
     [next.planId,JSON.stringify([truck])]);
-  const configured=await configureBinOrderWorkflow(command(first,{visitId:first.successorVisitId,...await dumping(),
+  const configured=await configureBinOrderWorkflow(command(first,{visitId:first.successorVisitId,...await dumping(first),
     collectionWindow:{startAt:`${first.planDate}T12:00:00Z`,endAt:`${first.planDate}T14:00:00Z`},
     destination:{kind:"delivery",orderId:next.frontVisitId}}));
   const c=configured.body.parts[0],d=(await getBinOrderWorkflow(next.frontVisitId)).parts[0];
-  await runPlanning(first,"assign",{visitId:c.visitId,expectedVisitRevision:c.revision,assetAssignments:[]});
-  await runPlanning(next,"assign",{loadId:first.binLoadIds[0],visitId:d.visitId,expectedVisitRevision:d.revision,assetAssignments:[]});
+  // Recreate an older, separately planned route with the single-visit primitive.
+  // New planner commands automatically put linked legs together; existing routes still confirm.
+  await withTransaction(async()=>{
+    await assignVisit(await planningCommand(first,'assign',{visitId:c.visitId,expectedVisitRevision:c.revision,assetAssignments:[]}),windowBoundary);
+    await assignVisit(await planningCommand(next,'assign',{loadId:first.binLoadIds[0],visitId:d.visitId,expectedVisitRevision:d.revision,assetAssignments:[]}),windowBoundary);
+  });
   await runPlanning(first,"confirm");
   await runPlanning(next,"confirm");
   const onward=(await storedPlan(next.planId)).trucks.find(t=>String(t.id)===first.binTruckId).loads[0].stops;
@@ -645,7 +740,7 @@ test("BIN workflow: stale locations, loaded delivery bins, and revoked reservati
 test("BIN workflow: invalid collection identities and targets do not rewrite an existing rental",async()=>{
   const f=await fixture("invalid-collection",await availableDriverExecutionPlanDate());
   const other=await fixture("invalid-target",await availableDriverExecutionPlanDate());
-  const dump=await dumping();
+  const dump=await dumping(f);
   const request=command(f,{visitId:f.successorVisitId,...dump,
     collectionWindow:{startAt:`${f.planDate}T14:00:00Z`,endAt:`${f.planDate}T16:00:00Z`},
     destination:{kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"}});
@@ -680,7 +775,7 @@ test("BIN workflow: linking a different source cannot silently retarget an assig
   const source=await fixture("frozen-destination-source",await availableDriverExecutionPlanDate());
   const target=await fixture("frozen-destination",await availableDriverExecutionPlanDate());
   await atCustomer(source);
-  const dump=await dumping(),destination={kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"};
+  const dump=await dumping(source,target),destination={kind:"yard",yardId:"00000000-0000-4000-8000-000000012441"};
   const delivery=await configureBinOrderWorkflow(command(target));
   const final=await configureBinOrderWorkflow(command(target,{visitId:target.successorVisitId,...dump,destination,
     collectionWindow:{startAt:`${target.planDate}T16:00:00Z`,endAt:`${target.planDate}T18:00:00Z`}}));
@@ -697,7 +792,7 @@ test("BIN workflow: a new exchange cannot redirect the bin promised to an assign
   const next=await fixture("frozen-onward-target",await availableDriverExecutionPlanDate());
   const spare=await fixture("frozen-onward-spare",await availableDriverExecutionPlanDate());
   await atCustomer(f);
-  const dump=await dumping();
+  const dump=await dumping(f);
   const final=await configureBinOrderWorkflow(command(f,{visitId:f.successorVisitId,...dump,
     collectionWindow:{startAt:`${f.planDate}T16:00:00Z`,endAt:`${f.planDate}T18:00:00Z`},
     destination:{kind:"delivery",orderId:next.frontVisitId,deliveryWindow:{startAt:`${f.planDate}T18:00:00Z`,endAt:`${f.planDate}T20:00:00Z`}}}));
@@ -718,7 +813,7 @@ test("BIN workflow: linked plan validation rejects reverse timing, forecast truc
   const truck=(await storedPlan(other.planId)).trucks[0];
   truck.loads[0].plannedStartMinute=540;truck.loads[0].plannedFinishMinute=600;
   await query("UPDATE dispatch_plan_snapshots SET trucks=trucks || $2::jsonb WHERE plan_id=$1",[f.planId,JSON.stringify([truck])]);
-  const id=await exchangeRoot(f),dump=await dumping();
+  const id=await exchangeRoot(f),dump=await dumping(f);
   const flow=await configureBinOrderWorkflow(command(f,{visitId:id,sequence:"collection_first",reuse:"same_bin",...dump,
     collectionWindow:{startAt:`${f.planDate}T12:00:00Z`,endAt:`${f.planDate}T14:00:00Z`}}));
   const c=await assignedPart(f,flow.body.parts.find(p=>p.role==="collection"));

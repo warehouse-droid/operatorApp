@@ -239,3 +239,12 @@ test("P3-F19: a client-version deployment cannot weaken or silently rewrite a fr
     "The manifest comparison must deliberately normalize compatibility metadata; the fingerprint stays immutable."
   );
 });
+
+test("BIN readable references survive offline sanitization without changing issued execution fingerprints",()=>{
+  const job=completeJob(),readable={...job,mbt:{...job.mbt,displayReference:"BIN00001D"}};
+  assert.equal(sanitizeDriverOfflineJob(readable).mbt.displayReference,"BIN00001D");
+  assert.equal(fingerprintDriverOfflineJob(readable),fingerprintDriverOfflineJob(job));
+  assert.equal(fingerprintDriverOfflineJobContent(readable),fingerprintDriverOfflineJobContent(job));
+  const changed=structuredClone(readable);changed.mbt.exactAssets.outgoing.assetCode="DIFFERENT-BIN";
+  assert.notEqual(fingerprintDriverOfflineJob(changed),fingerprintDriverOfflineJob(readable));
+});

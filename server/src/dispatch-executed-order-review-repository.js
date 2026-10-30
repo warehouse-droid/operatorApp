@@ -8,6 +8,7 @@ import { isDeepStrictEqual } from "node:util";
 import { evaluateExecutedPrefixPolicy, digestDispatchPlan, dispatchPlanBoard } from "./dispatch-planner-performance.js";
 import { preserveDispatchOrderAddress } from "./dispatch-address-guard.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
+import { dispatchSourceRefreshBaseline } from "./dispatch-source-refresh.js";
 
 const key = value => String(value || "").trim().toUpperCase();
 const error = (message, code, status = 409) => Object.assign(new Error(message), { code, status });
@@ -114,19 +115,29 @@ export async function getDispatchExecutedOrderReviews(planId) {
   return (await automaticallyAcceptPreExecutionSourceReviews(planId)).publicReviews;
 }
 
-export async function getDispatchSourceReviewPayload(planId, { baseRevision } = {}) {
+export async function getDispatchSourceReviewPayload(planId, { baseRevision, baseDigest } = {}) {
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
     const previous = await recordedPlan(planId);
     const reviews = await getDispatchExecutedOrderReviews(planId);
     const plan = await recordedPlan(planId);
+    const distance = plan.revision - Number(baseRevision);
+    const checkpoints = baseDigest && Number.isSafeInteger(Number(baseRevision)) && distance > 0 && distance <= 100
+      ? (await query(`SELECT revision,orders,trucks,summary,archive_reason FROM dispatch_plan_snapshot_history
+          WHERE plan_id=$1 AND revision >= $2 AND revision < $3
+            AND archive_reason <> 'save_recovery' ORDER BY revision,id LIMIT 101`, [planId, Number(baseRevision), plan.revision])).rows : [];
+    const sourceBaseline = dispatchSourceRefreshBaseline(plan, checkpoints, { baseRevision, baseDigest });
     const resolved = reviews.filter(review => review.decision === "protect_driver_work"
       || (review.decision === "accept_netsuite_change" && !review.acknowledged));
     const refs = new Set(resolved.flatMap(review => [key(review.orderRef), key(review.groupRef)]).filter(Boolean));
+    if (sourceBaseline) {return { reviews, sourceBaseline, orders: plan.orders,
+      orderRefs: plan.orders.map(order => order.id),
+      plan: { id: plan.id, revision: plan.revision, digest: plan.digest, savedAt: plan.savedAt, safeToAdvanceRevision: true } };}
     return { reviews, orderRefs: resolved.map(review => review.orderRef),
       ...(resolved.length ? { orders: plan.orders.filter(order => nestedOrders(order).some(child => refs.has(key(child.id)))),
         plan: { id: plan.id, revision: plan.revision, digest: plan.digest, savedAt: plan.savedAt,
-          safeToAdvanceRevision: baseRevision !== undefined && Number(baseRevision) === previous.revision } } : {}) };
+          safeToAdvanceRevision: baseRevision !== undefined && Number(baseRevision) === previous.revision
+            && (!baseDigest || baseDigest === previous.digest) } } : {}) };
   });
 }
 

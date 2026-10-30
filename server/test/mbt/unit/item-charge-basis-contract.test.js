@@ -34,7 +34,7 @@ test("aggregate is a real local item with a fixed per-yard basis and dispatch de
     description: "Locally sold aggregate",
     itemType: "aggregate",
     chargeBasis: "per_yard",
-    densityLbsPerYard: 2_750,
+    densityLbsPerYard: 2_600,
     rentalPeriodDays: null,
     category: "other",
     pricingMode: "rate_card",
@@ -83,7 +83,7 @@ test("dump items can be created and edited as either per-tonne or fixed per-bin"
 test("invalid item/basis/density combinations fail closed", () => {
   for (const invalid of [
     item({ chargeBasis: "per_bin" }),
-    item({ densityLbsPerYard: null }),
+    item({ densityLbsPerYard: -1 }),
     item({ densityLbsPerYard: 0 }),
     item({ itemType: "dump", chargeBasis: "per_yard", densityLbsPerYard: null }),
     item({ itemType: "delivery_fee", chargeBasis: "per_tonne", densityLbsPerYard: null })

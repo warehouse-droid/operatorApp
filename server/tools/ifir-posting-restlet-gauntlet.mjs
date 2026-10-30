@@ -25,6 +25,8 @@ const regressions = [
 ];
 const report = { source: {}, toolchain: { node: process.version }, checks: {}, mutants: [] };
 for (const file of changed) { report.source[file] = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
+report.source['test/support/ifir-suitescript.d.ts'] = crypto.createHash('sha256')
+  .update(fs.readFileSync('test/support/ifir-suitescript.d.ts')).digest('hex');
 for (const name of ['fast-check', 'typescript', 'eslint', 'c8']) {
   report.toolchain[name] = JSON.parse(fs.readFileSync(`node_modules/${name}/package.json`, 'utf8')).version;
 }
@@ -106,12 +108,9 @@ const beforePath = `${output}/old-flow-before.json`;
 if (fs.existsSync(beforePath)) {
   const oldFiles = JSON.parse(fs.readFileSync(beforePath, 'utf8'));
   for (const [file, expected] of Object.entries(oldFiles)) {
-    // .env.example is not required in a minimal image; the host repeats all hashes.
-    if (fs.existsSync(file)) {
-      assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), expected, file);
-    }
+    assert.equal(crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), expected, file);
   }
-  report.checks.oldFlow = 'Available baseline files unchanged; complete host hash check required.';
+  report.checks.oldFlow = `${Object.keys(oldFiles).length} baseline files unchanged.`;
 }
 fs.writeFileSync(path.join(fresh, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify({ contracts: report.checks.contracts, regressions: report.checks.regressions,

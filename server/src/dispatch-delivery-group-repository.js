@@ -306,7 +306,7 @@ function projectGlobalGroups(plan = {}) {
   return groups;
 }
 
-async function syncDispatchGlobalOrderGroupsFromPlan(plan = {}) {
+async function syncDispatchGlobalOrderGroupsFromPlan(plan = {}, allowedReactivations = new Set()) {
   const planId = Number(plan.id);
   const planDate = dateOnly(plan.planDate || plan.plan_date);
   if (!Number.isInteger(planId) || !planDate) return { groups: 0, members: 0, deactivated: 0 };
@@ -322,7 +322,7 @@ async function syncDispatchGlobalOrderGroupsFromPlan(plan = {}) {
   }
   const existingSources = projected.length
     ? await query(
-        `SELECT lower(group_ref) AS group_key, source_plan_id,
+        `SELECT lower(group_ref) AS group_key, source_plan_id, active,
                 source_plan_date::text AS source_plan_date
            FROM dispatch_global_order_groups
           WHERE lower(group_ref) = ANY($1::text[])`,
@@ -332,13 +332,18 @@ async function syncDispatchGlobalOrderGroupsFromPlan(plan = {}) {
   const sourceByGroup = new Map(existingSources.rows.map((row) => [
     text(row.group_key),
     {
+      active: row.active,
       planId: row.source_plan_id === null ? null : Number(row.source_plan_id),
       planDate: dateOnly(row.source_plan_date)
     }
   ]));
   const groups = projected.flatMap((group) => {
     const existingSource = sourceByGroup.get(group.groupRef.toLowerCase());
-    if (existingSource && existingSource.planId !== planId && !group.assigned) return [];
+    // Explicit regrouping must persist before its save acknowledgement clears
+    // the intent, even when the recreated group has not been put on a load.
+    const reactivating = existingSource?.active === false
+      && allowedReactivations.has(group.groupRef.toLowerCase());
+    if (existingSource && existingSource.planId !== planId && !group.assigned && !reactivating) return [];
     if (!existingSource) return [group];
     const sourcePlanId = existingSource.planId;
     const sourcePlanDate = existingSource.planDate || group.sourcePlanDate;
@@ -1141,7 +1146,8 @@ export async function reconcileDispatchGlobalOrderSources({ orders = [] } = {}) 
     }
     const transitState = await dispatchTransitCoState();
     const freshByRef = new Map(sourceByRef);
-    const updatedSplits = [];
+    const updatedSplits = /** @type {string[]} */ ([]);
+    const definitions = [];
     const splitRows = await query(
       `SELECT split_ref, parent_order_ref, full_order, eligible
          FROM dispatch_global_order_splits
@@ -1158,27 +1164,10 @@ export async function reconcileDispatchGlobalOrderSources({ orders = [] } = {}) 
       const next = splitWithFreshSource(row.full_order || {}, source, transitState);
       const eligible = source.eligible !== false && source.netsuiteActive !== false;
       freshByRef.set(text(row.split_ref).toLowerCase(), next);
-      if (JSON.stringify(next) === JSON.stringify(row.full_order || {}) && eligible === row.eligible) continue;
-      await query(
-        `UPDATE dispatch_global_order_splits
-            SET full_order = $2::jsonb,
-                card = $3::jsonb,
-                search_text = $4,
-                eligible = $5,
-                updated_at = now()
-          WHERE split_ref = $1`,
-        [
-          row.split_ref,
-          JSON.stringify(next),
-          JSON.stringify(compactDispatchOrderCard(next)),
-          dispatchOrderSearchText(next),
-          eligible
-        ]
-      );
-      updatedSplits.push(text(row.split_ref));
+      definitions.push({ row, next, eligible, kind: "split", ref: text(row.split_ref) });
     }
 
-    const updatedGroups = [];
+    const updatedGroups = /** @type {string[]} */ ([]);
     const refreshRefs = [...freshByRef.keys()];
     const groupRows = await query(
       `SELECT global_group.group_ref, global_group.full_order,
@@ -1200,24 +1189,43 @@ export async function reconcileDispatchGlobalOrderSources({ orders = [] } = {}) 
       const childDetails = Array.isArray(next.childOrderDetails) ? next.childOrderDetails : [];
       const eligible = childDetails.every((child) => child?.eligible !== false && child?.netsuiteActive !== false);
       freshByRef.set(text(row.group_ref).toLowerCase(), next);
+      definitions.push({ row, next, eligible, kind: "group", ref: text(row.group_ref) });
+    }
+
+    // Build quantities and PO manifests together before publishing the existing
+    // feed refresh. Split definitions may predate the link; copying their items
+    // alone would keep the PO reference but lose its allocated sales quantities.
+    const salesDefinitions = definitions.filter(entry => text(entry.next.type).toUpperCase() === "SO");
+    if (salesDefinitions.length) {
+      const [{ enrichDispatchOrdersWithPoTargetAllocations }, { stripDispatchPoAllocationProjection }] = await Promise.all([
+        import("./dispatch-repository.js"), import("./dispatch-plan-order-projection.js")
+      ]);
+      const projected = await enrichDispatchOrdersWithPoTargetAllocations(
+        salesDefinitions.map(entry => stripDispatchPoAllocationProjection(entry.next))
+      );
+      salesDefinitions.forEach((entry, index) => { entry.next = projected[index]; });
+    }
+    for (const { row, next, eligible, kind, ref } of definitions) {
       if (JSON.stringify(next) === JSON.stringify(row.full_order || {}) && eligible === row.eligible) continue;
+      const table = kind === "split" ? "dispatch_global_order_splits" : "dispatch_global_order_groups";
+      const key = kind === "split" ? "split_ref" : "group_ref";
       await query(
-        `UPDATE dispatch_global_order_groups
+        `UPDATE ${table}
             SET full_order = $2::jsonb,
                 card = $3::jsonb,
                 search_text = $4,
                 eligible = $5,
                 updated_at = now()
-          WHERE group_ref = $1`,
+          WHERE ${key} = $1`,
         [
-          row.group_ref,
+          ref,
           JSON.stringify(next),
           JSON.stringify(compactDispatchOrderCard(next)),
           dispatchOrderSearchText(next),
           eligible
         ]
       );
-      updatedGroups.push(text(row.group_ref));
+      (kind === "split" ? updatedSplits : updatedGroups).push(ref);
     }
 
     const updatedRefs = [...new Set([...updatedSplits, ...updatedGroups])];
@@ -1688,7 +1696,7 @@ async function syncDispatchDeliveryGroupsFromPlanInTransaction(plan = {}, {
     withoutRetiredGlobalOrderRefs(plan, retiredRefs),
     canonicalByRef
   );
-  const globalGroups = await syncDispatchGlobalOrderGroupsFromPlan(effectivePlan);
+  const globalGroups = await syncDispatchGlobalOrderGroupsFromPlan(effectivePlan, allowedReactivations);
   const globalSplits = await syncDispatchGlobalOrderSplitsFromPlan(effectivePlan);
   const groups = projectGroups(effectivePlan);
 

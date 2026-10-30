@@ -1,5 +1,7 @@
 import { isBackgroundPhotoReference } from "./operator-background-photos.js";
+import { receiveCoSourceSalesOrders, withCoReceivingMutation } from './co-source-receipt.js';
 import { query, withTransaction } from "./db.js";
+import { enqueuePurchaseReceiptRefresh } from './purchase-receipt-refresh-repository.js';
 import { captureTransferPosting,readTransferReceiptProgress,applyTransferReceiptProgress,
   readTransferLoadedQuantities,applyTransferLoadedQuantities } from './transfer-order-posting-repository.js';
 import { readReceivingReceiptProgress, applyReceivingReceiptProgress, receivingQuantityAfterReceipt } from "./receiving-receipt-progress.js";
@@ -1110,7 +1112,11 @@ export async function getLocalCoReceivingOrder(coRefOrId) {
   return { ...order.rows[0], lines: lines.rows };
 }
 
-export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, operatorId) {
+export function confirmLocalCoReceivingLine(...args) {
+  return withCoReceivingMutation(args[0], () => confirmLocalCoReceivingLineUnlocked(...args));
+}
+
+async function confirmLocalCoReceivingLineUnlocked(coRefOrId, lineRowId, values, operatorId) {
   await assertLocalCoReceivingSourceEditable(coRefOrId, "confirm a local CO Receiving line");
   const line = await query(
     `SELECT line.*
@@ -1154,7 +1160,11 @@ export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, 
   return getLocalCoReceivingOrder(coRefOrId);
 }
 
-export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operatorId) {
+export function unconfirmLocalCoReceivingLine(...args) {
+  return withCoReceivingMutation(args[0], () => unconfirmLocalCoReceivingLineUnlocked(...args));
+}
+
+async function unconfirmLocalCoReceivingLineUnlocked(coRefOrId, lineRowId, operatorId) {
   await assertLocalCoReceivingSourceEditable(coRefOrId, "unconfirm a local CO Receiving line");
   const line = await query(
     `SELECT line.*
@@ -1199,6 +1209,8 @@ export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operat
 export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls = [] } = {}) {
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) throw new Error("Two receiving photos are required.");
+  const sourceSalesReceipt = await receiveCoSourceSalesOrders(coRefOrId, operatorId, photos);
+  if (sourceSalesReceipt) return sourceSalesReceipt;
   const co = await getLocalCoReceivingOrder(coRefOrId);
   if (!co) throw new Error("Local CO not found.");
   if (!["planned", "completed"].includes(String(co.status || "").toLowerCase())) {
@@ -1564,6 +1576,7 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   itemReceiptTranid,
   allowNetSuiteCompleted = false,
   verifiedDirectCompletionEventId = null,
+  verifiedDirectReceiptJobId = null,
   verifiedSalesQuantities = {}
 }) {
   if (!allowNetSuiteCompleted) {
@@ -1571,7 +1584,18 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
   }
   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
   if (photos.length < 2) {
-    const directProof = verifiedDirectCompletionEventId && itemReceiptId
+    const allocationProof = verifiedDirectReceiptJobId && itemReceiptId
+      ? (await query(`SELECT job.id FROM dispatch_direct_po_ir_jobs job
+          JOIN driver_job_records driver ON driver.id=job.delivery_job_record_id
+          JOIN operator_netsuite_posting_commands command ON command.id=job.command_id AND command.status='finalizing'
+          JOIN operator_netsuite_posting_steps step ON step.command_id=command.id AND step.status='posted'
+          WHERE job.id=$1 AND job.local_po_id=$2 AND job.allocation_scoped
+            AND command.input_snapshot->'directDeliveryEvidence'->>'receiptJobId'=job.id::text
+            AND EXISTS(SELECT 1 FROM dispatch_direct_po_ir_allocation_claims claim WHERE claim.job_id=job.id)
+            AND step.transaction_type='IR' AND step.netsuite_transaction_id=$3
+            AND driver.status='complete' AND driver.stop_type='dropoff' AND driver.completed_at IS NOT NULL`,
+        [verifiedDirectReceiptJobId,orderId,itemReceiptId])).rows[0] : null;
+    const directProof = allocationProof || (verifiedDirectCompletionEventId && itemReceiptId
       ? (await query(`SELECT job.id FROM dispatch_direct_po_ir_jobs job
           JOIN dispatch_effective_order_completion_events event ON event.id=job.completion_event_id
           JOIN driver_job_records driver ON driver.job_id=event.completion_evidence_id
@@ -1583,7 +1607,7 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
             AND event.metadata->>'directPoLink'='true'
             AND driver.status='complete' AND driver.stop_type='dropoff' AND driver.completed_at IS NOT NULL`,
         [verifiedDirectCompletionEventId,orderId,itemReceiptId])).rows[0]
-      : null;
+      : null);
     if (!directProof) throw new Error("Two receiving photos are required.");
   }
   const order = await getReceivingOrder(orderId, { includeNetSuiteClosed: allowNetSuiteCompleted });
@@ -1687,6 +1711,9 @@ async function recordReceivingReceiptUnlocked(orderId, operatorId, {
 export async function recordReceivingReceipt(orderId, operatorId, options) {
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`receiving-receipt:${orderId}`]);
+    // Acquire the source queue lock before any PO row writes, as the worker does.
+    // Non-PO identities resolve to no job; failed receipt validation rolls this back.
+    await enqueuePurchaseReceiptRefresh(orderId);
     if (options.itemReceiptId) {
       const existing = (await query(`SELECT receipt_status,item_receipt_id,item_receipt_tranid
         FROM receiving_receipt_records WHERE order_id=$1 AND item_receipt_id=$2

@@ -1,0 +1,46 @@
+{
+  "captures": [
+    {
+      "name": "30-delivery-busy",
+      "filename": "screenshots/30-delivery-busy.png",
+      "caption": "Checking SO quantity and Base Yard; controls are disabled"
+    },
+    {
+      "name": "30-delivery-form",
+      "filename": "screenshots/30-delivery-form.png",
+      "caption": "Delivery with Base Yard 2967, Target Yard 3445 and calculated 200 SQFT / 2 PALLET"
+    },
+    {
+      "name": "30-delivery-retry",
+      "filename": "screenshots/30-delivery-retry.png",
+      "caption": "Retry SO check after a failed read without changing the input"
+    },
+    {
+      "name": "30-delivery-scm",
+      "filename": "screenshots/30-delivery-scm.png",
+      "caption": "SCM approves or rejects the entire Delivery request for Target Yard 150"
+    },
+    {
+      "name": "30-delivery-result",
+      "filename": "screenshots/30-delivery-result.png",
+      "caption": "Saved TO route and print queue status"
+    },
+    {
+      "name": "02-regular-form",
+      "filename": "screenshots/02-regular-form.png",
+      "caption": "Pickup request: 200 SQFT requested from 3445 for Sales yard 2967"
+    },
+    {
+      "name": "03-regular-scm",
+      "filename": "screenshots/03-regular-scm.png",
+      "caption": "Pickup SCM review: remaining stock below safety"
+    },
+    {
+      "name": "07-regular-expired",
+      "filename": "screenshots/07-regular-expired.png",
+      "caption": "Expired Pickup approval can be re-raised"
+    }
+  ],
+  "errors": [],
+  "source": "Deployed 2026-09-30 UI; fictional training data; no live API calls or order writes"
+}

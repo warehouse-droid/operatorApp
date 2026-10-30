@@ -82,7 +82,7 @@ export function specialFulfillmentBlocksAdjustment(change, { localOnly = false }
 /** Keep an unissued PO draft aligned with the active local request.
  * @param {Record<string,any>} detail @returns {Array<Record<string,any>>} */
 export function specialLocalPurchaseDraft(detail) {
-  if (!detail.localAdjustedAt || detail.purchaseOrderId || detail.purchaseOrderSkipped) {
+  if (!detail.localAdjustedAt || detail.purchaseOrderId || detail.purchaseOrderSkipped || detail.vendorDiscountReview?.independent) {
     return detail.purchaseOrderLines;
   }
   const active = new Map(/** @type {Array<Record<string,any>>} */ (detail.lines).map(line=>[line.id,line]));

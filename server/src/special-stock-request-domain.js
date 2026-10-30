@@ -33,6 +33,11 @@ function text(value, { required = false, label = "Value", max = 4_000, code = "S
   return normalized;
 }
 
+/** @param {unknown} value */
+export function normalizeSpecialCustomerName(value) {
+  return text(value, { required: true, label: 'Customer name', max: 500, code: 'SPECIAL_CASE_CUSTOMER_REQUIRED' });
+}
+
 function positiveId(value, label, code = "SPECIAL_ID_INVALID") {
   const normalized = Number(value);
   if (!Number.isSafeInteger(normalized) || normalized <= 0) {
@@ -169,10 +174,11 @@ function normalizeCaseLine(line, index, { minimumRequiredDate, workflowKind = 's
   };
 }
 
-/** @param {unknown} lines @param {{existingLineCount:number,minimumRequiredDate?:string}} options @returns {Array<Record<string,any>>} */
+/** @param {unknown} lines @param {{existingLineCount:number,minimumRequiredDate?:string,workflowKind?:string}} options @returns {Array<Record<string,any>>} */
 export function normalizeSpecialAdditionalLines(lines, {
   existingLineCount,
-  minimumRequiredDate = minimumSpecialCaseRequiredDate()
+  minimumRequiredDate = minimumSpecialCaseRequiredDate(),
+  workflowKind = 'special'
 }) {
   if (!Number.isSafeInteger(existingLineCount) || existingLineCount < 1
       || !Array.isArray(lines) || lines.length < 1 || existingLineCount + lines.length > SPECIAL_CASE_MAX_LINES) {
@@ -181,7 +187,7 @@ export function normalizeSpecialAdditionalLines(lines, {
   const earliestRequiredDate = isoDate(minimumRequiredDate, {
     required: true, label: 'Minimum required date', code: 'SPECIAL_CASE_REQUIRED_DATE_INVALID'
   });
-  return lines.map((line,index) => normalizeCaseLine(line,existingLineCount + index,{minimumRequiredDate:/** @type {string} */ (earliestRequiredDate)}));
+  return lines.map((line,index) => normalizeCaseLine(line,existingLineCount + index,{minimumRequiredDate:/** @type {string} */ (earliestRequiredDate),workflowKind}));
 }
 
 /** @param {{palletTotal?:unknown,palletRate?:unknown}} input */
@@ -234,12 +240,7 @@ export function normalizeSpecialCaseDraft(input = {}, {
       code: "SPECIAL_CASE_INQUIRY_DATE_INVALID"
     }),
     customerId: optionalPositiveId(input.customerId, "Customer", "SPECIAL_CASE_CUSTOMER_INVALID"),
-    customerName: text(input.customerName, {
-      required: workflowKind !== 'backorder',
-      label: "Customer name",
-      max: 500,
-      code: "SPECIAL_CASE_CUSTOMER_REQUIRED"
-    }),
+    customerName: normalizeSpecialCustomerName(input.customerName),
     customerPhone: text(input.customerPhone, { max: 100 }),
     vendorId: optionalPositiveId(input.vendorId, "Vendor", "SPECIAL_CASE_VENDOR_INVALID"),
     vendorName: text(input.vendorName, {

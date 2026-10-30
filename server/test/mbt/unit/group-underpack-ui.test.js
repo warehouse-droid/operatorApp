@@ -15,8 +15,8 @@ function ui() {
 }
 
 test("Operator resolves 93.26 SQFT to eight layers without a fractional leftover", () => {
-  const view = ui(), line = { quantity: 93.26, layer_qty: 8, to_lyr: 11.657, packed_layer_qty: 8, item_type: "InvtPart" };
-  assert.equal(view.wholeUnitsFromSalesQty(93.26, 11.657), 8);
+  const view = ui(), line = { quantity: 93.26, unit: "SQFT", layer_qty: 8, to_lyr: 11.657, packed_layer_qty: 8, item_type: "InvtPart" };
+  assert.equal(view.wholeUnitsFromSalesQty(93.26, 11.657, 'SQFT'), 8);
   assert.equal(view.remainingValue(line, "layers"), 0);
   assert.equal(view.hasRemainingQty(line), false);
   assert.equal(view.isUnderPacked(line), false);
@@ -29,20 +29,20 @@ test("property: 1000 converted pallet/layer totals keep whole physical quantitie
     fc.integer({ min: 1, max: 100 }), fc.integer({ min: 1000, max: 250000 }), (unit, count, conversionTicks) => {
       const [field, conversionField, label] = unit, conversion = conversionTicks / 1000;
       const salesHundredths = Math.round(count * conversionTicks / 10);
-      const line = { quantity: salesHundredths / 100, [`${field}_qty`]: count, [conversionField]: conversion,
+      const line = { quantity: salesHundredths / 100, unit: "SQFT", [`${field}_qty`]: count, [conversionField]: conversion,
         [`packed_${field}_qty`]: count, item_type: "InvtPart" };
-      assert.equal(view.wholeUnitsFromSalesQty(line.quantity, conversion), count);
+      assert.equal(view.wholeUnitsFromSalesQty(line.quantity, conversion, 'SQFT'), count);
       assert.equal(view.remainingValue(line, label), 0);
       assert.equal(view.hasRemainingQty(line), false);
       assert.equal(view.hasRemainingQty({ ...line, [`packed_${field}_qty`]: count - 1 }), true);
     }), { seed: 20260915, numRuns: 1000 });
 });
 
-test("property: exact tolerance boundary rounds to the whole package while larger differences stay short", () => {
+test("property: a different rounded SQFT total stays short without a physical-unit tolerance", () => {
   const view = ui();
   fc.assert(fc.property(fc.integer({ min: 1, max: 100 }), fc.integer({ min: 1000, max: 250000 }), (count, conversionTicks) => {
     const targetTicks = count * conversionTicks - 100;
-    assert.equal(view.wholeUnitsFromSalesQty(targetTicks / 1000, conversionTicks / 1000), count);
-    assert.equal(view.wholeUnitsFromSalesQty((targetTicks * 1000 - 1) / 1000000, conversionTicks / 1000), count - 1);
+    assert.equal(view.wholeUnitsFromSalesQty(targetTicks / 1000, conversionTicks / 1000, 'SQFT'), count - 1);
+    assert.equal(view.wholeUnitsFromSalesQty((targetTicks * 1000 - 1) / 1000000, conversionTicks / 1000, 'SQFT'), count - 1);
   }), { seed: 20260915, numRuns: 1000, examples: [[8, 11657]] });
 });

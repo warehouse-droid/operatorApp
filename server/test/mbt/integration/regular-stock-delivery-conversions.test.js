@@ -3,12 +3,13 @@ import test, {before, after} from 'node:test';
 import {randomUUID} from 'node:crypto';
 import fc from 'fast-check';
 import {query, closeDb} from '../../../src/db.js';
-import {calculateDeliveryStockRequest} from '../../../src/stock-request-repository.js';
-import {submitDeliveryStockRequest, decideDeliveryStockRequest, retryDeliveryStockRequest} from '../../../src/regular-stock-delivery.js';
+import {calculateDeliveryStockRequest, claimStockTransferConfirmation} from '../../../src/stock-request-repository.js';
+import {previewDeliveryStockRequest, submitDeliveryStockRequest, decideDeliveryStockRequest, retryDeliveryStockRequest} from '../../../src/regular-stock-delivery.js';
 import {buildStockRequestTransferPayload} from '../../../src/stock-request-service.js';
 
 const actor = 'delivery-conversions-' + randomUUID();
 const itemId = 9800000000000 + parseInt(randomUUID().replaceAll('-', '').slice(0, 5), 16);
+const salesOnlyItemId = itemId + 2000000;
 const context = {operatorId: actor, authorizedDestinationLocationIds: [1, 28, 15, 26]};
 const baseId = parseInt(randomUUID().replaceAll('-', '').slice(0, 10), 16);
 let sequence = 0;
@@ -20,9 +21,11 @@ before(async () => {
   assert.equal(process.env.MBT_TEST_ISOLATED, '1');
   await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,active) VALUES($1,$1,$1,'test','test','sales',ARRAY['sales'],true)", [actor]);
   await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,to_plt,to_lyr,to_sec,to_pcs) VALUES($1,'DELIVERY-CONVERSION-MATERIAL','PC',60,0,0,1)", [itemId]);
+  await query("INSERT INTO inventory_items(item_id,item_name,stock_unit) VALUES($1,'DELIVERY-SALES-UOM-MATERIAL','SQ FT')", [salesOnlyItemId]);
   await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,to_pcs,to_plt,item_weight) VALUES(1800000056,'PALLET','EA',1,1,50) ON CONFLICT DO NOTHING");
   for (const location of [1, 28, 15]) {
     await query('INSERT INTO inventory_balances(item_id,location_id,location,quantity_available,quantity_on_hand,synced_at) VALUES($1,$2,$3,100000000,100000000,now())', [itemId, location, String(location)]);
+    await query('INSERT INTO inventory_balances(item_id,location_id,location,quantity_available,quantity_on_hand,synced_at) VALUES($1,$2,$3,100000000,100000000,now())', [salesOnlyItemId, location, String(location)]);
   }
 });
 after(closeDb);
@@ -35,12 +38,103 @@ function fixture(source = 1, quantity = 160) {
     liveExecutionEnabled: true, readOrder: async () => structuredClone(order), refreshAvailability: async () => {},
     hydrateOrder: async () => {}, syncReplenishments: async () => {}, linkTransferDependency: async () => {},
     confirmTransfer: async transfer => {
-      payloads.push(buildStockRequestTransferPayload({transfer, locations}));
+      const claimed = await claimStockTransferConfirmation(transfer.id, {
+        expectedRevision: transfer.revision, requestId: `regular-stock:${transfer.requestId}:${transfer.id}`
+      }, context);
+      payloads.push(buildStockRequestTransferPayload({transfer: claimed, locations}));
       await query("UPDATE sales_stock_transfers SET netsuite_transfer_order_id=$2,netsuite_transfer_order_ref=$3,confirmation_status='complete',status='pending_fulfillment' WHERE id=$1", [transfer.id, 9600000 + transfer.id, `TO-CONVERSION-${transfer.id}`]);
     }
   };
   return {order, payloads, dependencies, input: {deliveryMethod: 'delivery', sourceLocationId: source, destinationLocationId: 28, salesOrderRef: ref}};
 }
+
+test('Delivery without conversions previews, confirms and retries in fractional Sales UOM without inventing packing units', async () => {
+  const f = fixture();
+  Object.assign(f.order.lines[0], {itemId: salesOnlyItemId, quantity: 12.75, backorderedQuantity: 3.25, uom: 'SQ FT'});
+  const preview = await previewDeliveryStockRequest(f.input, context, f.dependencies);
+  assert.equal(preview.calculationError, undefined);
+  assert.equal(preview.lines[0].salesQty, 12.75);
+  assert.equal(preview.lines[0].salesUom, 'SQ FT');
+  assert.deepEqual(packs(preview.lines[0]), [0, 0, 0, 0]);
+  assert.equal(preview.palletQuantity, 0);
+  const request = await submitDeliveryStockRequest(f.input, context, f.dependencies);
+  assert.equal(request.regular.handoffStatus, 'complete', request.regular.handoffError);
+  for (const line of [request.lines[0], request.transfers[0].lines[0]]) {
+    assert.equal(line.salesQty, 12.75);
+    assert.equal(line.salesUom, 'SQ FT');
+    assert.equal(line.quantityMode, 'sales');
+    assert.deepEqual(packs(line), [0, 0, 0, 0]);
+  }
+  assert.equal(request.transfers[0].palletQuantity, 0);
+  assert.equal(request.transfers[0].palletQuantityRequiresManual, false);
+  assert.equal(request.transfers[0].palletQuantityManuallyAdjusted, false);
+  assert.deepEqual(f.payloads[0].item.items, [{
+    item: {id: String(salesOnlyItemId)}, quantity: 12.75, custcol_plt: 0, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0
+  }]);
+  const retried = await retryDeliveryStockRequest(request.id, context, f.dependencies);
+  assert.equal(retried.transfers[0].id, request.transfers[0].id);
+  assert.equal(f.payloads.length, 1);
+});
+
+test('missing or nonpositive pallet conversions retain available piece conversions without blocking Delivery', async () => {
+  try {
+    for (const conversion of [null, 0, -60]) {
+      await query('UPDATE inventory_items SET to_plt=$2 WHERE item_id=$1', [itemId, conversion]);
+      const f = fixture(), request = await submitDeliveryStockRequest(f.input, context, f.dependencies);
+      assert.equal(request.regular.handoffStatus, 'complete', request.regular.handoffError);
+      assert.equal(request.transfers[0].palletQuantityRequiresManual, false);
+      assert.equal(request.transfers[0].palletQuantity, 0);
+      assert.equal(request.lines[0].salesQty, 160);
+      assert.equal(request.lines[0].salesUom, 'PC');
+      assert.deepEqual(packs(request.lines[0]), [0, 0, 0, 160]);
+      assert.deepEqual(f.payloads[0].item.items, [{
+        item: {id: String(itemId)}, quantity: 160, custcol_plt: 0, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 160
+      }]);
+    }
+  } finally {
+    await query('UPDATE inventory_items SET to_plt=60 WHERE item_id=$1', [itemId]);
+  }
+});
+
+test('mixed Delivery counts pallets only for convertible items and preserves Sales UOM for other items', async () => {
+  const f = fixture();
+  f.order.lines.push({...f.order.lines[0], remoteLineId: 2, itemId: salesOnlyItemId, quantity: 12.75, backorderedQuantity: 3.25, uom: 'SQ FT'});
+  const request = await submitDeliveryStockRequest(f.input, context, f.dependencies);
+  assert.equal(request.regular.handoffStatus, 'complete', request.regular.handoffError);
+  assert.equal(request.regular.palletQuantity, 3);
+  assert.equal(request.transfers[0].palletQuantity, 3);
+  assert.equal(request.transfers[0].palletQuantityRequiresManual, false);
+  const items = f.payloads[0].item.items;
+  assert.equal(items.length, 3);
+  assert.equal(items.find(line => Number(line.item.id) === itemId).quantity, 160);
+  assert.equal(items.find(line => Number(line.item.id) === salesOnlyItemId).quantity, 12.75);
+  assert.equal(items.find(line => Number(line.item.id) === request.transfers[0].palletItemId).quantity, 3);
+});
+
+test('SCM approval falls back to Sales UOM when conversions disappear and stock now only covers the backorder', async () => {
+  const f = fixture(15), pending = await submitDeliveryStockRequest(f.input, context, f.dependencies);
+  await query('UPDATE inventory_items SET to_plt=NULL,to_lyr=NULL,to_sec=NULL,to_pcs=NULL WHERE item_id=$1', [itemId]);
+  await query('UPDATE inventory_balances SET quantity_available=80 WHERE item_id=$1 AND location_id=15', [itemId]);
+  try {
+    const request = await decideDeliveryStockRequest(pending.id, {decision: 'stock', expectedRevision: pending.revision}, context, f.dependencies);
+    assert.equal(request.regular.handoffStatus, 'complete', request.regular.handoffError);
+    for (const line of [request.lines[0], request.transfers[0].lines[0]]) {
+      assert.equal(line.salesQty, 78);
+      assert.equal(line.salesUom, 'PC');
+      assert.equal(line.toPlt, null);
+      assert.deepEqual(packs(line), [0, 0, 0, 0]);
+    }
+    assert.equal(request.regular.palletQuantity, 0);
+    assert.equal(request.transfers[0].palletQuantity, 0);
+    assert.equal(request.transfers[0].palletQuantityRequiresManual, false);
+    assert.deepEqual(f.payloads[0].item.items, [{
+      item: {id: String(itemId)}, quantity: 78, custcol_plt: 0, custcol_lyr: 0, custcol_sec: 0, custcol_pcs: 0
+    }]);
+  } finally {
+    await query('UPDATE inventory_items SET to_plt=60,to_lyr=0,to_sec=0,to_pcs=1 WHERE item_id=$1', [itemId]);
+    await query('UPDATE inventory_balances SET quantity_available=100000000 WHERE item_id=$1 AND location_id=15', [itemId]);
+  }
+});
 
 test('SO quantity 160 at 60 PCS per PLT saves 2 PLT and 40 PCS before manual approval', async () => {
   const f = fixture(15), request = await submitDeliveryStockRequest(f.input, context, f.dependencies);

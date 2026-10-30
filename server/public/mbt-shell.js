@@ -1,3 +1,4 @@
+import {aggregateRoutingUI} from './mbt-aggregate-routing.js?v=mbr-aggregate-20261023';
 const app = document.getElementById("mbtApp");
 const statusRegion = app?.querySelector(".mbt-status");
 const surface = String(document.body.dataset.mbtSurface || "");
@@ -7,7 +8,7 @@ const surfaceDetails = {
   config: {
     endpoint: "/api/mbt/config",
     title: "Configuration is safely locked",
-    allowed: new Set(["admin"])
+    allowed: new Set(["admin", "dispatcher"])
   },
   frontdesk: {
     endpoint: "/api/mbt/frontdesk/status",
@@ -429,7 +430,7 @@ async function saveCustomLocalItem(event) {
     if (activeField) activeField.checked = true;
     fieldValue("customLocalItemRentalDays", "14");
     fieldValue("customLocalItemBinCapacityYards", "");
-    fieldValue("customLocalItemDensityLbsPerYard", "");
+    fieldValue("customLocalItemDensityLbsPerYard", "2600");
     syncCustomItemTypeFields();
     setLocalItemMessage("Custom local item created. No NetSuite item was required.");
   } catch (error) {
@@ -744,6 +745,10 @@ async function saveDumpSite(event) {
   event.preventDefault();
   const revision = Number(inputValue("dumpSiteRevision"));
   try {
+    const dumpSiteCode = inputValue("dumpSiteCode").toUpperCase();
+    if (!/^[A-Z0-9][A-Z0-9_-]{0,63}$/u.test(dumpSiteCode)) {
+      throw new Error("Dump-site code must start with a letter or number and contain only letters, numbers, underscores or hyphens (up to 64 characters).");
+    }
     const itemAcceptances = [...document.querySelectorAll("[data-dump-acceptance-item]")]
       .filter((control) => control instanceof HTMLInputElement && control.checked)
       .map((control) => {
@@ -766,11 +771,15 @@ async function saveDumpSite(event) {
       }));
     if (!itemAcceptances.length) throw new Error("Select at least one accepted dump item.");
     if (!openingHours.length) throw new Error("Select at least one opening day.");
+    const invalidHours = openingHours.find(({ opensAt, closesAt }) => !opensAt || !closesAt || closesAt <= opensAt);
+    if (invalidHours) {
+      throw new Error(`${dumpSiteWeekdayNames[invalidHours.isoWeekday]}: closing time must be after opening time.`);
+    }
     await api("/api/mbt/config/dump-sites", {
       method: "POST",
       idempotencyKey: commandIdentity("mbt-dump-site"),
       body: {
-        dumpSiteCode: inputValue("dumpSiteCode"),
+        dumpSiteCode,
         displayName: inputValue("dumpSiteName"),
         addressLine1: inputValue("dumpSiteAddress"),
         addressLine2: "",
@@ -3085,7 +3094,7 @@ function bindPhase3ConfigurationControls() {
 }
 
 function configurationTabs() {
-  return [...document.querySelectorAll(".mbt-tabs [role='tab']")];
+  return [...document.querySelectorAll(".mbt-tabs [role='tab']")].filter(tab=>!tab.hidden);
 }
 
 function activateConfigurationTab(tab, { focus = false } = {}) {
@@ -3120,6 +3129,7 @@ function activateConfigurationTab(tab, { focus = false } = {}) {
       await loadRateCards();
     })();
   }
+  if (tab.id==='aggregateRoutingTab') {void aggregateRouting.load();}
 }
 
 function handleConfigurationTabKeydown(event) {
@@ -3216,6 +3226,18 @@ async function load() {
     }
     if (surface === "config") {
       foundationState = foundation;
+      if (!granted.has("admin")) {
+        for (const tab of configurationTabs()) {
+          if (tab.id==="rateCardsTab") continue;
+          tab.hidden=true;
+          const panel=readinessElement(tab.getAttribute("aria-controls"));
+          if(panel) panel.hidden=true;
+        }
+        replaceStatus("Rate cards", ["Manage local rates, validate changes and activate a rate card."]);
+        await loadLocalItems();
+        activateConfigurationTab(readinessElement("rateCardsTab"));
+        return;
+      }
       const disabledCapabilities = Object.values(foundation.capabilities || {})
         .filter((capability) => capability?.enabled !== true).length;
       replaceStatus("Configuration is safely locked", [
@@ -3247,6 +3269,7 @@ async function load() {
   }
 }
 
+const aggregateRouting=aggregateRoutingUI({api});
 bindConfigurationTabs();
 bindLocalItemControls();
 bindPhase3ConfigurationControls();

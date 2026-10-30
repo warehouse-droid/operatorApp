@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { query } from "../db.js";
 import { MbtError } from "./errors.js";
 import { binOrderReference } from "./bin-order-workflow-domain.js";
+import { withBinCargo } from "./bin-cargo-repository.js";
 
 /** @param {number} status @param {string} message @param {string} [code] */
 export function binWorkflowError(status, message, code = "MBT_BIN_WORKFLOW_INVALID") {
@@ -98,10 +99,10 @@ export async function binWorkflowParts(orderId) {
 }
 
 /** @param {any} step @param {string} visitId @param {number} index @param {string} assetId */
-function mandatoryStop(step, visitId, index, assetId) {
+export function mandatoryStop(step, visitId, index, assetId) {
   const role = step.actionCode === "return_bin" ? "return_yard"
     : step.actionCode === "collect_empty_bin" ? "source_location" : step.location.kind;
-  return {...step,stopId:`${visitId}:S${index+1}`,sequence:index+1,locationRole:role,assetId,
+  return {...step,stopId:step.stopId || `${visitId}:S${index+1}`,sequence:index+1,locationRole:role,assetId,
     yardId:step.location.kind === "yard" ? step.location.id : null,yardCode:step.location.yardCode || null,
     siteProfileId:step.location.kind === "customer_site" ? step.location.id : null,
     planningAddress:step.location.address};
@@ -109,10 +110,12 @@ function mandatoryStop(step, visitId, index, assetId) {
 
 /** @param {any} root @param {any} flow @param {any} part @param {string} actorId @param {number} visitNumber */
 export async function insertBinWorkflowPart(root, flow, part, actorId, visitNumber) {
+  part=await withBinCargo(root,part);
   const visitId = part.visitId || crypto.randomUUID();
   const stops = part.steps.map((/** @type {any} */ s,/** @type {number} */ i)=>mandatoryStop(s,visitId,i,part.assetId));
   const snapshot = {schemaVersion:"mbt-bin-service-snapshot-v1",displayName:`${flow.kind} · ${part.role}`,
-    serviceAction:`bin_${part.role}_part`,mandatoryStops:stops,
+    serviceAction:`bin_${part.role}_part`,mandatoryStops:stops,cargoPlan:part.cargoPlan,
+    ...(root.service_snapshot.collectionPricing ? {collectionPricing:root.service_snapshot.collectionPricing} : {}),
     binWorkflow:{version:1,orderId:String(root.service_visit_id),kind:flow.kind,role:part.role,
       reference:part.reference,sequence:flow.sequence || null,source:part.source || null,
       sameDay:flow.sameDay,destination:part.destination || null,billingOwnerVisitId:String(root.service_visit_id)}};

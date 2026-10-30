@@ -1,6 +1,6 @@
 import { query } from './db.js';
 
-export async function getSpecialStockAlertCounts() {
+export async function getSpecialStockAlertCounts({includeRequests=false} = {}) {
   const { rows: [row] } = await query(`
     SELECT count(*) FILTER (WHERE stage = 'new_enquiry')::integer AS new_requests,
            count(*) FILTER (WHERE stage = 'confirmed')::integer AS confirmed_orders
@@ -8,12 +8,13 @@ export async function getSpecialStockAlertCounts() {
      WHERE stage IN ('new_enquiry', 'confirmed') AND request_id IN (SELECT request_id FROM sales_special_stock_cases WHERE workflow_kind='special')`);
   const newRequests = Number(row.new_requests);
   const confirmedOrders = Number(row.confirmed_orders);
-  return { newRequests, confirmedOrders, total: newRequests + confirmedOrders };
+  return { newRequests, confirmedOrders, total: newRequests + confirmedOrders,
+    ...(includeRequests ? {requests:await specialAlertRequests({audience:'scm'})} : {}) };
 }
 
-export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLocationIds=[]} = {}) {
+export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLocationIds=[],includeRequests=false} = {}) {
   const empty={awaitCustomerConfirmation:0,dispatchArrangement:0,waitForProduction:0,pendingUpdate:0,total:0};
-  if (!operatorId || !authorizedStoreLocationIds.length) return empty;
+  if (!operatorId || !authorizedStoreLocationIds.length) return {...empty,...(includeRequests ? {requests:[]} : {})};
   const {rows:[row]}=await query(`SELECT
     count(*) FILTER(WHERE workflow.stage='await_customer_confirmation')::int AS confirmation,
     count(*) FILTER(WHERE workflow.stage='dispatch_arrangement')::int AS dispatch,
@@ -23,5 +24,20 @@ export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLoca
     WHERE request.request_type='special' AND request.requested_by=$1 AND request.destination_location_id=ANY($2::bigint[])
       AND workflow.stage IN ('await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update')`,[operatorId,authorizedStoreLocationIds]);
   return {awaitCustomerConfirmation:row.confirmation,dispatchArrangement:row.dispatch,waitForProduction:row.production,
-    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.production+row.pending_update};
+    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.production+row.pending_update,
+    ...(includeRequests ? {requests:await specialAlertRequests({audience:'sales',operatorId,authorizedStoreLocationIds})} : {})};
+}
+
+async function specialAlertRequests({audience,operatorId=undefined,authorizedStoreLocationIds=[]}) {
+  const sales=audience==='sales';
+  const {rows}=await query(`SELECT request.id,request.request_ref,special.customer_name,workflow.stage
+    FROM special_stock_workflow_stages workflow JOIN sales_stock_requests request ON request.id=workflow.request_id
+    JOIN sales_special_stock_cases special ON special.request_id=request.id
+    WHERE request.request_type='special' AND special.workflow_kind='special'
+      AND workflow.stage=ANY($1::text[])
+      ${sales ? 'AND request.requested_by=$2 AND request.destination_location_id=ANY($3::bigint[])' : ''}
+    ORDER BY request.updated_at DESC,request.id DESC`,
+  [sales ? ['await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update'] : ['new_enquiry','confirmed'],
+    ...(sales ? [operatorId,authorizedStoreLocationIds] : [])]);
+  return rows.map(row=>({id:Number(row.id),requestRef:row.request_ref,customerName:row.customer_name,stage:row.stage}));
 }

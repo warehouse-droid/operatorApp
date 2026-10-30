@@ -1,0 +1,23 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fc from 'fast-check';
+import {createRepairNetSuite,workChildren,completionSos} from '../../src/repair/netsuite.js';
+const mapping={inspectionItemId:'10660',discountItemId:'10716',sosFormId:'183',subsidiaryId:'7',locationId:'52',currencyId:'1',taxCodeId:'11'};
+function boundary(){const records=new Map(),writes=[];let sequence=400;return {records,writes,adapter:createRepairNetSuite({queryAll:async()=>[],record:async(type,id,{method,body})=>{const key=`${type}:${id}`;if(method==='GET'){const value=id.startsWith('eid:')?[...records.values()].find(v=>v.type===type&&v.externalId===id.slice(4)):records.get(key);if(!value)throw Object.assign(new Error('Missing'),{status:404});return {data:structuredClone(value)};}writes.push({type,id,body:structuredClone(body)});const value=method==='POST'?{id:String(++sequence),type,...body}:{...records.get(key),...body};if(type==='salesOrder'){value.tranId='SOS-'+value.id;value.total=113;value.orderStatus={id:'B',refName:'Pending Fulfillment'};}records.set(`${type}:${value.id}`,value);return {status:204};}})};}
+const base={id:'request',number:'REP-1',company:'MBT',status:'completed',receipt:'accepted',inspectionFeeMinor:15000,inspectionTaxBps:1300,createdAt:'2026-10-29',data:{defect:'Repair fault',vehicle:{netsuiteId:'36',customerId:'7000',alias:'TRUCK-5'}}};
+const lines=[{id:'labor',kind:'labor',itemId:'10650',description:'Approved quote',quantityMilli:1000,unitMinor:10000,amountMinor:10000,taxBps:1300,taxMinor:1300,decision:'approved'}];
+test('property: actual hours and cost never change quoted SOS quantities or selling prices',()=>{
+ fc.assert(fc.property(fc.integer({min:1,max:100000}),fc.integer({min:0,max:100000}),fc.integer({min:1,max:100000}), (hoursMilli,hourlyCostMinor,quantityMilli)=>{
+  const quoted=[{...lines[0],quantityMilli}],work=[{data:{quoteLineId:'labor',hoursMilli,hourlyCostMinor,done:'Actual work'}}],wor=workChildren(base,mapping,'405',quoted,[],work)[0].payload,sos=completionSos(base,mapping,'405',quoted);
+  assert.equal(wor.custrecord152,hoursMilli/1000);assert.equal(wor.custrecord156,hoursMilli/1000);assert.ok(Math.abs(wor.custrecord157-hourlyCostMinor/100)<1e-9);assert.equal(sos.item.items.at(-1).quantity,quantityMilli/1000);assert.equal(sos.item.items.at(-1).rate,100);
+ }),{seed:20261029,numRuns:200});
+});
+test('manual WOR sends actual workforce only; separate SOS posts quote and verifies reciprocal links',async()=>{
+ const b=boundary(),job=structuredClone(base),remember=async data=>Object.assign(job.data,data),work=[{id:'inspection',phase:'inspection',created_at:'2026-10-29',actor:'technician:a',data:{technician:'Alex',hoursMilli:500,hourlyCostMinor:3000,done:'Inspected'}},{id:'repair',phase:'repair',created_at:'2026-10-29',actor:'technician:a',data:{technician:'Alex',hoursMilli:3250,hourlyCostMinor:4500,quoteLineId:'labor',done:'Repair complete'}}];
+ await b.adapter.postWor(job,mapping,lines,[],work,remember);assert.ok(b.writes.every(w=>w.type!=='salesOrder'&&w.type!=='vendorBill'));const actual=b.writes.filter(w=>w.type==='customrecord246'&&w.body.externalId?.endsWith('-repair'));assert.equal(actual[0].body.custrecord152,3.25);assert.equal(actual[0].body.custrecord156,3.25);assert.equal(actual[0].body.custrecord157,45);assert.equal(actual[0].body.custrecord154,true);assert.equal(b.records.get(`customrecord_mbr_work_order:${job.data.worId}`).custrecord_wo_status.id,'4');
+ job.data.worPostedAt='2026-10-29';const sos=await b.adapter.postSos(job,mapping,lines,remember);assert.equal(b.records.get(`salesOrder:${sos.sosId}`).custbody14.id,job.data.worId);assert.equal(b.records.get(`customrecord_mbr_work_order:${job.data.worId}`).custrecord_wo_so.id,sos.sosId);assert.equal(b.records.get(`salesOrder:${sos.sosId}`).item.items.at(-1).quantity,1);assert.equal(b.records.get(`salesOrder:${sos.sosId}`).item.items.at(-1).rate,100);assert.equal([...b.records.values()].filter(v=>v.type==='customrecord_mbr_work_order').length,1);assert.equal([...b.records.values()].filter(v=>v.type==='salesOrder').length,1);
+ await b.adapter.postSos(job,mapping,lines,remember);assert.equal([...b.records.values()].filter(v=>v.type==='salesOrder').length,1);
+});
+test('manual SOS refuses changed accounting identity before any remote write',async()=>{
+ const b=boundary(),job=structuredClone(base);job.data.worId='405';job.data.worPostedAt='2026-10-29';b.records.set('customrecord_mbr_work_order:405',{id:'405',custrecord_wo_vehicle:{id:'99'},custrecord_wo_customer:{id:'7000'}});await assert.rejects(b.adapter.postSos(job,mapping,lines,async()=>{}),/identity|reconcile/i);assert.deepEqual(b.writes,[]);
+});

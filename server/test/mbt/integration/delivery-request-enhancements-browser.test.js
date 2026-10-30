@@ -41,7 +41,7 @@ before(async()=>{
       return servePreview(req,res);
     }
     if(req.path==='/quotes'){return res.status(201).json({...quote,pricing:req.body});}
-    if(req.path.endsWith('/read')){return res.json({readRevision:req.body.revision});}
+    if(req.path.endsWith('/read')){if(row && req.body.revision>=row.revision)row.unreadMessageCount=0;return res.json({readRevision:req.body.revision});}
     if(req.path==='/') {
       if(req.method==='POST'){row={...request(),...req.body,quote,estimateRef:String(req.body.estimateRef || '').trim().toUpperCase(),history:[],conversation:[]};return res.status(201).json(row);}
       return res.json({requests:row?[row]:[]});
@@ -137,6 +137,29 @@ test('conversation follows Remarks, displays both teams and sends replies withou
       await page.screenshot({path:`test-artifacts/delivery-requests-ui/conversation-${audience}.png`,fullPage:true});
     } finally {await context.close();}
   }
+});
+for(const audience of ['sales','dispatch'])test(`unread delivery badge for ${audience} updates and clears after opening on desktop and mobile`,async()=>{
+  row={...request(),quote,history:[],conversation:[],unreadMessageCount:12};
+  const context=await browser.newContext({viewport:{width:1440,height:900},serviceWorkers:'block'});
+  await context.addInitScript(token=>{localStorage.setItem('mbbs.staff.token',token);window.streams=[];window.EventSource=class extends EventTarget{constructor(){super();window.streams.push(this);}close(){}};},`${audience}-token`);
+  const page=await context.newPage();try {
+    await page.goto(`${base}/${audience}/delivery-requests`);
+    const card=page.locator('[data-list] [data-id="1"]'),badge=card.locator('[data-request-unread-badge]');
+    await expect(badge).toHaveText('12');await expect(badge).toHaveAttribute('aria-label','12 unread messages');
+    for(const width of [1440,390]) {
+      await page.setViewportSize({width,height:900});await card.scrollIntoViewIfNeeded();
+      const geometry=await card.evaluate(card=>{
+        const badge=card.querySelector('[data-request-unread-badge]'),b=badge.getBoundingClientRect(),c=card.getBoundingClientRect(),l=card.closest('.dr-list').getBoundingClientRect();
+        return {overlap:(c.right-b.left)*(b.bottom-c.top)/(b.width*b.height),visible:b.top>=l.top && b.right<=l.right};
+      });
+      assert.ok(Math.abs(geometry.overlap-.25)<.02,JSON.stringify(geometry));assert.equal(geometry.visible,true);
+    }
+    await page.screenshot({path:`test-artifacts/delivery-requests-ui/unread-badge-${audience}.png`,fullPage:true});
+    row.unreadMessageCount=13;row.revision++;
+    await page.evaluate(()=>{for(const stream of window.streams)stream.dispatchEvent(new MessageEvent('app-event',{data:JSON.stringify({type:'delivery.requests.updated'})}));});
+    await expect(badge).toHaveText('13');await card.click();await expect(badge).toHaveCount(0);
+    assert.ok(calls.some(call=>call.path==='/1/read'&&call.body.revision===row.revision));
+  } finally {await context.close();}
 });
 test('failed replies retain text and a retry uses the same operation ID',async()=>{
   row={...request(),quote,history:[],conversation:[]};const {page,context}=await pageFor();

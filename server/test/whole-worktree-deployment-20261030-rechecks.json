@@ -1,0 +1,165 @@
+{
+  "passed": false,
+  "sourceTreeHash": "afdef366cc2a6772a10a7d2960ec377d80e9cea8ad62904cb7ffe2104ea03b32",
+  "originalNewFailures": [
+    {
+      "file": "test/mbt/integration/backorder-po-routing.test.js",
+      "failures": [
+        "Backorder routing retries failures and ignores late responses after switching requests"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+      "failures": [
+        "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+      ]
+    }
+  ],
+  "rule": "Same failure reproduced on production source; passing retries alone are insufficient",
+  "rounds": [
+    {
+      "attempt": 1,
+      "candidate": {
+        "exitCode": 0,
+        "fileCount": 2,
+        "tests": 21,
+        "pass": 21,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": []
+      },
+      "baseline": {
+        "exitCode": 0,
+        "fileCount": 2,
+        "tests": 21,
+        "pass": 21,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": []
+      },
+      "unresolved": [
+        {
+          "file": "test/mbt/integration/backorder-po-routing.test.js",
+          "failures": [
+            "Backorder routing retries failures and ignores late responses after switching requests"
+          ]
+        },
+        {
+          "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+          "failures": [
+            "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+          ]
+        }
+      ]
+    },
+    {
+      "attempt": 2,
+      "candidate": {
+        "exitCode": 0,
+        "fileCount": 2,
+        "tests": 21,
+        "pass": 21,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": []
+      },
+      "baseline": {
+        "exitCode": 0,
+        "fileCount": 2,
+        "tests": 21,
+        "pass": 21,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": []
+      },
+      "unresolved": [
+        {
+          "file": "test/mbt/integration/backorder-po-routing.test.js",
+          "failures": [
+            "Backorder routing retries failures and ignores late responses after switching requests"
+          ]
+        },
+        {
+          "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+          "failures": [
+            "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+          ]
+        }
+      ]
+    },
+    {
+      "attempt": 3,
+      "candidate": {
+        "exitCode": 0,
+        "fileCount": 2,
+        "tests": 21,
+        "pass": 21,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": []
+      },
+      "baseline": {
+        "exitCode": 1,
+        "fileCount": 2,
+        "tests": 22,
+        "pass": 21,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0,
+        "failedFiles": [
+          {
+            "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+            "failures": [
+              "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+            ],
+            "tests": 16,
+            "pass": 15,
+            "fail": 1,
+            "cancelled": 0,
+            "skipped": 0
+          }
+        ]
+      },
+      "unresolved": [
+        {
+          "file": "test/mbt/integration/backorder-po-routing.test.js",
+          "failures": [
+            "Backorder routing retries failures and ignores late responses after switching requests"
+          ]
+        }
+      ]
+    }
+  ],
+  "unresolved": [
+    {
+      "file": "test/mbt/integration/backorder-po-routing.test.js",
+      "failures": [
+        "Backorder routing retries failures and ignores late responses after switching requests"
+      ]
+    }
+  ],
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  },
+  "productionReproductions": [
+    {
+      "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+      "failures": [
+        "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+      ],
+      "testFileHash": "e86508ab5c6e0eef1f6ddeb8c57c2c8ff69f5fc8bc0db6522799c06b6f0d56c5",
+      "sourceTreeHash": "afdef366cc2a6772a10a7d2960ec377d80e9cea8ad62904cb7ffe2104ea03b32",
+      "evidence": "Observed in production-source paired replay with matching error signature"
+    }
+  ]
+}

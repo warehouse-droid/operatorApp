@@ -1,0 +1,53 @@
+{
+  "title": "MBT aggregate standard weight and configured item identity",
+  "date": "2026-10-23",
+  "validationPassed": true,
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); user supplied 2600 lb per yard. This is not independently approved specification evidence.",
+  "command": "bash docker/run-mbt-aggregate-checks.sh",
+  "sourceHashes": {
+    "src/mbt/aggregate-density.js": "1aad0bc65b46b92ec7b1b30086f8fe3f37dc0dafc93b8b33c69cdce38195d654",
+    "src/mbt/customer-charge-calculator.js": "dd82f833758a36f4da9893d96401869d669a3706a62a0787eec84c1fcc65057f",
+    "src/mbt/customer-charge-request-service.js": "7e6c91d103ed53d3b7dee392e6e652a491e0b65d9c30c0f313123aece8e059e5",
+    "src/mbt/local-master-data-service.js": "1187f35025419d42b2e837d8dcca03924bb52af5e84655af8bd0a3d48719c932",
+    "src/mbt/local-item-settings-repository.js": "fd0d15f6e3062e4ac64eb6d66ba68a4298f013081f330e0fdb2a858dff3ec268",
+    "public/mbt-config.html": "caabb245b4f0c09cda34f3a01ca7a0aca5f02b6494971d1e41a5476187bed81c",
+    "public/mbt-shell.js": "4afe9b14e84ea3422b6f124c2b94ce01f20b691bc8d760c393f990183b263542"
+  },
+  "toolchain": {"node": "20.20.2", "typescript": "7.0.2", "eslint": "10.8.0", "c8": "12.0.0", "fast-check": "4.9.0", "playwright": "1.62.1"},
+  "finalRun": {
+    "affectedSuites": {"passed": 172, "failed": 0, "skipped": 0},
+    "instrumentedRuntimeTests": {"passed": 159, "failed": 0},
+    "reverseOrderUnitAndPropertyTests": {"passed": 122, "failed": 0},
+    "browser": {"chromiumDesktopPassed": 1, "failed": 0},
+    "syntax": "passed for all changed JavaScript runtime files",
+    "lint": "0 errors, 0 warnings in changed backend source and new test tooling",
+    "types": "0 errors in changed backend modules and their checked dependencies",
+    "changedBackendLineCoverage": {"covered": 19, "total": 19, "uncovered": []},
+    "manualMutations": {"killed": 5, "total": 5, "cases": ["wrong standard density", "old AGG_ prefix restriction", "missing length bound", "duplicate identity accepted", "historical density overwritten"]},
+    "arithmeticProperty": {"examples": 100, "seed": 2600},
+    "propertyOnlyMutations": {"killed": ["old AGG_ prefix restriction"], "survived": ["wrong standard density", "missing length bound", "duplicate identity accepted", "historical density overwritten"], "interpretation": "The arithmetic property alone does not cover normalization or invalid inputs; dedicated regression tests kill those four mutants."},
+    "hostBudgetChecks": {"passed": 6},
+    "cleanup": "Compose down --volumes --remove-orphans completed; both docker ps and docker ps -a contained only the four production containers; health passed; temporary artifacts and task-specific check images removed."
+  },
+  "specMapping": {
+    "automatic standard density": "unit/aggregate-standard.test.js: aggregate density is automatic for missing, null, and historical values",
+    "existing configuration and new dispatch weight": "integration/customer-charge-request-workflow.test.js: configured local Gravel uses standard weight and requires an active material price",
+    "automatic form value": "e2e/p3-config-friendly-editor.spec.js: item-owned setup creates per-yard aggregate and changes a dump item to fixed per bin",
+    "configured item identity and hostile input": "unit/aggregate-standard.test.js: configured GRAVEL calculates CAD 120 and 5200 lb for two cubic yards; aggregate identities reject punctuation, oversized codes, and duplicates",
+    "missing rate rejection and snapshot preservation": "integration/customer-charge-request-workflow.test.js: configured local Gravel uses standard weight and requires an active material price",
+    "financial and historical invariants": "customer-charge calculator boundary/property and workflow suites; aggregate-standard.test.js historical replay case"
+  },
+  "limits": [
+    "The whole application's unrelated test suites were not rerun; all 21 affected aggregate/customer-charge/local-item/local-master test files were run.",
+    "Changed backend line coverage is measured; changed branch coverage is not separately extracted. Browser behavior covers the small UI edit.",
+    "No dependencies changed, so a new dependency vulnerability/license audit was not run. Runtime diff review found no new network, filesystem, subprocess, or secret access.",
+    "No database migration or concurrency mechanism changed; migration rollback/stress testing was not applicable. Historical persisted charge snapshots are not rewritten.",
+    "Browser validation covers Chromium desktop; other browser engines were not rerun."
+  ],
+  "honestNotes": [
+    "RED observed seven intended behavior failures; an additional historical-replay fixture used an invalid distance range and was corrected before implementation validation.",
+    "An initial check caught and fixed a variable-shadowing lint issue in the check runner.",
+    "An intermediate V8 coverage run stalled after UI source-text assertions passed, then could not write its removed artifact path. Direct execution passed. The final run retained all tests, collected coverage from runtime suites, and used a unique retention-managed directory under /tmp."
+  ]
+}

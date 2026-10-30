@@ -371,6 +371,22 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
        SELECT DISTINCT lower(btrim(value))
          FROM unnest($1::text[]) input(value)
         WHERE btrim(value) <> ''
+     ), reconciliation_projection AS MATERIALIZED (
+       SELECT state.id, state.application_status, state.reconciliation_status,
+              state.reconciled_at, lower(btrim(state.source_order_ref)) AS order_key,
+              NULL::text AS target_application_status, false AS matched
+         FROM scm_reconciliation_order_state state
+        WHERE state.order_kind = 'PO'
+       UNION ALL
+       SELECT state.id, state.application_status, state.reconciliation_status,
+              state.reconciled_at, lower(btrim(entry.key)),
+              entry.value->>'applicationStatus', true
+         FROM scm_reconciliation_order_state state
+         CROSS JOIN LATERAL jsonb_each(
+           CASE WHEN jsonb_typeof(state.quantity_summary->'targets') = 'object'
+             THEN state.quantity_summary->'targets' ELSE '{}'::jsonb END
+         ) entry
+        WHERE state.order_kind = 'PO'
      )
      SELECT requested.order_key,
             purchase.initial_scm_status AS source_initial_status,
@@ -423,11 +439,11 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
                 COALESCE(NULLIF(btrim(candidate.dispatch_ref), ''), candidate.tranid) AS schedule_ref,
                 candidate.memo, candidate.netsuite_note, candidate.dispatch_instructions
            FROM purchase_orders candidate
-          WHERE upper(btrim(candidate.tranid)) = upper(requested.order_key)
-             OR upper(btrim(COALESCE(candidate.dispatch_ref, ''))) = upper(requested.order_key)
+          WHERE lower(btrim(candidate.tranid)) = requested.order_key
+             OR lower(btrim(candidate.dispatch_ref)) = requested.order_key
           ORDER BY candidate.netsuite_active DESC,
                    CASE
-                     WHEN upper(btrim(candidate.tranid)) = upper(requested.order_key) THEN 0
+                     WHEN lower(btrim(candidate.tranid)) = requested.order_key THEN 0
                      ELSE 1
                    END,
                    candidate.synced_at DESC,
@@ -442,30 +458,16 @@ async function currentScmPurchaseOrderStatusEvidence(orderRefs = []) {
                 candidate.application_status,
                 candidate.reconciliation_status,
                 candidate.reconciled_at,
-                target.application_status AS target_application_status
-           FROM scm_reconciliation_order_state candidate
-           LEFT JOIN LATERAL (
-             SELECT entry.value->>'applicationStatus' AS application_status,
-                    true AS matched
-               FROM jsonb_each(
-                 CASE
-                   WHEN jsonb_typeof(candidate.quantity_summary->'targets') = 'object'
-                     THEN candidate.quantity_summary->'targets'
-                   ELSE '{}'::jsonb
-                 END
-               ) entry
-              WHERE lower(btrim(entry.key)) = requested.order_key
-              LIMIT 1
-           ) target ON true
-          WHERE candidate.order_kind = 'PO'
-            AND (
+                CASE WHEN candidate.order_key = requested.order_key AND candidate.matched
+                  THEN candidate.target_application_status END AS target_application_status
+           FROM reconciliation_projection candidate
+          WHERE (
               candidate.id = schedule.reconciliation_order_state_id
-              OR lower(btrim(candidate.source_order_ref)) = requested.order_key
-              OR target.matched = true
+              OR candidate.order_key = requested.order_key
             )
           ORDER BY
             CASE WHEN candidate.id = schedule.reconciliation_order_state_id THEN 1 ELSE 0 END DESC,
-            CASE WHEN target.matched = true THEN 1 ELSE 0 END DESC,
+            CASE WHEN candidate.order_key = requested.order_key AND candidate.matched THEN 1 ELSE 0 END DESC,
             candidate.reconciled_at DESC NULLS LAST,
             candidate.id DESC
           LIMIT 1
@@ -871,42 +873,64 @@ export async function claimScmPurchaseOrderCatalogRefreshes({ limit = 25 } = {})
     `WITH candidates AS (
        SELECT id
          FROM scm_purchase_order_catalog_refresh_outbox
-        WHERE status IN ('pending', 'failed') AND available_at <= now()
+        WHERE (status IN ('pending', 'failed') AND available_at <= now())
+           OR (status = 'running' AND updated_at < now() - interval '5 minutes')
         ORDER BY id
         FOR UPDATE SKIP LOCKED
         LIMIT $1
      )
      UPDATE scm_purchase_order_catalog_refresh_outbox outbox
-        SET status = 'running', updated_at = now()
+        SET status = 'running', updated_at = clock_timestamp()
        FROM candidates
       WHERE outbox.id = candidates.id
-     RETURNING outbox.id::text, outbox.order_ref, outbox.source, outbox.attempts`,
+     RETURNING outbox.id::text, outbox.order_ref, outbox.source, outbox.attempts,
+               outbox.updated_at::text AS claim_token`,
     [safeLimit]
   );
   return result.rows.map((row) => ({
     id: row.id,
     orderRef: row.order_ref || "",
     source: row.source || "",
-    attempts: Number(row.attempts || 0)
+    attempts: Number(row.attempts || 0),
+    claimToken: row.claim_token
   }));
 }
 
-export async function completeScmPurchaseOrderCatalogRefresh(id) {
+/** @param {{id:string,claimToken?:string}} refresh @param {() => Promise<unknown>} operation */
+export async function processScmPurchaseOrderCatalogRefresh(refresh, operation) {
+  if (!refresh?.claimToken) return false;
+  return withTransaction(async () => {
+    const owned = await query(
+      `SELECT id FROM scm_purchase_order_catalog_refresh_outbox
+        WHERE id = $1 AND status = 'running' AND updated_at = $2::timestamptz
+        FOR UPDATE`,
+      [refresh.id, refresh.claimToken]
+    );
+    if (!owned.rowCount) return false;
+    await operation();
+    await completeScmPurchaseOrderCatalogRefresh(refresh.id, refresh.claimToken);
+    return true;
+  });
+}
+
+/** @param {string} id @param {string | undefined} claimToken */
+export async function completeScmPurchaseOrderCatalogRefresh(id, claimToken) {
   await query(
     `UPDATE scm_purchase_order_catalog_refresh_outbox
         SET status = 'complete', completed_at = now(), updated_at = now()
-      WHERE id = $1 AND status = 'running'`,
-    [id]
+      WHERE id = $1 AND status = 'running' AND updated_at = $2::timestamptz`,
+    [id, claimToken || null]
   );
 }
 
-export async function failScmPurchaseOrderCatalogRefresh(id, error) {
+/** @param {string} id @param {any} error @param {string | undefined} claimToken */
+export async function failScmPurchaseOrderCatalogRefresh(id, error, claimToken) {
   await query(
     `UPDATE scm_purchase_order_catalog_refresh_outbox
         SET status = 'failed', attempts = attempts + 1,
             available_at = now() + (LEAST(300, power(2, LEAST(attempts, 8)))::text || ' seconds')::interval,
             last_error = $2, updated_at = now()
-      WHERE id = $1 AND status = 'running'`,
-    [id, text(error?.message || error || "SCM purchase-order catalog refresh failed.").slice(0, 8_000)]
+      WHERE id = $1 AND status = 'running' AND updated_at = $3::timestamptz`,
+    [id, text(error?.message || error || "SCM purchase-order catalog refresh failed.").slice(0, 8_000), claimToken || null]
   );
 }

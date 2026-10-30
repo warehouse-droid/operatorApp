@@ -1,0 +1,31 @@
+{
+  "request": "Allow multiple Special Item requests to share existing Sales Orders and Purchase Orders.",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run; user authorized the behavior change)",
+  "behaviors": [
+    "Two or more Special cases can manually link the same SO, PO, or SO/PO pair, including through the existing Sales and SCM HTTP routes.",
+    "Concurrent links by different cases both succeed and preserve each case's own lines, revision, and link event.",
+    "A case cannot overwrite its existing SO or PO with a different order; stale revisions, order identity validation, role authorization, and yard scope remain enforced.",
+    "Order-operation IDs remain unique even though order references may be shared.",
+    "An SO or PO webhook updates every linked Special case in ascending request ID order, including status, revision, reconciliation event, audit result, and UI update notification.",
+    "A line-reconciliation problem in one linked case records attention for that case while other linked cases continue to reconcile.",
+    "Unmatched webhooks and single-case result fields remain compatible, and existing Backorder sharing behavior is preserved.",
+    "The migration preserves existing rows and audit records and replaces only order-owner uniqueness with non-unique lookup indexes. Transactional migration rollback is rehearsed."
+  ],
+  "failureModel": {
+    "partialOrStaleUpdates": "Multi-case webhook regression and attention isolation tests.",
+    "concurrentLinkConflictOrOverwrite": "Actual concurrent database transactions plus same-case stale-revision checks.",
+    "authorizationRegression": "Sales/SCM HTTP role and yard tests.",
+    "dataLossOrWrongIndexRemoved": "Migration row snapshots, index inspection, operation-ID collision checks, and rollback rehearsal.",
+    "silentUiStaleness": "Webhook audit and emitted-event assertions."
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "Keep the existing dirty worktree; capture task-local baseline files. No commits or changes to unrelated edits.",
+    "tools": "Existing Node test runner, fast-check, c8, ESLint, TypeScript, and an available cached test image.",
+    "tests": "Repository standard isolated Compose configuration under mbbs-tests.slice, bounded CPU/memory/PIDs/tmpfs, teardown registered before launch.",
+    "evidence": "Persist baseline, RED/GREEN logs, source hashes, final regression results, mutation checks, static checks, changed-line coverage, and cleanup verification.",
+    "release": "Prepare a scoped candidate on each current app/worker image, preserve runtime configuration and rollback artifacts, and verify the deployed source and health."
+  },
+  "limits": "No order creation, cancellation, quantities, pricing, or Dispatch allocation semantics are changed by this task."
+}

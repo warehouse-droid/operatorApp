@@ -1,3 +1,5 @@
+import {assertRepairPlanAvailable} from './repair/guards.js';
+import {assertTransportOrderOwnership} from "./mbt/bin-transport-ownership.js";
 import { overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed } from "./dispatch-fulfilled-so-repository.js";
 import { isSalesPackingReconciliationReview } from "./dispatch-fulfilled-so-policy.js";
 import { query, withTransaction } from "./db.js";
@@ -153,6 +155,8 @@ async function syncDispatchPlannerReadProjections(plan = {}) {
 }
 
 async function assertActiveDispatchFleetAssignments(plan = {}, { previousPlan = null } = {}) {
+  await assertRepairPlanAvailable(plan);
+  await assertTransportOrderOwnership(previousPlan || {},plan);
   const driverResult = await query("SELECT id::text, name, login, active FROM dispatch_drivers ORDER BY id");
   const truckResult = await query("SELECT id::text, plate, active FROM dispatch_trucks ORDER BY id");
   let allowedInactiveLoadIds = new Set();

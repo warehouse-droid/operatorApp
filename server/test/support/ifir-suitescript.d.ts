@@ -28,6 +28,7 @@ interface IFIRSelection {
 }
 interface IFIRRequest {
   action: 'post';
+  quantityPolicy?: 'sqft_remaining_v1';
   sourceOrderKind: 'PO' | 'SO' | 'TO';
   transactionType: 'IF' | 'IR';
   sourceNetSuiteId: number;

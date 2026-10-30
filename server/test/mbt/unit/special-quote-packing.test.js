@@ -20,13 +20,15 @@ for(const draft of [true,false])test(`${draft?'draft':'saved'} special quote car
  assert.doesNotMatch(text,/PRIVATE|987654/);assert.equal(pdfPages(buffer).length,1);
  if(process.env.SPECIAL_PACK_OUTPUT){mkdirSync(process.env.SPECIAL_PACK_OUTPUT,{recursive:true});writeFileSync(`${process.env.SPECIAL_PACK_OUTPUT}/${draft?'draft':'saved'}-quote.pdf`,buffer);}
 });
-test('saved quotes retain ancillary packing and render missing or zero pack quantities blank',()=>{
+test('saved quotes retain ancillary packing and render missing or zero pack quantities blank',async()=>{
  const input=detail();input.lines[0].palletQty=0;input.lines[0].layerQty=null;delete input.lines[0].sectionQty;
  input.salesOrderLines=[{caseLineId:10,description:'Reviewed stone'},
   {ancillary:true,description:'PALLET',quantity:2,uom:'EACH',rate:40,pieceQty:2}];
  const quote=buildSpecialQuote(input,profile);
  assert.deepEqual(quote.snapshot.lines[0].packQuantities,{palletQty:null,layerQty:null,sectionQty:null,pieceQty:6});
  assert.deepEqual(quote.snapshot.lines[1].packQuantities,{palletQty:null,layerQty:null,sectionQty:null,pieceQty:2});
+ const text=pdfText(await quotePdf(quote));
+ assert(text.includes('$1,040.0062EACHPALLET$40.00$80.002Subtotal before discount'));
  const legacy=detail();delete legacy.lines[0].originalRate;
  for(const key of Object.keys(packs))delete legacy.lines[0][key];
  legacy.salesOrderLines=[{caseLineId:10,quantity:2,uom:'PLT',rate:520,...packs}];

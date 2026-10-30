@@ -1,9 +1,8 @@
 import { specialSalesReps } from './special-stock-sales-reps.js';
-import { specialOrderDiscountTotal } from './special-stock-discount-total.js';
 import { config as applicationConfig } from "./config.js";
 import {
   resolveSpecialOrderUnitsFromNetSuite,
-  synchronizeSpecialSalesDescriptionsInNetSuite,
+  resolveSpecialPurchaseUnitsFromNetSuite,
   createPurchaseOrderInNetSuite,
   findSpecialLinkedPurchaseOrderInNetSuite,
   finalizeSpecialLinkedPurchaseOrderInNetSuite,
@@ -25,7 +24,6 @@ import {
 import {
   markSpecialOrderSubmitted,
   prepareSpecialPurchaseOrder,
-  recordSpecialSalesDescriptionsSynced,
   claimSpecialOrderOperation,
   failSpecialOrderOperation,
   getSpecialStockCase,
@@ -113,9 +111,8 @@ export function createSpecialStockRequestService(dependencies = {}) {
   const deps = {
     markSubmitted: markSpecialOrderSubmitted,
     preparePurchaseOrder: prepareSpecialPurchaseOrder,
-    synchronizeSalesDescriptions: synchronizeSpecialSalesDescriptionsInNetSuite,
-    recordDescriptionSync: recordSpecialSalesDescriptionsSynced,
     resolveOrderUnits: resolveSpecialOrderUnitsFromNetSuite,
+    resolvePurchaseUnits: dependencies.resolveOrderUnits || resolveSpecialPurchaseUnitsFromNetSuite,
     getCase: getSpecialStockCase,
     claimOperation: claimSpecialOrderOperation,
     linkSalesOrder: linkSpecialSalesOrder,
@@ -268,9 +265,20 @@ export function createSpecialStockRequestService(dependencies = {}) {
     try {
       const before = await deps.getCase(caseId, { audience: 'scm' });
       assertSpecialStockRemoteOrderAllowed(before);
+      if (Array.isArray(input.lines) && !before.purchaseOrderSubmissionStartedAt) {
+        if (!Array.isArray(input.extraLines ?? []) || (input.extraLines || []).length > 100 || input.lines.length > 100) {
+          throw serviceError('Review at most 100 materials and 100 added PO items.', 'SPECIAL_PO_LINES_INVALID', 400);
+        }
+        const resolved = await deps.resolvePurchaseUnits([
+          ...input.lines.map(line => ({...line,itemId:2055})), ...(input.extraLines || [])
+        ]);
+        input = {...input,lines:resolved.slice(0,input.lines.length),extraLines:resolved.slice(input.lines.length)};
+      }
       const prepared = Array.isArray(input.lines) && !before.purchaseOrderSubmissionStartedAt
         ? await deps.preparePurchaseOrder(caseId, input, context) : before;
-      const independentPurchase = prepared.salesOrderSource === 'manual_link' || Boolean(prepared.localAdjustedAt);
+      // Only an already-submitted legacy operation may recover a native link.
+      const independentPurchase = !prepared.purchaseOrderSubmissionStartedAt || prepared.purchaseOrderCustomLinkage || prepared.vendorDiscountReview?.independent
+        || prepared.salesOrderSource === 'manual_link' || Boolean(prepared.localAdjustedAt);
       if (!prepared.purchaseOrderSubmissionStartedAt && prepared.vendorDiscountReview?.mode !== 'per_line') {
         throw serviceError('SCM must confirm a vendor discount percentage for every material, including 0, before PO creation.', 'SPECIAL_VENDOR_DISCOUNT_REQUIRED', 400);
       }
@@ -279,38 +287,20 @@ export function createSpecialStockRequestService(dependencies = {}) {
         orderKind: "purchase_order",
         operationId
       }, context);
-      const changes = (claimed.salesOrderId && !independentPurchase && !claimed.localAdjustedAt ? claimed.purchaseOrderLines || [] : []).flatMap(line => {
-        const sales = (claimed.salesOrderLines || []).find(candidate => candidate.caseLineId === line.caseLineId && !candidate.ancillary);
-        if (!sales || (sales.description === line.description && Number(sales.quantity) === Number(line.quantity) && sales.uom === line.uom)) return [];
-        if (!sales.remoteLineId) throw serviceError('Wait for the exact SO lines to synchronize before applying the SCM review.', 'SPECIAL_SO_LINES_NOT_READY');
-        return [{ ...sales, previousDescription: sales.description, previousQuantity: sales.quantity, previousUom: sales.uom,
-          description: line.description, quantity: line.quantity, uom: line.uom }];
-      });
-      if (changes.length) {
-        const previous = await deps.resolveOrderUnits(changes.map(line => ({ ...line, uom: line.previousUom })));
-        const resolved = (await deps.resolveOrderUnits(changes)).map((line, index) => ({ ...line, previousUnitId: previous[index].unitId }));
-        const materials = claimed.salesOrderLines.filter(line => !line.ancillary);
-        const discountTotal = claimed.salesDiscountMode === 'total' ? {
-          before: specialOrderDiscountTotal(materials),
-          after: specialOrderDiscountTotal(materials.map(line => ({ ...line, ...(resolved.find(change => change.caseLineId === line.caseLineId) || {}) })))
-        } : undefined;
-        await deps.synchronizeSalesDescriptions({ salesOrderId: claimed.salesOrderId, vendorId: claimed.vendorId, changes: resolved, discountTotal });
-        claimed = await deps.recordDescriptionSync(caseId, { expectedRevision: claimed.revision, operationId, changes: resolved }, context);
-      }
       const location = await resolvedLocation(claimed);
       /** @type {{salesOrderId:number|null,salesOrderLines:any[],purchaseOrderLines:any[],payload:Record<string,any>}|undefined} */
       let remoteInput;
       const prepareRemoteInput = async () => {
         if (!remoteInput) {
           const salesOrderRef = String(claimed.salesOrderRef || '').trim()
-            || (claimed.salesOrderId && !independentPurchase ? String((await deps.fetchSalesOrderReference(claimed.salesOrderId))?.tranid || '').trim() : '');
+            || (claimed.salesOrderId ? String((await deps.fetchSalesOrderReference(claimed.salesOrderId))?.tranid || '').trim() : '');
           if (claimed.salesOrderId && !salesOrderRef) throw serviceError(
             'The Sales Order number could not be hydrated from NetSuite.', 'SPECIAL_REMOTE_HYDRATION_FAILED', 502);
           remoteInput = { salesOrderId: claimed.salesOrderId, salesOrderLines: claimed.salesOrderLines,
             purchaseOrderLines: claimed.purchaseOrderLines,
             payload: buildSpecialPurchaseOrderPayload({ caseId: claimed.id, vendorId: claimed.vendorId, salesOrderRef, remarks: claimed.remarks,
               netsuiteLocationId: location.netsuiteLocationId, subsidiaryId: location.subsidiaryId || deps.config.subsidiaryId,
-              lines: await deps.resolveOrderUnits(claimed.purchaseOrderLines || []), vendorDiscountReview: claimed.vendorDiscountReview }) };
+              lines: await deps.resolvePurchaseUnits(claimed.purchaseOrderLines || []), vendorDiscountReview: claimed.vendorDiscountReview }) };
         }
         return remoteInput;
       };

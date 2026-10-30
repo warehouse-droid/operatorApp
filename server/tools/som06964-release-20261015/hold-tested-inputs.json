@@ -1,0 +1,4 @@
+{
+  "migrations/292_sales_order_line_sync_holds.sql": "68b1b1b90010cb9be2ae7eb1a3958e79a672f81d0673ce487e687010fb97ae3a",
+  "test/dispatch/integration/sales-line-sync-hold.test.js": "8c7b87f9591013a38aea2415da2a2fc444e439c0c53f4a96c8fe535cf9b39646"
+}

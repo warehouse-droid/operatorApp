@@ -1,0 +1,19 @@
+{
+  "feature": "Operator stock and pallet return customer email/SMS",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "setup": {"dependencies": "Existing Node, nodemailer, fast-check, c8, ESLint and TypeScript only; no installs or lockfile changes.", "git": "Preserve existing edits; no commits or resets.", "tests": "Repository disposable runner, bounded mbbs-tests.slice containers, synthetic credentials and mocked delivery; teardown and artifact removal on all exits."},
+  "scenarios": [
+    "N1: One recipient field on stock/pallet/combined confirmation and return history detects one email address or phone number; US/Canadian 10-digit numbers normalize to +1, international numbers require +country code.",
+    "N2: Only saved, non-voided returns with succeeded/manual_linked NetSuite status, transaction ID, and real reference permit sending. Pending, failed, local-only and missing-reference records cannot send.",
+    "N3: Server builds the message from the saved batch, preserving exact CMB/CM/RA numbers, deduplicating a shared transaction. No amounts, secrets, client-supplied message or invented reference.",
+    "N4: Authenticated operators can notify only their own return in an assigned yard; admin settings require admin authority.",
+    "N5: Admin Return settings accept a write-only Telnyx API key and sender number; blank key keeps the old key, explicit removal deletes it. Encryption at rest, restricted files, no key in responses/errors/browser storage.",
+    "N6: SMS uses Telnyx HTTPS v2 messages with Bearer authentication; email uses existing SMTP/TLS. Missing configuration produces an actionable error before reserving a send.",
+    "N7: Durable batch/reference/recipient deduplication prevents repeated clicks, concurrent requests, combined-return duplicates and refresh retries. Definitive provider refusals allow explicit retry; ambiguous network outcomes never retry automatically.",
+    "N8: Provider acceptance is reported as sent to the service, not customer delivery. Failures remain separate from the saved return and never trigger NetSuite posting.",
+    "N9: Reject multiple recipients, header injection, malformed phones and oversized input. At most 10 send attempts per batch per day.",
+    "N10: Existing return posting and financial data stay unchanged; no live customer messages are sent during development."
+  ],
+  "failureModel": {"credentialDisclosure": "encrypted persistence, response/error assertions, secret scan", "wrongCustomerOrReference": "ownership/yard HTTP tests and saved-reference tests", "duplicatePaidMessages": "database concurrency and replay tests", "uncertainProviderResponse": "transport timeout/rejection tests and durable uncertain status", "returnRegression": "existing return unit/integration suites", "hostImpact": "standard disposable runner and cleanup verification"}
+}

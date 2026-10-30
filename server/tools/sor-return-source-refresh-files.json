@@ -1,0 +1,7 @@
+[
+  "src/sor-rental-repository.js",
+  "src/sor-rental-service.js",
+  "src/dispatch-custom-order-repository.js",
+  "src/sor-return-source.js",
+  "src/sor-return-projection-repository.js"
+]

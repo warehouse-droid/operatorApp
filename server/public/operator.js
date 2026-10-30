@@ -24,6 +24,7 @@ const RETURN_ORDER_PREFIX_YARDS = Object.freeze({
 });
 
 const app = document.getElementById("app");
+window.MBBSReturnNotifications?.configure({ request: api, render, escapeHtml });
 const toast = document.getElementById("toast");
 const t = (key, fallback) => window.MBBS_I18N?.t(key, fallback) || fallback;
 const tf = (key, fallback, variables = {}) => window.MBBS_I18N?.format(key, fallback, variables) || fallback;
@@ -49,6 +50,7 @@ const RESTORABLE_MODULES = new Set([
   "return-select",
   "pallet-return",
   "stock-return",
+  "stock-exchange",
   "inventory",
   "cycle-count",
   "damage",
@@ -228,7 +230,7 @@ let pickupScanCandidate = "";
 let pickupScanCandidateHits = 0;
 let pickupScanCandidateAt = 0;
 
-let returnMode = initialOperatorState.returnMode === "stock" || currentModule === "stock-return" ? "stock"
+let returnMode = initialOperatorState.returnMode === "stock" || currentModule === "stock-return" || currentModule === "stock-exchange" ? "stock"
   : initialOperatorState.returnMode === "pallet" || currentModule === "pallet-return" ? "pallet"
     : "";
 let returnStage = ["lookup", "form", "review", "success"].includes(initialOperatorState.returnStage)
@@ -237,7 +239,7 @@ let returnStage = ["lookup", "form", "review", "success"].includes(initialOperat
 let returnView = ["workflow", "drafts", "history"].includes(initialOperatorState.returnView)
   ? initialOperatorState.returnView
   : "workflow";
-let returnType = initialOperatorState.returnType === "quality" ? "quality" : "normal";
+let returnType = currentModule === "stock-exchange" || initialOperatorState.returnType === "quality" ? "quality" : "normal";
 let returnLookupCode = String(initialOperatorState.returnLookupCode || "");
 let returnLookupMessage = "";
 let returnLookupData = null;
@@ -296,6 +298,7 @@ let returnBusy = false;
 let returnDirty = false;
 let returnResult = null;
 let returnValidationMessage = "";
+let returnDismissedInlineWarning = "";
 let returnPostingPolicies = {};
 let returnPostingError = "";
 let returnPostingLoading = false;
@@ -367,6 +370,12 @@ let pendingOperatorRequestAlert = false;
 const localDeliveryMutationRefs = new Map();
 let deliveryNotificationState = new Map();
 let deliveryNotificationStateReady = false;
+let deliveryNotificationScope = "";
+const deliveryPopupVersions = new Map();
+const deliveryPopupAudit = window.MBBSOperatorPopupAudit.create({
+  request: sendDeliveryPopupAudit,
+  context: () => ({ actorId: operator?.id || "", session: operatorSessionKey, locationId })
+});
 let cameraFacingMode = localStorage.getItem(CAMERA_FACING_KEY) === "user" ? "user" : "environment";
 if (currentModule === "customer-pickup-scan") {
   cameraFacingMode = "environment";
@@ -396,7 +405,7 @@ function operatorPhotoCameraContext(includeHidden = false) {
   }
   if (returnModuleActive() && returnView === "workflow" && returnStage === "review" && !returnBusy
       && app.querySelector('[data-action="return-start-camera"]')) {
-    return { kind: "return", key: `${currentModule}:${returnIdempotencyKey}`, automatic: true };
+    return { kind: "return", key: `${currentModule}:${returnIdempotencyKey}`, automatic: returnMode !== "pallet" };
   }
   return null;
 }
@@ -1128,6 +1137,7 @@ function connectEvents() {
     const deliveryEvents = [
       "dispatch.plan.saved",
       "dispatch.plan.confirmed",
+      "dispatch.plan.followups.completed",
       "dispatch.operator_request.created",
       "delivery.order.updated",
       "delivery.line.confirmed",
@@ -1485,7 +1495,7 @@ function changedDeliveryNotificationItems(items) {
   return items.filter((item) => {
     const base = deliveryNotificationBaseKey(item);
     const key = deliveryNotificationKey(item);
-    if (!base || base.endsWith(":") || !key || key.endsWith(":")) return false;
+    if (!base || base.endsWith(":") || !key) return false;
     const previous = deliveryNotificationState.get(base);
     if (!previous) return deliveryNotificationStateReady && Boolean(item?.dispatchPlanned);
     return previous !== key;
@@ -1505,6 +1515,10 @@ function urgentDeliveryBody(items = []) {
 }
 
 function playDeliveryDing() {
+  if (window.MBBSOSNotifications) {
+    void window.MBBSOSNotifications.playSound();
+    return;
+  }
   try {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) return;
@@ -1569,6 +1583,13 @@ async function showBrowserDeliveryNotification(items) {
 
 function showUrgentDeliveryAlert(items) {
   if (!items.length) return;
+  items = items.filter((item) => deliveryPopupVersions.get(deliveryNotificationBaseKey(item)) !== deliveryNotificationKey(item));
+  if (!items.length) return;
+  items = items.map((item) => ({ ...item, popupId: crypto.randomUUID(), popupScope: deliveryPopupAudit.scope(), notificationKey: deliveryNotificationKey(item) }));
+  for (const item of items) {
+    deliveryPopupVersions.set(deliveryNotificationBaseKey(item), item.notificationKey);
+    if (deliveryPopupVersions.size > 500) deliveryPopupVersions.delete(deliveryPopupVersions.keys().next().value);
+  }
   const existingItems = urgentDeliveryAlert?.items || [];
   const merged = [...items, ...existingItems].reduce((list, item) => {
     const key = deliveryNotificationBaseKey(item);
@@ -1581,11 +1602,34 @@ function showUrgentDeliveryAlert(items) {
     createdAt: urgentDeliveryAlert?.createdAt || Date.now(),
     updatedAt: Date.now()
   };
-  playDeliveryDing();
-  if (document.visibilityState !== "visible") {
-    showBrowserDeliveryNotification(items).catch(() => {});
+  deliveryPopupAudit.record("queued", items, document.visibilityState);
+  if (window.MBBSOSNotifications) {
+    void window.MBBSOSNotifications.notify({
+      id: `operator-delivery:${locationId}:${deliveryNotificationKey(items[0])}`,
+      title: urgentDeliveryTitle(items), body: urgentDeliveryBody(items), url: "/operator",
+      desktop: document.visibilityState !== "visible"
+    });
+  } else {
+    playDeliveryDing();
+    if (document.visibilityState !== "visible") {
+      showBrowserDeliveryNotification(items).catch(() => {});
+    }
   }
   render();
+}
+
+async function sendDeliveryPopupAudit(body) {
+  const response = await fetch("/api/delivery/notification-events", {
+    method: "POST", cache: "no-store", signal: AbortSignal.timeout(5000),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) throw Object.assign(new Error("Popup audit request failed."), { status: response.status });
+}
+
+function recordVisibleDeliveryPopup() {
+  if (document.visibilityState !== "visible" || !app.querySelector(".urgent-delivery-alert")) return;
+  deliveryPopupAudit.record("displayed", (urgentDeliveryAlert?.items || []).slice(0, 3), "visible");
 }
 
 function renderUrgentDeliveryAlert() {
@@ -1771,13 +1815,15 @@ function salesQuantityLabel(line, fallback = "Qty") {
 
 function lineUnitsToSalesQty(line, values) {
   if (!lineHasConversion(line)) return qty(values.pieces) || qty(values.sections) || qty(values.layers) || qty(values.pallets);
-  return (qty(values.pallets) * qty(line.to_plt))
+  const converted = (qty(values.pallets) * qty(line.to_plt))
     + (qty(values.layers) * qty(line.to_lyr))
     + (qty(values.sections) * qty(line.to_sec))
     + (qty(values.pieces) * qty(line.to_pcs));
+  return operatorRoundedSalesQuantity(converted, line.unit);
 }
 
 function lineRequiredSalesQty(line) {
+  if (qty(line.original_quantity) > 0) return qty(line.quantity);
   return qty(line.quantity) || lineUnitsToSalesQty(line, {
     pallets: line.pallet_qty,
     layers: line.layer_qty,
@@ -1786,19 +1832,36 @@ function lineRequiredSalesQty(line) {
   });
 }
 
-const LOAD_SALES_QTY_TOLERANCE = 0.1;
+// Keep these pure helpers identical to src/operator-load-quantity.js.
+function operatorRoundedSalesQuantity(value, unit) {
+  return String(unit || '').trim().toUpperCase() === 'SQFT'
+    ? Math.round(value * 100) / 100 : value;
+}
 
-function wholeUnitsFromSalesQty(salesQuantity, conversion) {
+function operatorLoadedUnitCount(loaded, consumed, required, conversion, unit) {
+  if (![loaded, consumed, required, conversion].every(Number.isFinite)
+      || loaded <= 0 || required <= 0 || conversion <= 0) { return 0; }
+  const available = Math.max(0, loaded - consumed);
+  const lower = Math.min(required, Math.floor(available / conversion));
+  const upper = Math.min(required, Math.ceil(available / conversion));
+  const lowerSales = operatorRoundedSalesQuantity(consumed + lower * conversion, unit);
+  const upperSales = operatorRoundedSalesQuantity(consumed + upper * conversion, unit);
+  return upper > lower && upperSales > lowerSales
+    && upperSales === operatorRoundedSalesQuantity(loaded, unit) ? upper : lower;
+}
+
+function operatorPackUnitCapacity(required, consumed, conversion, unit) {
+  if (![required, consumed, conversion].every(Number.isFinite) || conversion <= 0
+      || operatorRoundedSalesQuantity(required, unit) <= operatorRoundedSalesQuantity(consumed, unit)) return 0;
+  return operatorLoadedUnitCount(required, consumed,
+    Math.ceil(Math.max(0, required - consumed) / conversion), conversion, unit);
+}
+
+function wholeUnitsFromSalesQty(salesQuantity, conversion, unit) {
   const sales = qty(salesQuantity);
   const unitSize = qty(conversion);
   if (!sales || !unitSize) return 0;
-  const rawUnits = sales / unitSize;
-  const floorUnits = Math.floor(rawUnits + 0.000001);
-  const ceilUnits = Math.ceil(rawUnits - 0.000001);
-  if (ceilUnits > floorUnits && Number(Math.abs((ceilUnits * unitSize) - sales).toFixed(6)) <= LOAD_SALES_QTY_TOLERANCE) {
-    return ceilUnits;
-  }
-  return floorUnits;
+  return operatorLoadedUnitCount(sales, 0, Math.ceil(sales / unitSize), unitSize, unit);
 }
 
 function unitConversion(line, unit) {
@@ -1823,7 +1886,7 @@ function unitRequiredLimit(line, unit) {
   if (!conversion) return 0;
   const explicit = explicitUnitQty(line, unit);
   if (explicit > 0) return explicit;
-  return !hasCustomPackQty(line) ? wholeUnitsFromSalesQty(lineRequiredSalesQty(line), conversion) : 0;
+  return !hasCustomPackQty(line) ? wholeUnitsFromSalesQty(lineRequiredSalesQty(line), conversion, line.unit) : 0;
 }
 
 function loadedUnits(line) {
@@ -1832,20 +1895,47 @@ function loadedUnits(line) {
   if (shouldUseSalesQuantity(line)) {
     return { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: loadedSales };
   }
-  let remainingLoaded = loadedSales;
-  const consume = (required, conversion) => {
-    if (!required || !conversion || remainingLoaded <= 0) return 0;
-    const value = Math.min(required, Math.floor((remainingLoaded / conversion) + 0.000001));
-    remainingLoaded = Math.max(0, remainingLoaded - (value * conversion));
-    return value;
+  const result = { pallets: 0, layers: 0, sections: 0, pieces: 0, sales: loadedSales };
+  let consumed = 0;
+  for (const unit of preferredPackUnits(line)) {
+    const conversion = unitConversion(line, unit);
+    result[unit] = operatorPackUnitCapacity(loadedSales, consumed, conversion, line.unit);
+    consumed += result[unit] * conversion;
+  }
+  return result;
+}
+
+function preferredPackUnits(line) {
+  return ["pallets", "layers", "sections", "pieces"].sort((a, b) =>
+    Number(explicitUnitQty(line, b) > 0) - Number(explicitUnitQty(line, a) > 0));
+}
+
+function packingLoadedSalesQty(line) {
+  const loaded = qty(line.loaded_qty), counts = loadedUnits(line);
+  const converted = ["pallets", "layers", "sections", "pieces"].reduce((sum, unit) =>
+    sum + counts[unit] * unitConversion(line, unit), 0);
+  return operatorRoundedSalesQuantity(converted, line.unit) === operatorRoundedSalesQuantity(loaded, line.unit)
+    ? converted : loaded;
+}
+
+function convertedRemainingPack(line) {
+  const units = preferredPackUnits(line);
+  const result = { pallets: 0, layers: 0, sections: 0, pieces: 0 };
+  const loaded = loadedUnits(line);
+  let consumed = packingLoadedSalesQty(line) + units.reduce((sum, unit) =>
+    sum + packedValue(line, unit) * unitConversion(line, unit), 0);
+  const add = (unit, requested) => {
+    const conversion = unitConversion(line, unit);
+    const count = Math.min(requested,
+      operatorPackUnitCapacity(lineRequiredSalesQty(line), consumed, conversion, line.unit));
+    result[unit] += count;
+    consumed += count * conversion;
   };
-  return {
-    pallets: consume(unitRequiredLimit(line, "pallets"), qty(line.to_plt)),
-    layers: consume(unitRequiredLimit(line, "layers"), qty(line.to_lyr)),
-    sections: consume(unitRequiredLimit(line, "sections"), qty(line.to_sec)),
-    pieces: consume(unitRequiredLimit(line, "pieces"), qty(line.to_pcs)),
-    sales: loadedSales
-  };
+  // Keep the ordered packing as the default where it still fits. A broken pallet
+  // can leave more loose units than were listed on the original order.
+  for (const unit of units) add(unit, Math.max(0, requiredValue(line, unit) - loaded[unit] - packedValue(line, unit)));
+  for (const unit of units) add(unit, Infinity);
+  return result;
 }
 
 function pickupLoadedUnits(line) {
@@ -1968,6 +2058,16 @@ function canMarkPacked(order = selectedOrder) {
 
 function hasRemainingQty(line) {
   if (line.no_yard_load_required) return false;
+  if (lineHasConversion(line)) {
+    if (Object.values(convertedRemainingPack(line)).some(value => value > 0)) return true;
+    const loaded = loadedUnits(line);
+    // A fully consumed physical order can differ at the half-cent SQFT boundary.
+    if (hasCustomPackQty(line) && ["pallets", "layers", "sections", "pieces"].every(unit =>
+      loaded[unit] + packedValue(line, unit) >= explicitUnitQty(line, unit))) return false;
+    const consumed = qty(line.loaded_qty) + ["pallets", "layers", "sections", "pieces"].reduce((sum, unit) =>
+      sum + packedValue(line, unit) * unitConversion(line, unit), 0);
+    return operatorRoundedSalesQuantity(lineRequiredSalesQty(line), line.unit) > operatorRoundedSalesQuantity(consumed, line.unit);
+  }
   if (shouldUseSalesQuantity(line)) return remainingValue(line, "sales") > 0;
   return remainingValue(line, "pallets") > 0
     || remainingValue(line, "sections") > 0
@@ -2014,6 +2114,11 @@ function deliveryLineUnits(line) {
     ].filter((unit) => requiredValue(line, unit.key) > 0 || packedValue(line, unit.key) > 0);
     return [...physical, { key: "sales", label: line.unit || "Sales Qty" }];
   }
+  if (lineHasConversion(line)) {
+    return [{ key: "pallets", label: "PLT" }, { key: "layers", label: "LYR" },
+      { key: "sections", label: "SEC" }, { key: "pieces", label: "PCS" }]
+      .filter(unit => unitConversion(line, unit.key) > 0 || packedValue(line, unit.key) > 0);
+  }
   const units = [];
   if (requiredValue(line, "pallets") > 0 || packedValue(line, "pallets") > 0) {
     units.push({ key: "pallets", label: "PLT" });
@@ -2039,9 +2144,8 @@ function packedValue(line, unit) {
 }
 
 function remainingValue(line, unit) {
+  if (lineHasConversion(line) && unit !== "sales") return convertedRemainingPack(line)[unit] || 0;
   const loaded = loadedValue(line, unit);
-  // Do not convert remaining pallets back into loose units that were already
-  // collected or confirmed. Each required unit has its own remaining balance.
   return Math.max(0, requiredValue(line, unit) - loaded - packedValue(line, unit));
 }
 
@@ -2059,8 +2163,16 @@ function panelValue(line, unit) {
   return viewMode === "packed" ? packedValue(line, unit) : remainingValue(line, unit);
 }
 
-function panelLimit(line, unit) {
+function panelLimit(line, unit, values = null) {
   if (currentModule === "receiving") return receivingRemainingValue(line, unit);
+  if (lineHasConversion(line) && unit !== "sales") {
+    const absolute = isCustomerPickupMode() || viewMode === "packed" || isActiveDraftPackedLine(line);
+    const units = ["pallets", "layers", "sections", "pieces"];
+    const saved = absolute ? 0 : units.reduce((sum, key) => sum + packedValue(line, key) * unitConversion(line, key), 0);
+    const others = units.reduce((sum, key) => sum + (key === unit ? 0 : qty(values?.[key] ?? panelValue(line, key))) * unitConversion(line, key), 0);
+    return operatorPackUnitCapacity(lineRequiredSalesQty(line), packingLoadedSalesQty(line) + saved + others,
+      unitConversion(line, unit), line.unit);
+  }
   if (isCustomerPickupMode()) return Math.max(0, requiredValue(line, unit) - pickupLoadedValue(line, unit));
   if (isActiveDraftPackedLine(line)) return activeDraftLimit(line, unit);
   return viewMode === "packed" ? requiredValue(line, unit) : remainingValue(line, unit);
@@ -2082,7 +2194,7 @@ function receivingRemainingValue(line, unit) {
     : unit === "pieces" ? qty(line.to_pcs)
     : 0;
   if (!conversion) return 0;
-  return Math.max(0, Math.min(required, wholeUnitsFromSalesQty(remainingSales, conversion)));
+  return Math.max(0, Math.min(required, wholeUnitsFromSalesQty(remainingSales, conversion, line.unit)));
 }
 
 function hasReceivingRemainingQty(line) {
@@ -2289,6 +2401,7 @@ function shell(title, subtitle, body, actions = "") {
   if (returnCameraActive) window.requestAnimationFrame(attachReturnCamera);
   syncOperatorPhotoCamera();
   hydrateSecurePhotoImages(app);
+  window.requestAnimationFrame(recordVisibleDeliveryPopup);
 }
 
 function renderLogin() {
@@ -2419,8 +2532,8 @@ async function restoreOperatorView() {
       await loadPersonalHistory();
       return;
     }
-    if (currentModule === "pallet-return" || currentModule === "stock-return") {
-      returnMode = currentModule === "stock-return" ? "stock" : "pallet";
+    if (currentModule === "pallet-return" || currentModule === "stock-return" || currentModule === "stock-exchange") {
+      returnMode = currentModule === "pallet-return" ? "pallet" : "stock";
       await loadReturnReasons().catch(() => {});
       if (returnDraftId) {
         await loadReturnDrafts({ renderAfter: false }).catch(() => {});
@@ -2544,7 +2657,7 @@ function render() {
   if (currentModule === "receiving") return renderReceiving();
   if (currentModule === "receiving-receipt") return renderReceiptScreen();
   if (currentModule === "return-select") return renderReturnSelect();
-  if (currentModule === "pallet-return" || currentModule === "stock-return") return renderReturnWorkflow();
+  if (currentModule === "pallet-return" || currentModule === "stock-return" || currentModule === "stock-exchange") return renderReturnWorkflow();
   if (currentModule === "personal-history") return renderPersonalHistory();
   if (currentModule === "delivery-fulfill") return renderFulfillmentScreen();
   if (currentModule === "customer-pickup-load") return renderFulfillmentScreen();
@@ -2590,6 +2703,7 @@ function renderMenu() {
       </button>
     </section>
   `, `
+    <button class="secondary-button" data-action="repair-requests" type="button">Repair requests</button>
     <button class="secondary-button display-settings-button" data-action="open-display-settings" type="button" aria-label="${t("operator.displaySettings", "Display and input settings")}" title="${t("operator.displaySettings", "Display and input settings")}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m9.5 3-.6 2-2 .9L5 5l-2 3.5 1.6 1.4-.1 2.2L3 13.5 5 17l2-.7 1.9 1.1.6 2.1h4l.6-2.1 1.9-1.1 2 .7 2-3.5-1.5-1.4-.1-2.2L20 8.5 18 5l-1.9.9-2-.9-.6-2z"/><circle cx="11.5" cy="11.3" r="3.2"/></svg>
     </button>
@@ -2638,6 +2752,10 @@ function renderReturnSelect() {
         <strong>${t("operator.stockReturn", "Stock Return")}</strong>
         <span>${t("operator.stockReturnDesc", "Return stock by sales order.")}</span>
       </button>
+      <button class="module-tile" data-action="open-module" data-module="stock-exchange" type="button" ${[1,28,26].includes(Number(locationId)) ? "" : "disabled"}>
+        <strong>${t("operator.stockExchange", "Stock exchange")}</strong>
+        <span>${t("operator.stockExchangeDesc", "Exchange stock for Quality Issue (R1–R5).")}</span>
+      </button>
     </section>
   `, `
     <button class="secondary-button" data-action="main-menu" type="button">${t("common.menu", "Menu")}</button>
@@ -2646,10 +2764,11 @@ function renderReturnSelect() {
 }
 
 function returnModuleActive() {
-  return currentModule === "pallet-return" || currentModule === "stock-return";
+  return currentModule === "pallet-return" || currentModule === "stock-return" || currentModule === "stock-exchange";
 }
 
 function returnModuleTitle() {
+  if (currentModule === "stock-exchange") return t("operator.stockExchange", "Stock exchange");
   return returnMode === "stock"
     ? t("operator.stockReturn", "Stock Return")
     : t("operator.palletReturn", "Pallet Return");
@@ -2694,6 +2813,7 @@ function returnLines() {
 }
 
 function firstReturnLineId(lines = returnLines()) {
+  if (currentModule === "stock-exchange" && !lines.length) return "";
   if (returnMode === "pallet" || !lines.length) return "PALLET";
   const first = lines.find((line) => returnLinePolicy(line).effective !== "NOT_RETURNABLE") || lines[0];
   return first ? returnSourceLineId(first) : "";
@@ -2797,20 +2917,7 @@ function renderReturnYardBanner() {
       </div>
     `;
   }
-  const order = returnOrder();
-  if (!order) return "";
-  const orderingYard = returnLookupData?.defaultReturnLocationName
-    || returnLookupData?.default_return_location_name
-    || order.orderingLocationName
-    || order.ordering_location_name
-    || "";
-  return `
-    <div class="return-yard-banner">
-      <span>${t("operator.receivingYardLocked", "Receiving yard (locked)")}</span>
-      <strong>${escapeHtml(currentLocation()?.text || locationId)}</strong>
-      ${orderingYard ? `<em>${tf("operator.orderingYard", "Ordering yard: {yard}", { yard: orderingYard })}</em>` : ""}
-    </div>
-  `;
+  return "";
 }
 
 function normalizeReturnReason(reason, fallbackId = "") {
@@ -3011,6 +3118,7 @@ function returnReviewPhotoTargets() {
   if (Number(returnPalletQuantity) > 0) {
     targets.push({
       kind: "pallet",
+      optional: true,
       lineId: "",
       label: t("operator.palletEvidence", "PALLET evidence"),
       detail: tf("operator.palletCount", "{count} PALLET", { count: displayReturnQty(returnPalletQuantity) })
@@ -3028,7 +3136,7 @@ function selectReturnReviewPhotoTarget(target, { preferMissing = false } = {}) {
   const targets = returnReviewPhotoTargets();
   const requested = targets.find((candidate) => returnPhotoTargetsMatch(candidate, target));
   const nextTarget = requested
-    || (preferMissing ? targets.find((candidate) => returnPhotoCount(candidate.kind, candidate.lineId) < 1) : null)
+    || (preferMissing ? targets.find((candidate) => !candidate.optional && returnPhotoCount(candidate.kind, candidate.lineId) < 1) : null)
     || targets[0]
     || defaultReturnPhotoTarget({ open: false });
   returnPhotoTarget = {
@@ -3041,18 +3149,20 @@ function selectReturnReviewPhotoTarget(target, { preferMissing = false } = {}) {
   returnPhotoSlot = firstEmpty >= 0 ? firstEmpty : Math.max(0, photos.length - 1);
 }
 
-function renderReturnPhotoWorkspace() {
+function renderReturnPhotoWorkspace({ optional = returnMode === "pallet" } = {}) {
   const targets = returnReviewPhotoTargets();
   const photos = returnTargetPhotos();
   const selected = photos[returnPhotoSlot] || "";
-  const readyTargets = targets.filter((target) => returnPhotoCount(target.kind, target.lineId) > 0).length;
+  const requiredTargets = targets.filter((target) => !target.optional);
+  const readyTargets = requiredTargets.filter((target) => returnPhotoCount(target.kind, target.lineId) > 0).length;
   return `
     <div class="fulfillment-card return-photo-workspace return-review-photo-card">
-      <span>${t("operator.photoProof", "Photo proof")}</span>
+      <span>${t("operator.photoProof", "Photo proof")}${optional ? ` · ${t("common.optional", "Optional")}` : ""}</span>
       <strong>${escapeHtml(returnPhotoTargetLabel())}</strong>
+      ${optional ? "" : `
       <div class="return-evidence-heading">
         <span>${t("operator.evidenceTargets", "Required evidence")}</span>
-        <b>${tf("operator.evidenceReady", "{ready} / {total} ready", { ready: readyTargets, total: targets.length })}</b>
+        <b>${tf("operator.evidenceReady", "{ready} / {total} ready", { ready: readyTargets, total: requiredTargets.length })}</b>
       </div>
       <div class="return-evidence-targets">
         ${targets.map((target) => {
@@ -3061,12 +3171,13 @@ function renderReturnPhotoWorkspace() {
           return `
             <button class="${active ? "active" : ""} ${count ? "ready" : ""}" data-action="return-select-evidence-target" data-photo-kind="${escapeHtml(target.kind)}" data-line="${escapeHtml(target.lineId)}" type="button">
               <strong>${escapeHtml(target.label)}</strong>
-              <span>${escapeHtml(target.detail || "")}</span>
+              <span>${escapeHtml(target.detail || "")}${target.optional ? ` · ${t("common.optional", "Optional")}` : ""}</span>
               <b>${count} / ${RETURN_MAX_PHOTOS}</b>
             </button>
           `;
         }).join("")}
       </div>
+      `}
       <div class="camera-actions">
         <button class="primary-button" data-action="return-start-camera" ${operatorPhotoCamera.opening === "return" ? "disabled" : ""} type="button">${operatorPhotoCamera.opening === "return" ? t("operator.openingCamera", "Opening camera...") : returnCameraActive ? t("common.restartCamera", "Restart camera") : cameraOpenLabel()}</button>
         ${renderCameraSwitchButton("return-switch-camera")}
@@ -3076,7 +3187,7 @@ function renderReturnPhotoWorkspace() {
         ${Array.from({ length: Math.max(1, photos.length) }, (_, index) => `
           <button class="${index === returnPhotoSlot ? "active" : ""}" data-action="return-select-photo-slot" data-slot="${index}" type="button">
             <strong>${t("common.photos", "Photo")} ${index + 1}</strong>
-            <span>${photos[index] ? t("common.ready", "Ready") : t("common.needed", "Needed")}</span>
+            <span>${photos[index] ? t("common.ready", "Ready") : optional || returnPhotoTarget.kind === "pallet" ? t("common.optional", "Optional") : t("common.needed", "Needed")}</span>
           </button>
         `).join("")}
       </div>
@@ -3096,8 +3207,109 @@ function renderReturnPhotoWorkspace() {
   `;
 }
 
+function renderReturnEntryFields() {
+  return `
+    <label class="return-field">
+      <span>${t("operator.vehiclePlate", "Vehicle plate")} · ${t("common.optional", "Optional")}</span>
+      <input data-return-input="vehiclePlate" value="${escapeHtml(returnVehiclePlate)}" autocomplete="off" maxlength="32" />
+    </label>
+    <label class="return-field">
+      <span>${t("operator.returnNoteOptional", "Return note (optional)")}</span>
+      <textarea data-return-input="headerNote" maxlength="500">${escapeHtml(returnHeaderNote)}</textarea>
+    </label>
+  `;
+}
+
+function renderReturnCustomerResults() {
+  if (returnCustomerSearchBusy) return `<div class="empty-state small" role="status"><strong>${t("common.loading", "Loading")}</strong></div>`;
+  return returnCustomerResults.map((customer) => `
+    <button data-action="return-select-customer" data-customer-id="${escapeHtml(returnCustomerId(customer))}" ${returnBusy ? "disabled" : ""} type="button">
+      <strong>${escapeHtml([returnCustomerCode(customer), returnCustomerName(customer)].filter(Boolean).join(" — "))}</strong>
+      <span>${escapeHtml(customer.phone || customer.phoneNumber || customer.phone_number || "")}</span>
+      <em>${escapeHtml(customer.address || customer.primaryAddress || customer.primary_address || "")}</em>
+    </button>
+  `).join("") || (returnCustomerSearch.trim().length >= 2 ? `<div class="empty-state small"><strong>${t("operator.noActiveCustomers", "No active customers found")}</strong></div>` : "");
+}
+
+function refreshReturnCustomerResults() {
+  const results = document.getElementById("returnCustomerResults");
+  if (results) {
+    results.innerHTML = renderReturnCustomerResults();
+    results.setAttribute("aria-busy", String(returnCustomerSearchBusy));
+  }
+}
+
+function returnInlineWarning() {
+  return [...app.querySelectorAll('.sync-alert.danger:not(.customer-pickup-message), .return-posting-message[role="alert"]')]
+    .map((element) => {
+      element.classList.add("return-error-source");
+      return element.hidden ? "" : element.textContent.replace(/\s+/g, " ").trim();
+    }).filter(Boolean).join("\n");
+}
+
+function dismissReturnWarning() {
+  returnLookupMessage = "";
+  returnValidationMessage = "";
+  returnDismissedInlineWarning = returnInlineWarning();
+  refreshReturnWarning();
+}
+
+function refreshReturnWarning() {
+  document.getElementById("returnWorkflowMessage")?.remove();
+  if (!returnModuleActive() || returnView !== "workflow" || returnStage === "success") return;
+  const inlineWarning = returnInlineWarning();
+  if (!inlineWarning) returnDismissedInlineWarning = "";
+  const message = returnLookupMessage || returnValidationMessage
+    || (inlineWarning !== returnDismissedInlineWarning ? inlineWarning : "");
+  if (!message) return;
+  app.insertAdjacentHTML("beforeend", `
+    <div id="returnWorkflowMessage" class="sync-alert danger customer-pickup-message" role="alert" aria-labelledby="returnWorkflowMessageTitle">
+      <div class="customer-pickup-message-content">
+        <strong id="returnWorkflowMessageTitle">${t("common.notice", "Notice")}</strong>
+        <span>${escapeHtml(localizeMessage(message))}</span>
+      </div>
+      <button data-action="dismiss-return-message" type="button">${t("common.dismiss", "Dismiss")}</button>
+    </div>
+  `);
+}
+
+function renderPalletReturnSearch() {
+  return `
+    <section class="return-lookup-grid pallet-return-search">
+      <div class="return-card return-scanner-card" data-pallet-search-panel="barcode">
+        <div class="return-panel-heading"><div><span>${t("operator.scanSalesOrder", "Scan sales order")}</span><strong>${t("operator.orderBarcode", "Order barcode")}</strong></div></div>
+        <div class="camera-actions">
+          <button class="primary-button" data-action="return-start-scanner" ${returnBusy ? "disabled" : ""} type="button">${returnScannerActive ? t("common.restartCamera", "Restart camera") : cameraOpenLabel()}</button>
+          ${renderCameraSwitchButton("return-switch-scanner-camera")}
+        </div>
+        ${returnScannerActive ? `
+          <div class="barcode-scanner-viewport${cameraFacingMode === "user" ? " mirrored" : ""}" id="returnScannerCamera">
+            <div class="barcode-scan-guide" aria-hidden="true"><span></span></div>
+          </div>
+        ` : `<div class="photo-placeholder">${t("operator.returnScannerHelp", "Scan the Sales Order barcode to identify the exact customer and ordering yard.")}</div>`}
+      </div>
+      <div class="return-card return-lookup-card" data-pallet-search-panel="order">
+        <div class="return-panel-heading"><div><span>${t("operator.salesOrder", "Sales Order")}</span><strong>SOA / SOB / SOM</strong></div></div>
+        <label class="return-field">
+          <span>${t("operator.scanOrType", "Scan or type and press Enter")}</span>
+          <input id="returnOrderLookup" inputmode="${operatorDisplaySettings.inputMode()}" spellcheck="false" autocorrect="off" ${returnBusy ? "disabled" : ""} value="${escapeHtml(returnLookupCode)}" placeholder="SOB115976" autocomplete="off" />
+        </label>
+        ${window.OperatorOrderKeypad.html("returnOrderLookup")}
+        <button class="primary-button" data-action="return-lookup-order" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.loading", "Loading") : t("operator.findOrder", "Find Order")}</button>
+      </div>
+      <div class="return-card return-customer-card" data-pallet-search-panel="customer">
+        <label class="return-field">
+          <span>${t("operator.customerCodeNamePhone", "Customer code, name, or phone")}</span>
+          <input id="returnCustomerSearch" value="${escapeHtml(returnCustomerSearch)}" placeholder="${t("common.search", "Search")}" autocomplete="off" ${returnBusy ? "disabled" : ""} aria-controls="returnCustomerResults" />
+        </label>
+        <div id="returnCustomerResults" class="return-customer-results" aria-live="polite" aria-busy="${returnCustomerSearchBusy}">${renderReturnCustomerResults()}</div>
+      </div>
+    </section>
+  `;
+}
+
 function renderReturnLookup() {
-  const palletMode = returnMode === "pallet";
+  if (returnMode === "pallet") return renderPalletReturnSearch();
   return `
     <section class="return-lookup-grid">
       <div class="return-card return-scanner-card">
@@ -3122,7 +3334,7 @@ function renderReturnLookup() {
         ` : `<div class="photo-placeholder">${t("operator.scannerHelp", "Use the camera for 1D/QR barcodes, the Zebra scanner, or type the sales order number.")}</div>`}
       </div>
       <div class="return-card return-lookup-card">
-        ${returnMode === "stock" ? `
+        ${returnMode === "stock" && currentModule !== "stock-exchange" ? `
           <div class="return-type-toggle">
             <button class="${returnType === "normal" ? "active" : ""}" data-action="return-set-type" data-return-type="normal" type="button">
               <strong>${t("operator.normalStockReturn", "Normal Stock Return")}</strong>
@@ -3140,23 +3352,6 @@ function renderReturnLookup() {
         </label>
         ${window.OperatorOrderKeypad.html("returnOrderLookup")}
         <button class="primary-button" data-action="return-lookup-order" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.loading", "Loading") : t("operator.findOrder", "Find Order")}</button>
-        ${returnLookupMessage ? `<div class="sync-alert danger"><strong>${t("common.notice", "Notice")}</strong><span>${escapeHtml(localizeMessage(returnLookupMessage))}</span></div>` : ""}
-        ${palletMode ? `
-          <div class="return-divider"><span>${t("operator.orSearchCustomer", "or search customer directly")}</span></div>
-          <label class="return-field">
-            <span>${t("operator.customerCodeNamePhone", "Customer code, name, or phone")}</span>
-            <input id="returnCustomerSearch" value="${escapeHtml(returnCustomerSearch)}" placeholder="${t("common.search", "Search")}" autocomplete="off" />
-          </label>
-          <div class="return-customer-results">
-            ${returnCustomerSearchBusy ? `<div class="empty-state small"><strong>${t("common.loading", "Loading")}</strong></div>` : returnCustomerResults.map((customer) => `
-              <button data-action="return-select-customer" data-customer-id="${escapeHtml(returnCustomerId(customer))}" type="button">
-                <strong>${escapeHtml([returnCustomerCode(customer), returnCustomerName(customer)].filter(Boolean).join(" — "))}</strong>
-                <span>${escapeHtml(customer.phone || customer.phoneNumber || customer.phone_number || "")}</span>
-                <em>${escapeHtml(customer.address || customer.primaryAddress || customer.primary_address || "")}</em>
-              </button>
-            `).join("") || (returnCustomerSearch.trim().length >= 2 ? `<div class="empty-state small"><strong>${t("operator.noActiveCustomers", "No active customers found")}</strong></div>` : "")}
-          </div>
-        ` : ""}
       </div>
     </section>
   `;
@@ -3165,30 +3360,37 @@ function renderReturnLookup() {
 function renderReturnCustomerSummary() {
   const customer = returnCustomer();
   const order = returnOrder();
+  const orderingYard = returnLookupData?.defaultReturnLocationName
+    || returnLookupData?.default_return_location_name
+    || order?.orderingLocationName
+    || order?.ordering_location_name
+    || "";
   return `
-    <div class="return-customer-summary">
+    <div class="return-customer-summary ${order ? "has-order" : ""}">
       <div>
         <span>${t("operator.customer", "Customer")}</span>
         <strong>${escapeHtml([returnCustomerCode(customer), returnCustomerName(customer)].filter(Boolean).join(" — ") || "-")}</strong>
-        <em>${escapeHtml(customer?.address || customer?.primaryAddress || customer?.primary_address || "")}</em>
       </div>
       ${order ? `
         <div>
           <span>${t("operator.salesOrder", "Sales Order")}</span>
           <strong>${escapeHtml(returnOrderRef(order))}</strong>
-          <em>${t("operator.exactNetsuiteLines", "Exact NetSuite fulfillment lines")}</em>
+        </div>
+        <div class="return-ordering-yard">
+          <span>${t("operator.orderingYardLabel", "Ordering yard")}</span>
+          <strong>${escapeHtml(orderingYard || "-")}</strong>
         </div>
       ` : ""}
       <div>
         <span>${t("operator.receivingYard", "Receiving yard")}</span>
         <strong>${escapeHtml(currentLocation()?.text || locationId)}</strong>
-        <em>${t("operator.yardLockedAfterStart", "Locked for this draft")}</em>
       </div>
     </div>
   `;
 }
 
 function renderReturnPalletSection() {
+  if (currentModule === "stock-exchange") return "";
   const balance = currentPalletBalance();
   const available = returnBalanceAvailable(balance);
   const selected = returnActiveLineId === "PALLET";
@@ -3230,14 +3432,15 @@ function renderReturnPalletEditor() {
             value: returnPalletQuantity,
             kind: "pallet",
             field: "palletQuantity",
+            editable: standalone,
             label: standalone ? t("operator.palletsReturned", "PALLET returned") : t("operator.optionalPalletsReturned", "Optional PALLET returned")
           })}
         </div>
       </div>
-      <div class="sync-alert danger" data-return-pallet-over ${Number(returnPalletQuantity) > available + RETURN_QUANTITY_EPSILON ? "" : "hidden"}>
+      ${standalone ? "" : `<div class="sync-alert danger" data-return-pallet-over ${Number(returnPalletQuantity) > available + RETURN_QUANTITY_EPSILON ? "" : "hidden"}>
         <strong>${t("operator.overPalletQuota", "PALLET quantity exceeds quota")}</strong>
         <span>${tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: displayReturnQty(available) })}</span>
-      </div>
+      </div>`}
     </aside>
   `;
 }
@@ -3248,7 +3451,8 @@ function renderReturnQuantityStepper({
   field = "",
   lineId = "",
   step = 1,
-  label = ""
+  label = "",
+  editable = false
 } = {}) {
   const numericValue = Math.max(0, Number(value) || 0);
   const shared = `
@@ -3260,7 +3464,9 @@ function renderReturnQuantityStepper({
   return `
     <div class="return-quantity-stepper" role="group" aria-label="${escapeHtml(label)}">
       <button data-action="return-step-quantity" data-delta="-1" ${shared} ${numericValue <= 0 ? "disabled" : ""} type="button" aria-label="${t("operator.decreaseQuantity", "Decrease quantity")}">−</button>
-      <output data-return-quantity-value aria-live="polite">${displayReturnQty(numericValue)}</output>
+      ${editable
+        ? `<input type="number" inputmode="numeric" min="0" step="${escapeHtml(step)}" value="${numericValue}" ${shared} data-return-quantity-value aria-label="${escapeHtml(label)}" />`
+        : `<output data-return-quantity-value aria-live="polite">${displayReturnQty(numericValue)}</output>`}
       <button data-action="return-step-quantity" data-delta="1" ${shared} type="button" aria-label="${t("operator.increaseQuantity", "Increase quantity")}">+</button>
     </div>
   `;
@@ -3284,21 +3490,19 @@ function renderReturnUnitInputs(line, values) {
   return returnLineUnits(line).map((unit) => `
     <div class="stepper-field return-unit-field">
       <span>${escapeHtml(displayUnit(unit.label))}</span>
+      <small>× ${displayReturnQty(unit.conversion)} ${escapeHtml(returnLineSalesUom(line))}</small>
       ${renderReturnQuantityStepper({
         value: values[unit.key],
         field: unit.key,
         lineId: rowKey,
         label: displayUnit(unit.label)
       })}
-      <small>× ${displayReturnQty(unit.conversion)} ${escapeHtml(returnLineSalesUom(line))}</small>
     </div>
   `).join("");
 }
 
 function renderReturnStockRow(line, values, rowIndex) {
   const rowKey = values.clientRowKey;
-  const calculated = returnLineCalculatedSalesQty(line, values);
-  const remaining = returnLineRemaining(line);
   return `
     <div class="return-line-entry-row" data-return-row="${escapeHtml(rowKey)}">
       ${returnType === "quality" ? `
@@ -3308,11 +3512,6 @@ function renderReturnStockRow(line, values, rowIndex) {
         </div>
       ` : ""}
       <div class="return-line-inputs">${renderReturnUnitInputs(line, values)}</div>
-      <div class="return-calculated-qty ${calculated > remaining + RETURN_QUANTITY_EPSILON ? "over" : ""}" data-return-calculated>
-        <span>${t("operator.calculatedSalesQuantity", "Calculated Sales UOM quantity")}</span>
-        <strong data-return-calculated-value>${displayReturnQty(calculated)} ${escapeHtml(returnLineSalesUom(line))}</strong>
-        <em>${tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: `${displayReturnQty(remaining)} ${returnLineSalesUom(line)}` })}</em>
-      </div>
       ${returnType === "quality" ? `
         <div class="return-quality-fields">
           <label class="return-field">
@@ -3321,10 +3520,6 @@ function renderReturnStockRow(line, values, rowIndex) {
               <option value="">${t("operator.selectReason", "Select reason")}</option>
               ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(reason.label)}</option>`).join("")}
             </select>
-          </label>
-          <label class="return-field">
-            <span>${t("operator.shortNoteOptional", "Short note (optional)")}</span>
-            <input data-return-line-input="note" data-line="${escapeHtml(rowKey)}" value="${escapeHtml(values.note)}" maxlength="250" />
           </label>
         </div>
       ` : ""}
@@ -3341,26 +3536,18 @@ function renderReturnStockLine(line) {
   const remaining = returnLineRemaining(line);
   const proposedTotal = rows.reduce((total, values) => total + returnLineCalculatedSalesQty(line, values), 0);
   const over = proposedTotal > remaining + RETURN_QUANTITY_EPSILON;
-  const fulfilled = Number(line.fulfilledQuantity ?? line.fulfilled_quantity ?? 0) || 0;
-  const netsuiteReturned = Number(line.netsuiteReturned ?? line.netsuite_returned ?? 0) || 0;
-  const localReserved = Number(line.localReserved ?? line.local_reserved ?? 0) || 0;
-  const selectedRows = rows.filter((values) => returnLineHasQty(line, values));
-  const photoCount = selectedRows.reduce((total, values) => total + values.photos.filter(Boolean).length, 0);
   return `
     <button class="return-line-card ${disabled ? "disabled" : ""} ${active ? "active" : ""} ${over ? "over" : ""}" data-return-line-card="${escapeHtml(lineId)}" data-action="return-select-stock-line" data-source-line="${escapeHtml(lineId)}" type="button">
       <div class="return-line-identity">
         <strong>${escapeHtml(returnLineName(line))}</strong>
         <span>${escapeHtml(returnLineDescription(line))}</span>
-        <em>${tf("operator.sourceLine", "Source line {line}", { line: escapeHtml(lineId) })}</em>
-      </div>
-      <div class="return-line-card-measures">
-        <span>${t("operator.remaining", "Remaining")} <b>${displayReturnQty(remaining)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
-        <span>${t("operator.returning", "Returning")} <b data-return-line-proposed>${displayReturnQty(proposedTotal)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
-        <small>${t("operator.fulfilled", "Fulfilled")} ${displayReturnQty(fulfilled)} · ${t("operator.netsuiteReturned", "NetSuite returned")} ${displayReturnQty(netsuiteReturned)} · ${t("operator.localReserved", "Local reserved")} ${displayReturnQty(localReserved)}</small>
       </div>
       <div class="return-line-state">
         <span class="return-policy-pill ${returnPolicyClass(line)}">${returnPolicyLabel(line)}</span>
-        ${returnType === "quality" && selectedRows.length ? `<small>${selectedRows.length} ${t("operator.reasonRows", "reason row(s)")} · ${photoCount} ${t("common.photos", "photos")}</small>` : ""}
+      </div>
+      <div class="return-line-card-measures">
+        <span><span>${t("operator.remaining", "Remaining")}</span><b>${displayReturnQty(remaining)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
+        <span><span>${t("operator.returning", "Returning")}</span><b data-return-line-proposed>${displayReturnQty(proposedTotal)} ${escapeHtml(returnLineSalesUom(line))}</b></span>
       </div>
     </button>
   `;
@@ -3473,7 +3660,8 @@ function stepReturnQuantity(button) {
 
   const stepper = button.closest(".return-quantity-stepper");
   const output = stepper?.querySelector("[data-return-quantity-value]");
-  if (output) output.textContent = displayReturnQty(nextValue);
+  if (output instanceof HTMLInputElement) output.value = String(nextValue);
+  else if (output) output.textContent = displayReturnQty(nextValue);
   const decrease = stepper?.querySelector('[data-action="return-step-quantity"][data-delta="-1"]');
   if (decrease) decrease.disabled = nextValue <= 0;
   refreshReturnQuantityFeedback(button);
@@ -3481,6 +3669,8 @@ function stepReturnQuantity(button) {
 
 function refreshReturnQuantityFeedback(target) {
   if (target?.dataset?.returnInput === "palletQuantity") {
+    const decrease = target.closest(".return-quantity-stepper")?.querySelector('[data-action="return-step-quantity"][data-delta="-1"]');
+    if (decrease) decrease.disabled = Number(returnPalletQuantity) <= 0;
     const balance = currentPalletBalance();
     const over = Number(returnPalletQuantity) > returnBalanceAvailable(balance) + RETURN_QUANTITY_EPSILON;
     const alert = app.querySelector("[data-return-pallet-over]");
@@ -3489,11 +3679,11 @@ function refreshReturnQuantityFeedback(target) {
     selector?.classList.toggle("over", over);
     const proposed = selector?.querySelector("[data-return-pallet-proposed]");
     if (proposed) proposed.textContent = displayReturnQty(returnPalletQuantity);
-    updateReturnPhotoRequirement(
-      "pallet",
-      "",
-      returnMode === "pallet" || Number(returnPalletQuantity) > 0
-    );
+    updateReturnPhotoRequirement("pallet", "", false);
+    if (returnMode === "pallet") {
+      returnValidationMessage = over ? tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: displayReturnQty(returnBalanceAvailable(balance)) }) : "";
+    }
+    refreshReturnWarning();
     return;
   }
   if (!target?.dataset?.returnLineInput) return;
@@ -3502,13 +3692,6 @@ function refreshReturnQuantityFeedback(target) {
   if (!values || !line) return;
   const calculated = returnLineCalculatedSalesQty(line, values);
   const remaining = returnLineRemaining(line);
-  const row = target.closest("[data-return-row]");
-  const calculatedBox = row?.querySelector("[data-return-calculated]");
-  calculatedBox?.classList.toggle("over", calculated > remaining + RETURN_QUANTITY_EPSILON);
-  const calculatedValue = row?.querySelector("[data-return-calculated-value]");
-  if (calculatedValue) {
-    calculatedValue.textContent = `${displayReturnQty(calculated)} ${returnLineSalesUom(line)}`;
-  }
   if (returnType === "quality") {
     updateReturnPhotoRequirement("line", values.clientRowKey, calculated > 0);
   } else {
@@ -3530,6 +3713,7 @@ function refreshReturnQuantityFeedback(target) {
   if (proposedValue) {
     proposedValue.textContent = `${displayReturnQty(proposedTotal)} ${returnLineSalesUom(line)}`;
   }
+  refreshReturnWarning();
 }
 
 function renderReturnStockLines() {
@@ -3552,9 +3736,9 @@ function renderReturnStockLines() {
         <strong>${lines.length ? `${returnLinePage + 1} / ${pageCount(lines, RETURN_LINE_PAGE_SIZE)}` : "0 / 0"}</strong>
         <button class="secondary-button" data-action="return-line-next" ${returnLinePage >= pageCount(lines, RETURN_LINE_PAGE_SIZE) - 1 ? "disabled" : ""} type="button">${t("common.next", "Next")}</button>
       </div>
-      <div class="return-pallet-selector-footer">
+      ${currentModule !== "stock-exchange" ? `<div class="return-pallet-selector-footer">
         ${renderReturnPalletSection()}
-      </div>
+      </div>` : ""}
     </section>
   `;
 }
@@ -3576,11 +3760,11 @@ function renderReturnPalletSelectorPanel() {
 }
 
 function renderReturnForm() {
+  if (returnMode === "pallet") return renderPalletReturnInput();
   return `
     <section class="return-form-shell ${returnMode === "stock" ? "stock-return-form" : "pallet-return-form"}">
       ${renderReturnCustomerSummary()}
       ${renderReturnYardBanner()}
-      ${returnValidationMessage ? `<div class="sync-alert danger"><strong>${t("operator.returnNeedsAttention", "Return needs attention")}</strong><span>${escapeHtml(returnValidationMessage)}</span></div>` : ""}
       <div class="return-form-grid return-quantity-grid">
         ${returnMode === "stock" ? renderReturnStockLines() : renderReturnPalletSelectorPanel()}
         ${renderReturnSelectedLineEditor()}
@@ -3588,6 +3772,23 @@ function renderReturnForm() {
       <div class="return-bottom-actions">
         <button class="secondary-button" data-action="return-save-draft" ${returnBusy ? "disabled" : ""} type="button">${returnBusy ? t("common.saving", "Saving...") : t("operator.saveDraft", "Save Draft")}</button>
         <button class="primary-button" data-action="return-open-review" ${returnBusy || returnYardGate().blocked ? "disabled" : ""} type="button">${t("operator.reviewReturn", "Review Return")}</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderPalletReturnInput() {
+  return `
+    <section class="return-form-shell pallet-return-input">
+      ${renderReturnCustomerSummary()}
+      <div class="return-form-grid">
+        ${renderReturnPalletEditor()}
+        <div class="return-card">${renderReturnEntryFields()}</div>
+      </div>
+      <div class="return-bottom-actions">
+        <button class="secondary-button" data-action="return-back-to-lookup" ${returnBusy ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
+        <button class="secondary-button" data-action="return-save-draft" ${returnBusy ? "disabled" : ""} type="button">${t("operator.saveDraft", "Save Draft")}</button>
+        <button class="primary-button" data-action="return-open-review" ${returnBusy ? "disabled" : ""} type="button">${t("operator.reviewReturn", "Review Return")}</button>
       </div>
     </section>
   `;
@@ -3646,9 +3847,12 @@ function renderReturnPhotoSummary(photos, label) {
 }
 
 function renderReturnReview() {
+  if (returnMode === "pallet") return renderPalletReturnReview();
   const selectedRows = returnSelectedRows();
   const palletReviewLine = renderReturnPalletReviewLine();
   const reviewReference = returnOrderRef() || returnCustomerName();
+  const photoBlocked = selectedRows.length > 0 && (returnType === "quality"
+    ? selectedRows.some(({ values }) => !values.photos?.some(Boolean)) : !returnRecordPhotos.some(Boolean));
   return `
     <section class="fulfillment-screen return-review-screen">
       ${renderReturnPhotoWorkspace()}
@@ -3665,25 +3869,15 @@ function renderReturnReview() {
         <div class="return-review-detail-scroll">
           ${renderReturnCustomerSummary()}
           ${renderReturnYardBanner()}
-          ${returnValidationMessage ? `
-            <div class="sync-alert danger" data-return-review-validation>
-              <strong>${t("operator.returnNeedsAttention", "Return needs attention")}</strong>
-              <span>${escapeHtml(returnValidationMessage)}</span>
-            </div>
-          ` : ""}
           ${selectedRows.length || palletReviewLine ? `
             <div class="fulfillment-lines return-review-lines">
               ${palletReviewLine}
               ${selectedRows.map(renderReturnReviewLine).join("")}
             </div>
           ` : ""}
-          <div class="sync-alert">
-            <strong>${t("operator.finalValidationNotice", "Final validation runs when you confirm")}</strong>
-            <span>${t("operator.finalValidationHelp", "NetSuite and local reservations will be rechecked. Both linked records are saved atomically.")}</span>
-          </div>
           <div class="return-review-entry-fields">
             <label class="return-field">
-              <span>${t("operator.vehiclePlate", "Vehicle plate")} · ${t("operator.requiredBeforeConfirm", "Required before confirm")}</span>
+              <span>${t("operator.vehiclePlate", "Vehicle plate")} · ${t("common.optional", "Optional")}</span>
               <input data-return-input="vehiclePlate" value="${escapeHtml(returnVehiclePlate)}" autocomplete="off" maxlength="32" />
               <small>${t("operator.vehiclePlateHelp", "Enter the plate of the vehicle that brought the return.")}</small>
             </label>
@@ -3692,6 +3886,32 @@ function renderReturnReview() {
               <textarea data-return-input="headerNote" maxlength="500" placeholder="${t("operator.returnNoteHelp", "Add a short note for this return or PALLET record.")}">${escapeHtml(returnHeaderNote)}</textarea>
             </label>
           </div>
+        </div>
+      </div>
+      <div class="selected-actions return-review-actions">
+        <button class="secondary-button" data-action="return-back-to-form" ${returnBusy ? "disabled" : ""} type="button">${t("common.back", "Back")}</button>
+        <button class="primary-button" data-action="return-confirm-submit" aria-disabled="${photoBlocked}" ${photoBlocked ? 'aria-describedby="return-photo-submit-help"' : ''} ${returnBusy || !returnPostingReady() ? "disabled" : ""} type="button">${returnBusy ? t("operator.confirming", "Confirming...") : t("operator.confirmReturn", "Confirm Return")}</button>
+        ${photoBlocked ? `<span id="return-photo-submit-help" role="status">${t("operator.returnPhotoBeforeSubmit", "Add the required stock return photos before submitting.")}</span>` : ''}
+      </div>
+    </section>
+  `;
+}
+
+function renderPalletReturnReview() {
+  return `
+    <section class="fulfillment-screen return-review-screen pallet-return-confirmation">
+      ${renderReturnPhotoWorkspace({ optional: true })}
+      <div class="fulfillment-card return-review-details-card">
+        <div class="return-panel-heading"><div><span>${t("operator.finalReview", "Final review")}</span><strong>${t("operator.palletReturn", "Pallet Return")}</strong></div></div>
+        <div class="return-review-detail-scroll">
+        ${renderReturnCustomerSummary()}
+        ${renderReturnPalletReviewLine()}
+        <div class="return-review-meta">
+          <div><span>${t("operator.vehiclePlate", "Vehicle plate")} · ${t("common.optional", "Optional")}</span><strong>${escapeHtml(returnVehiclePlate || "—")}</strong></div>
+          <div><span>${t("operator.returnNoteOptional", "Return note (optional)")}</span><p>${escapeHtml(returnHeaderNote || "—")}</p></div>
+        </div>
+        ${renderReturnPhotoSummary(returnPalletPhotos, t("common.photos", "Photos"))}
+        <div class="return-posting-policies">${renderReturnPostingPolicies()}</div>
         </div>
       </div>
       <div class="selected-actions return-review-actions">
@@ -3705,7 +3925,7 @@ function renderReturnReview() {
 function returnNetSuiteResultLabel(record) {
   if (!(Number(record?.workflowVersion) >= 2)) {return record?.status || "";}
   const status = record.netSuiteSyncStatus;
-  const type = record.netSuiteStage === "credit_memo" ? "Credit Memo" : "RA";
+  const type = record.recordType === "exchange" ? "Inventory Transfer" : record.netSuiteStage === "credit_memo" ? "Credit Memo" : "RA";
   if (status === "disabled") {return "Local only — return saved";}
   if (status === "failed") {return `NetSuite ${type} failed — return saved; contact an administrator`;}
   if (status === "cancelled") {return `NetSuite ${type} ${record.netSuiteTransactionRef || ""} cancelled`.replace(/ +/g, " ");}
@@ -3717,14 +3937,15 @@ function returnNetSuiteResultLabel(record) {
 
 function renderReturnSuccess() {
   const batch = returnResult?.batchReference || returnResult?.batch_reference || "";
+  const exchange = returnResult?.stockExchange || null;
   const stock = returnResult?.stockReturn || returnResult?.stock_return || null;
   const pallet = returnResult?.palletReturn || returnResult?.pallet_return || null;
   const referenceOf = (record) => record?.reference || record?.returnReference || record?.return_reference || "";
   const statusOf = returnNetSuiteResultLabel;
-  const records = [stock, pallet].filter(Boolean);
+  const records = [stock, exchange, pallet].filter(Boolean);
   const raNumbers = [...new Set(records.map(record => record.netSuiteTransactionRef).filter(Boolean))];
   const raPosted = records.every(record => ["succeeded", "manual_linked"].includes(record.netSuiteSyncStatus));
-  const transactionLabel = records.some(record => record.netSuiteStage === "credit_memo") ? "Credit Memo" : "Return Authorization";
+  const transactionLabel = exchange ? "Inventory Transfer" : records.some(record => record.netSuiteStage === "credit_memo") ? "Credit Memo" : "Return Authorization";
   return `
     <section class="return-success-shell">
       <div class="return-success-mark">✓</div>
@@ -3733,9 +3954,11 @@ function renderReturnSuccess() {
       <p>Your return records are saved. NetSuite results are shown below.</p>
       ${raNumbers.map(number => `<div class="sync-alert ${raPosted ? "linked-supply-info" : ""}"><span>NetSuite ${transactionLabel}</span><strong>${escapeHtml(number)}</strong></div>`).join("")}
       <div class="return-created-records">
+        ${exchange ? `<div><span>${t("operator.stockExchange", "Stock exchange")}</span><strong>${escapeHtml(referenceOf(exchange))}</strong><em>${escapeHtml(localizeMessage(statusOf(exchange)))}</em></div>` : ""}
         ${stock ? `<div><span>${t("operator.stockReturn", "Stock Return")}</span><strong>${escapeHtml(referenceOf(stock))}</strong><em>${escapeHtml(localizeMessage(statusOf(stock)))}</em></div>` : ""}
         ${pallet ? `<div><span>${t("operator.palletReturn", "Pallet Return")}</span><strong>${escapeHtml(referenceOf(pallet))}</strong><em>${escapeHtml(localizeMessage(statusOf(pallet)))}</em></div>` : ""}
       </div>
+      ${globalThis.MBBSReturnNotifications?.html(records) || ""}
       <div class="return-bottom-actions">
         <button class="secondary-button" data-action="return-open-history-view" type="button">${t("common.history", "History")}</button>
         <button class="primary-button" data-action="return-new" type="button">${t("operator.newReturn", "New Return")}</button>
@@ -3759,6 +3982,7 @@ function renderReturnHistoryDetails(record) {
   const headerPhotos = (record?.photos || []).map(returnSavedPhotoReference).filter(Boolean);
   const palletQuantity = record?.palletQuantity ?? record?.pallet_quantity;
   return `
+    ${globalThis.MBBSReturnNotifications?.html([record]) || ""}
     ${Number(record.workflowVersion) >= 2 ? `<div class="sync-alert"><strong>${escapeHtml(returnNetSuiteResultLabel(record))}</strong></div>` : ""}
     ${palletQuantity !== null && palletQuantity !== undefined ? `
       <div class="return-header-note">
@@ -3812,7 +4036,7 @@ function renderReturnRecordList(records, type) {
       <div class="return-record-list">
         ${records.map((record) => `
           <button class="${String(record.id) === String(selected?.id) ? "active" : ""}" data-action="return-select-${type}" data-record="${escapeHtml(record.id)}" type="button">
-            <span>${escapeHtml(record.returnType || record.return_type || record.type || "")}</span>
+            <span>${escapeHtml(record.recordType === "exchange" ? t("operator.stockExchange", "Stock exchange") : record.returnType || record.return_type || record.type || "")}</span>
             <strong>${escapeHtml(returnRecordReference(record))}</strong>
             ${type === "history" && record.netSuiteTransactionRef ? `<span>${escapeHtml(record.netSuiteTransactionRef)}</span>` : ""}
             <em>${formatDateTime(record.submittedAt || record.submitted_at || record.updatedAt || record.updated_at || record.createdAt || record.created_at)}</em>
@@ -3873,6 +4097,7 @@ function renderReturnWorkflow() {
   else if (returnStage === "success") body = renderReturnSuccess();
   else body = renderReturnLookup();
   shell(returnModuleTitle(), `${t("common.location", "Location")} ${currentLocation()?.text || locationId}`, body, actions);
+  refreshReturnWarning();
 }
 
 function renderDeliverySelect() {
@@ -4659,6 +4884,7 @@ function renderDetailPanel(order) {
           ${viewMode === "packed" && !isCustomerPickupMode() && !vrmaReferenceOnly ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
         </div>
         <p class="muted">${order.customer || ""}</p>
+        ${order.co_waiting_for_arrival ? `<p class="dispatch-plan-note">Waiting for ${escapeHtml(order.transit_co_ref || "CO")} to arrive at ${escapeHtml(order.outbound_location || "this yard")}.</p>` : ""}
         <p class="muted">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
         ${order.dispatch_planned ? `<p class="dispatch-plan-note">${plannedOrderText(order, { spotLabel: "Parking spot" })}</p>` : ""}
       </div>
@@ -4889,6 +5115,24 @@ function renderPickupMeasures(line, units = deliveryLineUnits(line)) {
   `).join("");
 }
 
+function renderConvertedPackBalance(line) {
+  if (!lineHasConversion(line)) return "";
+  const conversion = qty(line.to_pcs) || 1;
+  const label = escapeHtml(displayUnit(qty(line.to_pcs) > 0 ? "PCS" : line.unit || "Qty"));
+  const total = operatorRoundedSalesQuantity(lineRequiredSalesQty(line), line.unit);
+  const loaded = operatorRoundedSalesQuantity(qty(line.loaded_qty), line.unit);
+  const confirmed = lineUnitsToSalesQty(line, {
+    pallets: line.packed_pallet_qty, layers: line.packed_layer_qty,
+    sections: line.packed_section_qty, pieces: line.packed_piece_qty
+  });
+  return `<div class="selected-measures converted-pack-balance">
+    ${[["total", t("operator.total", "Total"), total], ["loaded", t("common.loaded", "Loaded"), loaded],
+      ["confirmed", t("operator.confirmed", "Confirmed"), confirmed],
+      ["remaining", t("operator.remaining", "Remaining"), Math.max(0, total - loaded - confirmed)]]
+      .map(([key, title, value]) => `<div class="measure" data-pack-balance="${key}"><span>${title} ${label}</span><b>${value > 0 ? displayQty(value / conversion) : "0"}</b></div>`).join("")}
+  </div>`;
+}
+
 function renderLinkedSupplyBreakdown(line) {
   const original = qty(line.original_quantity ?? line.quantity);
   const linkedPo = qty(line.linked_po_sales_qty);
@@ -4974,6 +5218,7 @@ function renderSelectedLinePanel(line) {
       <div class="selected-measures">
         ${isCustomerPickupMode() ? renderPickupMeasures(line, units) : units.map((unit) => `<div class="measure"><span>${t("operator.required", "Required")} ${escapeHtml(displayUnit(unit.label))}</span><b>${displayQty(requiredValue(line, unit.key))}</b></div>`).join("")}
       </div>
+      ${renderConvertedPackBalance(line)}
       ${qty(line.linked_allocated_sales_qty) > 0 ? renderLinkedSupplyBreakdown(line) : ""}
       ${notice ? `<div class="line-alert"><strong>${t("operator.repackNeeded", "Repack needed")}</strong><span>${notice}</span></div>` : ""}
       ${notice || !loadAction.allowPackedQuantityEdit ? "" : units.map((unit) => renderStepper(unit.key, `${packedReview ? t("operator.packed", "Packed") : t("operator.pack", "Pack")} ${escapeHtml(displayUnit(unit.label))}`, panelValue(line, unit.key))).join("")}
@@ -6240,17 +6485,24 @@ async function loadDeliveryNotifications(options = {}) {
 }
 
 function applyDeliveryNotifications(nextNotifications, options = {}) {
+  const scope = deliveryPopupAudit.scope();
+  if (deliveryNotificationScope !== scope) {
+    deliveryNotificationScope = scope;
+    deliveryNotificationState = new Map();
+    deliveryNotificationStateReady = false;
+    deliveryPopupVersions.clear();
+    urgentDeliveryAlert = null;
+  }
   deliveryNotifications = nextNotifications || { total: 0, salesOrder: { dueToday: 0 }, transferOrder: { dueToday: 0 }, items: [] };
   const items = deliveryNotificationItems();
   const alertRefs = new Set((options.alertRefs || []).map((ref) => String(ref || "").trim()).filter(Boolean));
-  let alertItems = [];
+  let alertItems = changedDeliveryNotificationItems(items);
   if (alertRefs.size) {
-    alertItems = items.filter((item) => alertRefs.has(String(item.tranid || "")) || alertRefs.has(String(item.orderId || "")));
+    alertItems = [...alertItems, ...items.filter((item) => alertRefs.has(String(item.tranid || "")) || alertRefs.has(String(item.orderId || "")))];
   } else if (options.alertRecent) {
-    alertItems = items.filter(isRecentPlannedDeliveryNotification);
-  } else {
-    alertItems = changedDeliveryNotificationItems(items);
+    alertItems = [...alertItems, ...items.filter(isRecentPlannedDeliveryNotification)];
   }
+  alertItems = [...new Map(alertItems.map((item) => [deliveryNotificationBaseKey(item), item])).values()];
   updateDeliveryNotificationState(items);
   if (alertItems.length) {
     showUrgentDeliveryAlert(alertItems);
@@ -6262,6 +6514,8 @@ async function openUrgentDeliveryAlert() {
   const first = urgentDeliveryAlert?.items?.[0] || deliveryNotificationItems()[0];
   if (!first) return;
   const batch = deliveryBatchForNotification(first);
+  recordVisibleDeliveryPopup();
+  deliveryPopupAudit.record("opened", urgentDeliveryAlert?.items || [], document.visibilityState);
   urgentDeliveryAlert = null;
   deliveryOrderType = batch === "transfer" ? "transfer_order" : "sales_order";
   deliveryPrepMode = "standard";
@@ -6683,7 +6937,7 @@ async function decodeCameraPhoto(photo) {
 async function scanNativeCameraPhoto(kind) {
   const module = currentModule, yard = locationId, returnRequest = returnIdempotencyKey;
   const isCurrent = () => currentModule === module && locationId === yard && Boolean(operator)
-    && (kind !== "return" || (returnIdempotencyKey === returnRequest && returnStage === "lookup"));
+    && (kind !== "return" || (returnIdempotencyKey === returnRequest && returnScannerKeyActive()));
   try {
     const photo = await captureNativeCameraPhoto("environment");
     if (!photo || !isCurrent()) return;
@@ -8295,6 +8549,7 @@ function historyTypeLabel(type) {
     cycle_count: t("operator.cycleHistory", "Cycle"),
     customer_return: t("operator.customerReturnHistory", "Customer Return"),
     stock_return: t("operator.stockReturn", "Stock Return"),
+    stock_exchange: t("operator.stockExchange", "Stock exchange"),
     pallet_return: t("operator.palletReturn", "Pallet Return"),
     return_batch: t("operator.returnBatch", "Return Batch")
   }[type] || type || t("operator.recordHistory", "Record");
@@ -8417,6 +8672,7 @@ function renderPersonalHistory() {
   shell("Personal History", operator?.display_name || "", `
     <section class="history-shell">
       <div class="history-toolbar">
+        <button class="secondary-button" data-action="repair-requests" type="button">Repair requests</button>
         <label>
           <span>${t("operator.date", "Date")}</span>
           <input id="historyDate" type="date" value="${escapeHtml(personalHistoryDate)}" />
@@ -8464,9 +8720,9 @@ async function openModule(moduleName) {
     currentModule = "inventory";
     return render();
   }
-  if (moduleName === "pallet-return" || moduleName === "stock-return") {
-    resetReturnWorkflow(moduleName === "stock-return" ? "stock" : "pallet");
+  if (["pallet-return", "stock-return", "stock-exchange"].includes(moduleName)) {
     currentModule = moduleName;
+    resetReturnWorkflow(moduleName === "pallet-return" ? "pallet" : "stock");
     selectRearCamera();
     await loadReturnReasons().catch(() => {});
     return render();
@@ -8545,7 +8801,7 @@ function resetReturnWorkflow(mode = returnMode || "pallet", { keepResult = false
   returnMode = mode === "stock" ? "stock" : "pallet";
   returnStage = "lookup";
   returnView = "workflow";
-  returnType = "normal";
+  returnType = currentModule === "stock-exchange" ? "quality" : "normal";
   returnLookupCode = "";
   returnLookupMessage = "";
   returnLookupData = null;
@@ -8571,6 +8827,7 @@ function resetReturnWorkflow(mode = returnMode || "pallet", { keepResult = false
   returnDirty = false;
   returnBusy = false;
   returnValidationMessage = "";
+  returnDismissedInlineWarning = "";
   returnIdempotencyKey = createReturnIdempotencyKey();
   returnPostingPolicies = {};
   returnPostingError = "";
@@ -8621,6 +8878,7 @@ async function lookupReturnOrder(code = returnLookupCode) {
     }
   }
   stopReturnScannerCamera();
+  if (returnMode === "pallet") clearReturnCustomerSearch();
   returnBusy = true;
   render();
   try {
@@ -8629,23 +8887,27 @@ async function lookupReturnOrder(code = returnLookupCode) {
       body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: returnMode })
     });
     stopReturnScannerCamera();
-    returnLookupData = normalizeReturnLookup(payload);
+    const lookup = normalizeReturnLookup(payload);
+    const sameCustomer = String(returnCustomerId()) === String(returnCustomerId(lookup.customer));
+    returnLookupData = lookup;
     returnSelectedCustomer = returnLookupData.customer;
     returnPalletBalance = returnLookupData.palletBalance;
     returnLineValues = {};
     for (const line of returnLines()) ensureReturnLineValue(line);
     returnActiveLineId = firstReturnLineId();
-    returnPalletQuantity = 0;
-    returnVehiclePlate = "";
-    returnHeaderNote = "";
+    if (returnMode !== "pallet" || !sameCustomer) returnPalletQuantity = 0;
+    if (returnMode !== "pallet") {
+      returnVehiclePlate = "";
+      returnHeaderNote = "";
+      returnPalletPhotos = [];
+    }
     returnRecordPhotos = [];
-    returnPalletPhotos = [];
     returnLinePage = 0;
     returnPhotoTarget = defaultReturnPhotoTarget();
     returnPhotoSlot = 0;
     returnDraftId = "";
     returnIdempotencyKey = createReturnIdempotencyKey();
-    returnDirty = false;
+    returnDirty = returnMode === "pallet";
     returnStage = "form";
     returnView = "workflow";
     returnValidationMessage = "";
@@ -8662,6 +8924,21 @@ async function lookupReturnOrder(code = returnLookupCode) {
   }
 }
 
+function clearReturnCustomerSearch() {
+  window.clearTimeout(app.returnCustomerSearchTimer);
+  app.returnCustomerSearchTimer = null;
+  returnCustomerSearchGeneration += 1;
+  returnCustomerSearchPending = false;
+  returnCustomerSearchBusy = false;
+  returnCustomerSearch = "";
+  returnCustomerResults = [];
+}
+
+function returnCustomerSearchEnabled() {
+  return returnModuleActive() && returnMode === "pallet" && returnView === "workflow"
+    && returnStage === "lookup" && !returnBusy;
+}
+
 async function searchReturnCustomers() {
   if (returnCustomerSearchActive) {
     returnCustomerSearchPending = true;
@@ -8675,48 +8952,48 @@ async function searchReturnCustomers() {
       app.returnCustomerSearchTimer = null;
       const search = returnCustomerSearch.trim();
       const generation = returnCustomerSearchGeneration;
-      if (returnMode !== "pallet" || search.length < 2) {
+      const requestKey = returnIdempotencyKey;
+      const isCurrent = () => returnCustomerSearchEnabled() && requestKey === returnIdempotencyKey
+        && generation === returnCustomerSearchGeneration && search === returnCustomerSearch.trim();
+      if (!returnCustomerSearchEnabled() || search.length < 2) {
         returnCustomerResults = [];
         returnCustomerSearchBusy = false;
         break;
       }
-      stopReturnScannerCamera();
       returnCustomerSearchBusy = true;
-      render();
+      refreshReturnCustomerResults();
       try {
         const params = new URLSearchParams({
           search,
           receivingLocationId: String(locationId)
         });
         const payload = await api(`/api/returns/customers?${params.toString()}`);
-        if (generation === returnCustomerSearchGeneration && search === returnCustomerSearch.trim()) {
+        if (isCurrent()) {
           returnCustomerResults = Array.isArray(payload) ? payload : payload.customers || [];
         }
       } catch (error) {
-        if (generation === returnCustomerSearchGeneration) {
+        if (isCurrent()) {
           returnLookupMessage = error.message;
           returnCustomerResults = [];
+          refreshReturnWarning();
         }
       }
-      if (!returnCustomerSearchPending && generation === returnCustomerSearchGeneration) break;
+      if (!returnCustomerSearchEnabled() || (!returnCustomerSearchPending && generation === returnCustomerSearchGeneration)) break;
     }
   } finally {
     returnCustomerSearchActive = false;
     returnCustomerSearchBusy = false;
-    render();
-    window.requestAnimationFrame(() => {
-      const input = document.getElementById("returnCustomerSearch");
-      if (input) {
-        input.focus();
-        input.setSelectionRange(input.value.length, input.value.length);
-      }
-    });
+    refreshReturnCustomerResults();
   }
 }
 
 async function selectReturnCustomer(customerId) {
+  if (returnBusy) return;
   const customer = returnCustomerResults.find((item) => String(returnCustomerId(item)) === String(customerId));
   if (!customer) return;
+  const sameCustomer = String(returnCustomerId()) === String(returnCustomerId(customer));
+  clearReturnCustomerSearch();
+  stopReturnScannerCamera();
   returnBusy = true;
   returnLookupMessage = "";
   render();
@@ -8731,16 +9008,15 @@ async function selectReturnCustomer(customerId) {
       palletBalance: returnPalletBalance,
       lines: []
     });
-    returnPalletQuantity = 0;
-    returnVehiclePlate = "";
-    returnHeaderNote = "";
-    returnPalletPhotos = [];
+    if (!sameCustomer) returnPalletQuantity = 0;
+    returnLineValues = {};
     returnActiveLineId = "PALLET";
     returnPhotoTarget = defaultReturnPhotoTarget();
     returnPhotoSlot = 0;
     returnDraftId = "";
     returnIdempotencyKey = createReturnIdempotencyKey();
-    returnDirty = false;
+    returnDirty = true;
+    returnValidationMessage = "";
     returnStage = "form";
     returnView = "workflow";
   } catch (error) {
@@ -8796,7 +9072,7 @@ async function loadReturnHistoryDetail(id, { renderAfter = true } = {}) {
 function draftReturnMode(draft) {
   const type = String(draft?.returnMode || draft?.return_mode || draft?.mode || draft?.type || "").toLowerCase();
   if (type.includes("pallet")) return "pallet";
-  if (type.includes("stock") || type.includes("combined")) return "stock";
+  if (type.includes("stock") || type.includes("combined") || type === "exchange") return "stock";
   return draft?.orderId || draft?.order_id ? "stock" : "pallet";
 }
 
@@ -8806,8 +9082,8 @@ async function resumeReturnDraft(draft, { renderAfter = true } = {}) {
   stopReturnScannerCamera();
   const mode = draftReturnMode(draft);
   returnMode = mode;
-  currentModule = mode === "stock" ? "stock-return" : "pallet-return";
-  returnType = String(draft.stockReturnType || draft.stock_return_type || draft.returnType || draft.return_type || "normal").toLowerCase() === "quality"
+  currentModule = [draft.returnMode, draft.draftType, draft.type].includes("exchange") ? "stock-exchange" : mode === "stock" ? "stock-return" : "pallet-return";
+  returnType = currentModule === "stock-exchange" || String(draft.stockReturnType || draft.stock_return_type || draft.returnType || draft.return_type || "normal").toLowerCase() === "quality"
     ? "quality"
     : "normal";
   returnDraftId = String(draft.id || draft.draftId || draft.draft_id || "");
@@ -9052,7 +9328,7 @@ async function startReturnScannerCamera() {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error(t("operator.cameraUnavailable", "Camera is not available in this browser."));
     if (!window.Quagga) throw new Error(t("operator.scannerLoadFailed", "Barcode scanner could not load. Refresh the app and try again."));
     returnScannerActive = true;
-    returnLookupMessage = t("operator.startingScanner", "Starting 1D / QR camera scanner...");
+    returnLookupMessage = returnMode === "pallet" ? "" : t("operator.startingScanner", "Starting 1D / QR camera scanner...");
     render();
     await new Promise((resolve) => window.requestAnimationFrame(resolve));
     const target = document.getElementById("returnScannerCamera");
@@ -9091,6 +9367,7 @@ async function startReturnScannerCamera() {
     }
     returnLookupMessage = "";
     document.querySelector(".return-lookup-card .sync-alert")?.remove();
+    refreshReturnWarning();
   } catch (error) {
     returnLookupMessage = cameraErrorMessage(error);
     stopReturnScannerCamera();
@@ -9141,10 +9418,20 @@ async function handleReturnScannerKey(event) {
 function addReturnSplitRow(sourceLineId) {
   const line = returnLines().find((item) => returnSourceLineId(item) === String(sourceLineId));
   if (!line || returnType !== "quality") return;
+  // Tablets scroll the editor; phones scroll the app. Both are replaced by render.
+  const scrollPositions = ["#app", ".return-selected-editor", ".return-line-list"].map((selector) => {
+    const element = document.querySelector(selector);
+    return { selector, top: element?.scrollTop || 0, left: element?.scrollLeft || 0 };
+  });
+  const pageScroll = { top: window.scrollY, left: window.scrollX, behavior: "instant" };
   const rowKey = createReturnIdempotencyKey();
   ensureReturnLineValue(line, rowKey);
   returnDirty = true;
   render();
+  for (const position of scrollPositions) {
+    document.querySelector(position.selector)?.scrollTo({ top: position.top, left: position.left, behavior: "instant" });
+  }
+  window.scrollTo(pageScroll);
 }
 
 function removeReturnSplitRow(rowKey) {
@@ -9196,9 +9483,9 @@ function buildReturnPayload({ draft = false } = {}) {
   return {
     draftId: returnDraftId || undefined,
     idempotencyKey: returnIdempotencyKey,
-    returnMode,
+    returnMode: currentModule === "stock-exchange" ? "exchange" : returnMode,
     draftType: draft
-      ? returnMode === "pallet" ? "pallet" : Number(returnPalletQuantity) > 0 ? "combined" : "stock"
+      ? currentModule === "stock-exchange" ? "exchange" : returnMode === "pallet" ? "pallet" : Number(returnPalletQuantity) > 0 ? "combined" : "stock"
       : undefined,
     stockReturnType: returnMode === "stock" ? returnType : undefined,
     receivingLocationId: locationId,
@@ -9220,24 +9507,20 @@ function buildReturnPayload({ draft = false } = {}) {
   };
 }
 
-function validateReturnForReview({ requireVehiclePlate = true, requirePhotos = true } = {}) {
+function validateReturnForReview({ requirePhotos = true } = {}) {
   if (!returnCustomerId()) return t("operator.customerRequired", "A NetSuite customer is required.");
   if (returnMode === "stock" && !returnOrderId()) return t("operator.salesOrderRequired", "A Sales Order is required.");
   if (returnYardGate().blocked) {
     return tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardGate().requiredName || "-" });
   }
-  if (requireVehiclePlate && !returnVehiclePlate.trim()) return t("operator.vehiclePlateRequired", "Vehicle plate is required.");
+  const selectedRows = returnSelectedRows();
 
   const palletQty = Number(returnPalletQuantity) || 0;
   if (palletQty < 0 || !Number.isInteger(palletQty)) return t("operator.palletWholeNumber", "PALLET quantity must be a non-negative whole number.");
   if (returnMode === "pallet" && palletQty <= 0) return t("operator.palletPositiveRequired", "Enter at least one PALLET.");
   if (palletQty > 0 && !currentPalletBalance()) return t("operator.palletBalanceRequired", "A current PALLET balance is required.");
   if (palletQty > returnBalanceAvailable() + RETURN_QUANTITY_EPSILON) return tf("operator.maximumReturnable", "Maximum returnable: {quantity}", { quantity: displayReturnQty(returnBalanceAvailable()) });
-  if (requirePhotos && palletQty > 0 && returnPalletPhotos.filter(Boolean).length < 1) {
-    return t("operator.palletPhotoRequired", "Take at least one live photo of the returned PALLET.");
-  }
 
-  const selectedRows = returnSelectedRows();
   if (returnMode === "stock" && !selectedRows.length && palletQty <= 0) return t("operator.returnQuantityRequired", "Enter at least one stock or PALLET return quantity.");
   for (const line of returnLines()) {
     const rows = returnRowsForLine(line);
@@ -9317,7 +9600,7 @@ async function saveReturnDraft() {
 }
 
 function returnPostingFunctions() {
-  return [returnMode === "stock" && returnSelectedRows().length > 0 && "stock_return",
+  return [returnMode === "stock" && returnSelectedRows().length > 0 && (currentModule === "stock-exchange" ? "stock_exchange" : "stock_return"),
     Number(returnPalletQuantity) > 0 && "pallet_return"].filter(Boolean);
 }
 
@@ -9350,21 +9633,20 @@ async function loadReturnPostingPolicies() {
 }
 
 function renderReturnPostingPolicies() {
-  if (returnPostingLoading) {return `<div class="sync-alert" role="status">Checking NetSuite posting mode…</div>`;}
+  if (returnPostingLoading) {return `<p class="return-posting-message" role="status">Checking NetSuite posting mode…</p>`;}
   if (returnPostingError || !returnPostingReady()) {
-    return `<div class="sync-alert danger">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</div>
+    return `<p class="return-posting-message" role="alert">${escapeHtml(returnPostingError || "Refresh the posting mode before confirming.")}</p>
       <button data-action="return-refresh-posting" type="button">Refresh posting mode</button>`;
   }
   const enabled = returnPostingFunctions().every(key => returnPostingPolicies[key].effective);
   const types = new Set(returnPostingFunctions().map(key => returnPostingPolicies[key].transactionType || "RA"));
   if (enabled && types.size > 1) {
-    return `<div class="sync-alert danger">Stock and PALLET posting modes differ. Ask an administrator to align the Credit Memo gates before confirming this combined return.</div>`;
+    return `<p class="return-posting-message" role="alert">Stock and PALLET posting modes differ. Ask an administrator to align the Credit Memo gates before confirming this combined return.</p>`;
   }
   const creditMemo = types.size === 1 && types.has("CM");
-  return `<div class="sync-alert operator-posting-mode" data-posting-mode="${enabled ? "netsuite" : "local"}">
-    <strong>NetSuite ${creditMemo ? "Credit Memo" : "Return Authorization"}</strong>
-    <span>${enabled ? creditMemo ? "Creates one Credit Memo directly for this return, including stock and pallets" : "Creates one RA for this return, including stock and pallets" : "Local only — NetSuite posting is off for part or all of this return"}</span>
-  </div>`;
+  return `<span class="return-posting-message" data-posting-mode="${enabled ? "netsuite" : "local"}">${enabled
+    ? `NetSuite ${types.has("IT") ? "Inventory Transfer" : creditMemo ? "Credit Memo" : "Return Authorization"}`
+    : "Local only — NetSuite posting is off for part or all of this return"}</span>`;
 }
 
 async function openReturnReview() {
@@ -9385,6 +9667,7 @@ async function submitReturn() {
   if (validation) {
     returnValidationMessage = validation;
     returnStage = "review";
+    showToast(validation);
     return render();
   }
   returnBusy = true;
@@ -9580,7 +9863,9 @@ function stepQty(unit, delta) {
   const selectedLine = selectedOrder?.lines?.find((line) => String(line.id) === String(selectedLineId));
   const receivingLine = receivingSelectedOrder?.lines?.find((line) => String(line.id) === String(receivingSelectedLineId));
   const activeLine = currentModule === "receiving" ? receivingLine : selectedLine;
-  const max = unit.startsWith("cycle-") ? Number.POSITIVE_INFINITY : activeLine ? panelLimit(activeLine, unit) : Number.POSITIVE_INFINITY;
+  const values = Object.fromEntries(["pallets", "layers", "sections", "pieces"].map(key =>
+    [key, qty(app.querySelector(`.selected-panel [data-pack="${key}"]`)?.value)]));
+  const max = unit.startsWith("cycle-") ? Number.POSITIVE_INFINITY : activeLine ? panelLimit(activeLine, unit, values) : Number.POSITIVE_INFINITY;
   input.value = Math.min(max, Math.max(0, qty(input.value) + Number(delta)));
   if (unit.startsWith("cycle-")) updateCycleVariancePreview();
 }
@@ -9665,6 +9950,7 @@ app.addEventListener("click", async (event) => {
     input.focus({ preventScroll: true }); return;
   }
   const button = event.target.closest("button");
+  if (button?.dataset.action === "repair-requests") { location.assign("/operator/repair"); return; }
   if (!button) return;
 
   try {
@@ -9743,6 +10029,7 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "return-set-type") {
+      if (currentModule === "stock-exchange") return;
       const nextType = button.dataset.returnType === "quality" ? "quality" : "normal";
       if (nextType === returnType) return;
       if (returnLines().length && !confirm(t("operator.changeReturnTypeConfirm", "Changing return type clears entered stock quantities and line photos. Continue?"))) return;
@@ -9816,17 +10103,29 @@ app.addEventListener("click", async (event) => {
     }
     if (button.dataset.action === "return-save-draft") return saveReturnDraft();
     if (button.dataset.action === "return-open-review") return openReturnReview();
+    if (button.dataset.action === "return-notification-send") { return window.MBBSReturnNotifications?.send(button.dataset.notificationKey, button.dataset.record); }
     if (button.dataset.action === "return-refresh-posting") {return loadReturnPostingPolicies();}
+    if (button.dataset.action === "return-back-to-lookup") {
+      stopReturnCamera();
+      stopReturnScannerCamera();
+      returnLookupMessage = "";
+      returnValidationMessage = "";
+      returnStage = "lookup";
+      return render();
+    }
     if (button.dataset.action === "return-back-to-form") {
       stopReturnCamera();
       returnStage = "form";
       return render();
     }
+    if (button.dataset.action === "dismiss-return-message") {
+      return dismissReturnWarning();
+    }
     if (button.dataset.action === "return-confirm-submit") return submitReturn();
     if (button.dataset.action === "return-new") {
       const mode = returnMode;
       resetReturnWorkflow(mode);
-      currentModule = mode === "stock" ? "stock-return" : "pallet-return";
+      if (currentModule !== "stock-exchange") currentModule = mode === "stock" ? "stock-return" : "pallet-return";
       return render();
     }
     if (button.dataset.action === "return-open-drafts") {
@@ -9895,6 +10194,8 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "return-delete-draft") return deleteReturnDraft(button.dataset.record);
     if (button.dataset.action === "open-urgent-delivery-alert") return openUrgentDeliveryAlert();
     if (button.dataset.action === "dismiss-urgent-delivery-alert") {
+      recordVisibleDeliveryPopup();
+      deliveryPopupAudit.record("dismissed", urgentDeliveryAlert?.items || [], document.visibilityState);
       urgentDeliveryAlert = null;
       return render();
     }
@@ -10430,6 +10731,10 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("input", async (event) => {
+  if (event.target?.dataset?.returnNotificationRecipient) {
+    window.MBBSReturnNotifications?.input(event.target.dataset.returnNotificationRecipient, event.target.value);
+    return;
+  }
   if (event.target?.matches("[data-consolidation-date-part]")) {
     event.target.value = event.target.value.replace(/\D/g, "").slice(0, event.target.maxLength);
     event.target.removeAttribute("aria-invalid"); event.target.setCustomValidity("");
@@ -10439,12 +10744,17 @@ app.addEventListener("input", async (event) => {
   if (event.target?.id === "returnOrderLookup") {
     returnLookupCode = event.target.value;
     returnLookupMessage = "";
+    refreshReturnWarning();
     return;
   }
   if (event.target?.id === "returnCustomerSearch") {
     returnCustomerSearch = event.target.value;
     returnCustomerSearchGeneration += 1;
     returnLookupMessage = "";
+    returnCustomerResults = [];
+    returnCustomerSearchBusy = returnCustomerSearch.trim().length >= 2;
+    refreshReturnCustomerResults();
+    refreshReturnWarning();
     window.clearTimeout(app.returnCustomerSearchTimer);
     app.returnCustomerSearchTimer = window.setTimeout(() => {
       searchReturnCustomers().catch((error) => showToast(error.message));
@@ -10578,6 +10888,11 @@ app.addEventListener("change", async (event) => {
     return updateConsolidationLoadSelection();
   }
   if (event.target?.dataset?.returnInput || event.target?.dataset?.returnLineInput) {
+    if (returnMode === "pallet") {
+      if (event.target.dataset.returnInput === "vehiclePlate") event.target.value = returnVehiclePlate;
+      if (event.target.dataset.returnInput === "palletQuantity") event.target.value = String(returnPalletQuantity);
+      return;
+    }
     return render();
   }
   if (event.target?.id === "historyDate") {
@@ -10711,6 +11026,7 @@ document.addEventListener("visibilitychange", () => {
     stopReturnScannerCamera();
     return;
   }
+  window.requestAnimationFrame(recordVisibleDeliveryPopup);
   refreshOperatorAccess().catch(() => {});
   void refreshOperatorPhonePolicy();
   operatorDisplaySettings.refresh()?.catch(() => {});

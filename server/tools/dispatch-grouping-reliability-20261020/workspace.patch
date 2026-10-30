@@ -1,0 +1,289 @@
+--- a/public/dispatch.js
++++ b/public/dispatch.js
+@@ -507,6 +507,11 @@
+ const dispatchOrderSearchCache = new Map();
+ const dispatchOrderBrowseCursors = new Map();
+ const dispatchOrderHydrationPromises = new Map();
++/** @type {Promise<any[]> | null} */
++let dispatchGroupHydrationPromise = null;
++let dispatchGroupHydrationRefs = new Set();
++let dispatchGroupHydrationInvalidated = false;
++let dispatchGroupRefreshPending = false;
+ let modalType = "";
+ let modalOrderId = "";
+ let modalLoadId = "";
+@@ -616,6 +621,7 @@
+ let planPollInFlight = false;
+ let eventSource = null;
+ let remoteRefreshTimer = null;
++/** @type {number | null} */
+ let orderPoolRefreshTimer = null;
+ let orderPoolRefreshInFlight = false;
+ let orderPoolRefreshTrailing = false;
+@@ -1054,7 +1060,7 @@
+   }
+   const requestedDate = currentPlanDate;
+   const requestedGeneration = localPlanGeneration;
+-  await refreshPlannedAssignments();
++  await refreshPlannedAssignments({ includeSnapshots: false });
+   const response = await fetch("/api/dispatch/plan-edit-lease/acquire", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+@@ -4714,7 +4720,10 @@
+   return candidates.map((order) => verified.has(order.id) ? orderById(order.id) || order : order);
+ }
+ 
+-async function applyTargetedDispatchOrderUpdate(orderId) {
++async function applyTargetedDispatchOrderUpdate(orderId, { grouping = false } = {}) {
++  if (!grouping && dispatchGroupHydrationPromise) {
++    await dispatchGroupHydrationPromise.catch(() => null);
++  }
+   const token = dispatchOrderReadToken();
+   const key = dispatchOrderRefKey(orderId);
+   dispatchOrderReadRequests.set(key, token);
+@@ -4746,6 +4755,7 @@
+ }
+ 
+ async function loadDispatchOrderSearch(term, sequence) {
++  if (dispatchGroupHydrationPromise) await dispatchGroupHydrationPromise.catch(() => null);
+   const scope = dispatchOrderPoolScope();
+   const readToken = dispatchOrderReadToken();
+   try {
+@@ -4860,13 +4870,14 @@
+   return plannedAssignmentsByRef.get(String(orderRef || "").trim().toUpperCase()) || null;
+ }
+ 
+-async function refreshPlannedAssignments() {
+-  const response = await fetch("/api/dispatch/planned-assignments");
++async function refreshPlannedAssignments({ includeSnapshots = true } = {}) {
++  const response = await fetch(`/api/dispatch/planned-assignments${includeSnapshots ? "" : "?includeSnapshots=false"}`);
+   if (!response.ok) throw new Error(await response.text());
+   applyPlannedAssignments(await response.json());
+ }
+ 
+ async function loadDispatchOrders({ sync = false, append = false } = {}) {
++  if (dispatchGroupHydrationPromise) await dispatchGroupHydrationPromise.catch(() => null);
+   const scope = dispatchOrderPoolScope();
+   const readToken = dispatchOrderReadToken();
+   const requestedType = activeOrderType === "BIN" ? "SO" : activeOrderType;
+@@ -4973,18 +4984,49 @@
+ }
+ 
+ async function hydrateDispatchGroupSelection() {
++  if (dispatchGroupHydrationPromise) return dispatchGroupHydrationPromise;
+   const selected = selectedOrders();
+   const ids = selected.map((order) => order.id).sort();
+-  await Promise.all(selected.filter(dispatchGroupOrderNeedsHydration)
+-    .map((order) => hydrateDispatchOrder(order.id, { force: true })));
+-  const current = selectedOrders();
+-  if (JSON.stringify(current.map((order) => order.id).sort()) !== JSON.stringify(ids)) {
+-    throw new Error("The order selection changed while details loaded. Review the selection and group again.");
+-  }
+-  if (current.some(dispatchGroupOrderNeedsHydration)) {
+-    throw new Error("Complete item details could not be loaded for every selected order.");
+-  }
+-  return current;
++  const token = dispatchOrderReadToken();
++  dispatchGroupHydrationRefs = new Set(ids.map(dispatchOrderRefKey));
++  // Invalidate older pool reads and coalesce background work until this action
++  // has complete details. Events for selected sources still require a new read.
++  dispatchOrderRefreshEpoch += 1;
++  dispatchGroupRefreshPending ||= Boolean(orderPoolRefreshTimer);
++  window.clearTimeout(orderPoolRefreshTimer ?? undefined);
++  orderPoolRefreshTimer = null;
++  dispatchGroupHydrationPromise = (async () => {
++    for (let attempt = 0; attempt < 3; attempt += 1) {
++      dispatchGroupHydrationInvalidated = false;
++      await Promise.all(selectedOrders().filter(order => attempt > 0 || dispatchGroupOrderNeedsHydration(order))
++        .map(order => applyTargetedDispatchOrderUpdate(order.id, { grouping: true })));
++      const current = selectedOrders();
++      if (JSON.stringify(current.map(order => order.id).sort()) !== JSON.stringify(ids)) {
++        throw new Error("The order selection changed while details loaded. Review the selection and group again.");
++      }
++      if (token.generation !== localPlanGeneration || token.planId !== String(currentPlan?.id || "")
++        || token.planDate !== currentPlanDate) {
++        throw new Error("The plan changed while details loaded. Review the selection and group again.");
++      }
++      if (dispatchGroupHydrationInvalidated) continue;
++      if (current.some(dispatchGroupOrderNeedsHydration)) {
++        if (attempt < 2) continue;
++        throw new Error("Complete item details could not be loaded for every selected order.");
++      }
++      return current;
++    }
++    throw new Error("Selected orders changed while details loaded. Please group again.");
++  })();
++  try {
++    return await dispatchGroupHydrationPromise;
++  } finally {
++    dispatchGroupHydrationPromise = null;
++    dispatchGroupHydrationRefs.clear();
++    if (dispatchGroupRefreshPending) {
++      dispatchGroupRefreshPending = false;
++      queueDispatchOrderPoolRefresh(orderPoolRefreshReason);
++    }
++  }
+ }
+ 
+ async function loadMbtBinDispatchCapability() {
+@@ -7959,7 +8001,7 @@
+   dispatchOrderAppliedReads.clear();
+   clearTimeout(saveTimer);
+   clearTimeout(remoteRefreshTimer);
+-  clearTimeout(orderPoolRefreshTimer);
++  clearTimeout(orderPoolRefreshTimer ?? undefined);
+   orderPoolRefreshTimer = null;
+   orderPoolRefreshTrailing = false;
+   orderPoolRefreshReason = "";
+@@ -8295,9 +8337,9 @@
+ 
+ function queueDispatchOrderPoolRefresh(reason = "Order data updated.", payload = {}) {
+   orderPoolRefreshReason = reason || orderPoolRefreshReason;
+-  dispatchOrderRefreshEpoch += 1;
+   dispatchOrderSearchCache.clear();
+-  for (const ref of dispatchRelatedRefreshRefs(payload)) pendingDispatchOrderRefreshRefs.add(ref);
++  const relatedRefs = dispatchRelatedRefreshRefs(payload);
++  for (const ref of relatedRefs) pendingDispatchOrderRefreshRefs.add(ref);
+   // Explicit structural results can introduce cards beyond the current page.
+   for (const values of [payload.reactivatedGlobalOrderRefs, payload.affectedOrderRefs,
+     payload.change === "order_resplit" ? payload.orderRefs : [],
+@@ -8307,11 +8349,20 @@
+       if (key) pendingDispatchRequiredRefreshRefs.add(key);
+     }
+   }
++  if (dispatchGroupHydrationPromise) {
++    dispatchGroupRefreshPending = true;
++    if (!relatedRefs.length || relatedRefs.some(ref => dispatchGroupHydrationRefs.has(ref))) {
++      dispatchGroupHydrationInvalidated = true;
++      dispatchOrderRefreshEpoch += 1;
++    }
++    return;
++  }
++  dispatchOrderRefreshEpoch += 1;
+   if (orderPoolRefreshInFlight) {
+     orderPoolRefreshTrailing = true;
+     return;
+   }
+-  window.clearTimeout(orderPoolRefreshTimer);
++  window.clearTimeout(orderPoolRefreshTimer ?? undefined);
+   orderPoolRefreshTimer = window.setTimeout(() => {
+     orderPoolRefreshTimer = null;
+     void runQueuedDispatchOrderPoolRefresh();
+@@ -15644,6 +15695,15 @@
+   const grouped = normalizeOrder({
+     ...groupItems[0],
+     id: uniqueGroupedDispatchOrderId(leafItems),
++    originalOrderId: "",
++    parentOrderRef: "",
++    resplitSourceOrderId: "",
++    originalPallets: null,
++    isSplit: false,
++    globalOrderDefinition: false,
++    globalOrderDefinitionKind: "",
++    globalOrderSourcePlanId: "",
++    globalOrderSourcePlanDate: "",
+     groupPlanId: currentPlan?.id || "",
+     groupPlanDate: currentPlanDate,
+     planOwned: true,
+--- a/public/dispatch.html
++++ b/public/dispatch.html
+@@ -16,6 +16,6 @@
+     <script src="/delivery-instruction-upload.js?v=20260812-delivery-image-720p-v1"></script>
+     <script src="/dispatch-address-guard.js?v=20260920-executed-review-v1"></script>
+     <script src="/dispatch-edit-activity.js?v=20261015-editor-controls"></script>
+-    <script src="/dispatch.js?v=20261020-split-draft-identity-v1"></script>
++    <script src="/dispatch.js?v=20261020-edit-group-reliability-v1"></script>
+   </body>
+ </html>
+--- a/src/server.js
++++ b/src/server.js
+@@ -1233,8 +1233,8 @@
+   return merged;
+ }
+ 
+-async function dispatchPlannedAssignmentsFromProjection() {
+-  const rows = await listDispatchPlanOrderAssignmentsProjection();
++async function dispatchPlannedAssignmentsFromProjection({ includeSnapshots = true } = {}) {
++  const rows = await listDispatchPlanOrderAssignmentsProjection({ includeSnapshots });
+   const assignments = new Map();
+   for (const row of rows) {
+     if (assignments.has(row.orderRef)) continue;
+@@ -1252,8 +1252,8 @@
+   return assignments;
+ }
+ 
+-async function dispatchPlannedAssignmentsFromSnapshots() {
+-  return dispatchPlannedAssignmentsFromProjection();
++async function dispatchPlannedAssignmentsFromSnapshots(options = {}) {
++  return dispatchPlannedAssignmentsFromProjection(options);
+ }
+ 
+ async function removeStaleCoPlannedAssignments(assignments) {
+@@ -1289,8 +1289,8 @@
+   });
+ }
+ 
+-async function listDispatchPlannedAssignments() {
+-  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots();
++async function listDispatchPlannedAssignments(options = {}) {
++  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots(options);
+   return [...plannedAssignments.entries()]
+     .map(([orderRef, details]) => ({ orderRef, ...details }))
+     .sort((a, b) => String(a.orderRef).localeCompare(String(b.orderRef)));
+@@ -17808,7 +17808,7 @@
+ 
+ app.get("/api/dispatch/planned-assignments", async (req, res, next) => {
+   try {
+-    res.json(await listDispatchPlannedAssignments());
++    res.json(await listDispatchPlannedAssignments({ includeSnapshots: req.query.includeSnapshots !== "false" }));
+   } catch (error) {
+     next(error);
+   }
+--- a/src/dispatch-planner-v2-repository.js
++++ b/src/dispatch-planner-v2-repository.js
+@@ -534,7 +534,8 @@
+ export async function listDispatchPlanOrderAssignmentsProjection({
+   orderRefs = [],
+   excludePlanId = "",
+-  excludePlanDate = ""
++  excludePlanDate = "",
++  includeSnapshots = true
+ } = {}) {
+   const refs = [...new Set(
+     (orderRefs || []).map((ref) => text(ref).toLowerCase()).filter(Boolean)
+@@ -548,7 +549,7 @@
+             assignment.assignment_kind,
+             assignment.load_id,
+             assignment.stop_id,
+-            assignment.assignment
++            ${includeSnapshots ? "assignment.assignment" : "(assignment.assignment - 'plannedOrderSnapshot')"} AS assignment
+        FROM dispatch_plan_order_assignments assignment
+        JOIN dispatch_plans plan ON plan.id = assignment.plan_id
+       WHERE plan.status <> 'cancelled'
+--- a/src/dispatch-delivery-group-repository.js
++++ b/src/dispatch-delivery-group-repository.js
+@@ -224,6 +224,8 @@
+ function globalGroupSnapshot(order = {}, { sourcePlanId, sourcePlanDate, orderType } = {}) {
+   const snapshot = JSON.parse(JSON.stringify(order));
+   for (const field of [
++    "originalOrderId", "parentOrderRef", "resplitSourceOrderId", "originalPallets",
++    "globalOrderDefinition", "globalOrderDefinitionKind", "globalOrderSourcePlanId", "globalOrderSourcePlanDate",
+     "dispatchSnapshotSourcePlanId",
+     "dispatchSnapshotSourcePlanDate",
+     "dispatchPlanned",
+@@ -241,6 +243,7 @@
+   return {
+     ...snapshot,
+     type: orderType || canonicalGroupedOrderType(order) || snapshot.type,
++    isSplit: false,
+     globalGroupDefinition: true,
+     globalGroupSourcePlanId: sourcePlanId === null || sourcePlanId === undefined ? "" : String(sourcePlanId),
+     globalGroupSourcePlanDate: sourcePlanDate,
+@@ -458,6 +461,7 @@
+ 
+ function derivedDefinitionKind(order = {}) {
+   if (!canonicalDerivedOrderType(order)) return "";
++  if (isGroupedDispatchOrder(order)) return "";
+   if (order.orderKind === "sor_rental_return") { return "derived"; }
+   if (splitParentRef(order)) return "split";
+   const declared = text(order.globalOrderDefinitionKind).toLowerCase();

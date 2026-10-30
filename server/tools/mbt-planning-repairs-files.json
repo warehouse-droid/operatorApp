@@ -1,0 +1,12 @@
+[
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "public/mbt-planning.html",
+  "public/bin-asset-search.js",
+  "public/bin-order-workflow-ui.js",
+  "public/bin-transport-ui.js",
+  "public/mbt-frontdesk.js",
+  "public/mbt-frontdesk.html",
+  "src/mbt/frontdesk-service.js",
+  "src/mbt/router.js"
+]

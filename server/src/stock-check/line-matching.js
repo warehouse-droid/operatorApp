@@ -3,8 +3,8 @@ import crypto from 'node:crypto';
 export const isUnilock=name=>/^unilock(?:\s+(?:ltd\.?|limited|inc\.?|ontario))?$/iu.test(String(name??'').trim());
 const normalized=value=>String(value??'').replace(/[™®]/gu,'').replace(/\bTM\b/gu,'').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]+/gu,'');
 export function lineFingerprint(line) {
-  return crypto.createHash('sha256').update(JSON.stringify([line.vendorName,line.productName,line.color,line.size,
-    line.detailSpec,line.itemCode,line.vendorReference,line.quantity,line.uom])).digest('hex');
+  return crypto.createHash('sha256').update(JSON.stringify(['request-quantity-v2',line.vendorName,line.productName,line.color,line.size,
+    line.detailSpec,line.itemCode,line.vendorReference,line.quantity,line.uom,line.checkQuantity,line.requestedQuantity])).digest('hex');
 }
 export function matchLineProducts(line,products) {
   if(/\b(?:rdm|random)\b/iu.test([line.productName,line.size].join(' '))) {

@@ -11,7 +11,11 @@
   let offlineReviewEventSource = null;
   let sidebarOperator = null;
   let mbrContractsEnabled = false;
-  if (!path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbr") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
+  let repairEnabled = false;
+  const repairPage = path === "/repair" || path.startsWith("/repair/");
+  const repairParams = new URLSearchParams(window.location.search);
+  if (repairPage && (repairParams.has("embedded") || repairParams.get("mode") === "driver")) return;
+  if (!path.startsWith("/repair") && !path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbr") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -40,6 +44,7 @@
     if (item.controlSection) {
       return path === item.href;
     }
+    if (item.href === "/repair") return path === "/repair" || path.startsWith("/repair/");
     if (item.href === "/control") return path.startsWith("/control");
     if (item.href === "/admin") return path.startsWith("/admin");
     if (item.href === "/dispatch") return path === "/dispatch";
@@ -50,6 +55,7 @@
   }
 
   const mainItems = [
+    { label: "Repair", href: "/repair", icon: "RP", authorities: ["repair_office", "repair_technician", "admin", "dispatcher", "yard_manager", "mbr_sales"] },
     { label: "BOSS approvals", href: "/boss", icon: "BO", authorities: ["boss"] },
     { label: "Admin", href: "/admin", icon: "AD", authorities: ["admin"] },
     { label: "Control", href: "/control", icon: "CT", authorities: ["admin", "yard_manager"] },
@@ -147,7 +153,7 @@
     { label: "Front Desk", href: "/mbt/frontdesk", icon: "FD", mbtRole: "mbt_frontdesk" },
     { label: "Billing", href: "/mbt/billing", icon: "BL", mbtRole: "mbt_billing" },
     { label: "Assets", href: "/mbt/assets", icon: "BA", mbtRoles: ["admin", "dispatcher"] },
-    { label: "Configuration", href: "/mbt/config", icon: "CF", mbtRole: "admin" }
+    { label: "Configuration", href: "/mbt/config", icon: "CF", mbtRoles: ["admin", "dispatcher"] }
   ];
 
   function staffRoleSet() {
@@ -189,6 +195,7 @@
       && ["operator", "sales", "yard_manager"].some(role => roles.has(role));
     return mainItems.filter((item) => (!item.staffOnly || !operator?.publicSales)
       && (item.href !== "/mbr" || mbrContractsEnabled)
+      && (item.href !== "/repair" || repairEnabled)
       && (item.href !== "/aggregate-requests" || aggregateAccess) && itemAllowedByAuthority(item, roles));
   }
 
@@ -203,6 +210,10 @@
   }
 
   function currentItems() {
+    if (path === "/repair" || path.startsWith("/repair/")) return {title: "Repair", items: [
+      {label:"Repair portal",href:"/repair",icon:"RP"},
+      {label:"Repair Team",href:"/repair/workshop",icon:"RT",authorities:["admin","repair_technician"]}
+    ].filter(item=>itemAllowedByAuthority(item))};
     if (path.startsWith("/mbr")) return { title: "MBR", items: [{ label: "Contract", href: "/mbr/contracts", icon: "CT" }, { label: "MBR Setup", href: "/mbr/setup", icon: "SE" }] };
     if (path.startsWith("/aggregate-requests")) return {
       title: "Aggregate Requests", items: [{ label: "Requests", href: "/aggregate-requests", icon: "AG" }]
@@ -649,12 +660,12 @@
 
   function render() {
     const scoped = currentItems();
-    const group = ['admin','dispatch','scm','sales','mbr','mbt'].find(key => path.startsWith(`/${key}`)) || 'control';
+    const group = ['admin','dispatch','scm','sales','mbr','mbt','repair'].find(key => path.startsWith(`/${key}`)) || 'control';
     const ordered = (key,items) => window.MBBSMenuOrder?.sort(key,items) || items;
     const storedCollapsed = localStorage.getItem(STORAGE_KEY);
     const collapsed = storedCollapsed === "true"
       || (storedCollapsed === null
-        && (path.startsWith("/mbt") || path === "/dispatch/driver-pwa")
+        && (path.startsWith("/mbt") || repairPage || path === "/dispatch/driver-pwa")
         && window.matchMedia("(max-width: 760px)").matches);
     document.body.classList.toggle("app-sidebar-collapsed", collapsed);
     document.body.classList.add("has-app-sidebar");
@@ -746,28 +757,29 @@
   }
 
   function init() {
-    if(!document.querySelector('link[rel="manifest"]')) {
+    if(document.documentElement.dataset.appMode!=='browser'&&!document.querySelector('link[rel="manifest"]')) {
       const staffManifest=document.createElement('link');staffManifest.rel='manifest';
       staffManifest.href='/staff-manifest.webmanifest';document.head.appendChild(staffManifest);
     }
     const alertSound=document.createElement('script');
-    alertSound.async=false;alertSound.src='/app-alert-sound.js?v=20261014-attention';
+    alertSound.async=false;alertSound.src='/app-alert-sound.js?v=20261014-attention&preferences=20261021-sound-presets';
     document.head.appendChild(alertSound);
     const osNotifications = document.createElement('script');
     osNotifications.async = false;
-    osNotifications.src = '/app-notifications.js?v=20261014-preferences';
+    osNotifications.src = '/app-notifications.js?v=20261014-preferences&preferences=20261021-sound-presets';
     document.head.appendChild(osNotifications);
     const menuOrder = document.createElement('script');
     menuOrder.type = 'module';
     menuOrder.src = '/menu-order.js?v=20261006';
     document.head.appendChild(menuOrder);
+    if(!repairPage){
     const appEventStream = document.createElement('script');
     appEventStream.src = '/app-event-stream.js?v=20261005';
     appEventStream.async = false;
     document.head.appendChild(appEventStream);
     const regularAlert = document.createElement("script");
     regularAlert.async = false;
-    regularAlert.src = "/regular-stock-alert.js?arrival=20261020-v1&input=20261020-v1&v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009";
+    regularAlert.src = "/regular-stock-alert.js?alertSearch=20261023&allAlerts=20261022-v1&arrival=20261020-v1&input=20261020-v1&v=20261014-os-notifications&stockingReply=20261006-v1&backorder=20261007-v1&stockCheck=20261009&preferences=20261021-roles-sounds";
     document.head.appendChild(regularAlert);
     const aggregateAlert = document.createElement("script");
     aggregateAlert.async = false;
@@ -775,27 +787,29 @@
     document.head.appendChild(aggregateAlert);
     const specialAlert = document.createElement("script");
     specialAlert.async = false;
-    specialAlert.src = "/scm-special-alert.js?v=20261005-shared-events";
+    specialAlert.src = "/scm-special-alert.js?alertSearch=20261023&allAlerts=20261022-v1&v=20261005-shared-events";
     document.head.appendChild(specialAlert);
     const salesSpecialAlert = document.createElement("script");
     salesSpecialAlert.async = false;
-    salesSpecialAlert.src = "/sales-special-alert.js?v=20261005-shared-events";
+    salesSpecialAlert.src = "/sales-special-alert.js?alertSearch=20261023&allAlerts=20261022-v1&v=20261005-shared-events&preferences=20261021-roles-sounds";
     document.head.appendChild(salesSpecialAlert);
     const specialDeliveryAlert = document.createElement('script');
     specialDeliveryAlert.type = 'module';
-    specialDeliveryAlert.src = '/special-delivery-method-alert.js?v=20261014-os-notifications';
+    specialDeliveryAlert.src = '/special-delivery-method-alert.js?allAlerts=20261022-v1&v=20261014-os-notifications&preferences=20261021-roles-sounds';
     document.head.appendChild(specialDeliveryAlert);
     const deliveryAlert = document.createElement('script');
     deliveryAlert.async = false;
-    deliveryAlert.src = '/delivery-request-alert.js?v=20261015-transfer-orders';
+    deliveryAlert.src = '/delivery-request-alert.js?v=20261015-transfer-orders&preferences=20261021-roles-sounds';
     document.head.appendChild(deliveryAlert);
     const conversationAlert = document.createElement('script');
     conversationAlert.async = false;
-    conversationAlert.src = '/stock-request-conversation-alert.js?v=20261016';
+    conversationAlert.src = '/stock-request-conversation-alert.js?allAlerts=20261022-v1&v=20261016&preferences=20261021-roles-sounds';
     document.head.appendChild(conversationAlert);
+    }
     installStyle();
     render();
     void refreshSidebarAuthority();
+    void fetch('/api/repair/availability').then(r=>r.json()).then(r=>{repairEnabled=r.enabled===true;render();}).catch(()=>{});
     document.addEventListener("click", (event) => {
       if (event.target.closest?.("[data-sidebar-toggle]")) {
         const currentlyCollapsed = document.body.classList.contains("app-sidebar-collapsed");

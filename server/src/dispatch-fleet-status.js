@@ -187,10 +187,12 @@ export function dispatchFleetAssignmentStatusConflicts(
         const exactDriver = driverMaps.byLogin.get(driverLogin);
         const legacyNameMatches = exactDriver ? [] : (driverMaps.byName.get(driverLogin) || []);
         const resolvedDriver = exactDriver || (legacyNameMatches.length === 1 ? legacyNameMatches[0] : null);
-        if (!resolvedDriver || resolvedDriver.active === false) {
+        // Inactivation restricts execution, not dispatch planning. Retain the
+        // assignment until dispatch reassigns it, including across plan saves.
+        if (!resolvedDriver) {
           conflicts.push({
             code: "DISPATCH_DRIVER_DISABLED",
-            message: `${load.name || load.id} is assigned to disabled or unavailable driver ${assignment.driverName || assignment.driverLogin}. Reassign the load before saving.`,
+            message: `${load.name || load.id} is assigned to unavailable driver ${assignment.driverName || assignment.driverLogin}. Reassign the load before saving.`,
             loadId: String(load.id || ""),
             driverLogin: assignment.driverLogin
           });

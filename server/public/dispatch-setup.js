@@ -1129,7 +1129,7 @@ setupApp.addEventListener("click", (event) => {
     const active = !setupRecordActive(driver);
     const confirmed = window.confirm(active
       ? `Enable ${driver.name || driver.login}? The driver will be available for planning and sign-in again.`
-      : `Disable ${driver.name || driver.login}? The driver will be removed from new planning and sign-in. Existing history and statistics will remain. Active work must be reassigned or finished first.`);
+      : `Disable ${driver.name || driver.login}? Sign-in and job execution will be blocked immediately. Planning can continue. Unfinished jobs will remain assigned until Dispatch reassigns them to an active driver. Existing history and statistics will remain.`);
     if (!confirmed) return;
     driverActiveButton.disabled = true;
     driverActiveButton.textContent = active ? "Enabling..." : "Disabling...";

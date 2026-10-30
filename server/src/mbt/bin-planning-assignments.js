@@ -1,5 +1,6 @@
 // @ts-check
 import crypto from "node:crypto";
+import {stageTransportAssignment,publishTransportAssignments} from "./bin-transport-planning.js";
 import { query } from "../db.js";
 import { canonicalSha256 } from "./canonical-json.js";
 import { validateBinWorkflowClaims, updateBinWorkflowClaim } from "./bin-order-workflow-planning.js";
@@ -18,6 +19,7 @@ export async function withdrawPlanningAssignment(visit, input) {
 /** @param {string} visitId @param {any} plan @param {any} input @param {boolean} [bumpVisit] */
 export async function stagePlanningAssignment(visitId, plan, input, bumpVisit = true) {
   const visit = await lockPlanningVisit(visitId);
+  if (visit.transportTripId) {return stageTransportAssignment(visitId,plan,input);}
   if (["completed", "cancelled"].includes(visit.status)) {
     throw planningError(409, "MBT_BIN_VISIT_COMPLETE", "Completed BIN visits cannot be changed.");
   }
@@ -92,7 +94,7 @@ function matchesAssignmentEvidence(current, visit, group) {
   return samePlanningValue(current.snapshot, snapshot) && samePlanningValue(snapshot.stops, group.stops)
     && snapshot.serviceSnapshotHash === canonicalSha256(visit.service_snapshot)
     && Number(current.template_revision) === Number(snapshot.templateRevision)
-    && current.driver_active && current.truck_active && current.truck_type === "bin" && current.bin_service_enabled;
+    && current.truck_active && current.truck_type === "bin" && current.bin_service_enabled;
 }
 /** @param {any} visit @param {any} current @param {any} snapshot */
 async function validateAssignmentReservations(visit, current, snapshot) {
@@ -117,11 +119,12 @@ export function pendingPlanningReturns(plan) {
     .filter((/** @type {any} */ load) => load.mbtPlanning && load.returnOnly && load.mbtReturnReleased !== true);
 }
 
-/** @param {string} planId @param {string} actorId @param {number} previousRevision */
-export async function publishPlanningAssignments(planId, actorId, previousRevision) {
+/** @param {string} planId @param {string} actorId @param {number} previousRevision @param {string[] | null} [visitIds] */
+export async function publishPlanningAssignments(planId, actorId, previousRevision, visitIds=null) {
   const plan = await readPlanningPlan(planId);
   const pending = await query(`SELECT * FROM mbt_bin_planning_assignments WHERE plan_id=$1
-    AND withdrawn_at IS NULL AND released_at IS NULL ORDER BY service_visit_id FOR UPDATE`, [planId]);
+    AND withdrawn_at IS NULL AND released_at IS NULL AND ($2::uuid[] IS NULL OR service_visit_id=ANY($2::uuid[]))
+    ORDER BY service_visit_id FOR UPDATE`, [planId,visitIds]);
   for (const row of pending.rows) {
     const { load } = planningLoad(plan, row.load_id);
     const stops = load.stops.filter((/** @type {any} */ s) => s.mbt?.visitId === String(row.service_visit_id));
@@ -131,9 +134,10 @@ export async function publishPlanningAssignments(planId, actorId, previousRevisi
     await query("UPDATE mbt_service_visits SET dispatch_assignment_snapshot=$2::jsonb WHERE service_visit_id=$1", [row.service_visit_id, JSON.stringify(snapshot)]);
     await planningEvent(row.service_visit_id, "assignment_released", actorId, { generation: Number(row.generation), planId });
   }
-  const returns = pendingPlanningReturns(plan);
+  const transportCount=await publishTransportAssignments(plan,visitIds);
+  const returns = visitIds===null ? pendingPlanningReturns(plan) : [];
   for (const load of returns) {load.mbtReturnReleased = true;}
-  if (pending.rowCount || returns.length) {
+  if (pending.rowCount || returns.length || transportCount) {
     await query("UPDATE dispatch_plan_snapshots SET trucks=$2::jsonb,saved_at=now() WHERE plan_id=$1", [planId, JSON.stringify(plan.trucks)]);
     if (plan.revision === previousRevision) {await query("UPDATE dispatch_plans SET revision=revision+1,updated_at=now() WHERE id=$1", [planId]);}
   }

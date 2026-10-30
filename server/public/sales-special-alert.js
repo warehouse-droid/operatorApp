@@ -8,6 +8,7 @@
   let session = '', checkedSession = '', allowed = false, count = null;
   let timer = null, retry = null, events = null, observer = null, request = null, authority = null, refreshAgain = false;
   let link = null, status = null;
+
   let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitForProduction = 0, pendingUpdate = 0;
 
   function paint() {
@@ -18,7 +19,7 @@
     if (!link) {
       link = document.createElement('a');
       link.className = 'sales-special-alert';
-      link.href = '/sales/stock-requests?tab=special&mine=1&stages=pending_update,await_customer_confirmation,dispatch_arrangement,wait_for_production';
+      link.href = '/sales/stock-requests?tab=special&alerts=1';
       link.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg><span data-special-alert-label></span><strong data-special-alert-count></strong>';
     }
     if (link.parentElement !== host) { host.prepend(link); }
@@ -168,7 +169,7 @@
   function init() {
     const poReferenceAlert = document.createElement('script');
     poReferenceAlert.type = 'module';
-    poReferenceAlert.src = '/special-po-reference-alert.js?v=20261008-sales-queue';
+    poReferenceAlert.src = '/special-po-reference-alert.js?allAlerts=20261022-v1&v=20261008-sales-queue&preferences=20261021-roles-sounds';
     document.head.append(poReferenceAlert);
     const style = document.createElement('style');
     style.textContent = `

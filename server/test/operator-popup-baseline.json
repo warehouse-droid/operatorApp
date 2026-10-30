@@ -1,0 +1,18 @@
+{
+  "test": "yard lists and saved queues withhold unauthorized groups while preserving authorized standalone orders and saved rows",
+  "baselineCommand": "DISPATCH_SOURCE_SKIP_BUILD=1 DISPATCH_SOURCE_RUNTIME=\"$PWD/server/deployments/operator-popup-20261026/live-before\" DISPATCH_SOURCE_MIGRATIONS=\"$PWD/server/deployments/operator-popup-20261026/live-before/migrations\" python3 docker/retention/retention.py run --root /tmp -- bash docker/run-dispatch-source-tests.sh node tools/operator-popup-baseline.mjs",
+  "summary": {
+    "tests": 36,
+    "pass": 35,
+    "fail": 1,
+    "skipped": 0
+  },
+  "assertion": "saved-orders?locationId=1: 500 !== 200",
+  "cause": "invalid input syntax for type bigint: GRP-YARD-<fixture UUID>",
+  "sourceHashes": {
+    "src/server.js": "62a8f91a187fbe72c4a8f801957973776e8c73a06fcf5f48b24b8fd5da80ff87",
+    "src/delivery-repository.js": "3002a7052ba4163df1ab93097567a527358e926948fceefa3005a74d6423f535",
+    "src/auth-repository.js": "5fdb99da9ff4161d7f866a3539cee52fa79d6a5be2f1b72f9263291dd1c664e1"
+  },
+  "cleanupVerified": true
+}

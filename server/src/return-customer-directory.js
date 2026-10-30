@@ -103,7 +103,7 @@ function directorySearchInput(search, limit) {
   }
   const normalizedTerm = term.toLocaleLowerCase("en-CA");
   const escapedPrefix = `${normalizedTerm.replace(/[\\%_]/g, "\\$&")}%`;
-  const phoneDigits = term.replace(/\D/g, "");
+  const phoneDigits = term.replace(/\D/g, "").replace(/^1(?=\d{10}$)/, "");
   return {
     term,
     normalizedTerm,

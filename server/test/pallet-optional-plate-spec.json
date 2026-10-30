@@ -1,0 +1,12 @@
+{
+  "request": "Make vehicle plate optional for pallet returns",
+  "specApproval": "not obtained (autonomous run)",
+  "setup": "Existing test tooling only; isolated bounded containers and mocked NetSuite; no dependency or schema changes.",
+  "scenarios": [
+    "P1 Pallet-only returns accept omitted, empty or whitespace vehicle plates and create one verified Credit Memo; replay cannot create another.",
+    "P2 A supplied plate is normalized and retained; the existing 32-character limit still applies.",
+    "P3 Stock-containing returns still require a vehicle plate; photo, quantity, yard and posting checks remain in force.",
+    "P4 Operator review labels a pallet-only vehicle plate Optional and permits confirmation without it.",
+    "P5 A Credit Memo for a blank-plate return omits an empty plate label from its memo."
+  ]
+}

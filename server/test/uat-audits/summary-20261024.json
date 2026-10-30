@@ -1,0 +1,36 @@
+{
+  "createdFrom": [
+    "test/uat-audits/mbt-uat-2026-10-24T053404556Z.json",
+    "test/uat-audits/mbt-uat-2026-10-24T054636423Z.json",
+    "test/uat-audits/mbt-uat-2026-10-24T054835723Z.json"
+  ],
+  "firstStartedAt": "2026-10-24T05:34:04.556Z",
+  "lastFinishedAt": "2026-10-24T05:48:42.027Z",
+  "runtime": "/home/ubuntu/apps/operatorApp/server/deployments/bin-weight-warning-20261024/candidate",
+  "matchesDeployedSources": true,
+  "latestResults": {
+    "tests": 852,
+    "pass": 852,
+    "fail": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  },
+  "uniqueTestFiles": 201,
+  "browserTestFiles": 17,
+  "browserTests": 22,
+  "caseResults": {
+    "Partial - remaining checks recorded": 29,
+    "Passed automated checks": 123
+  },
+  "allManualCasesSignedOff": false,
+  "configurationFinding": "20YD maximum_payload_kg is not configured. Plan Transport requires bin payload capacity; configure the actual rating before 20YD transport UAT.",
+  "limitations": [
+    "Synthetic isolated data; external integrations disabled.",
+    "Real camera/scanner devices and physical driving not exercised.",
+    "Case-specific remaining checks are listed in the CSV; test totals are not manual-case pass counts."
+  ],
+  "resultFile": "test/mbt-uat-results-20261024.csv",
+  "cleanupPassed": true,
+  "findings": "test/uat-audits/findings-20261024.json"
+}

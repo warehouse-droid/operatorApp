@@ -10,4 +10,41 @@
 .bin-workflow-dialog .primary { background: #174e76; color: white; }
 .bin-workflow-dialog [data-error] { color: #ac2735; }
 .bin-workflow-dialog [hidden] { display: none !important; }
+.bin-transport-dialog table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+.bin-transport-dialog th, .bin-transport-dialog td { padding: 8px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+.bin-transport-dialog td input { width: 100px; }
+.bin-transport-dialog select { width: 100%; }
+.bin-transport-dialog footer { display: flex; gap: 12px; }
+.bin-transport-dialog [data-message] { color: #9f1239; }
 .bin-workflow-note { color: #475569; font-size: 12px; margin: 6px 0; white-space: normal; }
+
+.mbt-bin-planning-page [data-dispatch-order-pool],
+.mbt-bin-planning-page [data-dispatch-order-list],
+.mbt-bin-planning-page .order-card { min-width: 0; max-width: 100%; box-sizing: border-box; }
+/* Keep tall cards from shrinking when the scrollable pool fills up. */
+.mbt-bin-planning-page .order-list { grid-auto-rows: max-content; }
+.mbt-bin-planning-page .order-card { grid-template-columns: minmax(0, 1fr); overflow-wrap: anywhere; }
+.mbt-bin-planning-page .order-card > *,
+.mbt-bin-planning-page .selected-order-actions > * { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.mbt-bin-planning-page .selected-order-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.mbt-bin-planning-page .selected-order-actions label { display: flex; align-items: center; gap: 6px; }
+.mbt-bin-planning-page .selected-order-actions select { max-width: 100%; }
+.mbt-bin-planning-page .order-card.planned-elsewhere { cursor: pointer; }
+.mbt-bin-planning-page .order-card:has([data-bin-collection-waiting]) { background: #fff1f2; border-color: #fda4af; cursor: default; }
+.mbt-bin-planning-page [data-bin-collection-waiting] { background: #ffe4e6; color: #881337; white-space: normal; }
+
+/* Cargo inputs share the workflow dialog and fit narrow screens. */
+.bin-visit-details { width: min(850px, 94vw); box-sizing: border-box; }
+.bin-cargo-controls { border: 0; padding: 0; min-width: 0; }
+.bin-cargo-form label { display: grid; gap: 6px; margin: 10px 0; }
+.bin-cargo-form input, .bin-cargo-form select { min-width: 0; max-width: 100%; width: 100%; box-sizing: border-box; }
+.bin-cargo-row { border: 1px solid var(--line, #d3d8dd); border-radius: 8px; margin: 12px 0; padding: 12px; min-width: 0; }
+.bin-cargo-locations { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+[data-cargo-preview] li { padding: 5px 0; overflow-wrap: anywhere; }
+[data-cargo-preview] span { display: block; }
+.bin-cargo-travel { color: #667085; font-size: 0.85em; }
+@media (max-width: 640px) { .bin-cargo-locations { grid-template-columns: 1fr; } }
+
+.bin-workflow-dialog [data-workflow-fields] { border: 0; padding: 0; margin: 0; min-width: 0; }
+.bin-workflow-dialog { box-sizing: border-box; }
+.bin-workflow-dialog [data-cargo-required] { font-weight: 600; color: #174e76; }

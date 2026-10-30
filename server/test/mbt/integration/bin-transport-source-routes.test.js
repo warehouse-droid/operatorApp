@@ -1,0 +1,47 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import {query,closeDb} from '../../../src/db.js';
+import {reconcileSorReturnDrafts,sorReturnActivity} from '../../../src/sor-rental-repository.js';
+import {transportFixture,transportInput} from '../support/bin-transport-fixtures.js';
+import {saveTransportTrip,getTransportOptions} from '../../../src/mbt/bin-transport-service.js';
+import {readTransportSource} from '../../../src/mbt/bin-transport-sources.js';
+import {run,storedPlan} from '../support/bin-planning-fixtures.js';
+after(closeDb);
+test('Transport SOR return: original customer pickup, resolved yard 3445 drop, and source sync preserves started quantities',async()=>{
+  const f=await transportFixture(),ref=`${f.sourceRef}-Return`;
+  const parentId=Date.now();
+  await query("INSERT INTO sales_orders(netsuite_id,tranid,sales_order_type,netsuite_active,status_text) VALUES($1,$2,'Delivery',true,'Pending Fulfillment')",[parentId,f.sourceRef]);
+  const draft={refNumber:ref,parentOrderRef:f.sourceRef,parentSalesOrderId:parentId,lineSnapshot:[{itemId:777,lineRowId:'return-1',itemName:'Machine',quantity:1,salesQty:1,lineWeight:200}],
+    orderDetails:'Return machine',weightLbs:200,salesQty:1,pickupLocation:'100 Machine Road',dropoffLocation:'3445',customer:'Rental customer'};
+  await reconcileSorReturnDrafts(f.sourceRef,[draft]);
+  const input=await transportInput({...f,sourceRef:ref},[{lineKey:'return-1',quantity:'1'}]);
+  const trip=(await saveTransportTrip(input)).body.trip;
+  assert.equal(trip.route.pickup.address,'100 Machine Road');
+  assert.equal(trip.route.destination.kind,'yard');assert.equal(trip.route.destination.yardCode,'3445');
+  assert.ok(trip.route.destination.address.length>4);
+  await run(f,'assign',{visitId:trip.tripId,expectedVisitRevision:trip.revision,assetAssignments:[]});
+  assert.equal(await sorReturnActivity(ref),true);
+  await query("UPDATE mbt_transport_trips SET actual_started_at=now(),status='in_progress' WHERE trip_id=$1",[trip.tripId]);
+  const synced=await reconcileSorReturnDrafts(f.sourceRef,[{...draft,lineSnapshot:[{...draft.lineSnapshot[0],quantity:2,salesQty:2}]}]);
+  assert.equal(synced.review,1);
+  const source=await readTransportSource(ref);assert.equal(source.snapshot.lines[0].quantity,'1');assert.ok(source.order.sorReviewReason);
+});
+test('Transport same-day reuse: per-trip times permit 10:30 after a 10:00 return, reject overlap and breaking the predecessor',async()=>{
+  const f=await transportFixture(),plan=await storedPlan(f.planId),load=plan.trucks[0].loads.find(l=>l.id===f.binLoadIds[0]);
+  load.plannedStartMinute=540;load.plannedFinishMinute=720;
+  await query('UPDATE dispatch_plan_snapshots SET trucks=$2::jsonb WHERE plan_id=$1',[f.planId,JSON.stringify(plan.trucks)]);
+  const one=(await saveTransportTrip(await transportInput(f,[{lineKey:'loose-1',quantity:'1'}]))).body.trip;
+  const times=start=>[0,20,40,55].map((offset,i)=>({sequence:i+1,arrival:start+offset,depart:start+offset+5}));
+  await run(f,'assign',{visitId:one.tripId,expectedVisitRevision:one.revision,assetAssignments:[],stopTimings:times(540)});
+  const two=(await saveTransportTrip(await transportInput(f,[{lineKey:'loose-1',quantity:'1'}]))).body.trip;
+  const before=await storedPlan(f.planId);
+  await assert.rejects(run(f,'assign',{visitId:two.tripId,expectedVisitRevision:two.revision,assetAssignments:[],stopTimings:times(570)}),/reserved|return|available|pickup/i);
+  assert.equal((await storedPlan(f.planId)).digest,before.digest);
+  await run(f,'assign',{visitId:two.tripId,expectedVisitRevision:two.revision,assetAssignments:[],stopTimings:times(630)});
+  const options=await getTransportOptions({sourceRef:f.sourceRef,planDate:f.planDate});
+  const dependent=options.trips.find(t=>t.tripId===two.tripId);
+  assert.equal(dependent.route.source.availabilityPredecessorId,one.tripId);
+  assert.equal((await query('SELECT lifecycle_status FROM mbt_bin_asset_state WHERE asset_id=$1',[f.assetId])).rows[0].lifecycle_status,'available');
+  const revision=(await query('SELECT revision FROM mbt_transport_trips WHERE trip_id=$1',[one.tripId])).rows[0].revision;
+  await assert.rejects(run(f,'cancel',{visitId:one.tripId,expectedVisitRevision:revision}),/return|depend|pickup/i);
+});

@@ -1,0 +1,51 @@
+{
+  "at": "2026-10-22T23:09:12.088Z",
+  "node": "v20.20.2",
+  "baseline": {
+    "tests": 97,
+    "pass": 78,
+    "fail": 19,
+    "skipped": 0,
+    "cancelled": 0,
+    "failures": [
+      "All Already Ordered request shows Completed and no remaining SO/PO steps",
+      "Completing the last material after a PO was linked removes its remaining planning prompt",
+      "Mixed Backorder skips completed materials in PO readiness and finishes remaining normal workflow",
+      "Already Ordered clears an outstanding SCM review alert while the remaining material awaits PO linkage",
+      "Sales attaches the NetSuite quotation number before review and after closure with retained input on conflicts",
+      "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+      "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+      "A pending Backorder save cannot replace another request selected by Sales",
+      "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+      "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+      "New Backorder enquiry hides order links in Sales and SCM",
+      "SCM Request information appears before the material lines",
+      "SCM Regular queue filter supports multiple selections, persists them and clears with other filters",
+      "SCM shows the vendor and receiving yard for each line even when the vendor directory is unavailable",
+      "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+      "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+      "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+      "Manual Backorder links keep revised material confirmations in Sales notifications",
+      "backorder browser: transfer without date, Sales acceptance, then actual SO ETA"
+    ],
+    "exit": 1
+  },
+  "red": {
+    "tests": 10,
+    "pass": 2,
+    "fail": 8,
+    "skipped": 0,
+    "cancelled": 0,
+    "failures": [
+      "Sales attaches an optional SO after all SCM replies on mobile while confirmations remain pending",
+      "saved SCM reviews start hidden; Edit restores one material and successful save collapses it",
+      "saved Sales confirmations start hidden; errors keep edits open and a successful save collapses",
+      "fully reviewed pending materials accept an optional SO without changing workflow or quote",
+      "reviewed attachment retains role, yard, revision, invalid-input and concurrent-save protection",
+      "all SCM replies expose the optional SO before Sales acceptance",
+      "generated attachment eligibility follows saved SCM replies, preserving Already Ordered compatibility",
+      "saved Sales and SCM replies render independent accessible edit controls"
+    ],
+    "exit": 1
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "passed": true,
+  "at": "2026-10-27T18:26:21.356408+00:00",
+  "source": {
+    "src/backorder-arrival.js": "56111011c3df839b5a4b5dacc927e1b4c2ff28f989a887f57b0a8c823520d9e6",
+    "src/backorder-po-progress.js": "6b9ab364987db4cb7f56686d672ab9c13801c3bc16d8b6818282c3d2a3e2d2fe",
+    "src/backorder-request-service.js": "f05ede9d12be7fb0b985384d7309c3c74b0f613161d769f0ed87132635605683",
+    "src/special-stock-request-repository.js": "7a15a365ec8a51ea971535df85d4528cf2a52d7901d6d3545a4a50d42ad8871f",
+    "src/regular-stock-request-service.js": "fb0ac642c2da75f570c4111abff3ee5e628a0ab48ab26581b6596b780a666d32",
+    "public/backorder-stock-requests.js": "f5aca385724d27489625709910b9a2ef15456a4241a527c43c014a76f4a7646e",
+    "public/regular-stock-alert.js": "d7213b3799bfdde063358100a1f2ab2dec50c0da15e3ebb9109627f763fd10db",
+    "public/sales-stock-requests.js": "3e9ba0c5cf3f20c29c467c9cae9cb7ac885dd32add08f9ff14853c7067266a9e",
+    "public/scm-stock-requests.js": "ca9595b6a17b94e5d74088434c5aaa48267d1389c1b37bba085af98692b8257e",
+    "public/sales-stock-requests.html": "c68d8803a577202581fe8ebe4ae286f067eb09d351a299128ca6be609a312e12",
+    "public/scm-stock-requests.html": "106a295937752fbdafccf036b8a798d6fca33ebea4a156665f65dd7803738a42",
+    "migrations/315_backorder_po_alert_receipts.sql": "3ccb1752685447d73d67955f71b4311e50d61fc6712d06bc626af9e191500cb0"
+  },
+  "candidateTreeHash": "d0cc4e165b2f73abc9411b0a8ddfbefcb9771c8ee1d69cb53d7109fe1f78b8aa",
+  "tests": 32,
+  "suites": {
+    "backorder-po-progress.test.js": 6,
+    "backorder-po-progress-browser.test.js": 1,
+    "already-ordered-arrival.test.js": 5,
+    "already-ordered-arrival-browser.test.js": 2,
+    "backorder-already-ordered.test.js": 10,
+    "backorder-already-ordered-browser.test.js": 4,
+    "backorder-review-flow-browser.test.js": 4
+  },
+  "validationNote": "32 passing checks across seven suites; after the unrelated repair release, the same scoped source was rebased and all nine PO progress/arrival integration and browser checks passed again.",
+  "testSource": {
+    "backorder-po-progress.test.js": "d04f7af3d4dcb612848e22e92b9a6c2fd632cf8efb2022ed467e43e0022483c6",
+    "backorder-po-progress-browser.test.js": "67541a07de5627f78b166d55a2b0f48124c68397d9402c8005c60dd52ef22237",
+    "already-ordered-arrival.test.js": "e8da9c1f59e90d3f2c377cb089e4e919f4498dedab5b3e7087f78e8b81e72c5b",
+    "already-ordered-arrival-browser.test.js": "4d249af304f2565077ef1b3f6f44e3b2be93e174eb502f7288091f339c074e90",
+    "backorder-already-ordered.test.js": "92fd17dfd4e2b9675c631337c7cafbd596a38f406d9365d9524b401b46886caf",
+    "backorder-already-ordered-browser.test.js": "bf33f98aae1d6ec6e22d2cd9e3bcf776334163bd579da57caefd9a8f6d505faa",
+    "backorder-review-flow-browser.test.js": "79672a533d9392451430ac789f6597ff74288ae5d4465d61e12718694c14614a"
+  },
+  "cleanup": "Every disposable stack, cloned database and artifact directory removed; final docker ps and docker ps -a show only the four production containers.",
+  "rebaseValidation": {
+    "passed": true,
+    "tests": 9,
+    "suites": [
+      "backorder-po-progress.test.js",
+      "backorder-po-progress-browser.test.js",
+      "already-ordered-arrival-browser.test.js"
+    ]
+  }
+}

@@ -94,3 +94,13 @@ test("execution dependency rejects missing evidence and reports rather than lose
   assert.throws(()=>assertBinWorkflowDependency({completedAt:"2030-07-10T17:00:00Z",occurredAt:"2030-07-10T16:00:00Z"}), /before/i);
   assert.deepEqual(assertBinWorkflowDependency({completedAt:"2030-07-10T16:00:00Z",occurredAt:"2030-07-11T16:00:00Z",sameDay:true}), {late:true});
 });
+
+test("a different-size exchange requires a different bin and delivery before collection", () => {
+  const changedSize={collectionBinTypeId:"type-14",binTypeId:"type-20",reuse:"different_bin",deliveryAssetId:"B042"};
+  assert.throws(()=>buildBinOrderWorkflow(input(changedSize)),/different.*(size|type).*delivery first/i);
+  assert.throws(()=>buildBinOrderWorkflow(input({...changedSize,reuse:"same_bin",deliveryAssetId:"B017"})),/different.*(size|type)/i);
+  const flow=buildBinOrderWorkflow(input({...changedSize,sequence:"delivery_first"}));
+  assert.equal(flow.parts.find(p=>p.role==="collection").binTypeId,"type-14");
+  assert.equal(flow.parts.find(p=>p.role==="delivery").binTypeId,"type-20");
+  assert.deepEqual(flow.dependencies,[{part:"collection",actionCode:"pickup_bin",requiresPart:"delivery",requiresActionCode:"deliver_bin"}]);
+});

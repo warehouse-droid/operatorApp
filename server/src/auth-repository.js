@@ -16,6 +16,8 @@ export const OPERATOR_ROLES = Object.freeze([
   "sales",
   "field_sales",
   "mbr_sales",
+  "repair_technician",
+  "repair_office",
   "mbt_frontdesk",
   "mbt_billing",
   "boss"
@@ -58,6 +60,8 @@ export function operatorHomeRoute(value) {
   if (role === "sales") return "/sales";
   if (role === "field_sales") return "/field-sales/";
   if (role === "mbr_sales") return "/mbr/contracts";
+  if (role === "repair_technician") return "/repair/workshop";
+  if (role === "repair_office") return "/repair";
   if (role === "operator" && roles.has("mbt_frontdesk")) return "/mbt/frontdesk";
   if (role === "operator" && roles.has("mbt_billing")) return "/mbt/billing";
   if (role === "operator") return "/operator";
@@ -244,6 +248,8 @@ export async function logoutToken(token) {
   await query("DELETE FROM operator_sessions WHERE token_hash = $1", [hashToken(token)]);
 }
 
+/** @param {{actorType?: string, actorOperatorId?: string | null, source?: string, action: string,
+ * orderId?: string | number | null, lineId?: string | number | null, details?: Record<string, any>}} event */
 export async function writeAudit({
   actorType = "operator",
   actorOperatorId = null,

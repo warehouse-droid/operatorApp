@@ -1,0 +1,21 @@
+import {totals,amount,tax} from '../../public/repair/domain.js';
+import {repairDocument,dollars,isoDate} from './pdf-theme.js';
+export function quotePdf(view){
+ const {job,quote}=view,pending=quote.status==='pending',decision=pending?'AWAITING APPROVAL':quote.autoApproved?'AUTO-APPROVED':quote.lines.every(l=>l.decision==='rejected')?'REJECTED':quote.lines.every(l=>l.decision==='approved')?'ACCEPTED':'RECORDED';
+ const requestNumber=job.requestNumber||job.number.split('-J')[0],jobNumber=job.jobNumber||(/-J\d+$/u.test(job.number)?job.number:`${requestNumber}-J${String(quote.scopeNumber||1).padStart(2,'0')}`),vehicle=job.data?.vehicle||{};
+ const pdf=repairDocument({title:'QUOTATION',number:`${requestNumber} / Q${quote.scopeNumber||1}-R${quote.scopeRevision||1}`,date:quote.createdAt||job.createdAt,status:decision});
+ pdf.info([{title:'Prepared for',lines:[job.company==='EXTERNAL'?'Equipment owner / customer':job.company||'Customer',`Request ${requestNumber}`,`Repair job ${jobNumber}`]},{title:'Equipment',lines:[vehicle.alias||job.vehicle,vehicle.plate&&vehicle.plate!=='#'?`Registration ${vehicle.plate}`:null,vehicle.serial?`Serial ${vehicle.serial}`:null]}]);
+ pdf.paragraph(job.defect||job.data?.defect||quote.title||'Repair work as described below.',{heading:'REPORTED PROBLEM'});pdf.beginTable();quote.lines.forEach((line,index)=>pdf.row({description:line.description,quantity:line.quantityMilli/1000,rate:line.unitMinor,tax:`${line.taxBps/100}%`,amount:line.amountMinor,index}));
+ const fee=(job.sequence||quote.scopeNumber||1)===1?job.inspectionFeeMinor:0,summary=totals(quote.lines.map(line=>pending?{...line,decision:'approved'}:line),fee,job.inspectionTaxBps);
+ const rows=[[pending?'Proposed repair work':'Accepted repair work',summary.repairMinor],['Inspection',summary.inspectionMinor],['Inspection credit',-summary.creditMinor],['Subtotal',summary.subtotalMinor],['Tax',summary.taxMinor]];
+ pdf.summary(rows,pending?'Quote total':'Confirmed total',summary.totalMinor,quote.autoApproved?'Approval was recorded automatically using the repair quote policy. Inspection is credited once against accepted repair work. Additional work requires a separate quotation.':'Accept or reject the entire quotation in the app or your secure approval link. Inspection is payable when work is declined and credited once when repair work is accepted. Additional work requires a separate approved quotation.');
+ const whole=pending?view.proposedTotals:view.totals;if(whole&&whole.totalMinor!==summary.totalMinor)pdf.paragraph(`${pending?'Request total after acceptance':'Confirmed request total'}: CAD ${dollars(whole.totalMinor)} including other approved jobs and the single inspection charge / credit.`);
+ return pdf.finish();
+}
+export function purchaseOrderPdf(po){
+ const pdf=repairDocument({title:'PURCHASE ORDER',number:po.data.poNumber,date:po.purchaseDate,status:po.data.billId?'BILL POSTED':po.invoiceRef?'INVOICE RECORDED':'ORDER PLACED'});
+ pdf.info([{title:'Supplier',lines:[po.data.vendorName||`Supplier ${po.vendorId}`,`Supplier reference ${po.vendorId}`,`Order date ${isoDate(po.purchaseDate)}`]},{title:'Deliver for repair',lines:[po.data.equipment,po.data.requestNumber?`Request ${po.data.requestNumber}`:null,po.data.jobNumber?`Job ${po.data.jobNumber}`:null,`Expected arrival ${isoDate(po.data.eta)}`]}]);
+ pdf.paragraph('Supply the parts listed below. Include this PO number on the delivery note and supplier invoice. Quantities and prices below are the original order values.',{heading:'ORDER INSTRUCTIONS'});pdf.beginTable();let subtotal=0,taxTotal=0;
+ po.lines.forEach((line,index)=>{const rate=line.orderedUnitMinor??line.unitMinor,bps=line.orderedTaxBps??line.taxBps,net=amount(line.quantityMilli,rate);subtotal+=net;taxTotal+=tax(net,bps);pdf.row({description:line.description,quantity:line.quantityMilli/1000,rate,tax:`${bps/100}%`,amount:net,index});});
+ pdf.summary([['Subtotal',subtotal],['Tax',taxTotal]],'Order total',subtotal+taxTotal,'Quote the PO number on all correspondence. Physical receipt is recorded by Repair Team. The supplier invoice is checked separately before a Vendor Bill is posted. This is a local purchase order.');return pdf.finish();
+}

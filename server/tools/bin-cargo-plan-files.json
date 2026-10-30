@@ -1,0 +1,10 @@
+[
+  "src/mbt/bin-cargo-service.js",
+  "src/mbt/bin-cargo-repository.js",
+  "src/mbt/bin-order-workflow-service.js",
+  "public/bin-cargo-ui.js",
+  "public/bin-order-workflow-ui.js",
+  "public/mbt-planning.js",
+  "public/mbt-planning.html",
+  "public/bin-order-workflow.css"
+]

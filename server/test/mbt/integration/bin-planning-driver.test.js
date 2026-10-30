@@ -11,6 +11,20 @@ import { getMbtBinPlanning, runMbtBinPlanningCommand } from "../../../src/mbt/bi
 import { assertPlanningCapacity } from "../../../src/mbt/bin-planning-capacity.js";
 import { reserveResumedPlanningAsset } from "../../../src/mbt/bin-planning-reservations.js";
 after(closeDb);
+test("inactive drivers do not block staged BIN confirmation and cannot start the released job", async () => {
+  const f = await planningFixture(0, { planDate: await availableDriverExecutionPlanDate() });
+  await run(f, "assign");
+  await query("UPDATE dispatch_drivers SET active=false WHERE lower(login)=lower($1)", [f.driverLogin]);
+  await run(f, "confirm");
+  const job = (await getDriverDayJobs(f.driverLogin, { date: f.planDate, allowBin: true })).jobs.find(entry => entry.mbt);
+  assert(job);
+  const manifest = { manifestId: crypto.randomUUID(), schemaVersion: 2, planId: f.planId,
+    planRevision: (await storedPlan(f.planId)).revision };
+  const event = driverBinEvent(f, job, "job_started", 1, {}, { manifestId: manifest.manifestId });
+  await assert.rejects(startMbtDriverBinJob({ event, job, manifest }, { capability: enabledDriverBinBoundary }),
+    error => error.code === "DRIVER_INACTIVE");
+  assert.equal((await query("SELECT * FROM driver_job_records WHERE job_id=$1", [job.jobId])).rowCount, 0);
+});
 const driverBoundary = { capability: enabledDriverBinBoundary };
 async function releasedFixture() {
   const f = await planningFixture(0, { planDate: await availableDriverExecutionPlanDate() });
@@ -96,8 +110,11 @@ test("delivery completion releases its successor only to the pool and preserves 
   assert.equal(next.status, "ready");
   for (const field of ["dispatch_plan_id", "dispatch_load_id", "planned_driver_id", "planned_truck_id"]) {assert.equal(next[field], null);}
   assert.deepEqual({ scheduled_start_at: next.scheduled_start_at, scheduled_end_at: next.scheduled_end_at }, before);
-  const pool = await getMbtBinPlanning({ planDate: f.planDate, search: f.contractNumber }, boundary);
-  assert.deepEqual(pool.pool.items.map(v => v.mbt.visitId), [f.successorVisitId]);
+  const pool = await getMbtBinPlanning({ planDate: f.planDate }, boundary);
+  assert.deepEqual(pool.pool.items.filter(v=>v.mbt.contractId===f.contractId).map(v => v.mbt.visitId), [f.successorVisitId]);
+  const search = await getMbtBinPlanning({ planDate: f.planDate, search: f.contractNumber }, boundary);
+  assert.deepEqual(search.pool.items.map(v=>v.mbt.visitId).sort(),[f.frontVisitId,f.successorVisitId].sort());
+  assert.equal(search.pool.items.find(v=>v.mbt.visitId===f.frontVisitId).mbt.status,'completed');
   await assert.rejects(() => run(f, "cancel"), e => e.code === "MBT_BIN_VISIT_COMPLETE");
 });
 test("started cancellation preserves physical custody and completed evidence; replan resumes only remaining steps", async () => {

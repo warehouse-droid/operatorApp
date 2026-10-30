@@ -55,5 +55,5 @@
     if(key==='outcome'&&state.outcome&&state.unifiedStatus==='active')state.unifiedStatus='closed';
     save(audience,state);
   }
-  window.RegularStockStatus={ready:import('/regular-stock-status.js?v=20261021-pending-po').then(value=>{model=value;}),render,filters,params,defaults,restore,save,changed,typeFilter};
+  window.RegularStockStatus={ready:import('/regular-stock-status.js?v=20261028-hourly-so').then(value=>{model=value;}),render,filters,params,defaults,restore,save,changed,typeFilter};
 })();

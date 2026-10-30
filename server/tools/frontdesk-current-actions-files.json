@@ -1,0 +1,10 @@
+[
+  "public/mbt-frontdesk.js",
+  "public/mbt-frontdesk.html",
+  "src/mbt/frontdesk-service.js",
+  "src/mbt/customer-charge-request-service.js",
+  "src/mbt/router.js",
+  "src/mbt/frontdesk-action-rates.js",
+  "src/mbt/bin-dump-charge.js",
+  "src/mbt/bin-order-workflow-repository.js"
+]

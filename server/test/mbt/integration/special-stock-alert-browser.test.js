@@ -44,7 +44,7 @@ async function fixture({ role = 'scm', roles = [role], width = 1440, shell = fal
       if (path === '/api/auth/me') return route.fulfill({ json: { operator: { id: 'test-viewer', display_name: 'SCM Preview', role, roles, publicSales } } });
       if (path === '/api/scm/special-stock-requests/alerts') {
         state.calls++;
-        const counts = { ...state.counts }, status = state.status;
+        const counts = { ...state.counts, ...(url.searchParams.get('includeRequests')==='1'?{requests:state.records}: {}) }, status = state.status;
         if (state.hold) await state.hold;
         return route.fulfill({ status, json: counts }).catch(() => {});
       }
@@ -80,7 +80,7 @@ const transferCase = () => ({ id: 1, requestRef: 'SPREQ-TEST', stage: 'new_enqui
 test('Wait for Transfer requires ETA, sends the date, and keeps the selection after saving', async () => {
   const { page, context, state } = await fixture({ records: [transferCase()] });
   try {
-    await alert(page).click();
+    await page.goto('http://localhost/scm/stock-requests?tab=special&requestId=1');
     await page.locator('.stock-request-card[data-id="1"]').click();
     const supply = page.locator('[name=supplyStatus]'), eta = page.locator('[name=availableDate]');
     await supply.selectOption('vendor_transfer');
@@ -127,16 +127,17 @@ test('Sales sees the Wait for Transfer label and ETA on the saved case', async (
   } finally { await context.close(); }
 });
 
-test('Special and Aggregate alerts coexist; the Special link opens the new and confirmed stage filters', async () => {
-  const { page, context, state } = await fixture();
+test('Special and Aggregate alerts coexist; the Special badge opens the full list of alert requests', async () => {
+  const records=[transferCase(),{...transferCase(),id:2,requestRef:'SPREQ-SECOND'},{...transferCase(),id:3,requestRef:'SPREQ-THIRD',stage:'confirmed'}];
+  const { page, context, state } = await fixture({records});
   try {
     await expect(alert(page)).toHaveAccessibleName('3 special requests: 2 new requests, 1 confirmed order');
     await expect(page.locator('.scm-aggregate-alert')).toHaveAccessibleName('1 aggregate request awaiting SCM confirmation');
     await alert(page).click();
-    await expect(page.locator('[data-special-scm-stage][value="new_enquiry"]')).toBeChecked();
-    await expect(page.locator('[data-special-scm-stage][value="confirmed"]')).toBeChecked();
-    await expect.poll(() => state.queries.at(-1)).toBe('new_enquiry,confirmed');
-    await expect(page.locator('[data-stock-request-tab="special"]')).toHaveAttribute('aria-selected', 'true');
+    await expect(page).toHaveURL(/tab=special&alerts=1/);
+    await expect(page.locator('[data-special-scm-search]')).toHaveValue('SPREQ-TEST, SPREQ-SECOND, SPREQ-THIRD');
+    await expect(page.locator('.stock-request-list .stock-request-card')).toHaveCount(3);
+    await expect(page.locator('[data-stock-request-alert-list]')).toHaveCount(0);
     await expect(alert(page)).toHaveCount(1);
     await expect(page.locator('.scm-aggregate-alert')).toHaveCount(1);
     state.counts = { newRequests: 0, confirmedOrders: 1, total: 1 };

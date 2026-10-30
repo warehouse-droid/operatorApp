@@ -329,10 +329,11 @@ export async function listOperatorHistory({ operatorId, date = "", limit = 100, 
   const returnYard = yardClause("r.receiving_location_id", yardLocationIds, returnParams);
   const returns = await query(
     `SELECT ('return-' || r.id) AS id,
-            CASE WHEN r.record_type = 'pallet' THEN 'pallet_return' ELSE 'stock_return' END AS type,
+            CASE WHEN r.record_type = 'pallet' THEN 'pallet_return' WHEN r.record_type='exchange' THEN 'stock_exchange' ELSE 'stock_return' END AS type,
             'returns.record.submit' AS action,
             CASE
               WHEN r.record_type = 'pallet' THEN 'PALLET Return'
+              WHEN r.record_type = 'exchange' THEN 'Stock exchange'
               WHEN r.stock_return_type = 'quality' THEN 'Quality Stock Return'
               ELSE 'Normal Stock Return'
             END AS title,

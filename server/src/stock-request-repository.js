@@ -1,3 +1,5 @@
+import {requestSearchRefs} from '../public/stock-request-search.js';
+import {canAddRegularItems,resetRegularItemReview} from '../public/regular-stock-request-actions.js';
 import {withBackorderWorkflow} from './stock-case-workflow.js';
 import { query, withTransaction, hasActiveTransaction } from "./db.js";
 import {parseScmStockQueues} from '../public/stock-request-queue-filter.js';
@@ -215,7 +217,7 @@ function mapLine(row = {}) {
     dispatchTruckPlate: row.dispatch_truck_plate || null,
     dispatchLoadName: row.dispatch_load_name || null
   };
-  return /** @type {typeof line & {reply?:Record<string,unknown>|null,replyStatus?:string|null,resolution?:import('../tools/regular-stock-resolution-globals.js').RegularResolutionReply|null}} */ (line);
+  return /** @type {typeof line & {yardStock?:Record<string,any>|null,reply?:Record<string,unknown>|null,replyStatus?:string|null,resolution?:import('../tools/regular-stock-resolution-globals.js').RegularResolutionReply|null}} */ (line);
 }
 
 function mapTransfer(row = {}) {
@@ -597,6 +599,7 @@ async function requestDetailRows(requestId, {audience='scm',authorizedStoreLocat
       line.reply=state.reply||null;
       line.replyStatus=['closed','rejected','cancelled','received','fulfilled'].includes(line.status)?null:state.replyStatus||null;
       line.resolution=state.resolution||(line.status==='closed'?request.regular.resolution:null)||null;
+      line.yardStock=state.yardStock||null;
     }
   }
   request.transfers = transferResult.rows.map(mapTransfer);
@@ -765,15 +768,19 @@ export async function calculateDeliveryStockRequest(route, materials) {
       }
       const line = normalizeLineInput({itemId:material.itemId,sourceLocationId:route.sourceLocationId,salesQty:material.quantity},
         {...item,to_plt:null,to_lyr:null,to_sec:null,to_pcs:null}, route.destinationLocationId);
-      const packing = dependencyQuantityConversionDisplay(line.salesQty, Object.fromEntries(
+      const conversions = Object.fromEntries(
         ['to_plt','to_lyr','to_sec','to_pcs'].map(key => [key, Math.max(0,numeric(item[key]))])
-      ));
+      );
+      const packing = Object.values(conversions).some(value => value > 0)
+        ? dependencyQuantityConversionDisplay(line.salesQty, conversions)
+        : {palletQty:0,layerQty:0,sectionQty:0,pieceQty:0};
       return {...line,pallets:packing.palletQty,layers:packing.layerQty,sections:packing.sectionQty,pieces:packing.pieceQty,
         remoteLineId:material.remoteLineId,soQuantity:material.soQuantity,backorderedQuantity:material.backorderedQuantity,
         quantityBasis:material.quantityBasis,toPlt:nullableNumeric(item.to_plt),toLyr:nullableNumeric(item.to_lyr),toSec:nullableNumeric(item.to_sec),toPcs:nullableNumeric(item.to_pcs)};
     });
     const pallet = stockRequestPalletQuantity(lines);
-    if (pallet.requiresManualQuantity) throw stockRequestError('PALLET cannot be calculated. Update the missing item pallet conversion and retry.',409,'REGULAR_DELIVERY_PALLET_CONVERSION');
+    // Delivery keeps Sales quantity/UOM for unconvertible items. Only items with
+    // a pallet conversion contribute to the additional physical PALLET line.
     return {lines,palletQuantity:pallet.automaticQuantity};
   });
 }
@@ -821,6 +828,15 @@ export async function requestDetailsForQueue(rows, options = {}) {
   })));
 }
 
+// The legacy view calls all closed decisions Closed. Manual yard-stock outcomes
+// are Completed; keep the queue filter consistent with the hydrated detail.
+const backorderListStageSql=`(SELECT CASE WHEN workflow.stage='closed' AND request.status<>'cancelled'
+  AND EXISTS(SELECT 1 FROM sales_special_stock_cases case_row
+    JOIN sales_special_stock_lines line ON line.request_id=case_row.request_id
+    WHERE case_row.request_id=request.id AND case_row.workflow_kind='backorder' AND case_row.close_status='active'
+      AND line.removed_at IS NULL AND request.regular_details->'yardStockLines' ? line.id::text)
+  THEN 'completed' ELSE workflow.stage END FROM special_stock_workflow_stages workflow WHERE workflow.request_id=request.id)`;
+
 /** @param {string[]} clauses @param {any[]} params @param {number} normalStart @param {string} bucket @param {unknown} type @param {unknown} stage */
 function addBackorderListScope(clauses,params,normalStart,bucket,type,stage) {
   const normal=clauses.splice(normalStart).join(' AND ') || 'true';
@@ -830,7 +846,7 @@ function addBackorderListScope(clauses,params,normalStart,bucket,type,stage) {
   clauses.push(`((COALESCE(${back},false)=false AND (${normal})) OR (${back} AND ${eligible}))`);
   if (type === 'backorder') {
     clauses.push(back);
-    if (stage) {params.push(String(stage));clauses.push(`EXISTS(SELECT 1 FROM special_stock_workflow_stages WHERE request_id=request.id AND stage=$${params.length})`);}
+    if (stage) {params.push(String(stage));clauses.push(`${backorderListStageSql}=$${params.length}`);}
   }
 }
 
@@ -905,10 +921,13 @@ export async function listSalesStockRequests({
   }
   if (requestedStages.length) {
     params.push(requestedStages);
-    clauses.push(`request.regular_details->>'deliveryMethod'='backorder' AND EXISTS(
-      SELECT 1 FROM special_stock_workflow_stages WHERE request_id=request.id AND stage=ANY($${params.length}::text[]))`);
+    clauses.push(`request.regular_details->>'deliveryMethod'='backorder' AND ${backorderListStageSql}=ANY($${params.length}::text[])`);
   }
-  if (normalizedSearch) {
+  const refs = requestSearchRefs(search);
+  if (refs.length) {
+    params.push(refs);
+    clauses.push(`request.request_ref = ANY($${params.length}::text[])`);
+  } else if (normalizedSearch) {
     params.push(`%${normalizedSearch}%`);
     clauses.push(`(request.request_ref ILIKE $${params.length} OR EXISTS (
       SELECT 1 FROM sales_stock_request_lines search_line
@@ -958,6 +977,46 @@ export async function listSalesStockRequests({
   return details.filter((detail) => !requestedBucket
     || detail.bucket === requestedBucket
     || requestedBucket === "accepted").slice(0, boundedLimit);
+}
+
+export async function addRegularStockItems(requestId, input = {}, {
+  operatorId, authorizedDestinationLocationIds = [], allowOverAvailability = false
+} = {}) {
+  if (!operatorId) throw stockRequestError('An authenticated Sales operator is required.',401);
+  return withTransaction(async () => {
+    const row = await lockRequest(requestId);
+    assertSalesScope(row, authorizedDestinationLocationIds);
+    const expected = requiredRevision(input.expectedRevision);
+    if (Number(row.revision) !== expected) {
+      throw stockRequestError('This stock request changed after the screen loaded. Reload and try again.',409,'STOCK_REQUEST_REVISION_CONFLICT');
+    }
+    const existing = await requestLines(row.id,{forUpdate:true});
+    const locked = () => stockRequestError('Items can only be added to an active regular request before order processing starts.',409,'REGULAR_ITEMS_LOCKED');
+    if (!canAddRegularItems({...mapRequest(row),lines:existing.map(mapLine)})) throw locked();
+    const request = await requestDetailRows(row.id,{audience:'sales',authorizedStoreLocationIds:authorizedDestinationLocationIds});
+    if (!canAddRegularItems(request) || (await query('SELECT 1 FROM regular_stock_handoffs WHERE request_id=$1',[row.id])).rowCount) throw locked();
+    if (!Array.isArray(input.lines) || !input.lines.length || existing.length + input.lines.length > 100) {
+      throw stockRequestError('A stock request requires between 1 and 100 lines.');
+    }
+    if (input.lines.some(line => !line || typeof line !== 'object' || Array.isArray(line) || (line.id !== undefined && line.id !== null))) {
+      throw stockRequestError('Add new items without existing request-line IDs.');
+    }
+    const stockingType = row.regular_details?.stockingType || 'transfer';
+    const lines = await normalizeLines(input.lines,Number(row.destination_location_id),{allowOverAvailability,stockingType});
+    if (stockingType !== 'purchase') await assertCachedAvailability([...existing.map(mapLine),...lines],{allowOverAvailability});
+    for (const line of lines) await insertLine(row.id,line);
+    await query(`UPDATE sales_stock_request_lines SET status='submitted',regular_decision=NULL,
+      decision_reason=NULL,decided_by=NULL,decided_at=NULL,resubmitted_at=now(),updated_at=now() WHERE request_id=$1`,[row.id]);
+    await query(`UPDATE sales_stock_requests SET status='submitted',first_scm_decision_at=NULL,
+      manual_decision_event_id=0,regular_details=$2::jsonb,revision=revision+1,updated_at=now() WHERE id=$1`,
+    [row.id,JSON.stringify(resetRegularItemReview(row.regular_details || {}))]);
+    await recordEvent({requestId:row.id,eventType:'regular_items_added',actorId:operatorId,details:{
+      previousRevision:expected,lineCount:lines.length,previousRegular:row.regular_details,
+      previousLines:request.lines.map(line=>({id:line.id,status:line.status,decision:line.decision,
+        decisionReason:line.decisionReason,decidedBy:line.decidedBy,decidedAt:line.decidedAt}))
+    }});
+    return getSalesStockRequest(row.id,{authorizedDestinationLocationIds});
+  });
 }
 
 export async function updateSalesStockRequest(requestId, input = {}, {
@@ -1338,7 +1397,7 @@ export async function convertSalesStockRequestLines(requestId, input = {}, { ope
           palletItem?.item_id || null,
           palletItem?.item_name || null,
           pallet.automaticQuantity,
-          pallet.requiresManualQuantity,
+          request.regular_details?.deliveryVersion !== 1 && pallet.requiresManualQuantity,
           operatorId
         ]
       );
@@ -1472,7 +1531,11 @@ export async function listScmStockRequests({
   });
   if (queueScopes.length) clauses.push(`(${queueScopes.join(' OR ')})`);
   else addBackorderListScope(clauses,params,2,'',type,'');
-  if (normalizedSearch) {
+  const refs = requestSearchRefs(search);
+  if (refs.length) {
+    params.push(refs);
+    clauses.push(`request.request_ref = ANY($${params.length}::text[])`);
+  } else if (normalizedSearch) {
     params.push(`%${normalizedSearch}%`);
     clauses.push(`(request.request_ref ILIKE $${params.length} OR EXISTS (
       SELECT 1 FROM sales_stock_request_lines search_line
@@ -1502,8 +1565,7 @@ export async function listScmStockRequests({
     const stages = parseSalesCaseStages(allStatuses && normalizedSearch ? '' : stage);
     if (stages.length) {
       params.push(stages);
-      clauses.push(`request.regular_details->>'deliveryMethod'='backorder' AND EXISTS(
-        SELECT 1 FROM special_stock_workflow_stages WHERE request_id=request.id AND stage=ANY($${params.length}::text[]))`);
+      clauses.push(`request.regular_details->>'deliveryMethod'='backorder' AND ${backorderListStageSql}=ANY($${params.length}::text[])`);
     }
     return regularStockRowsBySummary({clauses,params,filters:statusFilters,limit:boundedLimit,offset:boundedOffset,hydrate:requestDetailsForQueue});
   }

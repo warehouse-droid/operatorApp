@@ -43,40 +43,41 @@ export async function movementRecordEvidence({ loadIds = [], receiptIds = [], co
           AND event.dispatch_completed_at >= l.created_at
           AND event.completion_evidence_type IN ('driver_job','manual_dispatch','direct_dependency','vrma_completion')
      ), candidate_documents AS (
-       SELECT c.id, c.completion_event_id, c.line_snapshot,
+       SELECT c.id, c.completion_event_id, c.operator_load_record_id, c.line_snapshot,
               jsonb_build_object('transactionType','IF','transactionRef',c.netsuite_transaction_ref) AS document
          FROM dispatch_sales_order_if_candidates c
         WHERE c.netsuite_transaction_ref IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM netsuite_item_fulfillment_parts p
                            WHERE p.plan_external_id=c.external_id AND p.status='posted')
-          AND c.completion_event_id IN (
+          AND (c.operator_load_record_id=ANY($1::bigint[]) OR c.completion_event_id IN (
             SELECT id FROM completions
             UNION ALL
             SELECT e.id FROM driver_job_records d
               JOIN dispatch_effective_order_completion_events e
                 ON e.completion_evidence_type='driver_job' AND e.completion_evidence_id=d.job_id
              WHERE d.id=ANY($4::bigint[])
-          )
+          ))
        UNION ALL
-       SELECT c.id, c.completion_event_id, c.line_snapshot,
+       SELECT c.id, c.completion_event_id, c.operator_load_record_id, c.line_snapshot,
               jsonb_build_object('transactionType','IF','transactionRef',p.netsuite_transaction_ref)
          FROM dispatch_sales_order_if_candidates c
          JOIN netsuite_item_fulfillment_parts p ON p.plan_external_id=c.external_id AND p.status='posted'
-        WHERE c.completion_event_id IN (
+        WHERE (c.operator_load_record_id=ANY($1::bigint[]) OR c.completion_event_id IN (
             SELECT id FROM completions
             UNION ALL
             SELECT e.id FROM driver_job_records d
               JOIN dispatch_effective_order_completion_events e
                 ON e.completion_evidence_type='driver_job' AND e.completion_evidence_id=d.job_id
              WHERE d.id=ANY($4::bigint[])
-          )
+          ))
      )
      SELECT 'load-' || l.id AS key, l.reference AS order_ref, l.response,
             COALESCE((SELECT jsonb_agg(c.document) FROM candidate_documents c
-              JOIN completions e ON e.id=c.completion_event_id AND e.load_record_id=l.id
-              WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(c.line_snapshot) line
-                             WHERE line->>'operatorLoadRecordId'=l.id::text)), '[]'::jsonb) AS documents,
-            (l.load_type IN ('sales_order_delivery_load','local_co_load','vrma_local_load')
+              WHERE c.operator_load_record_id=l.id OR
+                (EXISTS (SELECT 1 FROM completions e WHERE e.id=c.completion_event_id AND e.load_record_id=l.id)
+                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(c.line_snapshot) line
+                             WHERE line->>'operatorLoadRecordId'=l.id::text))), '[]'::jsonb) AS documents,
+            (l.load_type IN ('local_co_load','vrma_local_load')
               OR (l.load_type='transfer_order_load' AND EXISTS (
                 SELECT 1 FROM order_dependencies dependency WHERE dependency.transfer_order_id=l.order_id
                   AND dependency.dependency_mode='direct_to_customer' AND dependency.status<>'cancelled')))

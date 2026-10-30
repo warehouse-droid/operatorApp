@@ -1,0 +1,28 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "scope": "Coalesce overlapping planned-assignment reads and serialize their identical HTTP response once, so reconciliation and request handling can make progress.",
+  "behaviors": [
+    "Concurrent reads of the same snapshot mode perform one load and share one encoded response.",
+    "Full and lightweight reads remain independent; at most two response promises are retained.",
+    "Once a read finishes, a later read loads fresh data; there is no completed-response cache.",
+    "Load and serialization failures reject all joined readers and allow subsequent retries.",
+    "The real planned-assignment route preserves Express JSON bytes, content type, content length, ETag, and conditional GET behavior.",
+    "Unicode, hostile JSON strings, empty arrays, nested JSON, and bursts of concurrent requests preserve response contents.",
+    "The existing authorization, reconciliation writes, target checkpoints, and disabled 15-minute scheduler remain unchanged."
+  ],
+  "failureModel": {
+    "staleData": "Fresh-read and failure-retry assertions; no TTL cache.",
+    "mixedModes": "Overlapping true/false snapshot requests and route query contract.",
+    "responseDrift": "Real Express baseline comparisons and property tests.",
+    "duplicateWork": "Concurrent burst tests assert one load and shared encoded Buffer.",
+    "unhandledRejection": "Concurrent failure and retry cases.",
+    "deploymentInterruption": "Request a normal stop, wait for terminal target state, preserve checkpoints, then resume the same run after healthy deployment."
+  },
+  "setup": {
+    "dependencies": [],
+    "git": "No commits or resets; preserve concurrent workspace changes and deploy only this task's delta over the current live image.",
+    "tests": "Existing bounded isolated Compose runner and retention wrapper; existing Node test, fast-check, c8, TypeScript and ESLint tooling.",
+    "evidence": "Persist concise source evidence and operational deployment/recovery audit only."
+  }
+}

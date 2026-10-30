@@ -1,0 +1,10 @@
+[
+  "src/server.js",
+  "src/receiving-repository.js",
+  "src/netsuite-delayed-status-refresh-repository.js",
+  "src/netsuite-delayed-status-refresh-service.js",
+  "src/purchase-receipt-refresh-repository.js",
+  "migrations/312_purchase_receipt_refresh.sql",
+  "public/regular-stock-status.js",
+  "src/operator-netsuite-posting-finalizer.js"
+]

@@ -107,7 +107,7 @@ export async function readStockRequestConversation(id, input, context) {
     [id, context.operatorId, eventId]);
   return {ok: true};
 }
-export async function listStockRequestConversationAlerts(context) {
+export async function listStockRequestConversationAlerts(context,{includeRequests=false}={}) {
   actor(context);
   const policy = await getSpecialStockRequestPolicy();
   let enabled = true;
@@ -123,7 +123,7 @@ export async function listStockRequestConversationAlerts(context) {
       AND ($3 OR (request.request_type='regular' AND request.regular_details->>'deliveryMethod'<>'backorder'))
       ${context.audience === 'sales' ? `AND ${stockRequestSalesScopeSql('$4')}` : ''}
     ), ranked AS (SELECT *,count(*) OVER(PARTITION BY id) AS unread_count,row_number() OVER(PARTITION BY id ORDER BY event_id DESC) AS rank FROM unread)
-    SELECT *,sum(unread_count) OVER() AS total FROM ranked WHERE rank=1 ORDER BY event_id DESC LIMIT 100`,
+    SELECT *,sum(unread_count) OVER() AS total FROM ranked WHERE rank=1 ORDER BY event_id DESC ${includeRequests ? '' : 'LIMIT 100'}`,
     [context.operatorId, context.audience === 'sales' ? 'scm' : 'sales', enabled, ...(context.audience === 'sales' ? [context.authorizedDestinationLocationIds || []] : [])]);
   return {count: Number(result.rows[0]?.total || 0), requests: result.rows.map(row => ({id: Number(row.id), requestRef: row.request_ref,
     tab: row.request_type === 'special' ? 'special' : 'regular', latestEventId: Number(row.event_id), unreadCount: Number(row.unread_count),

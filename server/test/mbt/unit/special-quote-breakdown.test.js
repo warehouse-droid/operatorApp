@@ -27,8 +27,8 @@ for (const draft of [true, false]) {
     assert.equal(quote.snapshot.taxMinor, 201762);
     assert.equal(quote.snapshot.totalMinor, 1753776);
     const pdf = await quotePdf(quote), text = pdfText(pdf);
-    assert.match(text, /123PLTMBBS-SpecialsadasdDiscount: 12%\$123\.00\$15,129\.000000/);
-    assert.match(text, /23PLTMBBS-SpecialsdasDiscount: 22%\$123\.00\$2,829\.000000/);
+    assert.match(text, /123PLTMBBS-SpecialsadasdDiscount: 12%\$123\.00\$15,129\.0023PLT/);
+    assert.match(text, /23PLTMBBS-SpecialsdasDiscount: 22%\$123\.00\$2,829\.00Subtotal before discount/);
     assert.match(text, /Subtotal before discount\$17,958\.00Total Discount \(13\.58%\)\$2,437\.86Subtotal after discount\$15,520\.14HST \(13%\)\$2,017\.62Total CAD\$17,537\.76/);
     assert.doesNotMatch(text, /\$13,082\.28|\$1,700\.70|\$14,782\.98/);
     assert.equal(pdfPages(pdf).length, 1);

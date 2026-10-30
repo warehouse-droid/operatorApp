@@ -71,6 +71,20 @@ function harness({ markerRows = [], createResult = { id: 91 }, detail = caseDeta
   });
   return { service, calls };
 }
+test('new PO creation never synchronizes an application-created SO or discovers its native links',async()=>{
+ const detail=caseDetail({salesOrderId:51,salesOrderRef:'SO51',salesOrderSource:'standalone',salesOrderApproved:true,
+  salesOrderLines:[{caseLineId:1,itemId:2055,description:'Customer description',quantity:10,uom:'PC',rate:4.25,remoteLineId:11}],
+  purchaseOrderLines:[{caseLineId:1,itemId:2055,description:'Vendor description',quantity:2,uom:'PLT',unitPurchaseCost:2.1}]});
+ const before=structuredClone(detail.salesOrderLines);
+ const f=harness({detail,overrides:{synchronizeSalesDescriptions:async()=>assert.fail('SO write is forbidden'),
+  recordDescriptionSync:async()=>assert.fail('SO snapshot write is forbidden'),
+  findLinkedPurchaseOrder:async()=>assert.fail('A new PO must use its case marker')}});
+ await f.service.createPurchaseOrder(42,{expectedRevision:7,operationId:'independent-po'});
+ const payload=f.calls.find(([name])=>name==='create-po')[1];
+ assert.equal(payload.item.items[0].description,'Vendor description');assert.equal(payload.item.items[0].quantity,2);
+ assert.deepEqual(detail.salesOrderLines,before);
+});
+
 test('PO creation after a local request adjustment never synchronizes the existing SO',async()=>{
  const detail=caseDetail({salesOrderId:51,salesOrderRef:'SO51',salesOrderApproved:true,localAdjustedAt:'2026-10-13T00:00:00Z',
   purchaseOrderLines:[{caseLineId:1,itemId:2055,description:'Locally adjusted material',quantity:5,uom:'PC',unitPurchaseCost:2.1}]});

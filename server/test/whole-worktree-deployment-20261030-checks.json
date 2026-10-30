@@ -1,0 +1,4304 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "newFailures": [],
+  "passed": true,
+  "testShards": 2,
+  "perTestContainerMemory": "1536m",
+  "sharedSliceMemory": "4g",
+  "sharedSliceCpu": 2,
+  "candidate": {
+    "fileCount": 1253,
+    "tests": 7577,
+    "pass": 6987,
+    "fail": 588,
+    "cancelled": 1,
+    "skipped": 1,
+    "failedFiles": [
+      {
+        "file": "test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+        "failures": [
+          "P3.11: every unmutated Node test category is owned by main, coverage, and shuffle",
+          "P3.12: browser specs share one worker-owned database-pool lifecycle",
+          "P3.11: the extended mutation manifest owns every dedicated runner and the P3 gauntlet executes it"
+        ],
+        "tests": 10,
+        "pass": 7,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/config-legacy-seams.test.js",
+        "failures": [
+          "F01 legacy seam: MBT environment gates default false when absent",
+          "F01 legacy seam: MBT environment gates parse only explicit truthy values",
+          "F01 legacy seam: applyEnvFile replaces the live MBT config without process pollution",
+          "P2-R7 env replacement clears omitted file-owned NetSuite runtime keys only"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js",
+        "failures": [
+          "S11: the guarded client ships in a new atomic Driver shell generation"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-cache-repair.test.js",
+        "failures": [
+          "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+          "a successful repair replaces only the complete Driver shell and preserves offline data sentinels",
+          "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged"
+        ],
+        "tests": 4,
+        "pass": 1,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-site-reset.test.js",
+        "failures": [
+          "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/mbt-bin-cancellation.test.js",
+        "failures": [
+          "active physical-bin cards omit cancelled bins and retain the other bins"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operations-navigation-enhancements.test.js",
+        "failures": [
+          "operator cache assets advance with the cycle-count pagination release",
+          "main sidebar modules follow live primary and secondary authorities on every module path",
+          "Aggregate navigation requires a live separate grant and eligible account"
+        ],
+        "tests": 6,
+        "pass": 3,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-delivery-refresh.test.js",
+        "failures": [
+          "P2 the installed operator shell precaches the versioned refresh guard and client together"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+        "failures": [
+          "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-adapter.test.js",
+        "failures": [
+          "property: postponement cannot hide a due alert, readiness clears it, and accepted ETAs stay Confirmed",
+          "the filter exposes eight labelled choices, retains multiple selections and allows clearing"
+        ],
+        "tests": 11,
+        "pass": 9,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-native-service.test.js",
+        "failures": [
+          "native PO recovery before a durable submission updates the existing PO without creating",
+          "native PO recovery after a durable submission updates the existing PO without creating"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/property/backorder-link-sequence.property.test.js",
+        "failures": [
+          "Both link guards require reviewed and accepted open materials, including mixed Already Ordered lines",
+          "SO and PO readiness rejects each missing prerequisite and accepts resolved companion materials"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-pending-po.test.js",
+        "failures": [
+          "Sales and SCM APIs filter SO-linked requests by Pending SCM and retain production waiting",
+          "Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filter and detail",
+          "linking the PO clears Pending SCM and a production-only request then waits for stock"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-requests.test.js",
+        "failures": [
+          "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+          "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+          "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+          "Manual Backorder links keep revised material confirmations in Sales notifications",
+          "SO linking rejects unfinished material review and ignores forged confirmation and planning flags"
+        ],
+        "tests": 42,
+        "pass": 37,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/consolidation-load.test.js",
+        "failures": [
+          "CO and VRMA orders share load photos while preserving their local transitions",
+          "HTTP admission saves SO and TO locally with the native gate enabled and waits for Driver completion"
+        ],
+        "tests": 18,
+        "pass": 16,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/direct-ship-posting.test.js",
+        "failures": [
+          "fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence",
+          "changed direct route identity is held with a persisted pickup-evidence error"
+        ],
+        "tests": 11,
+        "pass": 9,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/http-shell.test.js",
+        "failures": [
+          "F15: all MBT routes render one accessible controlled shell with an explicit controller"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/load-followup.test.js",
+        "failures": [
+          "pickup load leaves one line available on a fresh local scan",
+          "observed IF persists while the local order stays blocked and private command details stay hidden"
+        ],
+        "tests": 3,
+        "pass": 1,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/mbt-bin-corrections-browser.test.js",
+        "failures": [
+          "browser: new BIN fee defaults to MBT and undelivered bin actions remain disabled"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/movement-document-history.test.js",
+        "failures": [
+          "saved IFs display for pickups in both lists and details without a driver wait",
+          "SO load history never waits for a Driver drop, pickup, or IF availability",
+          "legacy Driver-created IF retains its saved load snapshot and evidence outside the selected date",
+          "receipt IR number appears from both legacy and posting evidence and keeps yard scope",
+          "transfer load history no longer waits for its driver drop",
+          "multipart IF numbers show individually even while another part is pending"
+        ],
+        "tests": 7,
+        "pass": 1,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-background-http.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-background-http.test.js"
+        ],
+        "tests": 5,
+        "pass": 4,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-display-settings.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-display-settings.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-posting-photos.test.js",
+        "failures": [
+          "IF and IR commit durable photos before posting and enqueue only on successful completion",
+          "upload retries survive worker restart and cannot alter IF/IR posting state",
+          "concurrent workers claim distinct photos and expired leases are recoverable",
+          "replacement is atomic, scoped to associated proof, and preserves photo order",
+          "queued work cannot run before its owner completes and enqueue is idempotent",
+          "IR proof and a native consolidated batch keep their associations after background upload",
+          "changed photo identities and expired leases cannot overwrite durable proof"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-local-pilot-end-to-end.test.js",
+        "failures": [
+          "P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Driver -> reconciliation -> next leg -> local billing"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-predeploy-readiness.test.js",
+        "failures": [
+          "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/po-partial-static-lines.test.js",
+        "failures": [
+          "POB03684 partial IR contains exactly its two selected rows and the one open deselection",
+          "split receipts refresh their real positive parent and keep their selected quantity unchanged",
+          "property: shuffled live counters affect only exact deselections and never the selected quantities"
+        ],
+        "tests": 8,
+        "pass": 5,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/receiving-followup.test.js",
+        "failures": [
+          "the pallet follow-up creates a distinct IR draft and omits the already completed NetSuite line"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-input.test.js",
+        "failures": [
+          "browser uses one multi-select Status, persists it, shows input alert and closes expired request"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-resolution-browser.test.js",
+        "failures": [
+          "Sales notification opens the resolved case and its PO/ETA once, and remains dismissed after refresh"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-waitlist-safety.test.js",
+        "failures": [
+          "allocation notices stay unread once per event and case acknowledgement clears them"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/request-waiting-labels-browser.test.js",
+        "failures": [
+          "sales special cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "sales special cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "sales backorder cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "sales backorder cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "scm special cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "scm special cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "scm backorder cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "scm backorder cards show active waiting labels and clear them at dispatch handoff (390px)"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sn1400625-receiving.test.js",
+        "failures": [
+          "SN1400625 ignores deleted parent history and preserves the exact three confirmed receipt lines"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-batch-browser.test.js",
+        "failures": [
+          "SCM one save validates every ETA, preserves all line drafts after failure, and posts once on retry",
+          "SCM edits item names awaiting customer confirmation and retains them after a failed mobile save (in_stock)",
+          "SCM edits item names awaiting customer confirmation and retains them after a failed mobile save (no_stock)",
+          "SCM retains readiness fields without item-name editing after SO creation",
+          "Sales one save keeps undecided lines pending and requires the decline reason on mobile",
+          "SCM requires a percentage per material, retains distinct failed inputs, and sends gross costs",
+          "Sales loads real-directory choices, requires one, and sends the selected rep at SO creation"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-edits-browser.test.js",
+        "failures": [
+          "multiple material inputs retain separate values and an unchanged unpriced legacy line permits rate and PALLET edits",
+          "Sales edits material name and quantity, confirms a centered restart, and sees New enquiry without changing other item details",
+          "rate and PALLET edits save without a restart warning and preserve the reviewed request stage",
+          "PALLET remains editable at zero and can be added, removed or free without restarting the enquiry on a phone",
+          "canceling or escaping the restart warning preserves the unsaved editor, and Cancel edits writes nothing",
+          "a revision conflict retains typed values but requires reopening the current request before another save",
+          "closed or issued requests hide the pre-SO editor, and a no-op save sends no write"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-fields-browser.test.js",
+        "failures": [
+          "Sales editor submits every New Request field and retains values through decline on a phone",
+          "SCM stock check submits editable material details and packing in its existing batch",
+          "SCM description is normal size and quantity, UOM and packing align in one desktop row",
+          "SCM long descriptions and stock correction controls remain readable on a phone",
+          "SCM refreshes the right panel status and ETA layout from the latest request after saving",
+          "SCM keeps a successful stock check when refreshing the latest detail fails",
+          "SCM saves collapsed material values and keeps stock fields through a failed save at 1440px",
+          "SCM saves collapsed material values and keeps stock fields through a failed save at 390px",
+          "New Request defaults each new line to today plus 14 calendar days and preserves chosen dates",
+          "issued order adjustment submits all material fields without a conversion control",
+          "opening multiline saved details and notes never silently changes them during an unrelated price edit",
+          "sales pending adjustment shows every corrected field without a conversion prompt",
+          "scm pending adjustment shows every corrected field without a conversion prompt"
+        ],
+        "tests": 13,
+        "pass": 0,
+        "fail": 13,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-custom-po-browser.test.js",
+        "failures": [
+          "desktop and phone link existing PO beside Create PO without requiring new-PO costs, preserving input on refresh",
+          "empty linkage fails locally and Enter links the PO; server errors retain the entered number for retry",
+          "Create PO retains the normal reviewed-line submission even when custom number is filled"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-customer-confirmation.test.js",
+        "failures": [
+          "five lines: one rejected, one in-stock accepted and three accepted transfer ETAs await the SO everywhere",
+          "resolved accepted and rejected materials still await the SO, including a production ETA",
+          "all accepted transfer and production ETAs still await the SO",
+          "pending decisions, requested updates, unanswered stock checks and all rejected lines do not confirm",
+          "legacy saved edit stages cannot hide awaiting SO after customer decisions",
+          "migration reclassifies existing accepted requests without changing business rows",
+          "SPREQ-000041 yard-pickup evidence: locally received PO plus NetSuite Pending Billing SO is Completed",
+          "all 48 local and NetSuite evidence combinations obey the three delivery-method completion rules",
+          "delivery completion uses both current local order records and survives renamed PO references",
+          "yard pickup also accepts full local customer collection with a local PO arrival",
+          "vendor pickup requires NetSuite receipt and fulfillment, excluding partial or cancelled native orders"
+        ],
+        "tests": 11,
+        "pass": 0,
+        "fail": 11,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-fee-http.test.js",
+        "failures": [
+          "local HTTP submission retains the Sales fee, produces a quote and prepares a customer-only SO charge",
+          "invalid rates, forged rep IDs and unauthorized users cannot partially save",
+          "new local requests with 1, 10 and 100 lines complete within one second without network access"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-enhancements-browser.test.js",
+        "failures": [
+          "new request has required rep, calendar expiry and three proportional item rows with persistent values",
+          "sales supports multiple vendors and preserves selections on refresh",
+          "scm supports multiple vendors and preserves selections on refresh",
+          "SO account stays separate from original customer and Sales alert links to own queue",
+          "mobile composer stays within the page and shows specification and expiry controls"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-expiry-race.test.js",
+        "failures": [
+          "expiry skips an order claim lock, observes committed state and concurrent sweepers close once"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-handoff-notice-query.test.js",
+        "failures": [
+          "/app/test/mbt/integration/special-handoff-notice-query.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-http.test.js",
+        "failures": [
+          "Note-only header saves preserve new and reviewed status, every material, PALLET, draft and unrelated header value",
+          "one header save commits delivery fields and Note together without resetting reviewed lines or creating a remote journal",
+          "identical header saves are complete no-ops and clearing a Note leaves quote and copied header empty",
+          "invalid Note, delivery and revision inputs reject the entire header and injected client fields cannot change case ownership or prices",
+          "header endpoint requires Sales authentication, role, yard and workflow gate before any write",
+          "issued, closed, cancelled, pending, uncertain and planned requests reject delivery header saves without writes",
+          "stale and concurrent header saves serialize with exactly one successful revision and audit",
+          "SO claims and header saves serialize so an order cannot claim an obsolete Note revision",
+          "audit failure rolls back Note, delivery, revision and every related row in the header transaction",
+          "Note-only edits preserve stored delivery fields even when the preferred delivery date is in the past",
+          "pickup-to-delivery header persists the fee, updates one unitless SO charge and preserves materials and PO costs",
+          "invalid fee and stale delivery header leave the case, drafts and audit unchanged",
+          "legacy blank header fees remain optional and saved zero fees cannot be cleared to blank",
+          "confirmed, issued and planned requests allow Note-only edits without changing the case, drafts, decisions or order operations",
+          "issued Note-only edits retain role, yard, workflow, revision, terminal and atomic rollback checks",
+          "inline delivery fee editing removes a zero charge and can restore a paid charge without changing reviewed materials",
+          "legacy zero-fee SO drafts omit the row before submission and retain it after a durable submission"
+        ],
+        "tests": 17,
+        "pass": 0,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-line-decline-http.test.js",
+        "failures": [
+          "decline/revoke recalculates customer confirmation across Sales, SCM and SQL filters without deleting or resetting any line",
+          "historical declines and a changed SCM response revoke to pending; normal stock review then recalculates the stage",
+          "quote excludes declined lines, orders wait for a newly saved draft, and revoked omitted items return to the quote",
+          "invalid, foreign and duplicate actions, stale saves, scope failures and order locks leave the whole request unchanged",
+          "two concurrent decline saves have one winner and one revision conflict; repeating the saved state is a true no-op",
+          "failure on a later decision rolls back both decisions, charges, stage, revision and history together",
+          "an edited declined line allows remaining accepted lines to confirm; revoking the decline requires a fresh stock check",
+          "legacy decline migration plus current status view is repeatable and its schema changes roll back transactionally"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-operation-closure.test.js",
+        "failures": [
+          "SO-only closure retains scope, stale revision and executed-order protection"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-only-browser.test.js",
+        "failures": [
+          "reference-only SO displays accepted material purchase review on desktop and phone",
+          "any manual SO defaults to request materials despite approval and unrelated saved order drafts",
+          "manual PO number can be linked before the request has an SO or stock decisions",
+          "manual SO number can be linked before stock decisions or requested information are complete",
+          "manual SO purchase review retains SCM-confirmed quantities, units, descriptions, costs and discounts"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-routing-browser.test.js",
+        "failures": [
+          "SCM reviews PALLET quantity and cost, keeps failed input and submits it separately from material discounts",
+          "created PO routing saves the real Note and exact schedule revision, preserving failed drafts",
+          "Special Request edits the real Note while PO Split edits remain local, with the bar above line responses",
+          "switching requests ignores a late routing response from the previous PO",
+          "a mismatched catalog response cannot be edited and retry loads the matching PO",
+          "special request routing loads the packing alias and saves the Note through its real request"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-unsubmitted-link-http.test.js",
+        "failures": [
+          "custom PO link resolves an unsubmitted failed PO operation without a stranded lock or draft changes",
+          "failed custom PO linkage preserves pending-submission, revision and other operation guards atomically",
+          "resolving a PO preflight failure preserves unrelated Sales Order attention",
+          "/app/test/mbt/integration/special-po-unsubmitted-link-http.test.js"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-quote-pallet-browser.test.js",
+        "failures": [
+          "new request PALLET inputs exist before quoting, survive rerenders, and reach both Preview and Submit to SCM",
+          "completed requests retain a working saved quote preview and download in Sales and SCM",
+          "zero quantity omits PALLET from phone quote and positive quantity requires a rate while free PALLET is allowed",
+          "closed request copying and SO draft preparation retain quoted PALLET quantity and sales rate"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-internal-remark-http.test.js",
+        "failures": [
+          "New requests persist an internal remark and expose it only to Sales with a blank default for existing requests",
+          "Header saves both notes atomically without resetting stock checks; older clients preserve the internal remark",
+          "Internal remarks can change after order creation and during Pending Update, and remain readable after closure",
+          "Save endpoint enforces Sales role, yard scope, flag, validation and optimistic concurrency with one audit",
+          "Migration is additive and repeatable, preserves data, and rolls back with the transaction"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-items-copy-http.test.js",
+        "failures": [
+          "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft",
+          "HTTP appends require Sales role, yard access and enabled workflow; anonymous and outside-yard edits change nothing",
+          "HTTP revision conflict and hostile batch validation leave old items, draft, revision and events unchanged",
+          "HTTP rejects additions after orders, closure, remote submission, uncertain operations and pending reviews",
+          "HTTP combined count accepts exactly 100 items and rejects 101 without inserting anything",
+          "database failure on the second insert rolls back the first, SO draft deletion, revision bump and event",
+          "concurrent appends commit once per revision; rejected duplicate submission adds no duplicate lines",
+          "order claim and append serialize on the same row and never leave a claimed SO with an unreviewed new item",
+          "direct item update rejects a missing actor and preserves the request",
+          "hostile item fields cannot mark new items reviewed, alter prices or replace the existing vendor and header"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-request-corrections-http.test.js",
+        "failures": [
+          "single Sales edit saves PALLET and delivery fee atomically without changing reviewed materials, decisions, PO or stage",
+          "quote PDF omits declined stale-draft lines, keeps saved notes readable, and uses edited charges",
+          "new requests store a fee without creating ancillary-only drafts, and material restarts preserve the new fee",
+          "fee-only edits preserve authentication, yard, revision and closed/issued locks, and invalid combined edits write nothing",
+          "fee update failure rolls back PALLET, canonical fee, draft lines, revision and audit together",
+          "editing a legacy delivery charge consolidates duplicate unissued fees into one canonical SO charge",
+          "a missing delivery item aborts the complete edit when adding a saved SO charge"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-shared-orders.test.js",
+        "failures": [
+          "Special cases share an existing SO and preserve separate lines and audit events",
+          "Special cases share an existing PO before linking an SO",
+          "concurrent SO and PO links by separate cases all commit",
+          "Sales and SCM HTTP routes allow a shared SO/PO pair",
+          "sales_order webhook reconciles all cases sharing the order",
+          "purchase_order webhook reconciles all cases sharing the order",
+          "a reconciliation mismatch affects only that case and does not skip other shared cases",
+          "actual webhook processing audits and notifies every shared case",
+          "sharing preserves per-case replacement guards and rejects stale concurrent updates",
+          "shared links retain role authorization, yard scope, and order identity validation",
+          "operation IDs remain unique when cases share an SO or PO",
+          "property: every shared case reconciles exactly once regardless of count or link order",
+          "unmatched and single-case webhook results retain existing fields",
+          "migration lookup indexes permit sharing while retaining operation uniqueness"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-status-following.test.js",
+        "failures": [
+          "actual PostgreSQL refresh preserves all business fields and projects latest SO/PO statuses with microsecond fencing",
+          "driver evidence matches the PO alias, rejects unfinished/foreign-kind records and carries actual completion times",
+          "real list/detail handlers refresh both native headers once, preserve business data and serve cached state during remote failure",
+          "an intervening webhook and two concurrent refreshes cannot overwrite a newer header",
+          "audit failure rolls back the header and mirror outbox transaction",
+          "invalid kind, mismatched ref and unlinked identities do not persist",
+          "authenticated Sales/SCM list and detail endpoints expose separate local and latest NetSuite status"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-counts.test.js",
+        "failures": [
+          "Special counts include every new and confirmed case across yards, beyond the 60-case queue page"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-request-workflow.red.test.js",
+        "failures": [
+          "multi-line case transitions atomically from Sales to SCM and back to an exact SO draft"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-browser.test.js",
+        "failures": [
+          "SCM can save Low inventory without ETA and can request information before checking",
+          "Sales sees an alert, answers SCM, and can confirm low inventory normally"
+        ],
+        "tests": 4,
+        "pass": 2,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-worker.test.js",
+        "failures": [
+          "Worker preserves Pending Update and blocks stock readiness until Sales replies",
+          "Accepted Low inventory remains ready, permits a dispatch handoff and vendor collection, while unavailable stock is blocked"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-enquiry.test.js",
+        "failures": [
+          "directory customer identity persists from enquiry through SO draft without creating canonical data"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-review.test.js",
+        "failures": [
+          "accepted ETA needs no mapping and survives a revised SCM ETA",
+          "real order service persists submission and recovers after SO patch success before PO creation"
+        ],
+        "tests": 9,
+        "pass": 7,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-audit-scroll-browser.test.js",
+        "failures": [
+          "sales regular 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales regular 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales regular 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap"
+        ],
+        "tests": 12,
+        "pass": 0,
+        "fail": 12,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-view-browser.test.js",
+        "failures": [
+          "sales regular: events, focus and polling preserve the pool, details and edits",
+          "sales regular: clicking a card paints cached details before any detail response and retains every pool card",
+          "sales special: events, focus and polling preserve the pool, details and edits",
+          "sales special: clicking a card paints cached details before any detail response and retains every pool card",
+          "scm regular: events, focus and polling preserve the pool, details and edits",
+          "scm regular: clicking a card paints cached details before any detail response and retains every pool card",
+          "scm special: events, focus and polling preserve the pool, details and edits",
+          "scm special: clicking a card paints cached details before any detail response and retains every pool card",
+          "sales Regular: a failed enrichment retains cached detail, pool and an edited field",
+          "sales Regular: late detail responses cannot replace a newer selection or an edited input",
+          "scm Regular: a failed enrichment retains cached detail, pool and an edited field",
+          "scm Regular: late detail responses cannot replace a newer selection or an edited input",
+          "explicit Refresh applies the latest Special case, keeps selection and clears the update notice",
+          "failed Special background checks preserve the last view; a later explicit Refresh recovers",
+          "SCM Waitlist: background updates preserve the pool and allocation form, and another pool opens before its response",
+          "SCM Waitlist: a failed old pool response cannot disturb the current pool or allocation form",
+          "/app/test/mbt/integration/stock-request-view-browser.test.js"
+        ],
+        "tests": 17,
+        "pass": 0,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-return-draft-insert.test.js",
+        "failures": [
+          "normal stock draft preserves every line field and consumes the draft only on success"
+        ],
+        "tests": 5,
+        "pass": 4,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-line-actions-browser.test.js",
+        "failures": [
+          "SCM Purchase actions send only the clicked material even when other materials are pending",
+          "Transfer Stocking reply and Resolve controls belong to the individual material",
+          "Sales can reply only in the instructed material card and sends its line ID"
+        ],
+        "tests": 4,
+        "pass": 1,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-replies-browser.test.js",
+        "failures": [
+          "Stocking enables all supported destination yards for 150 while Pickup keeps its assigned yard",
+          "SCM Transfer Reply saves free text with no ETA and survives background updates",
+          "SCM Purchase Reply saves free text with no ETA and survives background updates",
+          "Sales responds to SCM instructions with an optional SO and retained unsaved text",
+          "Sales top-bar and popup alert reply and Resolve once per event without changing the pool",
+          "Stocking instructions remain available for SCM in Pending TO without changing the Transfer Order"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/infrastructure/production-runtime-contract.test.js",
+        "failures": [
+          "quality non-regression: production roots stay frozen and security patches are explicit"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/backorder-pending-po.test.js",
+        "failures": [
+          "every accepted supply state waits for SCM until the PO is linked",
+          "Already Ordered and other terminal outcomes do not wait for another PO",
+          "linked PO dispatch and non-Backorder handoffs retain their existing status"
+        ],
+        "tests": 6,
+        "pass": 3,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/control-yard-photo-thumbnail.test.js",
+        "failures": [
+          "Control and Admin request the cache-busted thumbnail hydration client"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/customer-pickup-yard-ui.test.js",
+        "failures": [
+          "E12 HTML and service worker share the new operator asset cache version"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-camera-ordinary-upload.test.js",
+        "failures": [
+          "a fresh Driver shell version evicts older copy-enabled cached assets"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-recovery-assets.test.js",
+        "failures": [
+          "the installed Driver shell cannot mix old DB/route code with photo recovery code"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-ux-regressions.test.js",
+        "failures": [
+          "the updated override policy is atomically included in the Driver PWA shell"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/guarded-delete-and-frontdesk-order-kind.test.js",
+        "failures": [
+          "Front Desk makes the 150-yard price choice explicit and durable"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/mbt-bin-corrections.test.js",
+        "failures": [
+          "new BIN pricing chooses DELIVERY_CHARGE_MBT even when MBBS sorts first or another contract was open",
+          "standalone aggregate origin starts unchecked and remains selectable"
+        ],
+        "tests": 7,
+        "pass": 5,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/menu-order.test.js",
+        "failures": [
+          "catalog has independent groups, unique links and the admin editor"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+        "failures": [
+          "S2/S3/S5: completion route accepts optional input but repository owns live enforcement",
+          "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-yard-assets.test.js",
+        "failures": [
+          "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/receiving-multi-yard-ui.test.js",
+        "failures": [
+          "installing the tablet cache fetches the updated client used by the HTML shell"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/sales-order-null-packs.test.js",
+        "failures": [
+          "PO payloads retain existing behavior and independent purchase quantities"
+        ],
+        "tests": 19,
+        "pass": 18,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/scm-ultimate-packing.test.js",
+        "failures": [
+          "captured plan 429 keeps BWS Woodbridge -> 2967 urgent quantity in one truck"
+        ],
+        "tests": 11,
+        "pass": 10,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-approval-fulfillment.test.js",
+        "failures": [
+          "property: a real unapproved PO remains Confirmed until approval, except terminal stages"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-manual-so-ui.browser.test.js",
+        "failures": [
+          "/app/test/mbt/unit/special-manual-so-ui.browser.test.js"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-sales-request-corrections.test.js",
+        "failures": [
+          "all declined or closed materials cannot produce a quote containing only charges; undecided legacy lines remain quotable"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-stock-request-wiring.red.test.js",
+        "failures": [
+          "Sales and SCM Special tabs are real feature-gated interfaces"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-order-sync.test.js",
+        "failures": [
+          "SCM descriptions synchronize the exact SO line before PO creation",
+          "failed SO description synchronization blocks PO creation"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-polish.test.js",
+        "failures": [
+          "property: skipped order stages match completed steps and preserve terminal/waiting priority"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/stock-request-ui-contract.test.js",
+        "failures": [
+          "stock-request feedback is content-sized and availability shows Sales plus conversion equivalents",
+          "Sales Request Stock has complete Simplified Chinese UI and validation coverage"
+        ],
+        "tests": 14,
+        "pass": 12,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/to-posting-reference.test.js",
+        "failures": [
+          "TOB01189 posts exact Operator quantities on fulfillment legs 2,5,8 and preserves source data",
+          "partial packing and deselected lines stay attached to their original items"
+        ],
+        "tests": 13,
+        "pass": 11,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/ui-navigation-contract.test.js",
+        "failures": [
+          "F02/F15: root login maps both MBT authorities to their controlled homes"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/property/backorder-po-recheck.property.test.js",
+        "failures": [
+          "PO recheck requires a linked SO and current stock review for pending materials"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/aggregate-request-browser.test.js",
+        "failures": [
+          "/app/test/mbt/integration/aggregate-request-browser.test.js"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 0,
+        "cancelled": 1,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-browser.test.js",
+        "failures": [
+          "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+          "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+          "A pending Backorder save cannot replace another request selected by Sales",
+          "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+          "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+          "New Backorder enquiry hides order links in Sales and SCM",
+          "SCM Request information appears before the material lines",
+          "SCM Regular queue filter supports multiple selections, persists them and clears with other filters"
+        ],
+        "tests": 11,
+        "pass": 3,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/co-completion.test.js",
+        "failures": [
+          "repaired transfer evidence cannot be claimed by an already queued fulfillment candidate",
+          "the deployment repair detects opaque stop IDs and preserves all protected fields"
+        ],
+        "tests": 13,
+        "pass": 11,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/direct-ship-materializer-red.test.js",
+        "failures": [
+          "fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/driver-live-route-prefix-lock.integration.test.js",
+        "failures": [
+          "automated billed reconciliation defers instead of deleting a completed route prefix"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/link-to-fix.test.js",
+        "failures": [
+          "L2 active CO, absent arrival evidence and real SO loading still block linking"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/local-item-settings-http.test.js",
+        "failures": [
+          "LC07/LC09: local item reads are Admin-only, no-store, bounded, and externally quiet"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/local-load-performance.test.js",
+        "failures": [
+          "/app/test/mbt/integration/local-load-performance.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/mbt-bin-corrections.test.js",
+        "failures": [
+          "two fresh deliveries show unavailable physical bins instead of reporting missing front legs"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/migration-upgrade.test.js",
+        "failures": [
+          "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/netsuite-attention-state.test.js",
+        "failures": [
+          "unsupported yard attention retains the exact actionable reason",
+          "unverified recovery from queued retains uncertainty and payload",
+          "unverified recovery from uncertain retains uncertainty and payload",
+          "late recovery lookup failure cannot overwrite a completed or leased candidate",
+          "waiting work cannot starve newly ready candidates behind the polling limit",
+          "registered first split uses its bounded planned quantity and resumes only after Operator proof"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/noninventory-fulfillment.test.js",
+        "failures": [
+          "future automatic fulfillment snapshots ignore resale rows while retaining loaded inventory evidence",
+          "an automatic completion containing only resale items is skipped without an IF"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-background-photos.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-background-photos.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-to-yard-flow.test.js",
+        "failures": [
+          "TO outbound preparation follows local progress across NetSuite delivery statuses"
+        ],
+        "tests": 16,
+        "pass": 15,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-yard-access.test.js",
+        "failures": [
+          "yard lists and saved queues withhold unauthorized groups while preserving authorized standalone orders and saved rows"
+        ],
+        "tests": 36,
+        "pass": 35,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-feature-gates.test.js",
+        "failures": [
+          "P3-F29: all seven Phase 3 environment gates default false when absent",
+          "P3-F29: all seven Phase 3 environment gates parse only explicit truthy values",
+          "P3-F29: env reload clears omitted Phase 3 gates instead of retaining prior activation"
+        ],
+        "tests": 9,
+        "pass": 6,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/reconciliation-blockers.test.js",
+        "failures": [
+          "C1 verified CM with accounting additions recovers the same transaction without a remote write",
+          "C2/R1 accounting additions cannot finalize a new draft and do not cause an automatic retry loop"
+        ],
+        "tests": 4,
+        "pass": 2,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-delivery-selection-browser.test.js",
+        "failures": [
+          "browser can uncheck either backordered line, recalculate and submit only the checked line on desktop and mobile"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-target-yard-access.test.js",
+        "failures": [
+          "SQL lists and detail authorization agree across yards, methods and versions",
+          "preview keeps candidates for missing pallet conversion and propagates unrelated calculation failures"
+        ],
+        "tests": 8,
+        "pass": 6,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-waitlist-http-browser.test.js",
+        "failures": [
+          "SCM selects PO demand, confirms partial allocation, and Sales converts only that quantity",
+          "SCM finds an existing PO, opens its item pool, releases a mature hold and acknowledges returned stock",
+          "Sales Close releases fresh allocations and the SCM notice deep-links the same PO pool",
+          "Delivery conversion persists fulfillment details and closing the remainder retains SO quantity",
+          "an invalid delivery date shows the error, preserves the draft and creates no conversion"
+        ],
+        "tests": 10,
+        "pass": 5,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sales-stock-check-popup.test.js",
+        "failures": [
+          "A live SCM stock check opens a popup on the selected request, preserves unsaved text, and notifies once including completion",
+          "Special stock checks notify the requester with Sales-visible notes and a link to the matching request"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sales-stock-status-filter-browser.test.js",
+        "failures": [
+          "Sales multi-select case stages, types and vendors combine correctly without a Status filter, persist, and work on mobile"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/scm-special-planned-card-browser.test.js",
+        "failures": [
+          "SCM Special Request detail loads the updated PO card at 1440px",
+          "SCM Special Request detail loads the updated PO card at 390px"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/scm-stock-actions-browser.test.js",
+        "failures": [
+          "SCM Transfer puts Reply in the existing action row and converts one line through customer selection",
+          "SCM Purchase puts Reply in the existing action row and converts one line through customer selection",
+          "SCM Pending TO keeps Reply in the TO action row and exposes no waitlist conversion for committed lines",
+          "Smart font controls scale text, preserve the current field and full width, remember size and stop at bounds"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-approval-browser.test.js",
+        "failures": [
+          "SCM sees delivery method and PO vendor pricing shares a desktop row",
+          "Confirmed request preserves SCM readiness instructions for an accepted production ETA",
+          "Sales local adjustment removal preserves the selection after a failed save and submits only that removal",
+          "SCM removal review explains the local effect and identifies the removed material",
+          "approved PO exposes shared reference form and preserves failed edits",
+          "Sales delivery editor remains available after SO and PO creation",
+          "mobile Sales delivery form preserves contact details across method toggles and failed saves",
+          "planned Sales order hides delivery editor; SCM pending PO hides reference editor and escapes delivery text",
+          "failed delivery recovery keeps header editable and saves the edited target explicitly",
+          "delivery recovery distinguishes retry from discard and hides discard after a saved remote plan"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-approval-http.test.js",
+        "failures": [
+          "delivery and PO reference endpoints enforce roles, yard and revision; SCM sees saved Sales delivery details",
+          "planning does not hold a Special case lock or prevent an unplanned delivery claim"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-batch-save.test.js",
+        "failures": [
+          "one SCM save records all responses, and one Sales save records selected decisions",
+          "a later invalid SCM line rolls back earlier responses, events and case revision",
+          "a later invalid Sales decision rolls back earlier decisions and rejects wrong scope",
+          "batch input rejects empty, oversized, duplicate, foreign and stale writes without partial changes",
+          "SCM saves readiness and pending responses together while retaining transfer status"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-edits-http.test.js",
+        "failures": [
+          "material productName edit restarts only changed reviews, invalidates both drafts and preserves unaffected SQL rows",
+          "material quantity edit restarts only changed reviews, invalidates both drafts and preserves unaffected SQL rows",
+          "material rate-only edits preserve every stage and stock decision, and synchronize converted SO rates without altering purchase costs",
+          "PALLET edits preserve all material SQL rows and progress, update one draft charge, and keep quote materials before any SO draft",
+          "mixed material and PALLET edits restart once and commit all requested values atomically",
+          "equivalent edits are a complete no-op including revision, timestamps, order drafts and audit",
+          "PALLET removal and zero sales rate keep progress and cannot leave a duplicate or empty-material quote",
+          "authenticated saved quote PDF reflects edited rates and PALLET while the request remains reviewed",
+          "Sales authentication, role, yard scope and workflow gate protect edits without changing any data",
+          "foreign/duplicate IDs, hostile values, overflow and stale revisions reject the whole batch before writes",
+          "existing or skipped orders, closure, remote submissions, uncertain operations and reviews lock all edits",
+          "direct repository edits require an actor and forged stock/order/header fields cannot escape the whitelist",
+          "failure on the second SQL edit rolls back every line, PALLET, draft, revision and audit change",
+          "concurrent saves commit once per original revision without duplicate pricing events",
+          "SO claim and material edit serialize without claiming an order with stale reviewed content",
+          "price-trigger migration is repeatable, rolls back without data changes, and grants only scoped pre-order rate edits",
+          "saved drafts without PALLET receive one charge, while duplicate, issued or inconsistent drafts reject atomically",
+          "entering legacy prices preserves the editor unit basis for rate-only and restarted material edits",
+          "legacy embedded discounts and non-PALLET draft charges are preserved when the selling rate changes",
+          "missing PALLET item master rolls back a combined price and PALLET draft edit"
+        ],
+        "tests": 20,
+        "pass": 0,
+        "fail": 20,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-fields-http.test.js",
+        "failures": [
+          "SCM required-date correction persists through HTTP and is visible to Sales with its audit",
+          "invalid SCM required dates reject and roll back earlier corrections in the same HTTP batch",
+          "SCM required-date corrections retain role and issued-order locks",
+          "Sales saves all new fields, updates quote basis, resets only changed reviews and audits every field",
+          "Sales discount and note preserve reviews, update native draft discount and leave purchase costs unchanged",
+          "SCM stock corrections save with the response and clear stale acceptance and conversions",
+          "SCM invalid second-line corrections roll back the whole stock batch",
+          "field migration is scoped, repeatable and rollback preserves old data",
+          "issued order metadata proposal stays pending until SCM approval and persists every approved field",
+          "description-only issued adjustment is reviewable and rejection leaves original fields and drafts intact",
+          "verified issued-order field corrections reach canonical SO and PO rows used by Dispatch",
+          "property: issued adjustments always use one and preserve original rate and purchase cost",
+          "missing historical conversion uses one without prompting while order-rate drift still blocks edits",
+          "new adjustments normalize a legacy conversion only through the existing SCM approval"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-custom-po-http.test.js",
+        "failures": [
+          "custom PO number links independently and survives PO webhook without changing SO or saved draft lines",
+          "custom linkage preserves revision, authorization and identity and allows PO sharing while skipping business comparisons",
+          "custom PO supports vendor-to-yard arrangement without inventing direct line allocation",
+          "standard linking still requires reviewed matching SO and PO lines and keeps custom mode off",
+          "/app/test/mbt/integration/special-custom-po-http.test.js"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-fee-browser.test.js",
+        "failures": [
+          "Sales enters Delivery fee below PALLET; rerenders, quote preview and submission retain it",
+          "phone form supports free delivery, hides the fee for pickup and preserves it when switching back",
+          "quoted and manually added delivery fees prefill SO preparation and request copies"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-method-browser.test.js",
+        "failures": [
+          "Sales can change linked SPREQ pickup at width 1440, planned=false, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=false, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 1440, planned=true, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=true, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 1440, planned=arrived, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=arrived, and sees team notification guidance",
+          "fulfilled pickup is Completed without a delivery dropdown at width 390",
+          "fulfilled pickup is Completed without a delivery dropdown at width 1440",
+          "scm sees a durable change popup with yard and order references",
+          "scm_staff sees a durable change popup with yard and order references",
+          "dispatcher sees a durable change popup with yard and order references",
+          "failed acknowledgement is retained, later events refresh, hostile text stays text, and logout removes team notices",
+          "pending notices survive reload, and public sessions never query private team alerts",
+          "polling and closing an existing dialog reveal queued notices without interrupting another form",
+          "malformed notices retain the current alert and revoked endpoint access clears private data",
+          "network errors keep acknowledgement retryable and stale acknowledgement cannot recreate a popup after account change"
+        ],
+        "tests": 16,
+        "pass": 0,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-method-http.test.js",
+        "failures": [
+          "team delivery alert routes enforce authentication and existing role permissions without caching",
+          "real HTTP pickup change publishes both team notices, and acknowledging SCM leaves Dispatch unread",
+          "twenty simultaneous acknowledgements of one notice commit once without changing the request",
+          "alert routes respect the Special workflow gate and reject malformed notice IDs"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-enhancements-http.test.js",
+        "failures": [
+          "SCM item-name correction uses the authenticated stock-check endpoint while awaiting confirmation",
+          "HTTP requires active Sales Rep and restricts Sales alerts and own queue to authenticated identity"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-handoff-notice-browser.test.js",
+        "failures": [
+          "handoffs page is notice-only, has Sp. O navigation, and removes a finished selection on refresh",
+          "planned PO card is green and white with large status/date and saved ETA on desktop and phone"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-browser.test.js",
+        "failures": [
+          "Sales edits Note and delivery address/contact directly with one Save header button and preserves request progress",
+          "phone header Note supports pickup, clearing, and a no-op save without exposing hidden delivery fields",
+          "header errors retain Note/address and revision conflicts require explicit reload before another save",
+          "unsaved header fields survive rerenders and must be saved before opening line or Add item editors",
+          "closed requests display safely escaped multiline Notes without a Note editor",
+          "pickup-to-delivery header shows, retains and submits the customer fee on desktop and phone",
+          "header fee survives save errors and pickup omits the hidden field from submission",
+          "confirmed and planned issued requests keep a Note-only editor on desktop and phone",
+          "issued Note edits keep unsaved text after a failed save and require reload after a revision conflict"
+        ],
+        "tests": 9,
+        "pass": 0,
+        "fail": 9,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-markup.test.js",
+        "failures": [
+          "blank lines and whitespace survive parsing the saved Note into the shared header textarea"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-line-decline-browser.test.js",
+        "failures": [
+          "bottom-right Decline/Revoke decline keeps the only line visible and saves through the existing case editor",
+          "mobile toggles keep typed charge edits and cancellation restores the original line without a write",
+          "revision conflicts retain the decline draft, and closed lines and issued requests keep their existing locks"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-local-adjustments.test.js",
+        "failures": [
+          "all-line removal remains local and completed requests stay locked"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-http.test.js",
+        "failures": [
+          "closed, completed, cancelled, closure-pending and skipped cases stop notifying"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-only.test.js",
+        "failures": [
+          "reference-only manual PO HTTP linkage ignores absent mappings and drafts and remains arrangeable",
+          "reference-only PO review inserts all purchase materials and retries without adding SO draft lines",
+          "incomplete, duplicate, foreign and invalid reference-only PO reviews preserve the original case",
+          "reference-only SO creates a reviewed standalone PO without SO writes",
+          "reference-only SO creates a reviewed standalone PO without SO writes and recovers a lost response",
+          "manual SO native pointers do not replace the reviewed request PO creation",
+          "manual SO HTTP linking skips customer, yard, activity, approval, stock and decision comparisons",
+          "manual PO links without an SO, accepted decisions, stock, vendor, yard, active order or cargo lines",
+          "manual SO with an old draft and pending approval creates only the SCM-reviewed request PO",
+          "manual PO linkage cannot overwrite an unresolved submitted operation even if its status was reset",
+          "concurrent manual-SO purchase creation produces one PO submission and one revision conflict",
+          "manual-SO PO submission with an invisible marker can recover without automatic resubmission",
+          "manual PO can be linked before the SO and the ready pair becomes arrangeable after SO linking",
+          "/app/test/mbt/integration/special-po-reference-only.test.js"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-quote-pallet-http.test.js",
+        "failures": [
+          "authenticated initial quote PDFs add positive PALLET and omit zero without creating any request or calling NetSuite",
+          "Submit to SCM persists quoted PALLET values for the saved PDF and subsequent SO draft",
+          "invalid PALLET inputs, anonymous viewers and other yards cannot create partial records or disclose quote PDFs"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-request-enhancements.test.js",
+        "failures": [
+          "Sales alert counts are own requests within permitted yards, regardless of list pagination"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-internal-remark-browser.test.js",
+        "failures": [
+          "Sales saves both notes in one header row and copied requests retain the private remark",
+          "After SO/PO planning the independent remark saves, preserves drafts on errors and rejects stale saves until reload",
+          "Mobile stacks the two notes without overflow and closed cases show escaped read-only Sales text",
+          "SCM keeps the customer Note and has no Sales internal remark control or display"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-items-copy-browser.test.js",
+        "failures": [
+          "purple Add item shares the Save decisions row after Case lines before Close; centered warning can be cancelled or escaped without writing",
+          "Save customer decisions stays left and Add item right on one row across desktop and phone widths",
+          "add item editor submits only new lines, retains inputs on failure and returns New enquiry while old items stay visible",
+          "copy beside SPREQ includes closed request fields and all items, makes no POST until explicit Submit to SCM",
+          "copy cancellation and add-item cancellation keep source unchanged and new draft removal never removes old lines",
+          "Add item is hidden after SO, skipped SO, closure or remote submission; Copy remains available for closed cases",
+          "phone warning, append form and copy draft remain usable at 390 pixels",
+          "SO created in another session blocks append without hiding unsaved items or trapping the user",
+          "existing post-SO quantity adjustment still submits material quantity, discount and PALLET review while Add item stays unavailable",
+          "Sales can accept the old item and then add a new item without losing the old decision, name, price or stock"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-request-corrections-browser.test.js",
+        "failures": [
+          "one existing line edit button edits PALLET and delivery fee in a single save, with no restart",
+          "fee-only free delivery saves from the same editor on mobile and failed saves retain all typed charges",
+          "saved Sales line and decision notes remain readable before and after an SO, and on closed cases",
+          "created and manually linked SOs retain every case-line stock response, ETA and status color",
+          "pickup uses the same PALLET editor without a delivery fee, and legacy blank fees do not block unrelated edits"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-scm-item-name.test.js",
+        "failures": [
+          "SCM vendor and item-name correction persists while awaiting customer confirmation with an audit"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-browser.test.js",
+        "failures": [
+          "Wait for Transfer requires ETA, sends the date, and keeps the selection after saving",
+          "Sales sees the Wait for Transfer label and ETA on the saved case",
+          "Special and Aggregate alerts coexist; the Special badge opens the full list of alert requests",
+          "SCM role variants see alerts, while Sales, Dispatch, public users and logged-out users do not fetch counts",
+          "polling recovers missed events, preserves counts through outages, and hides disabled or revoked alerts",
+          "logout removes the alert and a stale count response cannot restore it",
+          "both alerts fit desktop and mobile top bars and update after language changes"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-http.test.js",
+        "failures": [
+          "alert counts use the existing SCM read permissions and return only uncached counts",
+          "Sales Rep directory route requires Sales access and returns live directory choices without caching",
+          "new submissions update counts and saved PDFs credit the selected Sales Rep through Sales and SCM routes",
+          "batch routes enforce roles, save once, and reject one of two concurrent writes"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-check-editing-http.test.js",
+        "failures": [
+          "replied active lines plus an unanswered declined pallet fee await customer confirmation in API, SQL, filters and alerts",
+          "SCM revised decline becomes pending, clears decline metadata, preserves other lines and records actor and previous reason",
+          "Sales and unauthenticated callers cannot revise a declined stock check",
+          "closed lines cannot be reopened by a crafted SCM response",
+          "closed, pending-information, linked/skipped-order and busy cases cannot reopen a decline",
+          "invalid batch after a declined-line revision rolls back the reopened decision, stock and audit",
+          "concurrent SCM revisions of a decline allow exactly one save and one reopen event",
+          "property: JavaScript and SQL stages agree when declined/closed lines are unanswered but open lines need a reply"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-http.test.js",
+        "failures": [
+          "Information routes enforce role, yard, workflow flag and validation; concurrent requests and replies commit once"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates.test.js",
+        "failures": [
+          "SCM question pauses stock check, alerts scoped Sales, records reply, and returns to SCM",
+          "Pending information rejects blank/oversized notes, duplicate requests and issued or closed cases",
+          "Accepted Low inventory remains ready, permits a dispatch handoff and vendor collection, while unavailable stock is blocked"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-vendor-confirmation.test.js",
+        "failures": [
+          "SCM browser button saves the real request and Sales sees the waiting status after reload"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-description-race.test.js",
+        "failures": [
+          "discount and pallet adjustment survives an early webhook and lost SO response before committing locally",
+          "issued quantity confirmation tolerates exact SO/PO webhook transitions",
+          "issued quantity confirmation tolerates exact SO/PO webhook transitions across recovery",
+          "SCM PO creation survives SO webhooks after PATCH, before submission and before final linking",
+          "webhook revision changes do not grant another operation ownership or allow a future revision",
+          "loss of SO approval during the claimed operation blocks PO submission",
+          "owned PO submission still blocks when case closes",
+          "owned PO submission still blocks when SO becomes planned",
+          "owned PO submission still blocks when SO quantity changes",
+          "owned PO submission still blocks when SO UOM changes",
+          "owned PO submission still blocks when SO description is unreviewed",
+          "a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line",
+          "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks",
+          "real SCM workflow corrects SO quantity/UOM before updating the existing native PO despite webhooks",
+          "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks and a lost creation response",
+          "a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook"
+        ],
+        "tests": 17,
+        "pass": 1,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-polish-http.test.js",
+        "failures": [
+          "skip HTTP routes require authentication, correct role, gate and Sales yard access",
+          "duplicate concurrent SO and PO skips each commit once and preserve role-owned order kind",
+          "gate disable wins before a waiting skip transaction without advancing the request",
+          "real creation claim and test skip cannot both acquire the same request revision"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-pricing-http.test.js",
+        "failures": [
+          "saved quotes enforce login, role, yard and workflow scope and end only when a real SO is linked"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-queue-access.test.js",
+        "failures": [
+          "queue hydration uses bounded SQL reads and equals full case details"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/split-fulfillment-evidence.test.js",
+        "failures": [
+          "materialized split uses its own PO execution evidence and retains NetSuite lineage",
+          "PO evidence on the parent cannot satisfy a materialized split",
+          "PO evidence on the sibling cannot satisfy a materialized split",
+          "PO split remains blocked for missingPickup",
+          "PO split remains blocked for differentLoad",
+          "materialized split uses its own TO execution evidence and retains NetSuite lineage",
+          "TO evidence on the parent cannot satisfy a materialized split",
+          "TO evidence on the sibling cannot satisfy a materialized split",
+          "TO split remains blocked for missingPickup",
+          "TO split remains blocked for differentLoad",
+          "TO split remains blocked for differentDrop",
+          "split quantity conservation holds across integral and fractional supplier quantities",
+          "supplier quantity and split ownership property"
+        ],
+        "tests": 13,
+        "pass": 0,
+        "fail": 13,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/staff-login-browser.test.js",
+        "failures": [
+          "all staff module entry points share the login page while Driver remains separate"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-conversation-browser.test.js",
+        "failures": [
+          "conversation panel sales special replaces legacy editors and sends typed text",
+          "conversation panel sales backorder replaces legacy editors and sends typed text",
+          "conversation panel sales stocking replaces legacy editors and sends typed text",
+          "conversation panel sales purchase replaces legacy editors and sends typed text",
+          "conversation panel sales delivery replaces legacy editors and sends typed text",
+          "conversation panel scm special replaces legacy editors and sends typed text",
+          "conversation panel scm backorder replaces legacy editors and sends typed text",
+          "conversation panel scm stocking replaces legacy editors and sends typed text",
+          "conversation panel scm purchase replaces legacy editors and sends typed text",
+          "conversation panel scm delivery replaces legacy editors and sends typed text",
+          "empty conversation has no loading label and accepts its first message",
+          "unread card badge on sales special updates, stays outside the corner and clears when read",
+          "unread card badge on sales backorder updates, stays outside the corner and clears when read",
+          "unread card badge on sales stocking updates, stays outside the corner and clears when read",
+          "unread card badge on sales purchase updates, stays outside the corner and clears when read",
+          "unread card badge on sales delivery updates, stays outside the corner and clears when read",
+          "unread card badge on scm special updates, stays outside the corner and clears when read",
+          "unread card badge on scm backorder updates, stays outside the corner and clears when read",
+          "unread card badge on scm stocking updates, stays outside the corner and clears when read",
+          "unread card badge on scm purchase updates, stays outside the corner and clears when read",
+          "unread card badge on scm delivery updates, stays outside the corner and clears when read",
+          "unread card badges discard a late count after logout",
+          "new conversation message sorts sales special without losing selected detail or drafts",
+          "new conversation message sorts sales backorder without losing selected detail or drafts",
+          "new conversation message sorts sales stocking without losing selected detail or drafts",
+          "new conversation message sorts sales purchase without losing selected detail or drafts",
+          "new conversation message sorts sales delivery without losing selected detail or drafts",
+          "new conversation message sorts scm special without losing selected detail or drafts",
+          "new conversation message sorts scm backorder without losing selected detail or drafts",
+          "new conversation message sorts scm stocking without losing selected detail or drafts",
+          "new conversation message sorts scm purchase without losing selected detail or drafts",
+          "new conversation message sorts scm delivery without losing selected detail or drafts",
+          "conversation queue recovers from fetch failure and includes messages arriving during an in-flight refresh",
+          "conversation retains a draft across failed retry, live refresh, re-render and request switching",
+          "conversation notifications show unread badge and safe message link; visible history is acknowledged"
+        ],
+        "tests": 35,
+        "pass": 0,
+        "fail": 35,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-long-scroll-browser.test.js",
+        "failures": [
+          "sales regular 1440x600: long details remain reachable through repeated wheel round trips",
+          "sales regular 1024x500: long details remain reachable through repeated wheel round trips",
+          "sales regular 1920x800: long details remain reachable through repeated wheel round trips",
+          "sales special 1440x600: long details remain reachable through repeated wheel round trips",
+          "sales special 1024x500: long details remain reachable through repeated wheel round trips",
+          "sales special 1920x800: long details remain reachable through repeated wheel round trips",
+          "scm regular 1440x600: long details remain reachable through repeated wheel round trips",
+          "scm regular 1024x500: long details remain reachable through repeated wheel round trips",
+          "scm regular 1920x800: long details remain reachable through repeated wheel round trips",
+          "scm special 1440x600: long details remain reachable through repeated wheel round trips",
+          "scm special 1024x500: long details remain reachable through repeated wheel round trips",
+          "scm special 1920x800: long details remain reachable through repeated wheel round trips"
+        ],
+        "tests": 12,
+        "pass": 0,
+        "fail": 12,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-scroll-20261009-browser.test.js",
+        "failures": [
+          "/app/test/mbt/integration/stock-request-scroll-20261009-browser.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-customer-browser.test.js",
+        "failures": [
+          "Entered stocking customer persists and appears in Sales and SCM cards and details for Transfer and Purchase"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-replies-http.test.js",
+        "failures": [
+          "Resolve produces a new unread Sales alert after a previously read SCM reply"
+        ],
+        "tests": 14,
+        "pass": 13,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    ]
+  },
+  "candidateExitCode": 1,
+  "baseline": {
+    "fileCount": 153,
+    "tests": 1068,
+    "pass": 464,
+    "fail": 603,
+    "cancelled": 1,
+    "skipped": 0,
+    "failedFiles": [
+      {
+        "file": "test/mbt/infrastructure/p3-gauntlet-contract.test.js",
+        "failures": [
+          "P3.11: every unmutated Node test category is owned by main, coverage, and shuffle",
+          "P3.12: browser specs share one worker-owned database-pool lifecycle",
+          "P3.11: the extended mutation manifest owns every dedicated runner and the P3 gauntlet executes it"
+        ],
+        "tests": 10,
+        "pass": 7,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-plan-date-execution-wiring.contract.test.js",
+        "failures": [
+          "S11: the guarded client ships in a new atomic Driver shell generation"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-site-reset.test.js",
+        "failures": [
+          "the reset ships as a new atomic shell generation without forcing a protocol-version cutover"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operations-navigation-enhancements.test.js",
+        "failures": [
+          "operator cache assets advance with the cycle-count pagination release",
+          "main sidebar modules follow live primary and secondary authorities on every module path",
+          "Aggregate navigation requires a live separate grant and eligible account"
+        ],
+        "tests": 6,
+        "pass": 3,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-page-confirm-ui.contract.test.js",
+        "failures": [
+          "page confirmation has a duplicate-click guard and ships in a fresh Operator cache"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-native-service.test.js",
+        "failures": [
+          "native PO recovery before a durable submission updates the existing PO without creating",
+          "native PO recovery after a durable submission updates the existing PO without creating"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-pending-po.test.js",
+        "failures": [
+          "Sales and SCM APIs filter SO-linked requests by Pending SCM and retain production waiting",
+          "Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filter and detail",
+          "linking the PO clears Pending SCM and a production-only request then waits for stock"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/consolidation-load.test.js",
+        "failures": [
+          "CO and VRMA orders share load photos while preserving their local transitions",
+          "HTTP admission saves SO and TO locally with the native gate enabled and waits for Driver completion"
+        ],
+        "tests": 18,
+        "pass": 16,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/http-shell.test.js",
+        "failures": [
+          "F15: all MBT routes render one accessible controlled shell with an explicit controller"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/mbt-bin-corrections-browser.test.js",
+        "failures": [
+          "browser: new BIN fee defaults to MBT and undelivered bin actions remain disabled"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-background-http.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-background-http.test.js"
+        ],
+        "tests": 5,
+        "pass": 4,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-posting-photos.test.js",
+        "failures": [
+          "IF and IR commit durable photos before posting and enqueue only on successful completion",
+          "upload retries survive worker restart and cannot alter IF/IR posting state",
+          "concurrent workers claim distinct photos and expired leases are recoverable",
+          "replacement is atomic, scoped to associated proof, and preserves photo order",
+          "queued work cannot run before its owner completes and enqueue is idempotent",
+          "IR proof and a native consolidated batch keep their associations after background upload",
+          "changed photo identities and expired leases cannot overwrite durable proof"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-predeploy-readiness.test.js",
+        "failures": [
+          "P3.11: the deployment inventory exactly covers every on-disk MBT-era migration"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/receiving-followup.test.js",
+        "failures": [
+          "the pallet follow-up creates a distinct IR draft and omits the already completed NetSuite line"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-resolution-browser.test.js",
+        "failures": [
+          "Sales notification opens the resolved case and its PO/ETA once, and remains dismissed after refresh"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/request-waiting-labels-browser.test.js",
+        "failures": [
+          "sales special cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "sales special cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "sales backorder cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "sales backorder cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "scm special cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "scm special cards show active waiting labels and clear them at dispatch handoff (390px)",
+          "scm backorder cards show active waiting labels and clear them at dispatch handoff (1920px)",
+          "scm backorder cards show active waiting labels and clear them at dispatch handoff (390px)"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-batch-browser.test.js",
+        "failures": [
+          "SCM one save validates every ETA, preserves all line drafts after failure, and posts once on retry",
+          "SCM edits item names awaiting customer confirmation and retains them after a failed mobile save (in_stock)",
+          "SCM edits item names awaiting customer confirmation and retains them after a failed mobile save (no_stock)",
+          "SCM retains readiness fields without item-name editing after SO creation",
+          "Sales one save keeps undecided lines pending and requires the decline reason on mobile",
+          "SCM requires a percentage per material, retains distinct failed inputs, and sends gross costs",
+          "Sales loads real-directory choices, requires one, and sends the selected rep at SO creation"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-fields-browser.test.js",
+        "failures": [
+          "Sales editor submits every New Request field and retains values through decline on a phone",
+          "SCM stock check submits editable material details and packing in its existing batch",
+          "SCM description is normal size and quantity, UOM and packing align in one desktop row",
+          "SCM long descriptions and stock correction controls remain readable on a phone",
+          "SCM refreshes the right panel status and ETA layout from the latest request after saving",
+          "SCM keeps a successful stock check when refreshing the latest detail fails",
+          "SCM saves collapsed material values and keeps stock fields through a failed save at 1440px",
+          "SCM saves collapsed material values and keeps stock fields through a failed save at 390px",
+          "New Request defaults each new line to today plus 14 calendar days and preserves chosen dates",
+          "issued order adjustment submits all material fields without a conversion control",
+          "opening multiline saved details and notes never silently changes them during an unrelated price edit",
+          "sales pending adjustment shows every corrected field without a conversion prompt",
+          "scm pending adjustment shows every corrected field without a conversion prompt"
+        ],
+        "tests": 13,
+        "pass": 0,
+        "fail": 13,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-customer-confirmation.test.js",
+        "failures": [
+          "five lines: one rejected, one in-stock accepted and three accepted transfer ETAs await the SO everywhere",
+          "resolved accepted and rejected materials still await the SO, including a production ETA",
+          "all accepted transfer and production ETAs still await the SO",
+          "pending decisions, requested updates, unanswered stock checks and all rejected lines do not confirm",
+          "legacy saved edit stages cannot hide awaiting SO after customer decisions",
+          "migration reclassifies existing accepted requests without changing business rows",
+          "SPREQ-000041 yard-pickup evidence: locally received PO plus NetSuite Pending Billing SO is Completed",
+          "all 48 local and NetSuite evidence combinations obey the three delivery-method completion rules",
+          "delivery completion uses both current local order records and survives renamed PO references",
+          "yard pickup also accepts full local customer collection with a local PO arrival",
+          "vendor pickup requires NetSuite receipt and fulfillment, excluding partial or cancelled native orders"
+        ],
+        "tests": 11,
+        "pass": 0,
+        "fail": 11,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-enhancements-browser.test.js",
+        "failures": [
+          "new request has required rep, calendar expiry and three proportional item rows with persistent values",
+          "sales supports multiple vendors and preserves selections on refresh",
+          "scm supports multiple vendors and preserves selections on refresh",
+          "SO account stays separate from original customer and Sales alert links to own queue",
+          "mobile composer stays within the page and shows specification and expiry controls"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-handoff-notice-query.test.js",
+        "failures": [
+          "/app/test/mbt/integration/special-handoff-notice-query.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-line-decline-http.test.js",
+        "failures": [
+          "decline/revoke recalculates customer confirmation across Sales, SCM and SQL filters without deleting or resetting any line",
+          "historical declines and a changed SCM response revoke to pending; normal stock review then recalculates the stage",
+          "quote excludes declined lines, orders wait for a newly saved draft, and revoked omitted items return to the quote",
+          "invalid, foreign and duplicate actions, stale saves, scope failures and order locks leave the whole request unchanged",
+          "two concurrent decline saves have one winner and one revision conflict; repeating the saved state is a true no-op",
+          "failure on a later decision rolls back both decisions, charges, stage, revision and history together",
+          "an edited declined line allows remaining accepted lines to confirm; revoking the decline requires a fresh stock check",
+          "legacy decline migration plus current status view is repeatable and its schema changes roll back transactionally"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-only-browser.test.js",
+        "failures": [
+          "reference-only SO displays accepted material purchase review on desktop and phone",
+          "any manual SO defaults to request materials despite approval and unrelated saved order drafts",
+          "manual PO number can be linked before the request has an SO or stock decisions",
+          "manual SO number can be linked before stock decisions or requested information are complete",
+          "manual SO purchase review retains SCM-confirmed quantities, units, descriptions, costs and discounts"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-unsubmitted-link-http.test.js",
+        "failures": [
+          "custom PO link resolves an unsubmitted failed PO operation without a stranded lock or draft changes",
+          "failed custom PO linkage preserves pending-submission, revision and other operation guards atomically",
+          "resolving a PO preflight failure preserves unrelated Sales Order attention",
+          "/app/test/mbt/integration/special-po-unsubmitted-link-http.test.js"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-internal-remark-http.test.js",
+        "failures": [
+          "New requests persist an internal remark and expose it only to Sales with a blank default for existing requests",
+          "Header saves both notes atomically without resetting stock checks; older clients preserve the internal remark",
+          "Internal remarks can change after order creation and during Pending Update, and remain readable after closure",
+          "Save endpoint enforces Sales role, yard scope, flag, validation and optimistic concurrency with one audit",
+          "Migration is additive and repeatable, preserves data, and rolls back with the transaction"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-request-corrections-http.test.js",
+        "failures": [
+          "single Sales edit saves PALLET and delivery fee atomically without changing reviewed materials, decisions, PO or stage",
+          "quote PDF omits declined stale-draft lines, keeps saved notes readable, and uses edited charges",
+          "new requests store a fee without creating ancillary-only drafts, and material restarts preserve the new fee",
+          "fee-only edits preserve authentication, yard, revision and closed/issued locks, and invalid combined edits write nothing",
+          "fee update failure rolls back PALLET, canonical fee, draft lines, revision and audit together",
+          "editing a legacy delivery charge consolidates duplicate unissued fees into one canonical SO charge",
+          "a missing delivery item aborts the complete edit when adding a saved SO charge"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-status-following.test.js",
+        "failures": [
+          "actual PostgreSQL refresh preserves all business fields and projects latest SO/PO statuses with microsecond fencing",
+          "driver evidence matches the PO alias, rejects unfinished/foreign-kind records and carries actual completion times",
+          "real list/detail handlers refresh both native headers once, preserve business data and serve cached state during remote failure",
+          "an intervening webhook and two concurrent refreshes cannot overwrite a newer header",
+          "audit failure rolls back the header and mirror outbox transaction",
+          "invalid kind, mismatched ref and unlinked identities do not persist",
+          "authenticated Sales/SCM list and detail endpoints expose separate local and latest NetSuite status"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-request-workflow.red.test.js",
+        "failures": [
+          "multi-line case transitions atomically from Sales to SCM and back to an exact SO draft"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-worker.test.js",
+        "failures": [
+          "Worker preserves Pending Update and blocks stock readiness until Sales replies",
+          "Accepted Low inventory remains ready, permits a dispatch handoff and vendor collection, while unavailable stock is blocked"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-review.test.js",
+        "failures": [
+          "accepted ETA needs no mapping and survives a revised SCM ETA",
+          "real order service persists submission and recovers after SO patch success before PO creation"
+        ],
+        "tests": 9,
+        "pass": 7,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-view-browser.test.js",
+        "failures": [
+          "sales regular: events, focus and polling preserve the pool, details and edits",
+          "sales regular: clicking a card paints cached details before any detail response and retains every pool card",
+          "sales special: events, focus and polling preserve the pool, details and edits",
+          "sales special: clicking a card paints cached details before any detail response and retains every pool card",
+          "scm regular: events, focus and polling preserve the pool, details and edits",
+          "scm regular: clicking a card paints cached details before any detail response and retains every pool card",
+          "scm special: events, focus and polling preserve the pool, details and edits",
+          "scm special: clicking a card paints cached details before any detail response and retains every pool card",
+          "sales Regular: a failed enrichment retains cached detail, pool and an edited field",
+          "sales Regular: late detail responses cannot replace a newer selection or an edited input",
+          "scm Regular: a failed enrichment retains cached detail, pool and an edited field",
+          "scm Regular: late detail responses cannot replace a newer selection or an edited input",
+          "explicit Refresh applies the latest Special case, keeps selection and clears the update notice",
+          "failed Special background checks preserve the last view; a later explicit Refresh recovers",
+          "SCM Waitlist: background updates preserve the pool and allocation form, and another pool opens before its response",
+          "SCM Waitlist: a failed old pool response cannot disturb the current pool or allocation form",
+          "/app/test/mbt/integration/stock-request-view-browser.test.js"
+        ],
+        "tests": 17,
+        "pass": 0,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-line-actions-browser.test.js",
+        "failures": [
+          "SCM Purchase actions send only the clicked material even when other materials are pending",
+          "Transfer Stocking reply and Resolve controls belong to the individual material",
+          "Sales can reply only in the instructed material card and sends its line ID"
+        ],
+        "tests": 4,
+        "pass": 1,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/infrastructure/production-runtime-contract.test.js",
+        "failures": [
+          "quality non-regression: production roots stay frozen and security patches are explicit"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/control-yard-photo-thumbnail.test.js",
+        "failures": [
+          "Control and Admin request the cache-busted thumbnail hydration client"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-camera-ordinary-upload.test.js",
+        "failures": [
+          "a fresh Driver shell version evicts older copy-enabled cached assets"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-ux-regressions.test.js",
+        "failures": [
+          "the updated override policy is atomically included in the Driver PWA shell"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/mbt-bin-corrections.test.js",
+        "failures": [
+          "new BIN pricing chooses DELIVERY_CHARGE_MBT even when MBBS sorts first or another contract was open",
+          "standalone aggregate origin starts unchecked and remains selectable"
+        ],
+        "tests": 7,
+        "pass": 5,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-customer-pickup-photo-gate-ui.contract.test.js",
+        "failures": [
+          "S2/S3/S5: completion route accepts optional input but repository owns live enforcement",
+          "S7: Operator cache revision ships the live-policy client once; later toggles are server-only"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/receiving-multi-yard-ui.test.js",
+        "failures": [
+          "installing the tablet cache fetches the updated client used by the HTML shell"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/scm-ultimate-packing.test.js",
+        "failures": [
+          "captured plan 429 keeps BWS Woodbridge -> 2967 urgent quantity in one truck"
+        ],
+        "tests": 11,
+        "pass": 10,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-manual-so-ui.browser.test.js",
+        "failures": [
+          "/app/test/mbt/unit/special-manual-so-ui.browser.test.js"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-stock-request-wiring.red.test.js",
+        "failures": [
+          "Sales and SCM Special tabs are real feature-gated interfaces"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-polish.test.js",
+        "failures": [
+          "property: skipped order stages match completed steps and preserve terminal/waiting priority"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/to-posting-reference.test.js",
+        "failures": [
+          "TOB01189 posts exact Operator quantities on fulfillment legs 2,5,8 and preserves source data",
+          "partial packing and deselected lines stay attached to their original items"
+        ],
+        "tests": 13,
+        "pass": 11,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/property/backorder-po-recheck.property.test.js",
+        "failures": [
+          "PO recheck requires a linked SO and current stock review for pending materials"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-browser.test.js",
+        "failures": [
+          "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+          "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+          "A pending Backorder save cannot replace another request selected by Sales",
+          "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+          "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+          "New Backorder enquiry hides order links in Sales and SCM",
+          "SCM Request information appears before the material lines",
+          "SCM Regular queue filter supports multiple selections, persists them and clears with other filters"
+        ],
+        "tests": 11,
+        "pass": 3,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/direct-ship-materializer-red.test.js",
+        "failures": [
+          "fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/link-to-fix.test.js",
+        "failures": [
+          "L2 active CO, absent arrival evidence and real SO loading still block linking"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/local-load-performance.test.js",
+        "failures": [
+          "/app/test/mbt/integration/local-load-performance.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/migration-upgrade.test.js",
+        "failures": [
+          "F06/F16: schema-101 upgrade preserves representative legacy records and is migration-runner idempotent"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/noninventory-fulfillment.test.js",
+        "failures": [
+          "future automatic fulfillment snapshots ignore resale rows while retaining loaded inventory evidence",
+          "an automatic completion containing only resale items is skipped without an IF"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-to-yard-flow.test.js",
+        "failures": [
+          "TO outbound preparation follows local progress across NetSuite delivery statuses"
+        ],
+        "tests": 16,
+        "pass": 15,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-feature-gates.test.js",
+        "failures": [
+          "P3-F29: all seven Phase 3 environment gates default false when absent",
+          "P3-F29: all seven Phase 3 environment gates parse only explicit truthy values",
+          "P3-F29: env reload clears omitted Phase 3 gates instead of retaining prior activation"
+        ],
+        "tests": 9,
+        "pass": 6,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-delivery-selection-browser.test.js",
+        "failures": [
+          "browser can uncheck either backordered line, recalculate and submit only the checked line on desktop and mobile"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-waitlist-http-browser.test.js",
+        "failures": [
+          "SCM selects PO demand, confirms partial allocation, and Sales converts only that quantity",
+          "SCM finds an existing PO, opens its item pool, releases a mature hold and acknowledges returned stock",
+          "Sales Close releases fresh allocations and the SCM notice deep-links the same PO pool",
+          "Delivery conversion persists fulfillment details and closing the remainder retains SO quantity",
+          "an invalid delivery date shows the error, preserves the draft and creates no conversion"
+        ],
+        "tests": 10,
+        "pass": 5,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sales-stock-status-filter-browser.test.js",
+        "failures": [
+          "Sales multi-select case stages, types and vendors combine correctly without a Status filter, persist, and work on mobile"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/scm-stock-actions-browser.test.js",
+        "failures": [
+          "SCM Transfer puts Reply in the existing action row and converts one line through customer selection",
+          "SCM Purchase puts Reply in the existing action row and converts one line through customer selection",
+          "SCM Pending TO keeps Reply in the TO action row and exposes no waitlist conversion for committed lines",
+          "Smart font controls scale text, preserve the current field and full width, remember size and stop at bounds"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-approval-http.test.js",
+        "failures": [
+          "delivery and PO reference endpoints enforce roles, yard and revision; SCM sees saved Sales delivery details",
+          "planning does not hold a Special case lock or prevent an unplanned delivery claim"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-edits-http.test.js",
+        "failures": [
+          "material productName edit restarts only changed reviews, invalidates both drafts and preserves unaffected SQL rows",
+          "material quantity edit restarts only changed reviews, invalidates both drafts and preserves unaffected SQL rows",
+          "material rate-only edits preserve every stage and stock decision, and synchronize converted SO rates without altering purchase costs",
+          "PALLET edits preserve all material SQL rows and progress, update one draft charge, and keep quote materials before any SO draft",
+          "mixed material and PALLET edits restart once and commit all requested values atomically",
+          "equivalent edits are a complete no-op including revision, timestamps, order drafts and audit",
+          "PALLET removal and zero sales rate keep progress and cannot leave a duplicate or empty-material quote",
+          "authenticated saved quote PDF reflects edited rates and PALLET while the request remains reviewed",
+          "Sales authentication, role, yard scope and workflow gate protect edits without changing any data",
+          "foreign/duplicate IDs, hostile values, overflow and stale revisions reject the whole batch before writes",
+          "existing or skipped orders, closure, remote submissions, uncertain operations and reviews lock all edits",
+          "direct repository edits require an actor and forged stock/order/header fields cannot escape the whitelist",
+          "failure on the second SQL edit rolls back every line, PALLET, draft, revision and audit change",
+          "concurrent saves commit once per original revision without duplicate pricing events",
+          "SO claim and material edit serialize without claiming an order with stale reviewed content",
+          "price-trigger migration is repeatable, rolls back without data changes, and grants only scoped pre-order rate edits",
+          "saved drafts without PALLET receive one charge, while duplicate, issued or inconsistent drafts reject atomically",
+          "entering legacy prices preserves the editor unit basis for rate-only and restarted material edits",
+          "legacy embedded discounts and non-PALLET draft charges are preserved when the selling rate changes",
+          "missing PALLET item master rolls back a combined price and PALLET draft edit"
+        ],
+        "tests": 20,
+        "pass": 0,
+        "fail": 20,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-custom-po-http.test.js",
+        "failures": [
+          "custom PO number links independently and survives PO webhook without changing SO or saved draft lines",
+          "custom linkage preserves revision, authorization and identity and allows PO sharing while skipping business comparisons",
+          "custom PO supports vendor-to-yard arrangement without inventing direct line allocation",
+          "standard linking still requires reviewed matching SO and PO lines and keeps custom mode off",
+          "/app/test/mbt/integration/special-custom-po-http.test.js"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-method-browser.test.js",
+        "failures": [
+          "Sales can change linked SPREQ pickup at width 1440, planned=false, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=false, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 1440, planned=true, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=true, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 1440, planned=arrived, and sees team notification guidance",
+          "Sales can change linked SPREQ pickup at width 390, planned=arrived, and sees team notification guidance",
+          "fulfilled pickup is Completed without a delivery dropdown at width 390",
+          "fulfilled pickup is Completed without a delivery dropdown at width 1440",
+          "scm sees a durable change popup with yard and order references",
+          "scm_staff sees a durable change popup with yard and order references",
+          "dispatcher sees a durable change popup with yard and order references",
+          "failed acknowledgement is retained, later events refresh, hostile text stays text, and logout removes team notices",
+          "pending notices survive reload, and public sessions never query private team alerts",
+          "polling and closing an existing dialog reveal queued notices without interrupting another form",
+          "malformed notices retain the current alert and revoked endpoint access clears private data",
+          "network errors keep acknowledgement retryable and stale acknowledgement cannot recreate a popup after account change"
+        ],
+        "tests": 16,
+        "pass": 0,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-enhancements-http.test.js",
+        "failures": [
+          "SCM item-name correction uses the authenticated stock-check endpoint while awaiting confirmation",
+          "HTTP requires active Sales Rep and restricts Sales alerts and own queue to authenticated identity"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-browser.test.js",
+        "failures": [
+          "Sales edits Note and delivery address/contact directly with one Save header button and preserves request progress",
+          "phone header Note supports pickup, clearing, and a no-op save without exposing hidden delivery fields",
+          "header errors retain Note/address and revision conflicts require explicit reload before another save",
+          "unsaved header fields survive rerenders and must be saved before opening line or Add item editors",
+          "closed requests display safely escaped multiline Notes without a Note editor",
+          "pickup-to-delivery header shows, retains and submits the customer fee on desktop and phone",
+          "header fee survives save errors and pickup omits the hidden field from submission",
+          "confirmed and planned issued requests keep a Note-only editor on desktop and phone",
+          "issued Note edits keep unsaved text after a failed save and require reload after a revision conflict"
+        ],
+        "tests": 9,
+        "pass": 0,
+        "fail": 9,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-line-decline-browser.test.js",
+        "failures": [
+          "bottom-right Decline/Revoke decline keeps the only line visible and saves through the existing case editor",
+          "mobile toggles keep typed charge edits and cancellation restores the original line without a write",
+          "revision conflicts retain the decline draft, and closed lines and issued requests keep their existing locks"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-http.test.js",
+        "failures": [
+          "closed, completed, cancelled, closure-pending and skipped cases stop notifying"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-quote-pallet-http.test.js",
+        "failures": [
+          "authenticated initial quote PDFs add positive PALLET and omit zero without creating any request or calling NetSuite",
+          "Submit to SCM persists quoted PALLET values for the saved PDF and subsequent SO draft",
+          "invalid PALLET inputs, anonymous viewers and other yards cannot create partial records or disclose quote PDFs"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-internal-remark-browser.test.js",
+        "failures": [
+          "Sales saves both notes in one header row and copied requests retain the private remark",
+          "After SO/PO planning the independent remark saves, preserves drafts on errors and rejects stale saves until reload",
+          "Mobile stacks the two notes without overflow and closed cases show escaped read-only Sales text",
+          "SCM keeps the customer Note and has no Sales internal remark control or display"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-request-corrections-browser.test.js",
+        "failures": [
+          "one existing line edit button edits PALLET and delivery fee in a single save, with no restart",
+          "fee-only free delivery saves from the same editor on mobile and failed saves retain all typed charges",
+          "saved Sales line and decision notes remain readable before and after an SO, and on closed cases",
+          "created and manually linked SOs retain every case-line stock response, ETA and status color",
+          "pickup uses the same PALLET editor without a delivery fee, and legacy blank fees do not block unrelated edits"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-browser.test.js",
+        "failures": [
+          "Wait for Transfer requires ETA, sends the date, and keeps the selection after saving",
+          "Sales sees the Wait for Transfer label and ETA on the saved case",
+          "Special and Aggregate alerts coexist; the Special badge opens the full list of alert requests",
+          "SCM role variants see alerts, while Sales, Dispatch, public users and logged-out users do not fetch counts",
+          "polling recovers missed events, preserves counts through outages, and hides disabled or revoked alerts",
+          "logout removes the alert and a stale count response cannot restore it",
+          "both alerts fit desktop and mobile top bars and update after language changes"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-check-editing-http.test.js",
+        "failures": [
+          "replied active lines plus an unanswered declined pallet fee await customer confirmation in API, SQL, filters and alerts",
+          "SCM revised decline becomes pending, clears decline metadata, preserves other lines and records actor and previous reason",
+          "Sales and unauthenticated callers cannot revise a declined stock check",
+          "closed lines cannot be reopened by a crafted SCM response",
+          "closed, pending-information, linked/skipped-order and busy cases cannot reopen a decline",
+          "invalid batch after a declined-line revision rolls back the reopened decision, stock and audit",
+          "concurrent SCM revisions of a decline allow exactly one save and one reopen event",
+          "property: JavaScript and SQL stages agree when declined/closed lines are unanswered but open lines need a reply"
+        ],
+        "tests": 8,
+        "pass": 0,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates.test.js",
+        "failures": [
+          "SCM question pauses stock check, alerts scoped Sales, records reply, and returns to SCM",
+          "Pending information rejects blank/oversized notes, duplicate requests and issued or closed cases",
+          "Accepted Low inventory remains ready, permits a dispatch handoff and vendor collection, while unavailable stock is blocked"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-description-race.test.js",
+        "failures": [
+          "discount and pallet adjustment survives an early webhook and lost SO response before committing locally",
+          "issued quantity confirmation tolerates exact SO/PO webhook transitions",
+          "issued quantity confirmation tolerates exact SO/PO webhook transitions across recovery",
+          "SCM PO creation survives SO webhooks after PATCH, before submission and before final linking",
+          "webhook revision changes do not grant another operation ownership or allow a future revision",
+          "loss of SO approval during the claimed operation blocks PO submission",
+          "owned PO submission still blocks when case closes",
+          "owned PO submission still blocks when SO becomes planned",
+          "owned PO submission still blocks when SO quantity changes",
+          "owned PO submission still blocks when SO UOM changes",
+          "owned PO submission still blocks when SO description is unreviewed",
+          "a stopped owner cannot finalize, and description recording cannot conceal a changed commercial line",
+          "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks",
+          "real SCM workflow corrects SO quantity/UOM before updating the existing native PO despite webhooks",
+          "real SCM workflow corrects SO quantity/UOM before creating a standalone PO despite webhooks and a lost creation response",
+          "a confirmed quantity change preserves gross PO costs, updates the vendor summary and private review, and accepts its webhook"
+        ],
+        "tests": 17,
+        "pass": 1,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-pricing-http.test.js",
+        "failures": [
+          "saved quotes enforce login, role, yard and workflow scope and end only when a real SO is linked"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/split-fulfillment-evidence.test.js",
+        "failures": [
+          "materialized split uses its own PO execution evidence and retains NetSuite lineage",
+          "PO evidence on the parent cannot satisfy a materialized split",
+          "PO evidence on the sibling cannot satisfy a materialized split",
+          "PO split remains blocked for missingPickup",
+          "PO split remains blocked for differentLoad",
+          "materialized split uses its own TO execution evidence and retains NetSuite lineage",
+          "TO evidence on the parent cannot satisfy a materialized split",
+          "TO evidence on the sibling cannot satisfy a materialized split",
+          "TO split remains blocked for missingPickup",
+          "TO split remains blocked for differentLoad",
+          "TO split remains blocked for differentDrop",
+          "split quantity conservation holds across integral and fractional supplier quantities",
+          "supplier quantity and split ownership property"
+        ],
+        "tests": 13,
+        "pass": 0,
+        "fail": 13,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-conversation-browser.test.js",
+        "failures": [
+          "conversation panel sales special replaces legacy editors and sends typed text",
+          "conversation panel sales backorder replaces legacy editors and sends typed text",
+          "conversation panel sales stocking replaces legacy editors and sends typed text",
+          "conversation panel sales purchase replaces legacy editors and sends typed text",
+          "conversation panel sales delivery replaces legacy editors and sends typed text",
+          "conversation panel scm special replaces legacy editors and sends typed text",
+          "conversation panel scm backorder replaces legacy editors and sends typed text",
+          "conversation panel scm stocking replaces legacy editors and sends typed text",
+          "conversation panel scm purchase replaces legacy editors and sends typed text",
+          "conversation panel scm delivery replaces legacy editors and sends typed text",
+          "empty conversation has no loading label and accepts its first message",
+          "unread card badge on sales special updates, stays outside the corner and clears when read",
+          "unread card badge on sales backorder updates, stays outside the corner and clears when read",
+          "unread card badge on sales stocking updates, stays outside the corner and clears when read",
+          "unread card badge on sales purchase updates, stays outside the corner and clears when read",
+          "unread card badge on sales delivery updates, stays outside the corner and clears when read",
+          "unread card badge on scm special updates, stays outside the corner and clears when read",
+          "unread card badge on scm backorder updates, stays outside the corner and clears when read",
+          "unread card badge on scm stocking updates, stays outside the corner and clears when read",
+          "unread card badge on scm purchase updates, stays outside the corner and clears when read",
+          "unread card badge on scm delivery updates, stays outside the corner and clears when read",
+          "unread card badges discard a late count after logout",
+          "new conversation message sorts sales special without losing selected detail or drafts",
+          "new conversation message sorts sales backorder without losing selected detail or drafts",
+          "new conversation message sorts sales stocking without losing selected detail or drafts",
+          "new conversation message sorts sales purchase without losing selected detail or drafts",
+          "new conversation message sorts sales delivery without losing selected detail or drafts",
+          "new conversation message sorts scm special without losing selected detail or drafts",
+          "new conversation message sorts scm backorder without losing selected detail or drafts",
+          "new conversation message sorts scm stocking without losing selected detail or drafts",
+          "new conversation message sorts scm purchase without losing selected detail or drafts",
+          "new conversation message sorts scm delivery without losing selected detail or drafts",
+          "conversation queue recovers from fetch failure and includes messages arriving during an in-flight refresh",
+          "conversation retains a draft across failed retry, live refresh, re-render and request switching",
+          "conversation notifications show unread badge and safe message link; visible history is acknowledged"
+        ],
+        "tests": 35,
+        "pass": 0,
+        "fail": 35,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-scroll-20261009-browser.test.js",
+        "failures": [
+          "/app/test/mbt/integration/stock-request-scroll-20261009-browser.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-replies-http.test.js",
+        "failures": [
+          "Resolve produces a new unread Sales alert after a previously read SCM reply"
+        ],
+        "tests": 14,
+        "pass": 13,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/config-legacy-seams.test.js",
+        "failures": [
+          "F01 legacy seam: MBT environment gates default false when absent",
+          "F01 legacy seam: MBT environment gates parse only explicit truthy values",
+          "F01 legacy seam: applyEnvFile replaces the live MBT config without process pollution",
+          "P2-R7 env replacement clears omitted file-owned NetSuite runtime keys only"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-cache-repair.test.js",
+        "failures": [
+          "a fresh Driver worker reloads every v41 shell asset and initializes only its scoped sentinel",
+          "a successful repair replaces only the complete Driver shell and preserves offline data sentinels",
+          "a failed staging download leaves the active and non-Driver caches byte-for-byte unchanged"
+        ],
+        "tests": 4,
+        "pass": 1,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/mbt-bin-cancellation.test.js",
+        "failures": [
+          "active physical-bin cards omit cancelled bins and retain the other bins"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-delivery-refresh.test.js",
+        "failures": [
+          "P2 the installed operator shell precaches the versioned refresh guard and client together"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-adapter.test.js",
+        "failures": [
+          "property: postponement cannot hide a due alert, readiness clears it, and accepted ETAs stay Confirmed",
+          "the filter exposes eight labelled choices, retains multiple selections and allows clearing"
+        ],
+        "tests": 11,
+        "pass": 9,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/property/backorder-link-sequence.property.test.js",
+        "failures": [
+          "Both link guards require reviewed and accepted open materials, including mixed Already Ordered lines",
+          "SO and PO readiness rejects each missing prerequisite and accepts resolved companion materials"
+        ],
+        "tests": 5,
+        "pass": 3,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/backorder-requests.test.js",
+        "failures": [
+          "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+          "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+          "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+          "Manual Backorder links keep revised material confirmations in Sales notifications",
+          "SO linking rejects unfinished material review and ignores forged confirmation and planning flags"
+        ],
+        "tests": 42,
+        "pass": 37,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/direct-ship-posting.test.js",
+        "failures": [
+          "fully direct special SO materializes its 270.78 delivered quantity with exact pickup/drop evidence",
+          "changed direct route identity is held with a persisted pickup-evidence error"
+        ],
+        "tests": 11,
+        "pass": 9,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/load-followup.test.js",
+        "failures": [
+          "pickup load leaves one line available on a fresh local scan",
+          "observed IF persists while the local order stays blocked and private command details stay hidden"
+        ],
+        "tests": 3,
+        "pass": 1,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/movement-document-history.test.js",
+        "failures": [
+          "saved IFs display for pickups in both lists and details without a driver wait",
+          "SO load history never waits for a Driver drop, pickup, or IF availability",
+          "legacy Driver-created IF retains its saved load snapshot and evidence outside the selected date",
+          "receipt IR number appears from both legacy and posting evidence and keeps yard scope",
+          "transfer load history no longer waits for its driver drop",
+          "multipart IF numbers show individually even while another part is pending"
+        ],
+        "tests": 7,
+        "pass": 1,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-display-settings.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-display-settings.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/p3-local-pilot-end-to-end.test.js",
+        "failures": [
+          "P3.11 E2E-A: imported customer -> Front Desk -> BIN Dispatch -> offline Driver -> reconciliation -> next leg -> local billing"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/po-partial-static-lines.test.js",
+        "failures": [
+          "POB03684 partial IR contains exactly its two selected rows and the one open deselection",
+          "split receipts refresh their real positive parent and keep their selected quantity unchanged",
+          "property: shuffled live counters affect only exact deselections and never the selected quantities"
+        ],
+        "tests": 8,
+        "pass": 5,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-input.test.js",
+        "failures": [
+          "browser uses one multi-select Status, persists it, shows input alert and closes expired request"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-waitlist-safety.test.js",
+        "failures": [
+          "allocation notices stay unread once per event and case acknowledgement clears them"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sn1400625-receiving.test.js",
+        "failures": [
+          "SN1400625 ignores deleted parent history and preserves the exact three confirmed receipt lines"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-edits-browser.test.js",
+        "failures": [
+          "multiple material inputs retain separate values and an unchanged unpriced legacy line permits rate and PALLET edits",
+          "Sales edits material name and quantity, confirms a centered restart, and sees New enquiry without changing other item details",
+          "rate and PALLET edits save without a restart warning and preserve the reviewed request stage",
+          "PALLET remains editable at zero and can be added, removed or free without restarting the enquiry on a phone",
+          "canceling or escaping the restart warning preserves the unsaved editor, and Cancel edits writes nothing",
+          "a revision conflict retains typed values but requires reopening the current request before another save",
+          "closed or issued requests hide the pre-SO editor, and a no-op save sends no write"
+        ],
+        "tests": 7,
+        "pass": 0,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-custom-po-browser.test.js",
+        "failures": [
+          "desktop and phone link existing PO beside Create PO without requiring new-PO costs, preserving input on refresh",
+          "empty linkage fails locally and Enter links the PO; server errors retain the entered number for retry",
+          "Create PO retains the normal reviewed-line submission even when custom number is filled"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-fee-http.test.js",
+        "failures": [
+          "local HTTP submission retains the Sales fee, produces a quote and prepares a customer-only SO charge",
+          "invalid rates, forged rep IDs and unauthorized users cannot partially save",
+          "new local requests with 1, 10 and 100 lines complete within one second without network access"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-expiry-race.test.js",
+        "failures": [
+          "expiry skips an order claim lock, observes committed state and concurrent sweepers close once"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-http.test.js",
+        "failures": [
+          "Note-only header saves preserve new and reviewed status, every material, PALLET, draft and unrelated header value",
+          "one header save commits delivery fields and Note together without resetting reviewed lines or creating a remote journal",
+          "identical header saves are complete no-ops and clearing a Note leaves quote and copied header empty",
+          "invalid Note, delivery and revision inputs reject the entire header and injected client fields cannot change case ownership or prices",
+          "header endpoint requires Sales authentication, role, yard and workflow gate before any write",
+          "issued, closed, cancelled, pending, uncertain and planned requests reject delivery header saves without writes",
+          "stale and concurrent header saves serialize with exactly one successful revision and audit",
+          "SO claims and header saves serialize so an order cannot claim an obsolete Note revision",
+          "audit failure rolls back Note, delivery, revision and every related row in the header transaction",
+          "Note-only edits preserve stored delivery fields even when the preferred delivery date is in the past",
+          "pickup-to-delivery header persists the fee, updates one unitless SO charge and preserves materials and PO costs",
+          "invalid fee and stale delivery header leave the case, drafts and audit unchanged",
+          "legacy blank header fees remain optional and saved zero fees cannot be cleared to blank",
+          "confirmed, issued and planned requests allow Note-only edits without changing the case, drafts, decisions or order operations",
+          "issued Note-only edits retain role, yard, workflow, revision, terminal and atomic rollback checks",
+          "inline delivery fee editing removes a zero charge and can restore a paid charge without changing reviewed materials",
+          "legacy zero-fee SO drafts omit the row before submission and retain it after a durable submission"
+        ],
+        "tests": 17,
+        "pass": 0,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-operation-closure.test.js",
+        "failures": [
+          "SO-only closure retains scope, stale revision and executed-order protection"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-routing-browser.test.js",
+        "failures": [
+          "SCM reviews PALLET quantity and cost, keeps failed input and submits it separately from material discounts",
+          "created PO routing saves the real Note and exact schedule revision, preserving failed drafts",
+          "Special Request edits the real Note while PO Split edits remain local, with the bar above line responses",
+          "switching requests ignores a late routing response from the previous PO",
+          "a mismatched catalog response cannot be edited and retry loads the matching PO",
+          "special request routing loads the packing alias and saves the Note through its real request"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-quote-pallet-browser.test.js",
+        "failures": [
+          "new request PALLET inputs exist before quoting, survive rerenders, and reach both Preview and Submit to SCM",
+          "completed requests retain a working saved quote preview and download in Sales and SCM",
+          "zero quantity omits PALLET from phone quote and positive quantity requires a rate while free PALLET is allowed",
+          "closed request copying and SO draft preparation retain quoted PALLET quantity and sales rate"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-items-copy-http.test.js",
+        "failures": [
+          "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft",
+          "HTTP appends require Sales role, yard access and enabled workflow; anonymous and outside-yard edits change nothing",
+          "HTTP revision conflict and hostile batch validation leave old items, draft, revision and events unchanged",
+          "HTTP rejects additions after orders, closure, remote submission, uncertain operations and pending reviews",
+          "HTTP combined count accepts exactly 100 items and rejects 101 without inserting anything",
+          "database failure on the second insert rolls back the first, SO draft deletion, revision bump and event",
+          "concurrent appends commit once per revision; rejected duplicate submission adds no duplicate lines",
+          "order claim and append serialize on the same row and never leave a claimed SO with an unreviewed new item",
+          "direct item update rejects a missing actor and preserves the request",
+          "hostile item fields cannot mark new items reviewed, alter prices or replace the existing vendor and header"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-shared-orders.test.js",
+        "failures": [
+          "Special cases share an existing SO and preserve separate lines and audit events",
+          "Special cases share an existing PO before linking an SO",
+          "concurrent SO and PO links by separate cases all commit",
+          "Sales and SCM HTTP routes allow a shared SO/PO pair",
+          "sales_order webhook reconciles all cases sharing the order",
+          "purchase_order webhook reconciles all cases sharing the order",
+          "a reconciliation mismatch affects only that case and does not skip other shared cases",
+          "actual webhook processing audits and notifies every shared case",
+          "sharing preserves per-case replacement guards and rejects stale concurrent updates",
+          "shared links retain role authorization, yard scope, and order identity validation",
+          "operation IDs remain unique when cases share an SO or PO",
+          "property: every shared case reconciles exactly once regardless of count or link order",
+          "unmatched and single-case webhook results retain existing fields",
+          "migration lookup indexes permit sharing while retaining operation uniqueness"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-counts.test.js",
+        "failures": [
+          "Special counts include every new and confirmed case across yards, beyond the 60-case queue page"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-browser.test.js",
+        "failures": [
+          "SCM can save Low inventory without ETA and can request information before checking",
+          "Sales sees an alert, answers SCM, and can confirm low inventory normally"
+        ],
+        "tests": 4,
+        "pass": 2,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-enquiry.test.js",
+        "failures": [
+          "directory customer identity persists from enquiry through SO draft without creating canonical data"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-audit-scroll-browser.test.js",
+        "failures": [
+          "sales regular 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales regular 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales regular 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "sales special 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm regular 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 1440: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 900: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap",
+          "scm special 390: wheel scrolling reaches the trail or final detail controls and returns without a nested scroll trap"
+        ],
+        "tests": 12,
+        "pass": 0,
+        "fail": 12,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-return-draft-insert.test.js",
+        "failures": [
+          "normal stock draft preserves every line field and consumes the draft only on success"
+        ],
+        "tests": 5,
+        "pass": 4,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-replies-browser.test.js",
+        "failures": [
+          "Stocking enables all supported destination yards for 150 while Pickup keeps its assigned yard",
+          "SCM Transfer Reply saves free text with no ETA and survives background updates",
+          "SCM Purchase Reply saves free text with no ETA and survives background updates",
+          "Sales responds to SCM instructions with an optional SO and retained unsaved text",
+          "Sales top-bar and popup alert reply and Resolve once per event without changing the pool",
+          "Stocking instructions remain available for SCM in Pending TO without changing the Transfer Order"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/backorder-pending-po.test.js",
+        "failures": [
+          "every accepted supply state waits for SCM until the PO is linked",
+          "Already Ordered and other terminal outcomes do not wait for another PO",
+          "linked PO dispatch and non-Backorder handoffs retain their existing status"
+        ],
+        "tests": 6,
+        "pass": 3,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/customer-pickup-yard-ui.test.js",
+        "failures": [
+          "E12 HTML and service worker share the new operator asset cache version"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/driver-pwa-recovery-assets.test.js",
+        "failures": [
+          "the installed Driver shell cannot mix old DB/route code with photo recovery code"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/guarded-delete-and-frontdesk-order-kind.test.js",
+        "failures": [
+          "Front Desk makes the 150-yard price choice explicit and durable"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/menu-order.test.js",
+        "failures": [
+          "catalog has independent groups, unique links and the admin editor"
+        ],
+        "tests": 6,
+        "pass": 5,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/operator-yard-assets.test.js",
+        "failures": [
+          "Operator service worker precaches the exact new page assets, preserves Driver caches, and bypasses API requests"
+        ],
+        "tests": 2,
+        "pass": 1,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/sales-order-null-packs.test.js",
+        "failures": [
+          "empty or zero pack input 0 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 1 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 2 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 3 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 4 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 5 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 6 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 7 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 8 is null in requests, additional lines and NetSuite columns",
+          "empty or zero pack input 9 is null in requests, additional lines and NetSuite columns",
+          "pack edits can clear values to null and empty/legacy zero values render blank",
+          "property: independent positive packing quantities survive without modifying SO pricing or input",
+          "invalid pack quantities are rejected before SO submission",
+          "PO payloads retain existing behavior and independent purchase quantities",
+          "Field Sales SO creation writes blank pack columns without changing accepted amounts",
+          "Field Sales normalizes zero and positive text packing, rejecting invalid counts before save"
+        ],
+        "tests": 19,
+        "pass": 3,
+        "fail": 16,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-approval-fulfillment.test.js",
+        "failures": [
+          "property: a real unapproved PO remains Confirmed until approval, except terminal stages"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-sales-request-corrections.test.js",
+        "failures": [
+          "all declined or closed materials cannot produce a quote containing only charges; undecided legacy lines remain quotable"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/special-workflow-order-sync.test.js",
+        "failures": [
+          "SCM descriptions synchronize the exact SO line before PO creation",
+          "failed SO description synchronization blocks PO creation"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/stock-request-ui-contract.test.js",
+        "failures": [
+          "stock-request feedback is content-sized and availability shows Sales plus conversion equivalents",
+          "Sales Request Stock has complete Simplified Chinese UI and validation coverage"
+        ],
+        "tests": 14,
+        "pass": 12,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/unit/ui-navigation-contract.test.js",
+        "failures": [
+          "F02/F15: root login maps both MBT authorities to their controlled homes"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/aggregate-request-browser.test.js",
+        "failures": [
+          "/app/test/mbt/integration/aggregate-request-browser.test.js"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 0,
+        "cancelled": 1,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/co-completion.test.js",
+        "failures": [
+          "repaired transfer evidence cannot be claimed by an already queued fulfillment candidate",
+          "the deployment repair detects opaque stop IDs and preserves all protected fields"
+        ],
+        "tests": 13,
+        "pass": 11,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/driver-live-route-prefix-lock.integration.test.js",
+        "failures": [
+          "automated billed reconciliation defers instead of deleting a completed route prefix"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/local-item-settings-http.test.js",
+        "failures": [
+          "LC07/LC09: local item reads are Admin-only, no-store, bounded, and externally quiet"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/mbt-bin-corrections.test.js",
+        "failures": [
+          "two fresh deliveries show unavailable physical bins instead of reporting missing front legs"
+        ],
+        "tests": 13,
+        "pass": 12,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/netsuite-attention-state.test.js",
+        "failures": [
+          "unsupported yard attention retains the exact actionable reason",
+          "unverified recovery from queued retains uncertainty and payload",
+          "unverified recovery from uncertain retains uncertainty and payload",
+          "late recovery lookup failure cannot overwrite a completed or leased candidate",
+          "waiting work cannot starve newly ready candidates behind the polling limit",
+          "registered first split uses its bounded planned quantity and resumes only after Operator proof"
+        ],
+        "tests": 6,
+        "pass": 0,
+        "fail": 6,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-background-photos.test.js",
+        "failures": [
+          "/app/test/mbt/integration/operator-background-photos.test.js"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/operator-yard-access.test.js",
+        "failures": [
+          "yard lists and saved queues withhold unauthorized groups while preserving authorized standalone orders and saved rows"
+        ],
+        "tests": 36,
+        "pass": 35,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/reconciliation-blockers.test.js",
+        "failures": [
+          "C1 verified CM with accounting additions recovers the same transaction without a remote write",
+          "C2/R1 accounting additions cannot finalize a new draft and do not cause an automatic retry loop"
+        ],
+        "tests": 4,
+        "pass": 2,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/regular-stock-target-yard-access.test.js",
+        "failures": [
+          "SQL lists and detail authorization agree across yards, methods and versions",
+          "preview keeps candidates for missing pallet conversion and propagates unrelated calculation failures"
+        ],
+        "tests": 8,
+        "pass": 6,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/sales-stock-check-popup.test.js",
+        "failures": [
+          "A live SCM stock check opens a popup on the selected request, preserves unsaved text, and notifies once including completion",
+          "Special stock checks notify the requester with Sales-visible notes and a link to the matching request"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/scm-special-planned-card-browser.test.js",
+        "failures": [
+          "SCM Special Request detail loads the updated PO card at 1440px",
+          "SCM Special Request detail loads the updated PO card at 390px"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-approval-browser.test.js",
+        "failures": [
+          "SCM sees delivery method and PO vendor pricing shares a desktop row",
+          "Confirmed request preserves SCM readiness instructions for an accepted production ETA",
+          "Sales local adjustment removal preserves the selection after a failed save and submits only that removal",
+          "SCM removal review explains the local effect and identifies the removed material",
+          "approved PO exposes shared reference form and preserves failed edits",
+          "Sales delivery editor remains available after SO and PO creation",
+          "mobile Sales delivery form preserves contact details across method toggles and failed saves",
+          "planned Sales order hides delivery editor; SCM pending PO hides reference editor and escapes delivery text",
+          "failed delivery recovery keeps header editable and saves the edited target explicitly",
+          "delivery recovery distinguishes retry from discard and hides discard after a saved remote plan"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-batch-save.test.js",
+        "failures": [
+          "one SCM save records all responses, and one Sales save records selected decisions",
+          "a later invalid SCM line rolls back earlier responses, events and case revision",
+          "a later invalid Sales decision rolls back earlier decisions and rejects wrong scope",
+          "batch input rejects empty, oversized, duplicate, foreign and stale writes without partial changes",
+          "SCM saves readiness and pending responses together while retaining transfer status"
+        ],
+        "tests": 5,
+        "pass": 0,
+        "fail": 5,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-case-fields-http.test.js",
+        "failures": [
+          "SCM required-date correction persists through HTTP and is visible to Sales with its audit",
+          "invalid SCM required dates reject and roll back earlier corrections in the same HTTP batch",
+          "SCM required-date corrections retain role and issued-order locks",
+          "Sales saves all new fields, updates quote basis, resets only changed reviews and audits every field",
+          "Sales discount and note preserve reviews, update native draft discount and leave purchase costs unchanged",
+          "SCM stock corrections save with the response and clear stale acceptance and conversions",
+          "SCM invalid second-line corrections roll back the whole stock batch",
+          "field migration is scoped, repeatable and rollback preserves old data",
+          "issued order metadata proposal stays pending until SCM approval and persists every approved field",
+          "description-only issued adjustment is reviewable and rejection leaves original fields and drafts intact",
+          "verified issued-order field corrections reach canonical SO and PO rows used by Dispatch",
+          "property: issued adjustments always use one and preserve original rate and purchase cost",
+          "missing historical conversion uses one without prompting while order-rate drift still blocks edits",
+          "new adjustments normalize a legacy conversion only through the existing SCM approval"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-fee-browser.test.js",
+        "failures": [
+          "Sales enters Delivery fee below PALLET; rerenders, quote preview and submission retain it",
+          "phone form supports free delivery, hides the fee for pickup and preserves it when switching back",
+          "quoted and manually added delivery fees prefill SO preparation and request copies"
+        ],
+        "tests": 3,
+        "pass": 0,
+        "fail": 3,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-delivery-method-http.test.js",
+        "failures": [
+          "team delivery alert routes enforce authentication and existing role permissions without caching",
+          "real HTTP pickup change publishes both team notices, and acknowledging SCM leaves Dispatch unread",
+          "twenty simultaneous acknowledgements of one notice commit once without changing the request",
+          "alert routes respect the Special workflow gate and reject malformed notice IDs"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-handoff-notice-browser.test.js",
+        "failures": [
+          "handoffs page is notice-only, has Sp. O navigation, and removes a finished selection on refresh",
+          "planned PO card is green and white with large status/date and saved ETA on desktop and phone"
+        ],
+        "tests": 2,
+        "pass": 0,
+        "fail": 2,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-header-note-markup.test.js",
+        "failures": [
+          "blank lines and whitespace survive parsing the saved Note into the shared header textarea"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-local-adjustments.test.js",
+        "failures": [
+          "all-line removal remains local and completed requests stay locked"
+        ],
+        "tests": 9,
+        "pass": 8,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-po-reference-only.test.js",
+        "failures": [
+          "reference-only manual PO HTTP linkage ignores absent mappings and drafts and remains arrangeable",
+          "reference-only PO review inserts all purchase materials and retries without adding SO draft lines",
+          "incomplete, duplicate, foreign and invalid reference-only PO reviews preserve the original case",
+          "reference-only SO creates a reviewed standalone PO without SO writes",
+          "reference-only SO creates a reviewed standalone PO without SO writes and recovers a lost response",
+          "manual SO native pointers do not replace the reviewed request PO creation",
+          "manual SO HTTP linking skips customer, yard, activity, approval, stock and decision comparisons",
+          "manual PO links without an SO, accepted decisions, stock, vendor, yard, active order or cargo lines",
+          "manual SO with an old draft and pending approval creates only the SCM-reviewed request PO",
+          "manual PO linkage cannot overwrite an unresolved submitted operation even if its status was reset",
+          "concurrent manual-SO purchase creation produces one PO submission and one revision conflict",
+          "manual-SO PO submission with an invisible marker can recover without automatic resubmission",
+          "manual PO can be linked before the SO and the ready pair becomes arrangeable after SO linking",
+          "/app/test/mbt/integration/special-po-reference-only.test.js"
+        ],
+        "tests": 14,
+        "pass": 0,
+        "fail": 14,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-request-enhancements.test.js",
+        "failures": [
+          "Sales alert counts are own requests within permitted yards, regardless of list pagination"
+        ],
+        "tests": 7,
+        "pass": 6,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-sales-items-copy-browser.test.js",
+        "failures": [
+          "purple Add item shares the Save decisions row after Case lines before Close; centered warning can be cancelled or escaped without writing",
+          "Save customer decisions stays left and Add item right on one row across desktop and phone widths",
+          "add item editor submits only new lines, retains inputs on failure and returns New enquiry while old items stay visible",
+          "copy beside SPREQ includes closed request fields and all items, makes no POST until explicit Submit to SCM",
+          "copy cancellation and add-item cancellation keep source unchanged and new draft removal never removes old lines",
+          "Add item is hidden after SO, skipped SO, closure or remote submission; Copy remains available for closed cases",
+          "phone warning, append form and copy draft remain usable at 390 pixels",
+          "SO created in another session blocks append without hiding unsaved items or trapping the user",
+          "existing post-SO quantity adjustment still submits material quantity, discount and PALLET review while Add item stays unavailable",
+          "Sales can accept the old item and then add a new item without losing the old decision, name, price or stock"
+        ],
+        "tests": 10,
+        "pass": 0,
+        "fail": 10,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-scm-item-name.test.js",
+        "failures": [
+          "SCM vendor and item-name correction persists while awaiting customer confirmation with an audit"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-alert-http.test.js",
+        "failures": [
+          "alert counts use the existing SCM read permissions and return only uncached counts",
+          "Sales Rep directory route requires Sales access and returns live directory choices without caching",
+          "new submissions update counts and saved PDFs credit the selected Sales Rep through Sales and SCM routes",
+          "batch routes enforce roles, save once, and reject one of two concurrent writes"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-stock-updates-http.test.js",
+        "failures": [
+          "Information routes enforce role, yard, workflow flag and validation; concurrent requests and replies commit once"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-vendor-confirmation.test.js",
+        "failures": [
+          "SCM browser button saves the real request and Sales sees the waiting status after reload"
+        ],
+        "tests": 8,
+        "pass": 7,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-polish-http.test.js",
+        "failures": [
+          "skip HTTP routes require authentication, correct role, gate and Sales yard access",
+          "duplicate concurrent SO and PO skips each commit once and preserve role-owned order kind",
+          "gate disable wins before a waiting skip transaction without advancing the request",
+          "real creation claim and test skip cannot both acquire the same request revision"
+        ],
+        "tests": 4,
+        "pass": 0,
+        "fail": 4,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/special-workflow-queue-access.test.js",
+        "failures": [
+          "queue hydration uses bounded SQL reads and equals full case details"
+        ],
+        "tests": 4,
+        "pass": 3,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/staff-login-browser.test.js",
+        "failures": [
+          "all staff module entry points share the login page while Driver remains separate"
+        ],
+        "tests": 3,
+        "pass": 2,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stock-request-long-scroll-browser.test.js",
+        "failures": [
+          "sales regular 1440x600: long details remain reachable through repeated wheel round trips",
+          "sales regular 1024x500: long details remain reachable through repeated wheel round trips",
+          "sales regular 1920x800: long details remain reachable through repeated wheel round trips",
+          "sales special 1440x600: long details remain reachable through repeated wheel round trips",
+          "sales special 1024x500: long details remain reachable through repeated wheel round trips",
+          "sales special 1920x800: long details remain reachable through repeated wheel round trips",
+          "scm regular 1440x600: long details remain reachable through repeated wheel round trips",
+          "scm regular 1024x500: long details remain reachable through repeated wheel round trips",
+          "scm regular 1920x800: long details remain reachable through repeated wheel round trips",
+          "scm special 1440x600: long details remain reachable through repeated wheel round trips",
+          "scm special 1024x500: long details remain reachable through repeated wheel round trips",
+          "scm special 1920x800: long details remain reachable through repeated wheel round trips"
+        ],
+        "tests": 12,
+        "pass": 0,
+        "fail": 12,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      {
+        "file": "test/mbt/integration/stocking-customer-browser.test.js",
+        "failures": [
+          "Entered stocking customer persists and appears in Sales and SCM cards and details for Transfer and Purchase"
+        ],
+        "tests": 1,
+        "pass": 0,
+        "fail": 1,
+        "cancelled": 0,
+        "skipped": 0
+      }
+    ]
+  },
+  "baselineExitCode": 1,
+  "priorProductionReproductions": [
+    {
+      "file": "test/mbt/integration/stock-check-lines-browser.test.js",
+      "failures": [
+        "/app/test/mbt/integration/stock-check-lines-browser.test.js"
+      ],
+      "testFileHash": "e86508ab5c6e0eef1f6ddeb8c57c2c8ff69f5fc8bc0db6522799c06b6f0d56c5",
+      "sourceTreeHash": "afdef366cc2a6772a10a7d2960ec377d80e9cea8ad62904cb7ffe2104ea03b32",
+      "evidence": "Observed in production-source paired replay with matching error signature"
+    }
+  ],
+  "sourceTreeHash": "afdef366cc2a6772a10a7d2960ec377d80e9cea8ad62904cb7ffe2104ea03b32",
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  }
+}

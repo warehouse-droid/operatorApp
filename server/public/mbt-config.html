@@ -58,6 +58,7 @@
           aria-controls="rateCardsPanel"
           tabindex="-1"
         >Rate Cards</button>
+        <button id="aggregateRoutingTab" type="button" role="tab" aria-selected="false" aria-controls="aggregateRoutingPanel" tabindex="-1">Aggregate Routing</button>
         <button
           id="netSuiteReadinessTab"
           type="button"
@@ -67,6 +68,11 @@
           tabindex="-1"
         >Future NetSuite Setup</button>
       </div>
+      <section id="aggregateRoutingPanel" class="mbt-readiness" role="tabpanel" aria-labelledby="aggregateRoutingTab" tabindex="0" hidden>
+        <h2>Aggregate Routing</h2><p>Choose catalog items that require BIN transport. Any order containing a selected item appears in MBR/Agg.</p>
+        <form class="mbt-form-actions"><label>Search catalog items<input name="search" type="search" maxlength="120"></label><button type="submit">Search items</button></form>
+        <p role="status" aria-live="polite"></p><div class="mbt-table-wrap"><table><thead><tr><th>Item ID</th><th>Name</th><th>Unit</th><th>Status</th><th>Routing</th><th>Affected orders</th><th>Action</th></tr></thead><tbody></tbody></table></div>
+      </section>
       <section
         id="customerSyncPanel"
         class="mbt-readiness"
@@ -164,7 +170,7 @@
               <label>Charging method<select id="customLocalItemChargeBasis"></select></label>
               <label data-bin-item-field>Capacity (cubic yards)<input id="customLocalItemBinCapacityYards" type="number" min="1" step="1" inputmode="numeric" placeholder="For example, 50" /></label>
               <label data-bin-item-field>Rental period (days)<input id="customLocalItemRentalDays" type="number" min="1" step="1" value="14" /></label>
-              <label data-aggregate-item-field hidden>Density (lb / yard)<input id="customLocalItemDensityLbsPerYard" type="number" min="1" step="1" inputmode="numeric" placeholder="Used only for dispatch weight" /></label>
+              <label data-aggregate-item-field hidden>Density (lb / yard)<input id="customLocalItemDensityLbsPerYard" type="number" value="2600" readonly /><small>Standard dispatch weight per cubic yard.</small></label>
               <label class="mbt-checkbox"><input id="customLocalItemActive" type="checkbox" checked /><span>Active</span></label>
               <label class="mbt-form-wide">Description<textarea id="customLocalItemDescription" maxlength="2000" rows="3"></textarea></label>
             </div>
@@ -261,7 +267,8 @@
               <div><h3>Dump-site editor</h3><p id="dumpSiteEditorMode">Creating a new dump site.</p></div>
               <button id="newDumpSiteButton" type="button" class="mbt-button-secondary">New dump site</button>
             </div>
-            <label>Code<input id="dumpSiteCode" required autocomplete="off" /></label>
+            <label>Code<input id="dumpSiteCode" required maxlength="64" autocomplete="off" aria-describedby="dumpSiteCodeHelp" /></label>
+            <p id="dumpSiteCodeHelp" class="mbt-field-help">Start with a letter or number, for example 3445. Letters, numbers, underscores and hyphens are allowed.</p>
             <label>Name<input id="dumpSiteName" required autocomplete="off" /></label>
             <label>Address<input id="dumpSiteAddress" autocomplete="off" /></label>
             <label>City<input id="dumpSiteCity" autocomplete="off" /></label>
@@ -584,7 +591,7 @@
         </section>
       </section>
     </main>
-    <script src="/app-sidebar.js"></script>
-    <script src="/mbt-shell.js" type="module"></script>
+    <script src="/app-sidebar.js?v=mbr-aggregate-20261023&repairNav=20261027-v2"></script>
+    <script src="/mbt-shell.js?v=mbr-aggregate-20261023" type="module"></script>
   </body>
 </html>

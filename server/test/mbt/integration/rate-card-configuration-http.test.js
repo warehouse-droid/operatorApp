@@ -222,11 +222,11 @@ after(async () => {
   await closeDb();
 });
 
-test("P3-F12 HTTP: private rate-card reads are Admin-only, no-store, and local-only", async () => {
+test("P3-F12 HTTP: private rate-card reads are Admin/Dispatcher, no-store, and local-only", async () => {
   const anonymous = await request("/api/mbt/config/rate-cards");
   assert.equal(anonymous.response.status, 401);
 
-  for (const actor of ["dispatcher", "operator"]) {
+  for (const actor of ["operator"]) {
     const forbidden = await request("/api/mbt/config/rate-cards", { actor });
     assert.equal(forbidden.response.status, 403);
     assert.match(forbidden.response.headers.get("cache-control") || "", /no-store/);
@@ -250,9 +250,9 @@ test("P3-F12 HTTP: private rate-card reads are Admin-only, no-store, and local-o
   assert.equal(netSuiteTransportCalls, 0);
 });
 
-test("customer-charge pricing configuration is Admin-only, optimistic, audited, and local-only", async () => {
+test("customer-charge pricing configuration is Admin/Dispatcher, optimistic, audited, and local-only", async () => {
   const forbidden = await request(`/api/mbt/config/customer-charges/${VERSION_ID}`, {
-    actor: "dispatcher"
+    actor: "operator"
   });
   assert.equal(forbidden.response.status, 403);
 
@@ -322,7 +322,7 @@ test("P3-F12 HTTP: create, validate, and activate bind the server actor and requ
   };
 
   const dispatcher = await request("/api/mbt/config/rate-cards", {
-    actor: "dispatcher",
+    actor: "operator",
     method: "POST",
     body: forgedBody,
     idempotencyKey: "p3-rate-http-forbidden"

@@ -78,15 +78,16 @@ export function buildReturnBatchIntent(records) {
     }
     lines.push({ kind: "pallet", itemId, returnedSalesQuantity: quantity, rate: 40, reasonId: 10, salesUomId: null });
   }
-  return { version: 3, batchId: Number(first.batchId), batchReference: first.batchReference,
+  return { version: 5, batchId: Number(first.batchId), batchReference: first.batchReference,
     recordIds: records.map(record => id(record.id, "return record")).sort((a, b) => a - b),
     externalId: `MBBS-${first.batchReference}`, customerId: Number(first.customerId),
     receivingLocationId: Number(first.receivingLocationId),
     sourceSalesOrderId: stock ? id(stock.sourceSalesOrderId, "Sales Order") : null,
+    sourceSalesOrderRef: stock?.sourceSalesOrderRef || '', operatorAccount: first.operatorAccount || '',
     submittedDate: first.submittedDate,
-    memo: [records.map(record => record.recordReference).join(" + "), first.batchReference,
+    memo: [first.operatorAccount, records.map(record => record.recordReference).join(" + "), first.batchReference,
       stock?.sourceSalesOrderRef ? `SO ${stock.sourceSalesOrderRef}` : "", `yard ${first.receivingLocationId}`,
-      `plate ${first.vehiclePlate}`, first.note || ""].filter(Boolean).join(" | "), lines };
+      first.vehiclePlate ? `plate ${first.vehiclePlate}` : "", first.note || ""].filter(Boolean).join(" | "), lines };
 }
 
 /** @param {Record<string, any>} intent */
@@ -101,7 +102,7 @@ export function buildReturnBatchPayload(intent) {
       ...(linked ? { orderLine: line.netSuiteOrderLine } : {}),
       ...(split ? { description: `Return from SO ${intent.sourceSalesOrderId}; source line ${line.sourceSalesOrderLineId}; reason ${line.reasonId}; row ${index + 1}` } : {}),
       item: { id: String(line.itemId) }, quantity: line.returnedSalesQuantity, rate: line.rate,
-      location: { id: String(intent.receivingLocationId) },
+      location: { id: String(line.locationId || intent.receivingLocationId) },
       ...(line.salesUomId ? { units: String(line.salesUomId) } : {}),
       custcol_atlas_rc_so: { id: String(line.reasonId) }
     };
@@ -145,9 +146,9 @@ function verifyHeader(intent, snapshot, allowInactive) {
   }
 }
 
-/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean}} [options] */
-export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = false } = {}) {
-  if (intent.transactionType === "credit_memo") { return verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive }); }
+/** @param {Record<string, any>} intent @param {Record<string, any>} snapshot @param {{allowInactive?: boolean, allowAccountingAdjustments?: boolean}} [options] */
+export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = false, allowAccountingAdjustments = false } = {}) {
+  if (intent.transactionType === "credit_memo") { return verifyReturnCreditMemoSnapshot(intent, snapshot, { allowInactive, allowAccountingAdjustments }); }
   verifyHeader(intent, snapshot, allowInactive);
   const actual = snapshot.item?.items;
   if (!Array.isArray(actual) || actual.length !== intent.lines.length) {throw mismatch("item rows were added, removed or merged.");}
@@ -158,11 +159,12 @@ export function verifyReturnBatchSnapshot(intent, snapshot, { allowInactive = fa
   const payload = buildReturnBatchPayload(intent);
   const splitDescriptions = new Set(payload.item.items.map((/** @type {Record<string, any>} */ line) => line.description).filter(Boolean));
   const key = (/** @type {Record<string, any>} */ line) => {
-    if (line.location && reference(line.location) !== intent.receivingLocationId) {throw mismatch("item receiving yard does not match.");}
+    if (!(Number(intent.version) >= 4) && line.location && reference(line.location) !== intent.receivingLocationId) {throw mismatch("item receiving yard does not match.");}
     const item = reference(line.item);
     const source = splitDescriptions.has(line.description) ? line.description : Number(line.orderLine ?? line.orderline);
     return [item, palletIds.has(item) ? "" : source, exact(line.quantity), exact(line.rate),
-      reference(line.custcol_atlas_rc_so ?? line.custcolAtlasRcSo), unitIds.has(item) ? reference(line.units) : ""].join("|");
+      reference(line.custcol_atlas_rc_so ?? line.custcolAtlasRcSo), unitIds.has(item) ? reference(line.units) : "",
+      Number(intent.version) >= 4 ? reference(line.location) : ""].join("|");
   };
   const expected = payload.item.items.map(key).sort();
   const observed = actual.map(key).sort();

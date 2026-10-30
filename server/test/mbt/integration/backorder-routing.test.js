@@ -21,7 +21,7 @@ before(async()=>{
 });
 after(async()=>{server?.closeAllConnections();if(server)await new Promise(r=>server.close(r));await query('DELETE FROM sales_stock_requests WHERE id=ANY($1::bigint[])',[requests]);await closeDb();});
 async function http(role,path,body){const r=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{authorization:'Bearer '+users[role].token,'content-type':'application/json'},...(body===undefined?{}:{body:JSON.stringify(body)})});return {status:r.status,body:await r.json()};}
-const draft=()=>({deliveryMethod:'backorder',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:4,rate:0,destinationLocationId:1},{itemId:other,salesQty:6,rate:0,destinationLocationId:28}]});
+const draft=()=>({deliveryMethod:'backorder',customerName:'TEST Backorder Customer',destinationLocationId:1,fulfillmentMethod:'yard_pickup',lines:[{itemId:sku,salesQty:4,rate:0,destinationLocationId:1},{itemId:other,salesQty:6,rate:0,destinationLocationId:28}]});
 async function create(input=draft()){const r=await http('sales','/api/sales/stock-requests',input);assert.equal(r.status,201,JSON.stringify(r.body));requests.push(r.body.id);return r.body;}
 async function action(d,role,name,input){const r=await http(role,`/api/${role}/stock-requests/${d.id}/backorder/${name}`,{expectedRevision:d.revision,...input});assert.equal(r.status,200,JSON.stringify(r.body));return r.body;}
 

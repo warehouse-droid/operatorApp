@@ -1,0 +1,404 @@
+{
+  "suiteOrderSeed": 248,
+  "sourceHashes": {
+    "src/sor-rental-repository.js": "8d7aa3ca14ab7c1840c5d4f9f11c3658f3a7bfb780cc284876784b7ca6162eee",
+    "src/sor-rental-service.js": "e876956f68b8ae8330c3ae6146525258f7c19b3cf54eb5e34d8821e2cd904557",
+    "src/dispatch-custom-order-repository.js": "87a04349c97bbbc7462d335f239729eee4df2635ed393bfdf90f23b876d1600f",
+    "src/sor-return-source.js": "f8adb6cfbaf73446ded0aed251968fb3b6e38625c3856bcaacb5ac6418d8b37c",
+    "src/sor-return-projection-repository.js": "4384cde29ceac29cb7f20f8fadf2cf6a6c80f1ecc60cf15b728be02458d7b463"
+  },
+  "toolchain": {
+    "node": "v20.20.2",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "c8": "12.0.0",
+    "fast-check": "4.9.0",
+    "pg": "8.21.0"
+  },
+  "steps": [
+    {
+      "name": "custom-baseline",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "Isolated sor-source-refresh run failed in 1/1 file(s): /app/test-artifacts/sor-candidate/test-artifacts/sor-return-source-refresh/baseline/src/dispatch-custom-order-harness.js"
+      ]
+    },
+    {
+      "name": "custom-candidate",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "Isolated sor-source-refresh run failed in 1/1 file(s): src/dispatch-custom-order-harness.js"
+      ]
+    },
+    {
+      "name": "coverage-suite",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "Isolated sor-source-refresh run passed: 14 file(s), 85 test(s)."
+      ]
+    },
+    {
+      "name": "assigned-stays-blocked",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 10",
+        "# fail 4",
+        "# skipped 0"
+      ]
+    },
+    {
+      "name": "assigned-stays-blocked-property",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 1",
+        "# fail 0",
+        "# skipped 13"
+      ]
+    },
+    {
+      "name": "skip-plan-refresh",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 10",
+        "# fail 4",
+        "# skipped 0"
+      ]
+    },
+    {
+      "name": "skip-plan-refresh-property",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 1",
+        "# fail 0",
+        "# skipped 13"
+      ]
+    },
+    {
+      "name": "skip-derived-catalog",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 12",
+        "# fail 2",
+        "# skipped 0"
+      ]
+    },
+    {
+      "name": "skip-derived-catalog-property",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 1",
+        "# fail 0",
+        "# skipped 13"
+      ]
+    },
+    {
+      "name": "rewrite-completed",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 13",
+        "# fail 1",
+        "# skipped 0"
+      ]
+    },
+    {
+      "name": "rewrite-completed-property",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 1",
+        "# fail 0",
+        "# skipped 13"
+      ]
+    },
+    {
+      "name": "unordered-fingerprint",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 13",
+        "# fail 1",
+        "# skipped 0"
+      ]
+    },
+    {
+      "name": "unordered-fingerprint-property",
+      "status": 1,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 0",
+        "# fail 1",
+        "# skipped 13"
+      ]
+    },
+    {
+      "name": "focused-repeat",
+      "status": 0,
+      "signal": null,
+      "summaries": [
+        "# tests 14",
+        "# pass 14",
+        "# fail 0",
+        "# skipped 0"
+      ]
+    }
+  ],
+  "static": {
+    "lint": [],
+    "baselineLint": [
+      {
+        "file": "/app/test-artifacts/sor-candidate/src/dispatch-custom-order-repository.js",
+        "line": 718,
+        "message": "'stops' is never reassigned. Use 'const' instead."
+      }
+    ],
+    "types": [],
+    "typeScope": "Two new JS modules; checkJs=true, strict=false; existing modules syntax/lint",
+    "syntax": [
+      {
+        "file": "src/sor-rental-repository.js",
+        "status": 0
+      },
+      {
+        "file": "src/sor-rental-service.js",
+        "status": 0
+      },
+      {
+        "file": "src/dispatch-custom-order-repository.js",
+        "status": 0
+      },
+      {
+        "file": "src/sor-return-source.js",
+        "status": 0
+      },
+      {
+        "file": "src/sor-return-projection-repository.js",
+        "status": 0
+      }
+    ],
+    "secrets": []
+  },
+  "customHarness": {
+    "baselineStatus": 1,
+    "candidateStatus": 1,
+    "baselineFailure": "The server-side TO feed must include open Custom Orders.",
+    "candidateFailure": "The server-side TO feed must include open Custom Orders."
+  },
+  "coverage": {
+    "total": {
+      "lines": {
+        "total": 1489,
+        "covered": 1079,
+        "skipped": 0,
+        "pct": 72.46
+      },
+      "statements": {
+        "total": 1489,
+        "covered": 1079,
+        "skipped": 0,
+        "pct": 72.46
+      },
+      "functions": {
+        "total": 58,
+        "covered": 43,
+        "skipped": 0,
+        "pct": 74.13
+      },
+      "branches": {
+        "total": 504,
+        "covered": 340,
+        "skipped": 0,
+        "pct": 67.46
+      },
+      "branchesTrue": {
+        "total": 0,
+        "covered": 0,
+        "skipped": 0,
+        "pct": "Unknown"
+      }
+    },
+    "/app/test-artifacts/sor-candidate/src/dispatch-custom-order-repository.js": {
+      "lines": {
+        "total": 1081,
+        "covered": 674,
+        "skipped": 0,
+        "pct": 62.34
+      },
+      "functions": {
+        "total": 32,
+        "covered": 17,
+        "skipped": 0,
+        "pct": 53.12
+      },
+      "statements": {
+        "total": 1081,
+        "covered": 674,
+        "skipped": 0,
+        "pct": 62.34
+      },
+      "branches": {
+        "total": 265,
+        "covered": 148,
+        "skipped": 0,
+        "pct": 55.84
+      }
+    },
+    "/app/test-artifacts/sor-candidate/src/sor-rental-repository.js": {
+      "lines": {
+        "total": 160,
+        "covered": 160,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 13,
+        "covered": 13,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 160,
+        "covered": 160,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 104,
+        "covered": 87,
+        "skipped": 0,
+        "pct": 83.65
+      }
+    },
+    "/app/test-artifacts/sor-candidate/src/sor-rental-service.js": {
+      "lines": {
+        "total": 134,
+        "covered": 131,
+        "skipped": 0,
+        "pct": 97.76
+      },
+      "functions": {
+        "total": 5,
+        "covered": 5,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 134,
+        "covered": 131,
+        "skipped": 0,
+        "pct": 97.76
+      },
+      "branches": {
+        "total": 76,
+        "covered": 60,
+        "skipped": 0,
+        "pct": 78.94
+      }
+    },
+    "/app/test-artifacts/sor-candidate/src/sor-return-projection-repository.js": {
+      "lines": {
+        "total": 91,
+        "covered": 91,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 5,
+        "covered": 5,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 91,
+        "covered": 91,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 42,
+        "covered": 30,
+        "skipped": 0,
+        "pct": 71.42
+      }
+    },
+    "/app/test-artifacts/sor-candidate/src/sor-return-source.js": {
+      "lines": {
+        "total": 23,
+        "covered": 23,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 3,
+        "covered": 3,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 23,
+        "covered": 23,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 17,
+        "covered": 15,
+        "skipped": 0,
+        "pct": 88.23
+      }
+    }
+  },
+  "changedLineCoverage": {
+    "covered": 163,
+    "total": 163,
+    "uncovered": []
+  },
+  "mutations": [
+    {
+      "name": "assigned-stays-blocked",
+      "killed": true,
+      "propertyKilled": false
+    },
+    {
+      "name": "skip-plan-refresh",
+      "killed": true,
+      "propertyKilled": false
+    },
+    {
+      "name": "skip-derived-catalog",
+      "killed": true,
+      "propertyKilled": false
+    },
+    {
+      "name": "rewrite-completed",
+      "killed": true,
+      "propertyKilled": false
+    },
+    {
+      "name": "unordered-fingerprint",
+      "killed": true,
+      "propertyKilled": true
+    }
+  ],
+  "passed": true,
+  "runtimeBaseImage": "sha256:d187ca668fa5b774f39cc0244f8d7b410f9c2bc701d58d155a00c16938c05ca3"
+}

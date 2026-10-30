@@ -36,8 +36,8 @@ export function copySpecialRequestDraft(detail, {today = torontoDate(), expiresO
   };
 }
 
-/** @returns {Promise<boolean>} */
-export function confirmSpecialAddItems() {
+/** @param {{message?:string}} [options] @returns {Promise<boolean>} */
+export function confirmSpecialAddItems({message} = {}) {
   const focus = document.activeElement;
   const dialog = document.createElement('dialog');
   dialog.className = 'regular-stock-dialog special-add-items-warning';
@@ -47,6 +47,7 @@ export function confirmSpecialAddItems() {
     <h2 id="specialAddItemsTitle">Add items to this request?</h2>
     <p id="specialAddItemsMessage">Adding new items will make this request become a new request again. Existing items’ names, prices and stock information will be saved. This action can only be done before creating a Sales Order.</p>
     <div class="regular-dialog-actions"><button type="button" data-special-add-cancel>Cancel</button><button type="button" class="special-add-item-button" data-special-add-continue>Continue</button></div>`;
+  if (message) dialog.querySelector('#specialAddItemsMessage').textContent = message;
   document.body.append(dialog);
   return new Promise(resolve => {
     /** @param {boolean} confirmed */

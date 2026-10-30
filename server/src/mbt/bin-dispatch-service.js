@@ -1,10 +1,13 @@
 // @ts-check
 
 import crypto from "node:crypto";
+import {validateTransportPlan} from "./bin-transport-planning.js";
 
 import { query, withTransaction } from "../db.js";
 import { reserveBinWorkflowAsset, validateBinWorkflowClaims, assertBinWorkflowPlanDependencies } from "./bin-order-workflow-planning.js";
 import { projectBinWorkflowCard } from "./bin-order-workflow-read.js";
+import { binStopAssetId } from "./bin-stop-labels.js";
+import { binVisitDisplayReference } from "./bin-order-workflow-repository.js";
 import { reserveResumedPlanningAsset } from "./bin-planning-reservations.js";
 import { validatePlanningAssignment, publishPlanningAssignments, pendingPlanningReturns } from "./bin-planning-assignments.js";
 import { readPlanningPlan, assertPlanningSchedule, syncPlanningProjections } from "./bin-planning-repository.js";
@@ -224,8 +227,13 @@ async function stopsForVisit(visit, forUpdate = false) {
     });
     byAction.set(key, list);
   }
-  return mandatory.map((stop) => ({
-    ...(snapshot.binWorkflow ? {reference:stop.reference,location:stop.location,planningAddress:stop.planningAddress} : {}),
+  const assets=await query("SELECT asset_id,asset_code FROM mbt_bin_assets WHERE asset_id=ANY($1::uuid[])",
+    [[visit.expected_asset_id,visit.outgoing_asset_id,visit.incoming_asset_id,...mandatory.map((/** @type {any} */ s)=>s.assetId)].filter(Boolean)]);
+  return Promise.all(mandatory.map(async (stop) => ({
+    ...(snapshot.binWorkflow ? workflowStopPresentation(stop) : {}),
+    reference:await binVisitDisplayReference(String(visit.service_visit_id),String(stop.actionCode)) || String(visit.visit_reference),
+    assetId:binStopAssetId(visit,stop),
+    assetCode:assets.rows.find((/** @type {any} */ a)=>a.asset_id===(binStopAssetId(visit,stop)))?.asset_code || "",
     id: String(stop.stopId),
     sequence: Number(stop.sequence),
     type: String(stop.stopKind),
@@ -235,7 +243,15 @@ async function stopsForVisit(visit, forUpdate = false) {
     yardCode: stop.yardCode ? String(stop.yardCode) : null,
     siteProfileId: stop.siteProfileId ? String(stop.siteProfileId) : null,
     evidenceRequirements: byAction.get(String(stop.actionCode)) || []
-  }));
+  })));
+}
+
+/** @param {Record<string,any>} stop */
+function workflowStopPresentation(stop) {
+  return {reference:stop.reference,location:stop.location,planningAddress:stop.planningAddress,
+    displayName:stop.displayName || stop.actionCode,
+    ...(stop.cargo ? {cargo:stop.cargo} : {}),...(stop.cargoDropoffs ? {cargoDropoffs:stop.cargoDropoffs} : {}),
+    ...(stop.cargoWeightLbs!==undefined ? {cargoWeightLbs:stop.cargoWeightLbs} : {})};
 }
 
 /** @param {Record<string, any>} visit @param {boolean} [forUpdate] */
@@ -445,6 +461,8 @@ export async function projectMbtBinPlanningCard(visit) {
     if (!visit.dispatch_plan_id) {await assertPlanningCardAssets(visit);}
     const card = await projectFrontLeg(visit, visits);
     card.mbt.status = visit.status;
+    const reference=await binVisitDisplayReference(String(visit.service_visit_id));
+    if (reference) {Object.assign(card,{displayReference:reference});Object.assign(card.mbt,{displayReference:reference});}
     return card;
   } catch (error) {
     if (!(error instanceof MbtError) || error.status >= 500) {throw error;}
@@ -838,6 +856,22 @@ function isUnchangedDependentReturn(dependent, delivery, revision) {
     && !dependent.incoming_asset_id;
 }
 
+/** @param {any} visit @param {any} deliverySnapshot */
+async function selectedDeliveryDependent(visit,deliverySnapshot) {
+  const dependentVisitId = String(deliverySnapshot.dependentReturnVisitId || "");
+  const expectedDependentRevision = Number(deliverySnapshot.dependentReturnVisitRevision);
+  if ((!dependentVisitId && !deliverySnapshot.collectionOnRequest)
+      || (dependentVisitId && (!Number.isSafeInteger(expectedDependentRevision) || expectedDependentRevision < 1))) {
+    throw mbtError(409, "MBT_BIN_DEPENDENT_VISIT_CHANGED", "The dependent BIN return leg is unavailable. Refresh before assigning.");
+  }
+  const dependent = dependentVisitId ? await lockVisit(dependentVisitId) : null;
+  if (dependent && !isUnchangedDependentReturn(dependent, visit, expectedDependentRevision)) {
+    throw mbtError(409, "MBT_BIN_DEPENDENT_VISIT_CHANGED", "The dependent BIN return leg changed. Refresh before assigning.");
+  }
+
+  return {dependent,dependentVisitId};
+}
+
 /**
  * Bind an eligible exact asset at the dispatch decision point. Both the
  * delivery and its still-tentative dependent return are locked and updated in
@@ -880,22 +914,14 @@ async function bindUnboundDeliveryAsset(visit, assignments, actorId) {
   }
 
   const deliverySnapshot = objectValue(visit.service_snapshot);
-  const dependentVisitId = String(deliverySnapshot.dependentReturnVisitId || "");
-  const expectedDependentRevision = Number(deliverySnapshot.dependentReturnVisitRevision);
-  if (!dependentVisitId || !Number.isSafeInteger(expectedDependentRevision) || expectedDependentRevision < 1) {
-    throw mbtError(409, "MBT_BIN_DEPENDENT_VISIT_CHANGED", "The dependent BIN return leg is unavailable. Refresh before assigning.");
-  }
-  const dependent = await lockVisit(dependentVisitId);
-  if (!isUnchangedDependentReturn(dependent, visit, expectedDependentRevision)) {
-    throw mbtError(409, "MBT_BIN_DEPENDENT_VISIT_CHANGED", "The dependent BIN return leg changed. Refresh before assigning.");
-  }
+  const {dependent,dependentVisitId} = await selectedDeliveryDependent(visit,deliverySnapshot);
 
-  const nextDependentRevision = Number(dependent.revision) + 1;
+  const nextDependentRevision = dependent ? Number(dependent.revision) + 1 : null;
   const nextDeliverySnapshot = {
     ...snapshotWithAsset(deliverySnapshot, assetId),
-    dependentReturnVisitRevision: nextDependentRevision
+    ...(dependent ? { dependentReturnVisitRevision: nextDependentRevision } : {})
   };
-  const nextDependentSnapshot = snapshotWithAsset(dependent.service_snapshot, assetId);
+  const nextDependentSnapshot = dependent ? snapshotWithAsset(dependent.service_snapshot, assetId) : null;
   await query(
     `UPDATE mbt_service_visits
         SET expected_asset_id = $2, outgoing_asset_id = $2,
@@ -910,6 +936,7 @@ async function bindUnboundDeliveryAsset(visit, assignments, actorId) {
       WHERE service_visit_id = $1`,
     [visit.service_visit_id, assetId]
   );
+  if (dependent) {
   await query(
     `UPDATE mbt_service_visits
         SET expected_asset_id = $2, service_snapshot = $3::jsonb,
@@ -923,6 +950,7 @@ async function bindUnboundDeliveryAsset(visit, assignments, actorId) {
       WHERE service_visit_id = $1`,
     [dependentVisitId, assetId]
   );
+  }
 
   visit.expected_asset_id = assetId;
   visit.outgoing_asset_id = assetId;
@@ -1051,6 +1079,7 @@ function lockedPlanBinGroups(plan) {
         const marker = objectValue(stop.mbt);
         if (!Object.keys(marker).length) {continue;}
         projectedBinStops.add(stop);
+        if (marker.transportTripId) {continue;}
         const visitId = String(marker.visitId || "");
         if (!visitId) {throw confirmationInvalid("bin_stop_visit_missing");}
         const existing = groups.get(visitId);
@@ -1066,7 +1095,7 @@ function lockedPlanBinGroups(plan) {
     }
   }
   const detected = binDispatchOrders(plan);
-  if (!detected.length || !groups.size) {
+  if (!detected.length || (!groups.size && ![...projectedBinStops].some(stop=>stop.mbt?.transportTripId))) {
     throw confirmationInvalid("bin_assignment_missing");
   }
   if (detected.some((candidate) => !projectedBinStops.has(candidate))) {
@@ -1263,7 +1292,6 @@ async function assertCurrentTruckCapability(visit, group) {
   });
   if (!current
       || current.active !== true
-      || current.driver_active !== true
       || current.bin_type_active !== true
       || String(current.truck_type) !== "bin"
       || current.bin_service_enabled !== true
@@ -1353,7 +1381,7 @@ async function assertLockedTemplateAndStops(visit, assignment, truck) {
     baseYardId: truck.yard.yardId,
     baseYardCode: truck.yard.yardCode
   }, true)).map((stop) => ({ ...stop, loadId: String(assignment.loadId || "") }));
-  if (!sameCanonicalValue(currentStops, arrayValue(assignment.stops))) {
+  if (!sameCanonicalValue(comparableStopLabels(currentStops, arrayValue(assignment.stops)), arrayValue(assignment.stops))) {
     throw confirmationInvalid("visit_assignment_mismatch", {
       visitId: String(visit.service_visit_id)
     });
@@ -1452,8 +1480,7 @@ function assertAggregateTruckCapacity(validations) {
     byTruck.set(truckId, aggregate);
   }
   for (const [truckId, aggregate] of byTruck) {
-    if (aggregate.groups > aggregate.slotCapacity
-        || aggregate.requiredWeightLbs > aggregate.capacityLbs) {
+    if (aggregate.groups > aggregate.slotCapacity) {
       throw confirmationInvalid("truck_capacity_mismatch", {
         truckId,
         requiredSlots: aggregate.groups,
@@ -1470,8 +1497,9 @@ async function validateLockedBinConfirmation(locked) {
     throw confirmationInvalid("plan_status_invalid", { status: String(locked.status) });
   }
   const groups = lockedPlanBinGroups(plan);
+  await validateTransportPlan(plan);
   const selected = await query(
-    `SELECT service_visit_id::text, contract_id::text, service_line_id::text,
+    `SELECT service_visit_id::text, visit_reference, contract_id::text, service_line_id::text,
             predecessor_visit_id::text, service_action, status,
             revision::int, planning_generation::int, dispatch_plan_id, dispatch_plan_revision::int,
             dispatch_load_id, dispatch_assignment_snapshot,
@@ -1495,7 +1523,7 @@ async function validateLockedBinConfirmation(locked) {
     throw confirmationInvalid("visit_group_set_mismatch");
   }
   const validations = [];
-  let hasPlanningAssignments = false;
+  let hasPlanningAssignments = plan.trucks.some((/** @type {any} */ t)=>t.loads.some((/** @type {any} */ l)=>l.stops.some((/** @type {any} */ s)=>s.mbt?.transportTripId)));
   for (const visit of selected.rows) {
     const group = groups.get(String(visit.service_visit_id));
     if (!group) {throw confirmationInvalid("visit_group_set_mismatch");}
@@ -1560,9 +1588,27 @@ async function validatePlanningVisitDetails(visit, group) {
     return { ...identity, ...(visit.service_snapshot?.binWorkflow ? {planningAddress:stop.planningAddress} : {}),
       id: String(stop.id).replace(/:mbt-g\d+$/u, ""), mbt };
   });
-  if (!sameCanonicalValue(expected, remaining)) {
+  if (!sameCanonicalValue(comparableStopLabels(expected, remaining), remaining)) {
     throw confirmationInvalid("visit_assignment_mismatch", { visitId: String(visit.service_visit_id) });
   }
+}
+
+/** Presentation fields were added after existing assignments were frozen.
+ * Compare them when present without changing historical assignment snapshots.
+ * @param {Array<Record<string, any>>} expected @param {any[]} saved
+ */
+function comparableStopLabels(expected, saved) {
+  const byId = new Map(saved.map(stop => [String(stop.id).replace(/:mbt-g\d+$/u, ""), stop]));
+  return expected.map(stop => {
+    const original = byId.get(String(stop.id).replace(/:mbt-g\d+$/u, ""));
+    const result = { ...stop };
+    if (original) {
+      for (const field of ["reference", "assetId", "assetCode"]) {
+        if (!Object.hasOwn(original, field)) {delete result[field];}
+      }
+    }
+    return result;
+  });
 }
 
 /**
@@ -1585,7 +1631,8 @@ export async function confirmMbtBinDispatchPlan(input, { capability, hooks = {} 
       note, validate: validateLockedBinConfirmation, hooks
     });
     const pending = await query("SELECT 1 FROM mbt_bin_planning_assignments WHERE plan_id=$1 AND withdrawn_at IS NULL AND released_at IS NULL LIMIT 1", [planId]);
-    if (!pending.rowCount && !pendingPlanningReturns(confirmed).length) {return confirmed;}
+    const transportPending=await query("SELECT 1 FROM mbt_transport_trips WHERE plan_id=$1 AND driver_released_at IS NULL LIMIT 1",[planId]);
+    if (!pending.rowCount && !transportPending.rowCount && !pendingPlanningReturns(confirmed).length) {return confirmed;}
     const plan = await publishPlanningAssignments(planId, String(input.actor.operatorId), before.revision);
     await syncPlanningProjections(plan);
     return plan;

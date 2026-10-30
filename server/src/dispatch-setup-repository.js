@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 import { query, withTransaction } from "./db.js";
+import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 
 export { updateDispatchTruckCapabilities } from "./mbt/dispatch-truck-capability-repository.js";
 
@@ -339,6 +340,7 @@ function fleetRecordId(value, label) {
 export async function setDispatchDriverActive(id, active) {
   const driverId = fleetRecordId(id, "Driver");
   return withTransaction(async () => {
+    await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
     const existing = await query("SELECT * FROM dispatch_drivers WHERE id = $1 FOR UPDATE", [driverId]);
     if (!existing.rows[0]) return null;
     const updated = await query(

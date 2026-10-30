@@ -19,9 +19,22 @@ before(async()=>{
 });
 after(async()=>{await browser?.close();server?.closeAllConnections();if(server)await new Promise(done=>server.close(done));await closeDb();});
 async function api(role,path,body){const r=await fetch(base+path,{method:body?'POST':'GET',headers:{...(role?{authorization:'Bearer '+users[role]}:{}),'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});assert.ok(r.ok,await r.clone().text());return r.json();}
-const create=type=>api('sales','/api/sales/stock-requests',{workflowVersion:2,deliveryMethod:'stocking',stockingType:type,destinationLocationId:28,remarks:'Keep remark <b>text</b>',customerName:'Keep customer',lines:[{itemId:sku,...(type==='transfer'?{sourceLocationId:1}:{}),pieces:31},{itemId:sku,...(type==='transfer'?{sourceLocationId:1}:{}),pieces:19}]});
+const create=(type,customerName='Keep customer')=>api('sales','/api/sales/stock-requests',{workflowVersion:2,deliveryMethod:'stocking',stockingType:type,destinationLocationId:28,remarks:'Keep remark <b>text</b>',customerName,lines:[{itemId:sku,...(type==='transfer'?{sourceLocationId:1}:{}),pieces:31},{itemId:sku,...(type==='transfer'?{sourceLocationId:1}:{}),pieces:19}]});
 async function pageFor(role,d){const context=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:'block'});await context.addInitScript(token=>{localStorage.setItem('mbbs.staff.token',token);localStorage.setItem('mbbs.scm.stockRequests.queue','request');},users[role]);const page=await context.newPage(),errors=[],calls=[];page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.method()==='POST'&&r.url().includes('/backorder-conversion'))calls.push(r.postDataJSON());});page.setDefaultTimeout(10000);await page.coverage.startJSCoverage({resetOnNavigation:false});await page.goto(`${base}/${role}/stock-requests?tab=regular&requestId=${d.id}`);await expect(page.locator('.stock-request-detail')).toContainText(d.requestRef);return {page,errors,calls,async close(){writeFileSync(out+'/'+role+'-'+d.id+'.coverage.json',JSON.stringify(await page.coverage.stopJSCoverage()));await context.close();}};}
 
+test('SCM must supply a customer when converting unnamed Stocking requests',async()=>{
+  const d=await create('purchase',''),f=await pageFor('scm',d);
+  try {
+    const p=f.page;await p.locator('[data-scm-stock-action="backorder-convert"]').click();
+    const dialog=p.locator('[data-stocking-backorder-dialog]'),customer=dialog.locator('[name="customerName"]');
+    await expect(customer).toHaveAttribute('required','');await dialog.locator('[data-stocking-backorder-confirm]').click();
+    assert.equal(await customer.evaluate(input=>input.validity.valueMissing),true);assert.equal(f.calls.length,0);
+    await customer.fill('   ');await dialog.locator('[data-stocking-backorder-confirm]').click();
+    await expect(dialog.locator('[data-stocking-backorder-error]')).toContainText('Customer name is required');
+    await customer.fill('Conversion Customer');await dialog.locator('[data-stocking-backorder-confirm]').click();
+    await expect(p.locator('[data-backorder-detail]')).toContainText('Conversion Customer');assert.deepEqual(f.errors,[]);
+  }finally{await f.close();}
+});
 test('SCM converts the whole Transfer or Purchase through a confirmation dialog and opens the same Backorder',async()=>{
   for(const type of ['transfer','purchase']){const d=await create(type),f=await pageFor('scm',d);try{
     const p=f.page;await p.locator('[data-scm-stock-action="backorder-convert"]').click();const dialog=p.locator('[data-stocking-backorder-dialog]');await expect(dialog).toBeVisible();await expect(dialog).toContainText(d.requestRef);await expect(dialog).toContainText('31 EA');await expect(dialog).toContainText('19 EA');await expect(dialog.locator('script')).toHaveCount(0);

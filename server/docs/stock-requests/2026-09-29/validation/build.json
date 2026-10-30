@@ -1,0 +1,16 @@
+{
+  "language": "en",
+  "pages": 28,
+  "screenshots": 29,
+  "pdfBytes": 1695163,
+  "checks": [
+    "No clipped pages or footer overlap",
+    "All screenshots loaded",
+    "All internal links resolved",
+    "No external dependencies or network access",
+    "No browser errors",
+    "Screenshot zoom opens and closes",
+    "PDF page count matches HTML"
+  ],
+  "verifiedAt": "2026-09-29T16:22:06.846Z"
+}

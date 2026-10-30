@@ -7,7 +7,10 @@
 define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime, log) => {
   const VERSION = 1;
   const MAX_LINES = 1000;
+  const QUANTITY_POLICY = 'sqft_remaining_v1';
   const PACK_FIELDS = ['custcol_plt', 'custcol_lyr', 'custcol_sec', 'custcol_pcs'];
+  /** @type {Array<'memo'|'custbody9'>} */
+  const REFERENCE_FIELDS = ['memo', 'custbody9'];
   const SOURCES = { PO: 'purchaseorder', SO: 'salesorder', TO: 'transferorder' };
   const TARGETS = { IR: 'itemreceipt', IF: 'itemfulfillment' };
   const PAIRS = ['PO:IR', 'SO:IF', 'TO:IF', 'TO:IR'];
@@ -106,7 +109,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
   function get() {
     return { ok: true, contractVersion: VERSION, ...activation(), environment: runtime.envType,
       supportedTransforms: PAIRS, maxLines: MAX_LINES, savedRecordReadback: true,
-      explicitInventoryAssignments: false, kits: false };
+      explicitInventoryAssignments: false, kits: false, quantityPolicies: [QUANTITY_POLICY] };
   }
 
   /** @param {any} item @returns {IFIRSelection} */
@@ -121,27 +124,35 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
     }
     return normalized;
   }
+  /** @param {any} payload */
+  function validateReferences(payload) {
+    if (typeof payload.externalId !== 'string' || !/^[A-Za-z0-9_:-]{1,255}$/.test(payload.externalId)) {
+      invalid('A stable externalId of 1 to 255 letters, digits, underscores, colons or hyphens is required.');
+    }
+    for (const field of REFERENCE_FIELDS) {
+      if (payload[field] !== undefined && (typeof payload[field] !== 'string' || payload[field].length > 4000)) {
+        invalid(`${field} must be a string of at most 4000 characters.`);
+      }
+    }
+  }
   /** @param {any} input @returns {IFIRRequest} */
   function validateRequest(input) {
-    keys(input, ['action', 'sourceOrderKind', 'transactionType', 'sourceNetSuiteId', 'payload'], 'request');
+    keys(input, ['action', 'sourceOrderKind', 'transactionType', 'sourceNetSuiteId', 'payload', 'quantityPolicy'], 'request');
+    if (input.quantityPolicy !== undefined && input.quantityPolicy !== QUANTITY_POLICY) {
+      invalid('Unsupported quantity policy.');
+    }
     if (input.action !== 'post' || !PAIRS.includes(`${input.sourceOrderKind}:${input.transactionType}`)) {
       invalid('Only PO -> IR, SO -> IF, TO -> IF and TO -> IR posting is supported.');
     }
     const payload = input.payload;
     keys(payload, ['externalId', 'memo', 'custbody9', 'inventoryLocation', 'shipStatus', 'item'], 'payload');
-    if (typeof payload.externalId !== 'string' || !/^[A-Za-z0-9_:-]{1,255}$/.test(payload.externalId)) {
-      invalid('A stable externalId of 1 to 255 letters, digits, underscores, colons or hyphens is required.');
-    }
-    for (const field of ['memo', 'custbody9']) {
-      if (payload[field] !== undefined && (typeof payload[field] !== 'string' || payload[field].length > 4000)) {
-        invalid(`${field} must be a string of at most 4000 characters.`);
-      }
-    }
+    validateReferences(payload);
     validateFulfillmentHeaders(input);
     keys(payload.item, ['items'], 'item sublist');
     if (!Array.isArray(payload.item.items) || !payload.item.items.length || payload.item.items.length > MAX_LINES) {
       invalid(`Supply between 1 and ${MAX_LINES} explicit item selections.`);
     }
+    /** @type {IFIRSelection[]} */
     const items = payload.item.items.map(validateLine);
     if (new Set(items.map(item => item.orderLine)).size !== items.length || !items.some(item => item.itemReceive)) {
       invalid('Order lines must be unique and at least one must be selected.');
@@ -206,12 +217,31 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
       fail('IFIR_UNSUPPORTED_INVENTORY_DETAIL', 'Explicit bin, lot or serial allocation requires the existing posting flow.');
     }
   }
-  /** @param {NSRecord} rec @param {number} line @param {IFIRSelection} selected */
-  function applySelectedLine(rec, line, selected) {
+  /** The transform supplies the remaining transaction-unit quantity. Never use
+   * stock on hand, the submitted quantity, or a cached app quantity as evidence.
+   * @param {IFIRRequest} request @param {NSRecord} rec @param {number} line @param {IFIRSelection} selected */
+  function postingQuantity(request, rec, line, selected) {
+    if (request.quantityPolicy !== QUANTITY_POLICY) { return selected.quantity; }
+    const remaining = finiteNumber(lineOptional(rec, line, 'quantityremaining'));
+    const unit = units(rec, line).trim().toUpperCase();
+    if (remaining === null || remaining <= 0 || remaining > 1e9 || !unit) {
+      fail('IFIR_QUANTITY_EVIDENCE_UNAVAILABLE', `Source line ${selected.orderLine} has no valid remaining quantity or unit.`);
+    }
+    const requested = quantity(selected.quantity, 'quantity');
+    const roundoff = Math.min(1e-8, Number.EPSILON * Math.max(1, requested, remaining) * 2);
+    if (unit === 'SQFT' && Math.abs(requested - remaining) < 0.01 - roundoff) { return remaining; }
+    if (requested > remaining) {
+      fail('IFIR_QUANTITY_EXCEEDS_REMAINING', `Source line ${selected.orderLine} exceeds its remaining quantity.`);
+    }
+    return requested;
+  }
+  /** @param {IFIRRequest} request @param {NSRecord} rec @param {number} line @param {IFIRSelection} selected */
+  function applySelectedLine(request, rec, line, selected) {
     assertSimpleLine(rec, line);
+    const quantityToPost = postingQuantity(request, rec, line, selected);
     setLine(rec, line, 'itemreceive', true);
     if (selected.location !== undefined) { setLine(rec, line, 'location', selected.location); }
-    setLine(rec, line, 'quantity', selected.quantity);
+    setLine(rec, line, 'quantity', quantityToPost);
     for (const field of PACK_FIELDS) {
       if (selected[field] !== undefined) { setLine(rec, line, field, selected[field]); }
     }
@@ -226,7 +256,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
       if (seen.has(orderLine)) { fail('IFIR_AMBIGUOUS_LINE', 'The transformed order line is not unique.'); }
       seen.add(orderLine);
       const selected = requested.get(orderLine);
-      if (selected?.itemReceive === true) { applySelectedLine(rec, line, selected); }
+      if (selected?.itemReceive === true) { applySelectedLine(request, rec, line, selected); }
       else if (selected || !nativeCharge(request, rec, line, cache)) { setLine(rec, line, 'itemreceive', false); }
     }
     for (const selected of requested.values()) {
@@ -240,7 +270,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
     const rec = record.transform({ fromType: SOURCES[request.sourceOrderKind], fromId: request.sourceNetSuiteId,
       toType: TARGETS[request.transactionType], isDynamic: false });
     rec.setValue({ fieldId: 'externalid', value: request.payload.externalId });
-    for (const field of ['memo', 'custbody9']) {
+    for (const field of REFERENCE_FIELDS) {
       if (request.payload[field] !== undefined) { rec.setValue({ fieldId: field, value: request.payload[field] }); }
     }
     if (request.payload.inventoryLocation !== undefined) {
@@ -328,9 +358,26 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
       fail('IFIR_INCOMPLETE_READBACK', 'The saved transaction number or line evidence is incomplete; reconcile by internal/external ID.');
     }
   }
+  /** Derive adjustments from saved evidence, including on external-ID replay.
+   * A save-time workflow change must not be hidden by echoing planned values.
+   * @param {IFIRRequest} request @param {IFIRSavedLine[]} items */
+  function quantityEvidence(request, items) {
+    if (request.quantityPolicy !== QUANTITY_POLICY) { return {}; }
+    const quantityAdjustments = [];
+    for (const selected of request.payload.item.items.filter(item => item.itemReceive)) {
+      const saved = items.find(item => item.itemReceive && item.orderLine === selected.orderLine);
+      if (saved && saved.quantity !== selected.quantity) {
+        quantityAdjustments.push({ orderLine: selected.orderLine, requestedQuantity: selected.quantity,
+          netSuiteQuantity: saved.quantity, salesUom: saved.unitsDisplay });
+      }
+    }
+    return { quantityPolicy: QUANTITY_POLICY, quantityAdjustments };
+  }
   /** @param {IFIRRequest} request @param {IFIRState} state @param {string} outcome @param {Map<number,IFIRClassification>} cache */
   function savedResponse(request, state, outcome, cache) {
     state.stage = 'readback';
+    // Classification must also be current after save-time workflows run.
+    cache.clear();
     const rec = record.load({ type: TARGETS[request.transactionType], id: positiveId(state.id, 'saved transaction ID'), isDynamic: false });
     assertSavedIdentity(request, rec);
     const items = [];
@@ -345,7 +392,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'], (record, search, runtime,
     const source = sourceSnapshot(request);
     logEvent('audit', { outcome, id: state.id, tranId: snapshot.tranId, externalId: snapshot.externalId });
     return { ok: true, contractVersion: VERSION, complete: true, requiresReconciliation: false,
-      outcome, id: state.id, tranId: snapshot.tranId, record: snapshot, source };
+      outcome, id: state.id, tranId: snapshot.tranId, record: snapshot, source, ...quantityEvidence(request, items) };
   }
   /** @param {IFIRRequest} request @param {NSRecord} rec @param {IFIRState} state */
   function saveOnce(request, rec, state) {

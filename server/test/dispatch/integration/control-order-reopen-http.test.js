@@ -86,7 +86,7 @@ test("real browser: manager previews, confirms reset and sees retained images in
     page.once("dialog", dialog => dialog.accept());
     await page.locator('[data-reopen-action="confirm"]').click();
     await page.locator('[data-operator-order-reopen] [role="status"]').waitFor();
-    assert.match(await page.locator('[role="status"]').innerText(), /2 images retained/u);
+    assert.match(await page.locator('[data-operator-order-reopen] [role="status"]').innerText(), /2 images retained/u);
     assert.equal((await state(f)).header.operator_status, "open");
     coverageEntries.push(...await page.coverage.stopJSCoverage());
     await page.coverage.startJSCoverage({ resetOnNavigation: false });

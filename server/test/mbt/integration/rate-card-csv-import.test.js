@@ -216,7 +216,7 @@ test("P3-F12 CSV boundaries: Admin, gate, hash, ownership, and expiry fail close
     await assert.rejects(
       () => previewRateCardCsvImport({
         ...previewInput("ROLE"),
-        actor: { operatorId: "not-admin", roles: ["dispatcher"] }
+        actor: { operatorId: "not-admin", roles: ["operator"] }
       }),
       (error) => error?.status === 403 && error?.code === "MBT_ADMIN_REQUIRED"
     );

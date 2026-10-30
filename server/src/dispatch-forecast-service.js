@@ -410,6 +410,16 @@ function travelInterval({
   };
 }
 
+function unrecordedStartTravelOrigin(entry, previousEntry, visitsByLoad) {
+  const changedTruck = previousEntry && entry.assignment.truckPlate
+    && previousEntry.assignment.truckPlate !== entry.assignment.truckPlate;
+  const yard = !previousEntry || changedTruck
+    ? text(entry.assignment.switchYard || entry.parentTruck.base)
+    : previousEntry.load.returnOnly ? text(previousEntry.load.returnYard || "12441") : "";
+  if (yard) return { from: yard, address: YARD_ADDRESSES[yard] || yard, actualEnd: null };
+  return previousEntry ? visitsByLoad.get(text(previousEntry.load.id))?.at(-1) || null : null;
+}
+
 function buildLaneTravelRows(plan, laneEntries, visits, records, laneKey) {
   const expected = expectedTravelJobs(plan, laneKey);
   const usedJobs = new Set();
@@ -427,7 +437,7 @@ function buildLaneTravelRows(plan, laneEntries, visits, records, laneKey) {
     return job;
   };
 
-  for (const laneEntry of laneEntries) {
+  for (const [laneIndex, laneEntry] of laneEntries.entries()) {
     const { load, assignment } = laneEntry;
     const loadId = text(load.id);
     const loadVisits = visitsByLoad.get(loadId) || [];
@@ -492,6 +502,26 @@ function buildLaneTravelRows(plan, laneEntries, visits, records, laneKey) {
           inferredEnd: firstVisit.actualStart,
           ordinal: ordinal++
         }));
+      } else if (firstVisit.visit.type === "drop" && !(load.stops || []).some((stop) => ["pick", "pickup"].includes(text(stop.type)))) {
+        // Delivery-only loads have no initial Driver pickup task. Their opening
+        // journey still belongs on the planning timeline, inferred from stops.
+        const origin = unrecordedStartTravelOrigin(laneEntry, laneEntries[laneIndex - 1], visitsByLoad);
+        if (origin?.address && firstVisit.address && !sameDriverPhysicalAddress(origin.address, firstVisit.address)) {
+          const travel = travelInterval({
+            plan,
+            loadId,
+            kind: "start",
+            from: origin.from,
+            to: firstVisit.from,
+            plannedStartMinute: assignment.plannedStartMinute ?? finiteMinute(load.timing?.start) ?? 0,
+            plannedEndMinute: (firstVisit.plannedStart - dispatchTorontoMinuteEpoch(plan.planDate, 0)) / MINUTE_MS,
+            inferredStart: origin.actualEnd,
+            inferredEnd: firstVisit.actualStart,
+            ordinal: ordinal++
+          });
+          if (Number.isFinite(firstVisit.actualEnd)) travel.status = "complete";
+          travelRows.push(travel);
+        }
       }
     }
 

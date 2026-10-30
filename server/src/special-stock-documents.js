@@ -17,7 +17,7 @@ const moneyMinor = value => {
 
 function quotePackQuantities(line) {
   const native = specialPackPayload(line);
-  return Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field,key]) => [field,native[key] ?? null]));
+  return Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field,key]) => [field,native[key] === 0 ? null : native[key] ?? null]));
 }
 
 /** @param {bigint} grossSubtotal @param {bigint} subtotal */
@@ -112,7 +112,8 @@ export function specialOrderSnapshot(detail, kind, audience) {
   const sales = kind === 'sales_order';
   const id = sales ? detail.salesOrderId : detail.purchaseOrderId;
   const lines = (sales ? detail.salesOrderLines : detail.purchaseOrderLines) || [];
-  const manualSalesLink = (sales && detail.salesOrderSource === 'manual_link') || detail.workflowKind === 'backorder';
+  const manualSalesLink = (sales && detail.salesOrderSource === 'manual_link')
+    || (!sales && detail.purchaseOrderCustomLinkage) || detail.workflowKind === 'backorder';
   if (!id || (sales ? detail.salesOrderSkipped : detail.purchaseOrderSkipped) || (!lines.length && !manualSalesLink)) throw invalid('This request has no linked order to preview.', 409);
   return { version: 2, source: 'netsuite-native', kind, audience, id, title: sales ? 'Sales Order' : 'Purchase Order',
     number: sales ? detail.salesOrderRef : detail.purchaseOrderRef, requestRef: detail.requestRef,

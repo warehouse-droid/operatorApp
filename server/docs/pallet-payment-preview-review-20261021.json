@@ -1,0 +1,137 @@
+{
+  "date": "2026-10-21",
+  "account": "6518947",
+  "customer": "5240",
+  "scope": "Read-only investigation of IDs in the user's successful v2 native preview. No financial or custom-record writes and no deployment performed.",
+  "userReportedPreview": {
+    "generatedAt": "2026-10-21T19:28:44.609Z",
+    "verified": false,
+    "issued": 207,
+    "credited": 203,
+    "physical": 4,
+    "allocationRows": 60,
+    "refundRows": 0,
+    "displayedRows": 12,
+    "displayedPaymentMethod": "1 (Cash)"
+  },
+  "cardReferenceFindings": {
+    "source": "SuiteQL transaction metadata for exact flagged transaction IDs",
+    "allEightFlaggedPaymentsAreDebit": true,
+    "paymentMethod": "8 (Debit Card)",
+    "payments": [
+      {
+        "id": "354563",
+        "memo": "SOB43227"
+      },
+      {
+        "id": "359815",
+        "memo": "SOB44418"
+      },
+      {
+        "id": "360202",
+        "memo": "SOB44499"
+      },
+      {
+        "id": "374635",
+        "memo": "SOB47551"
+      },
+      {
+        "id": "386653",
+        "memo": "SOB50013"
+      },
+      {
+        "id": "386656",
+        "memo": "SOB50014"
+      },
+      {
+        "id": "390301",
+        "memo": "SOB50748"
+      },
+      {
+        "id": "653354",
+        "memo": "SOB85759(CMB17752)"
+      }
+    ],
+    "refunds": [
+      {
+        "id": "357394",
+        "credit": "357388",
+        "memo": "CMB09091",
+        "method": "8"
+      },
+      {
+        "id": "390305",
+        "credit": "390265",
+        "memo": "CMB10506",
+        "method": "8"
+      }
+    ],
+    "conclusion": "The flagged memos contain document references, not card suffixes. Taking the final four digits of those document numbers would fabricate a card reference.",
+    "structuredFieldCheck": "REST GET responses for payments 354563/653354 and refund 357394 did not expose card or payment-option fields to this integration role. This does not prove such information cannot exist elsewhere.",
+    "confirmedBusinessChoice": "User rejected combining all Debit Card payments and clarified that balances with the same last four should combine. Summary grouping remains customer, payment method, last four, currency and subsidiary across invoices. Missing last fours remain unresolved and separate by source payment. No script policy change required."
+  },
+  "refundFindings": [
+    {
+      "credit": "188388",
+      "refund": "188630",
+      "method": "1 (Cash)",
+      "palletQuantity": 10,
+      "subtotal": 400,
+      "tax": 52,
+      "creditTotal": 452,
+      "refundApplied": 452,
+      "explanation": "Historical cash refund includes tax. v2 intentionally requires review because the current cash allocation rate is 40 and 452 is not a whole multiple of 40. This is separate from card parsing."
+    },
+    {
+      "credit": "1080133",
+      "refund": "1080475",
+      "method": "1 (Cash)",
+      "palletQuantity": 9,
+      "subtotal": 360,
+      "tax": 46.8,
+      "creditTotal": 406.8,
+      "refundApplied": 333.21,
+      "invoiceApplication": {
+        "invoice": "1080373",
+        "amount": 73.59
+      },
+      "explanation": "Credit is split between a cash refund and an invoice application. Neither monetary leg corresponds directly to a whole number of 40-dollar cash pallets. Original allocation and settlement quantities need an explicit rule or review."
+    }
+  ],
+  "limitations": [
+    "No verified payment-method balance is established by the physical balance of four.",
+    "Zero generated refund rows means v2 could not automatically allocate the historical deductions, not that no refunds occurred.",
+    "Preview's available values remain provisional while verified is false.",
+    "Upload issue is resolved by the user using v2; no CRLF replacement or diagnostic upload is needed."
+  ],
+  "confirmedFieldCorrection": {
+    "field": "custrecord_ppa_method",
+    "internalId": "1398",
+    "previousListRecord": "Transaction",
+    "requiredListRecord": "Payment Method",
+    "userReportedChanged": true,
+    "financialRecordsChangedByAssistant": false
+  },
+  "afterCorrectionReadOnlyQuery": {
+    "customer": "5240",
+    "allocationRows": 60,
+    "allocated": 207,
+    "refunded": 0,
+    "verified": false,
+    "otherCustomersPresent": false,
+    "source": "SuiteQL customrecord_pallet_payment_alloc grouped by customer and verified flag, active records"
+  },
+  "v3PreparedChanges": {
+    "historicalCashCredit": "Posted single full-gross cash refund of a pure pallet credit uses the credited quantity, preserving net cash principal. Actual linked refund amount remains unchanged. Partial/refund-source/card-evidence gaps stay under review.",
+    "automaticRefresh": "New queue library, transaction User Event and scheduled dispatcher; local package only.",
+    "cashSummary": "One Cash row per customer/currency/subsidiary; source invoices/payments remain on underlying lots."
+  },
+  "allCustomerNativeInputFailure": {
+    "reportedTime": "2026-10-21 17:13 account log time",
+    "trigger": "Customer Internal ID cleared from 5240",
+    "error": "SSS_SEARCH_ERROR_OCCURRED: Invalid or unsupported search",
+    "location": "ppa_netsuite.js:45 customers() paged fetch, before any customer reduce",
+    "legacyPath": "UNION SuiteQL query over pallet transactions and existing allocation records",
+    "preparedCorrection": "Two separate paged N/search GROUP searches merged and deduplicated in JavaScript. Native verification pending upload."
+  }
+}

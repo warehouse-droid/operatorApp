@@ -1,3 +1,4 @@
+import {assertRepairVehicleAvailable} from './repair/guards.js';
 import { isSorFeatureEnabled } from './sor-feature-gate.js';
 import crypto from "node:crypto";
 import { decorateSorOrders, getSorSignatureSettings } from "./sor-rental-repository.js";
@@ -12,6 +13,7 @@ import {
 } from "./driver-client-version.js";
 import { selectDriverRouteCursor } from "./driver-route-cursor.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
+import { assertDriverExecutionActive } from "./driver-execution-access.js";
 import { writeDispatchAudit } from "./dispatch-audit-repository.js";
 import { supersedeDriverOfflineManifests } from "./driver-offline-repository.js";
 import { createSamsaraDriverVehicleAssignment, createSamsaraMechanicDvir, findSamsaraDvirForVehicle, setSamsaraDriverDutyStatus } from "./samsara.js";
@@ -2206,28 +2208,35 @@ function directAllocationForPlanItem(order = {}, item = {}) {
 function planItemForPickup(item, context = {}) {
   if (context.stopType !== "pickup") return item;
   if (String(context.orderType || "").trim().toUpperCase() === "CUSTOM") return item;
+  const totalSales = Number(item.quantity ?? item.salesQty);
+  const knownSales = (item.quantity != null || item.salesQty != null) && Number.isFinite(totalSales);
+  // Packing describes this sales quantity; it is not a second cargo balance.
+  const packing = (field, legacy, sales) => !knownSales ? legacy : totalSales <= 0 ? 0
+    : Math.max(numberValue(item[field]), 0) * Math.min(Math.max(sales, 0), totalSales) / totalSales;
   const pickupLocation = String(context.pickupLocation || "").trim();
   const ownPickup = !pickupLocation || isOwnYard(context.plan, pickupLocation);
   if (ownPickup) {
     const direct = directAllocationForPlanItem(context.planOrder,item);
+    const sales = positiveBalance(item.quantity ?? item.salesQty, numberValue(item.poAllocatedSalesQty)+direct.quantity);
     return {
       ...item,
-      pallets: positiveBalance(item.pallets, numberValue(item.poAllocatedPallets)+direct.pallets),
-      layers: positiveBalance(item.layers, numberValue(item.poAllocatedLayers)+direct.layers),
-      sections: positiveBalance(item.sections, numberValue(item.poAllocatedSections)+direct.sections),
-      pieces: positiveBalance(item.pieces, numberValue(item.poAllocatedPieces)+direct.pieces),
-      quantity: positiveBalance(item.quantity ?? item.salesQty, numberValue(item.poAllocatedSalesQty)+direct.quantity),
-      salesQty: positiveBalance(item.salesQty ?? item.quantity, numberValue(item.poAllocatedSalesQty)+direct.quantity)
+      pallets: packing('pallets', positiveBalance(item.pallets, numberValue(item.poAllocatedPallets)+direct.pallets), sales),
+      layers: packing('layers', positiveBalance(item.layers, numberValue(item.poAllocatedLayers)+direct.layers), sales),
+      sections: packing('sections', positiveBalance(item.sections, numberValue(item.poAllocatedSections)+direct.sections), sales),
+      pieces: packing('pieces', positiveBalance(item.pieces, numberValue(item.poAllocatedPieces)+direct.pieces), sales),
+      quantity: sales,
+      salesQty: sales
     };
   }
+  const sales = Math.max(0, knownSales ? Math.min(totalSales, numberValue(item.poAllocatedSalesQty)) : numberValue(item.poAllocatedSalesQty));
   return {
     ...item,
-    pallets: numberValue(item.poAllocatedPallets),
-    layers: numberValue(item.poAllocatedLayers),
-    sections: numberValue(item.poAllocatedSections),
-    pieces: numberValue(item.poAllocatedPieces),
-    quantity: numberValue(item.poAllocatedSalesQty),
-    salesQty: numberValue(item.poAllocatedSalesQty)
+    pallets: packing('pallets', numberValue(item.poAllocatedPallets), sales),
+    layers: packing('layers', numberValue(item.poAllocatedLayers), sales),
+    sections: packing('sections', numberValue(item.poAllocatedSections), sales),
+    pieces: packing('pieces', numberValue(item.poAllocatedPieces), sales),
+    quantity: sales,
+    salesQty: sales
   };
 }
 
@@ -2278,6 +2287,7 @@ export function driverOrderDetailsFromPlan(orderRef, planOrder = null, context =
     orderId: Number(planOrder?.netsuiteId || planOrder?.netsuite_id || 0) || null,
     orderType: canonicalDriverPlanOrderType(planOrder, context.orderType),
     orderRef,
+    poRefs: [...new Set(poManifests.map(/** @param {{poOrderRef?: unknown}} entry */ entry => String(entry.poOrderRef || "").trim()).filter(Boolean))],
     party: planOrder?.customer || planOrder?.vendor || planOrder?.party || "",
     source: "dispatch_plan",
     items: items.map((item) => ({
@@ -2724,6 +2734,7 @@ function driverJobRecordDetails(job = {}, { driverRemark, completionContext = nu
 export async function startDriverJob(driverLogin, jobIdValue, options = {}) {
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [DISPATCH_FLEET_PLANNING_LOCK]);
+    await assertDriverExecutionActive(driverLogin, options.job);
     return startDriverJobUnlocked(driverLogin, jobIdValue, options);
   });
 }
@@ -2734,6 +2745,10 @@ async function startDriverJobUnlocked(driverLogin, jobIdValue, {
   offlineTrace = null
 } = {}) {
   if (!job) throw new Error("Driver job is no longer available.");
+  if (config.repair?.enabled) {
+    const existingRepairStart = await query("SELECT job_id FROM driver_job_records WHERE job_id=$1 AND driver_login=$2 AND truck_id=$3 AND status IN ('in_progress','complete') AND started_at IS NOT NULL", [jobIdValue,driverKey(driverLogin),String(job.truckId||'')]);
+    if (!existingRepairStart.rowCount) await assertRepairVehicleAvailable({truckId:job.truckId,plate:job.truckPlate});
+  }
   await assertSorReturnReady(job);
   assertDriverPlanExecutionDate(job.planDate);
   await assertNoClosedNetSuiteOrders(job.orderRefs || [], "start Driver work");
@@ -2973,7 +2988,14 @@ export async function endDriverRest(driverLogin, {
   return mapRestRecord(result.rows[0]);
 }
 
-export async function recordDriverJobPhotos(driverLogin, jobIdValue, {
+export async function recordDriverJobPhotos(driverLogin, jobIdValue, options = {}) {
+  return withTransaction(async () => {
+    await assertDriverExecutionActive(driverLogin, options.job);
+    return recordDriverJobPhotosUnlocked(driverLogin, jobIdValue, options);
+  });
+}
+
+async function recordDriverJobPhotosUnlocked(driverLogin, jobIdValue, {
   customerSignature = null,
   photoDataUrls = [],
   job = null,

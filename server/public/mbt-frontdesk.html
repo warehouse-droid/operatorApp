@@ -27,6 +27,11 @@
         Loading the controlled Front Desk configuration…
       </div>
 
+      <section id="overdueBins" class="mbt-frontdesk-panel" aria-label="Overdue bins" hidden>
+        <h2>Overdue bins</h2>
+        <p>Review the expected return date and request collection when the customer is ready.</p>
+        <div id="overdueBinList" aria-live="polite"></div>
+      </section>
       <div class="mbt-frontdesk-grid">
         <section class="mbt-frontdesk-panel" aria-labelledby="customerHeading">
           <div class="mbt-frontdesk-section-heading">
@@ -240,8 +245,8 @@
       </form>
     </dialog>
 
-    <script src="/app-sidebar.js"></script>
+    <script src="/app-sidebar.js?repairNav=20261027-v2"></script>
     <script src="/mbt-shell.js" type="module"></script>
-    <script src="/mbt-frontdesk.js" type="module"></script>
+    <script src="/mbt-frontdesk.js?v=frontdesk-current-actions-20261026" type="module"></script>
   </body>
 </html>

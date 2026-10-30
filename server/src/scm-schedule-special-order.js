@@ -16,9 +16,9 @@ export const SCM_SCHEDULE_SPECIAL_ORDER_CTES = `
           ON lower(member.order_ref) = lower(COALESCE(NULLIF(member_po.dispatch_ref, ''), member_po.tranid))
     ),
     po_request_sources AS (
-      SELECT schedule_po_id, po_id FROM po_schedule_sources
+      SELECT schedule_po_id, po_id, po_id AS target_po_id FROM po_schedule_sources
       UNION
-      SELECT source.schedule_po_id, split.source_po_id
+      SELECT source.schedule_po_id, split.source_po_id, source.po_id AS target_po_id
         FROM po_schedule_sources source
         JOIN dispatch_scm_po_splits split
           ON split.split_po_id = source.po_id AND split.status = 'active'
@@ -40,6 +40,10 @@ export const SCM_SCHEDULE_SPECIAL_ORDER_CTES = `
         JOIN sales_special_stock_cases special
           ON special.purchase_order_netsuite_id = source.po_id
          AND special.workflow_kind = 'special'
+         AND (special.purchase_order_split_id IS NULL OR EXISTS (
+           SELECT 1 FROM dispatch_scm_po_splits selected
+           WHERE selected.id=special.purchase_order_split_id AND selected.split_po_id=source.target_po_id
+             AND selected.status='active'))
        GROUP BY source.schedule_po_id
     ),
 `;

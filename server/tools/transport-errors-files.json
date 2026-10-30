@@ -1,0 +1,5 @@
+[
+  "src/mbt/bin-transport-domain.js",
+  "public/bin-transport-ui.js",
+  "public/mbt-planning.html"
+]

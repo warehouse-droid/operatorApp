@@ -1,3 +1,4 @@
+import { addLegacyCollection } from "../support/legacy-bin-collection-fixture.js";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
@@ -18,6 +19,7 @@ test("a ready unassigned return can be extended or exchanged without changing co
   await issueFrontdeskQuote(frontdeskCommand("planning-issue", actor, { quoteId, expectedRevision: 1, validUntil: "2037-08-04T12:00:00Z" }));
   await acceptFrontdeskQuote(frontdeskCommand("planning-accept", actor, { quoteId, expectedRevision: 2, acceptedAt: "2037-08-03T10:00:00Z" }));
   const result = await convertFrontdeskQuote(frontdeskCommand("planning-convert", actor, { quoteId, expectedRevision: 3 }));
+  await addLegacyCollection(result, actor);
   const contractId = result.body.contract.contractId; const line = result.body.serviceLines[0];
   await query("UPDATE mbt_service_visits SET status='completed',actual_completed_at=now() WHERE service_line_id=$1 AND service_action='delivery'", [line.serviceLineId]);
   await query("UPDATE mbt_service_visits SET status='ready' WHERE service_line_id=$1 AND service_action='return_bin'", [line.serviceLineId]);

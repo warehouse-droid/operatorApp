@@ -1,0 +1,25 @@
+{
+  "language": "zh-CN",
+  "pages": 32,
+  "screenshots": 33,
+  "pdfBytes": 1967787,
+  "chineseFonts": [
+    {
+      "familyName": "WenQuanYi Zen Hei",
+      "postScriptName": "WenQuanYiZenHei",
+      "isCustomFont": false,
+      "glyphCount": 4
+    }
+  ],
+  "checks": [
+    "No clipped pages or footer overlap",
+    "All screenshots loaded",
+    "All internal links resolved",
+    "No external dependencies or network access",
+    "No browser errors",
+    "Screenshot zoom opens and closes",
+    "PDF page count matches HTML",
+    "Chinese glyphs use a Chinese font"
+  ],
+  "verifiedAt": "2026-09-30T04:22:02.235Z"
+}

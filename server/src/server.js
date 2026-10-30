@@ -1,3 +1,10 @@
+import {filterOrdinaryTransportOrders,assertTransportOrderOwnership} from "./mbt/bin-transport-ownership.js";
+import { getDispatchOrderUnavailableReason } from "./dispatch-repository.js";
+import { createSharedJsonRead } from "./shared-json-read.js";
+import { mountReturnNotificationRoutes } from './return-notification-router.js';
+import { automaticReturnNotifications } from './return-automatic-notifications.js';
+import { aggregateReconciliationNightlyTick } from './aggregate-reconciliation-service.js';
+import { startStockRequestSalesOrderRefresh } from './stock-request-so-refresh.js';
 import {traceDriverCompletion} from "./driver-completion-trace.js";
 import {mountStockRequestConversationRoutes} from './stock-request-conversation-router.js';
 import { previewOperatorOrderReopen, reopenOperatorOrder, searchOperatorReopenOrders } from "./operator-order-reopen-repository.js";
@@ -63,6 +70,7 @@ import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-acc
 import express from "express";
 import { createFieldSalesRuntime } from "./field-sales/runtime.js";
 import { createMbrRuntime } from "./mbr/runtime.js";
+import { createRepairRuntime } from "./repair/runtime.js";
 import { createStockCheckRuntime } from "./stock-check/runtime.js";
 import { isMbrOnly, staffPathAllowed } from "../public/mbr/domain.js";
 import { decorateSorOrders } from "./sor-rental-repository.js";
@@ -86,6 +94,7 @@ import {
 } from "./google-maps-service.js";
 import { readNetSuiteOrderLine } from "./netsuite-order-line.js";
 import { netSuiteOrderWebhookLineFinancials } from "./netsuite-order-webhook-financials.js";
+import { binStopLabels } from "./mbt/bin-stop-labels.js";
 import { createMbtRouter } from "./mbt/router.js";
 import { createFrontdeskPricingAdapter } from "./mbt/frontdesk-pricing-adapter.js";
 import { confirmMbtBinDispatchPlan } from "./mbt/bin-dispatch-service.js";
@@ -93,7 +102,7 @@ import { pendingPlanningReturns, publishPlanningAssignments } from "./mbt/bin-pl
 import { binDispatchOrders } from "./mbt/dispatch-bin-safety.js";
 import { authorizeMbtPhase3Capability } from "./mbt/phase3-authorization.js";
 import { afterTransactionCommit, beginRollbackContext, pool, query, withTransaction } from "./db.js";
-import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from "./netsuite.js";
+import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite, listSpecialPurchaseUnitsFromNetSuite } from "./netsuite.js";
 import { fetchTransactionStatusesFromNetSuite } from "./netsuite.js";
 import {
   activateNetSuiteM2m,
@@ -121,7 +130,6 @@ import {
 } from "./netsuite-delayed-status-refresh-repository.js";
 import { createDelayedStatusRefreshWorker } from "./netsuite-delayed-status-refresh-service.js";
 import {
-  SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS,
   createScmScheduleStatusRefresh
 } from "./scm-schedule-status-refresh.js";
 import {
@@ -234,6 +242,7 @@ import {
 } from "./sales-order-auto-fulfillment-repository.js";
 import { configureOperatorNetSuitePostingCompletionEvents } from "./operator-netsuite-posting-finalizer.js";
 import { createOperator, getOperatorByToken, hasOperators, listAudit, listAuditOptions, listOperators, loginOperator, logoutToken, operatorHomeRoute, setOperatorActive, updateOperatorEmail, updateOperatorPassword, updateOperatorRoles, writeAudit } from "./auth-repository.js";
+import { recordOperatorPopupEvent } from "./operator-popup-audit.js";
 import {confirmFreshCycleCount,blindCycleCount} from './cycle-count-stock-refresh.js';
 import { applyInventoryClassificationRules, getCycleCountDraft, listCycleCountRecords, listInventoryClassifications, listInventoryFacets, listInventoryItems, submitCycleCount, updateInventoryClassification, upsertInventoryBalances } from "./inventory-repository.js";
 import { listReceivingVendors, listReceivingSources, listReceivingOrders, getReceivingOrder, searchReceivingItems, confirmReceivingLine, confirmPurchaseOrderReceivingLines, unconfirmReceivingLine, getReceivableReceivingOrder, buildItemReceiptPayload, recordReceivingReceipt, recordReceivingReceiptFailure, listReceivingReceipts, listLocalCoSources, listLocalCoReceivingOrders, searchLocalCoItems, getLocalCoReceivingOrder, confirmLocalCoReceivingLine, unconfirmLocalCoReceivingLine, receiveLocalCoOrder } from "./receiving-repository.js";
@@ -312,7 +321,7 @@ import {
 import {
   claimScmPurchaseOrderCatalogRefreshes,
   compactScmPurchaseOrderCard,
-  completeScmPurchaseOrderCatalogRefresh,
+  processScmPurchaseOrderCatalogRefresh,
   enqueueScmPurchaseOrderCatalogRefresh,
   failScmPurchaseOrderCatalogRefresh,
   getScmPurchaseOrderCatalogOrder,
@@ -511,6 +520,7 @@ import {
   queueScmTransferOrderPrint
 } from "./scm-transfer-order-print-service.js";
 import {
+  addRegularStockItems,
   cancelSalesStockRequest,
   getSalesStockRequest,
   getScmStockRequest,
@@ -888,6 +898,7 @@ async function assertNewHistoricalInactiveSalesOrdersReconciled(previousPlan = {
 }
 
 async function assertNewDispatchOrdersCanBePlanned(previousPlan = {}, nextPlan = {}, action = "plan these orders") {
+  await assertTransportOrderOwnership(previousPlan,nextPlan);
   await assertNoClosedNetSuiteOrders(
     operationalPlanOrderRefs(nextPlan),
     `remain in Dispatch when you ${action}`
@@ -1234,8 +1245,8 @@ function mergeDispatchTruckSequence(latestTrucks = [], requestedTrucks = []) {
   return merged;
 }
 
-async function dispatchPlannedAssignmentsFromProjection({ includeSnapshots = true } = {}) {
-  const rows = await listDispatchPlanOrderAssignmentsProjection({ includeSnapshots });
+async function dispatchPlannedAssignmentsFromProjection({ includeSnapshots = true, orderRefs = [] } = {}) {
+  const rows = await listDispatchPlanOrderAssignmentsProjection({ includeSnapshots, orderRefs });
   const assignments = new Map();
   for (const row of rows) {
     if (assignments.has(row.orderRef)) continue;
@@ -1283,7 +1294,11 @@ async function removeStaleCoPlannedAssignments(assignments) {
 }
 
 async function enrichDispatchOrdersWithPlanAssignments(orders = []) {
-  const plannedAssignments = await dispatchPlannedAssignmentsFromSnapshots();
+  if (!orders.length) {return [];}
+  const orderRefs = orders.map((order) => String(order.id || "")).filter(Boolean);
+  const plannedAssignments = orderRefs.length
+    ? await dispatchPlannedAssignmentsFromSnapshots({ orderRefs })
+    : new Map();
   return (orders || []).map((order) => {
     const planned = plannedAssignments.get(String(order.id || ""));
     return applyDispatchPlannedAssignment(order, planned || null);
@@ -1457,7 +1472,19 @@ async function listRestrictedScmDispatchOrderRefs({ exactOrderRefs = [] } = {}) 
     .map((ref) => String(ref || "").trim().toLowerCase())
     .filter(Boolean))].slice(0, 200);
   const result = await query(
-    `WITH restricted_rows AS (
+    `WITH scoped_reconciliation_states AS MATERIALIZED (
+       SELECT state.* FROM scm_reconciliation_order_state state
+        WHERE cardinality($1::text[]) = 0
+           OR state.source_order_netsuite_id::text = ANY($1::text[])
+           OR LOWER(BTRIM(state.source_order_ref)) = ANY($1::text[])
+           OR EXISTS (
+             SELECT 1 FROM jsonb_object_keys(CASE
+               WHEN jsonb_typeof(state.quantity_summary->'targets') = 'object'
+                 THEN state.quantity_summary->'targets'
+               ELSE '{}'::jsonb END) target_ref
+              WHERE LOWER(BTRIM(target_ref)) = ANY($1::text[])
+           )
+     ), restricted_rows AS (
        SELECT s.order_ref,
               s.display_ref,
               s.group_ref
@@ -1518,7 +1545,7 @@ async function listRestrictedScmDispatchOrderRefs({ exactOrderRefs = [] } = {}) 
        SELECT state.source_order_ref AS order_ref,
               NULL::text AS display_ref,
               NULL::text AS group_ref
-         FROM scm_reconciliation_order_state state
+         FROM scoped_reconciliation_states state
         WHERE LOWER(BTRIM(COALESCE(state.application_status, 'Queued'))) IN (
           'hold', 'complete', 'completed', 'cancelled', 'canceled'
         )
@@ -1558,7 +1585,7 @@ async function listRestrictedScmDispatchOrderRefs({ exactOrderRefs = [] } = {}) 
        SELECT target.target_ref AS order_ref,
               NULL::text AS display_ref,
               NULL::text AS group_ref
-         FROM scm_reconciliation_order_state state
+         FROM scoped_reconciliation_states state
          CROSS JOIN LATERAL JSONB_EACH(
            CASE
              WHEN JSONB_TYPEOF(state.quantity_summary->'targets') = 'object'
@@ -2018,23 +2045,24 @@ export async function loadDispatchOrdersForResponse({
       : Promise.resolve(new Set())
   ]);
   const exactCandidateOrders = [...orders, ...snapshotOrders];
-  const transferStates = await listFulfilledTransferStates(
-    [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "TO")
-      .flatMap(order => [order.id, ...(order.childOrders || [])])
-  );
-  const decorateTransfer = order => annotateFulfilledTransferOrders([order], transferStates)[0];
-  const fulfilledSalesStates = await listFulfilledSalesDeliveryStates(
-    [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "SO")
-      .flatMap(order => [order.id, ...(order.childOrders || [])])
-  );
-  const restrictedScmRefs = exactIdentityRequest
-    ? await listRestrictedScmDispatchOrderRefs({
+  const [transferStates, fulfilledSalesStates, restrictedScmRefs] = await Promise.all([
+    listFulfilledTransferStates(
+      [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "TO")
+        .flatMap(order => [order.id, ...(order.childOrders || [])])
+    ),
+    listFulfilledSalesDeliveryStates(
+      [...orders, ...snapshotOrders, ...hiddenScmOrders].filter(order => order.type === "SO")
+        .flatMap(order => [order.id, ...(order.childOrders || [])])
+    ),
+    exactIdentityRequest ? listRestrictedScmDispatchOrderRefs({
         exactOrderRefs: [
           ...normalizedExactOrderRefs,
           ...exactCandidateOrders.flatMap((order) => dispatchOrderLogicalRefs(order))
         ]
       })
-    : initialRestrictedScmRefs;
+      : initialRestrictedScmRefs
+  ]);
+  const decorateTransfer = order => annotateFulfilledTransferOrders([order], transferStates)[0];
   const historicalCandidates = historicalDate
     ? [...hiddenScmOrders, ...snapshotOrders].filter((order) => (
         ["SO", "PO", "TO"].includes(String(order?.type || "").trim().toUpperCase())
@@ -2109,14 +2137,16 @@ export async function loadDispatchOrdersForResponse({
     }
   }
   const completedSearchCandidates = [...completedSearchCandidatesById.values()];
-  const reconciliationPendingRefs = revealCompletedScmSearch && completedSearchCandidates.length
-    ? await listReconciliationCompletedOperationallyPendingDispatchRefs({
+  const [reconciliationPendingRefs, assigned] = await Promise.all([
+    revealCompletedScmSearch && completedSearchCandidates.length
+    ? listReconciliationCompletedOperationallyPendingDispatchRefs({
         candidateRefs: completedSearchCandidates.flatMap((order) => dispatchOrderLogicalRefs(order))
       })
-    : new Set();
-  const assigned = await enrichDispatchOrdersWithPlanAssignments([
-    ...planningVisibleOrders,
-    ...completedSearchCandidates
+    : new Set(),
+    enrichDispatchOrdersWithPlanAssignments([
+      ...planningVisibleOrders,
+      ...completedSearchCandidates
+    ])
   ]);
   const poLinked = await enrichDispatchOrdersWithPoTargetAllocations(assigned);
   const enriched = await enrichDispatchOrdersWithDependencies(poLinked);
@@ -5400,7 +5430,7 @@ function auditOrderId(value) {
 }
 
 const MUTATING_API_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-const AUDIT_SENSITIVE_FIELD = /(password|passcode|passphrase|private[_ -]?key|credential|token|secret|authorization|cookie|signature|photo|image|base64|data_?url)/i;
+const AUDIT_SENSITIVE_FIELD = /(password|passcode|passphrase|private[_ -]?key|api[_ -]?key|credential|token|secret|authorization|cookie|signature|photo|image|base64|data_?url)/i;
 const AUDIT_REFERENCE_FIELDS = [
   ["tranid", "tranid"],
   ["vrmaRef", "vrmaRef"],
@@ -6377,6 +6407,7 @@ function returnListFilters(req, extra = {}) {
           : {};
   return {
     ...mapped,
+    ...(type === "exchange" ? { recordType: "exchange" } : {}),
     status: requestedStatus === "approved"
       ? "accepted"
       : ["sync_failed", "synced"].includes(requestedStatus)
@@ -8440,6 +8471,8 @@ function normalizeWebhookReceivingOrder(payload, { type, locationId, locationTex
   };
 }
 
+import {applyPurchaseReceiptProgress,enqueuePurchaseReceiptWebhook,queueStalePurchaseReceiptRefreshes} from './purchase-receipt-refresh-repository.js';
+
 const DELAYED_STATUS_REFRESH_CONFIG = {
   sales_order: {
     netsuiteType: "SalesOrd",
@@ -8449,7 +8482,7 @@ const DELAYED_STATUS_REFRESH_CONFIG = {
   purchase_order: {
     netsuiteType: "PurchOrd",
     updateStatus: updatePurchaseOrderNetSuiteStatus,
-    events: ["dispatch.orders.updated", "receiving.order.updated"]
+    events: ["dispatch.orders.updated", "receiving.order.updated", "stock-request.updated", "special-stock-request.updated"]
   },
   transfer_order: {
     netsuiteType: "TrnfrOrd",
@@ -8505,6 +8538,7 @@ const delayedStatusRefreshWorker = createDelayedStatusRefreshWorker({
   ),
   fetchSalesOrderLines: fetchDeliveryOrderDetailsFromNetSuite,
   fetchPurchaseOrderLines: fetchPurchaseOrderDetailsFromNetSuite,
+  applyPurchaseOrderLines: applyPurchaseReceiptProgress,
   applyPurchaseOrderWeights: applyPurchaseOrderItemWeights,
   applyStatus: async ({ orderType, netsuiteOrderId, tranid, status, statusText }) => {
     const refreshConfig = DELAYED_STATUS_REFRESH_CONFIG[orderType];
@@ -8560,6 +8594,16 @@ export async function scmScheduleStatusRefreshTick() {
   } catch (error) {
     console.error("Scheduled stale PO/TO status refresh failed:", error.message);
     return { started: false, reason: "error", error: error.message };
+  }
+}
+
+export async function purchaseReceiptCatchupTick() {
+  if(!config.netsuite.directAccessEnabled) return [];
+  try {
+    return await queueStalePurchaseReceiptRefreshes();
+  } catch(error) {
+    console.error('Linked PO receipt catch-up failed:',error.message);
+    return [];
   }
 }
 
@@ -8748,6 +8792,8 @@ export async function processNetSuiteOrderWebhook(payload = {}, {
 app.use('/api/webhooks/netsuite/customer', createCustomerWebhookRouter());
 
 const mbrRuntime = createMbrRuntime({ authenticate: requireOperator, config, dataDir });
+const repairRuntime = createRepairRuntime({authenticate:requireOperator,authenticateDriver:requireDriver,config,dataDir});
+app.use('/api/repair',repairRuntime.router);
 // Bound contract inputs before the application-wide large photo parser.
 app.use('/api/mbr', mbrRuntime.router);
 
@@ -8897,10 +8943,14 @@ app.post("/api/webhooks/netsuite/if-ir", async (req, res, next) => {
     if (req.body?.eventId && String(req.body.eventId) !== String(eventId)) {
       return res.status(400).json({ error: "IF/IR webhook event ID does not match its signed header." });
     }
-    const stored = await storeScmIfIrWebhook(req.body || {}, {
-      rawBody: req.rawBody || "",
-      eventId,
-      timestamp
+    const stored = await withTransaction(async () => {
+      const accepted = await storeScmIfIrWebhook(req.body || {}, {
+        rawBody: req.rawBody || "",
+        eventId,
+        timestamp
+      });
+      await enqueuePurchaseReceiptWebhook(accepted);
+      return accepted;
     });
     res.status(202).json({
       accepted: true,
@@ -9062,6 +9112,10 @@ app.get('/mbr/setup', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/cont
 app.get(['/mbr/contracts', '/mbr/contracts/:id'], (_req, res) => res.sendFile(path.join(publicDir, 'mbr/contracts.html')));
 app.get('/mbr/sign', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/sign.html')));
 app.use(express.static(publicDir));
+app.get(['/operator/repair','/driver/repair'],(_req,res)=>res.sendFile(path.join(publicDir,'repair/requester.html')));
+app.get('/repair/office',(req,res)=>res.redirect(302,'/repair'+(req.originalUrl.includes('?')?req.originalUrl.slice(req.originalUrl.indexOf('?')):'')));
+app.get(['/repair','/repair/','/repair/workshop'],(_req,res)=>res.sendFile(path.join(publicDir,'repair/index.html')));
+app.get('/repair/quote',(_req,res)=>res.sendFile(path.join(publicDir,'repair/quote.html')));
 
 const smartScmRawUpload = express.raw({
   type: () => true,
@@ -10563,7 +10617,9 @@ const fieldSalesRuntime = createFieldSalesRuntime({ maps: googleMapsGateway, bro
 app.use("/api/field-sales", requireOperator, fieldSalesRuntime.router);
 app.get("/field-sales", (req, res) => res.redirect(302, "/field-sales/"));
 app.use("/api/mbt", requireOperator, createMbtRouter({
+  transportSourceLoader: input=>loadDispatchOrdersForResponse(input),
   planningChanged: change => emitAppEvent("dispatch.plan.saved", { ...change, refreshOrderPool: false }),
+  binSelectionRouteEstimator: input => googleMapsGateway.estimateRoute({ ...input, subsystem: "dispatch_route" }),
   confirmPlanningDay: (req, res, next) => {
     req.params.id = String(req.body?.planId || "");
     req.body = { ...req.body, commandId: `mbt-confirm:${req.operator.id}:${req.get("idempotency-key") || ""}`,
@@ -12316,7 +12372,7 @@ app.post("/api/sales/stock-requests", requireSalesAccess, requirePrivateSalesRec
 });
 
 app.get('/api/sales/stock-requests/alerts', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
-  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
+  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator),includeRequests:req.query.includeRequests==='1'}));} catch(error){next(error);}
 });
 app.post('/api/sales/stock-requests/:id/decisions/read', requireSalesAccess, requirePrivateSalesRecordAccess, async(req,res,next)=>{
   try {res.json(await acknowledgeRegularStockDecisions(req.params.id,req.body||{},{operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator)}));} catch(error){next(error);}
@@ -12360,6 +12416,18 @@ app.get("/api/sales/stock-requests/:id", requireSalesAccess, requirePrivateSales
   } catch (error) {
     next(error);
   }
+});
+
+app.post('/api/sales/stock-requests/:id/items', requireSalesAccess, requirePrivateSalesRecordAccess, async (req, res, next) => {
+  try {
+    const policy = await getSalesStockRequestAvailabilityPolicy();
+    const request = await addRegularStockItems(req.params.id,req.body || {},{
+      operatorId:req.operator.id,authorizedDestinationLocationIds:operatorSalesYardLocationIds(req.operator),
+      allowOverAvailability:policy.allowOverAvailability
+    });
+    emitStockRequestUpdate('sales-add-items',{requestId:request.id});
+    res.json(request);
+  } catch (error) { next(error); }
 });
 
 app.patch("/api/sales/stock-requests/:id", requireSalesAccess, requirePrivateSalesRecordAccess, async (req, res, next) => {
@@ -12434,7 +12502,7 @@ app.get("/api/scm/stock-requests", requireScmAccess, async (req, res, next) => {
 });
 
 app.get('/api/scm/stock-requests/alerts', requireScmAccess, async(req,res,next)=>{
-  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({scm:true,operatorId:req.operator.id}));} catch(error){next(error);}
+  try {res.setHeader('Cache-Control','private, no-store');res.json(await regularStockAlerts({scm:true,operatorId:req.operator.id,includeRequests:req.query.includeRequests==='1'}));} catch(error){next(error);}
 });
 app.get('/api/scm/stock-request-items', requireScmAccess, async(req,res,next)=>{
   try {res.setHeader('Cache-Control','private, no-store');res.json({items:await searchStockRequestItems({search:req.query.search,limit:req.query.limit})});} catch(error){next(error);}
@@ -12781,7 +12849,7 @@ app.post('/api/dispatch/special-stock-requests/delivery-method-alerts/:id/ack', 
 });
 
 app.get('/api/sales/special-stock-requests/alerts', requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async(req,res,next)=>{
-  try { specialStockNoStore(res);res.json(await getSpecialSalesAlertCounts(specialStockSalesContext(req))); }
+  try { specialStockNoStore(res);res.json(await getSpecialSalesAlertCounts({...specialStockSalesContext(req),includeRequests:req.query.includeRequests==='1'})); }
   catch(error){next(error);}
 });
 
@@ -13058,6 +13126,15 @@ app.post("/api/sales/special-stock-requests/:id/vendor-pickup/complete", require
   }
 });
 
+app.get('/api/scm/special-stock-requests/items/:itemId/units', requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    specialStockNoStore(res);
+    res.json(await listSpecialPurchaseUnitsFromNetSuite(req.params.itemId));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/scm/special-stock-requests/items", requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
@@ -13094,10 +13171,10 @@ app.get("/api/scm/special-stock-requests", requireSpecialStockWorkflow, async (r
   }
 });
 
-app.get('/api/scm/special-stock-requests/alerts', requireSpecialStockWorkflow, async (_req, res, next) => {
+app.get('/api/scm/special-stock-requests/alerts', requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json(await getSpecialStockAlertCounts());
+    res.json(await getSpecialStockAlertCounts({includeRequests:req.query.includeRequests==='1'}));
   } catch (error) { next(error); }
 });
 
@@ -13160,6 +13237,14 @@ app.post('/api/scm/special-stock-requests/:id/lines/:lineId/readiness', requireS
   } catch (error) { next(error); }
 });
 
+app.get('/api/scm/special-stock-requests/:id/purchase-order/splits', requireSmartScmAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    specialStockNoStore(res);
+    const {listSpecialPurchaseOrderSplits} = await import('./special-stock-request-repository.js');
+    res.json(await listSpecialPurchaseOrderSplits(req.params.id));
+  } catch (error) { next(error); }
+});
+
 app.get('/api/scm/special-stock-requests/:id/purchase-order/note', requireSmartScmAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
@@ -13208,6 +13293,7 @@ app.post("/api/scm/special-stock-requests/:id/purchase-order/link", requireSmart
   try {
     const detail = await linkSpecialPurchaseOrder(req.params.id, { ...req.body, verifiedRemote: false, operationId: null }, { operatorId: req.operator.id });
     emitSpecialStockUpdate("purchase-order-link", { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
+    emitAppEvent('scm.schedule.updated', {source:'special-po-link'});
     res.json(detail);
   } catch (error) {
     next(error);
@@ -13348,6 +13434,10 @@ app.get("/api/sales/schedule", async (req, res, next) => {
       brand: req.query.brand || "",
       from: req.query.from || "",
       to: req.query.to || "",
+      contentSearch: req.query.contentSearch || "",
+      remarkSearch: req.query.remarkSearch || "",
+      orderSearch: req.query.orderSearch || "",
+      packingSearch: req.query.packingSearch || "",
       view,
       audience: includeRestricted ? "scm" : "operations"
     });
@@ -13664,7 +13754,7 @@ async function legacyDispatchOrderPool({ type = "", search = "", historyPlanDate
     ? orders
     : orders.filter((order) => order?.dispatchPlanned !== true);
   return {
-    orders: visible,
+    orders: await filterOrdinaryTransportOrders(visible),
     nextCursor: "",
     ready: false,
     source: "legacy",
@@ -13738,7 +13828,11 @@ app.get("/api/dispatch/v2/order-feed/:id", async (req, res, next) => {
       order = candidates.find((candidate) => String(candidate.id).toLowerCase() === String(req.params.id).toLowerCase()
         || (/^\d+$/.test(req.params.id) && String(candidate.netsuiteId) === String(req.params.id))) || null;
     }
-    if (!order) return res.status(404).json({ error: "Dispatch order not found", code: "DISPATCH_ORDER_NOT_FOUND" });
+    if (!order) {
+      const reason = await getDispatchOrderUnavailableReason(req.params.id);
+      if (reason) return res.status(409).json(reason);
+      return res.status(404).json({ error: "Dispatch order not found", code: "DISPATCH_ORDER_NOT_FOUND" });
+    }
     res.json({ order: { ...order, catalogHydrated: true,
       catalogDetailSignature: compactDispatchOrderCard(order).catalogDetailSignature } });
   } catch (error) {
@@ -13932,7 +14026,7 @@ async function prepareDispatchV2DeltaCommand(previousPlan = {}, command = {}) {
   };
 }
 
-app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatcher, async (req, res, next) => {
+app.post("/api/dispatch/v2/plans/:id/commands", reportDispatchSaveTiming, requireOperator, requireDispatcher, async (req, res, next) => {
   let previousPlan = null;
   let submittedCommand = null;
   let command = null;
@@ -14050,7 +14144,7 @@ app.post("/api/dispatch/v2/plans/:id/commands", requireOperator, requireDispatch
   }
 });
 
-app.post("/api/dispatch/v2/plans/:id/checkpoints", requireOperator, requireDispatcher, async (req, res, next) => {
+app.post("/api/dispatch/v2/plans/:id/checkpoints", reportDispatchSaveTiming, requireOperator, requireDispatcher, async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
     if (config.dispatch?.plannerCommandMode !== "on") {
@@ -14290,7 +14384,7 @@ app.get("/api/dispatch/plans/current", async (req, res, next) => {
   try {
     const plan = await getCurrentDispatchPlan({ planDate: req.query.date });
     res.json(plan
-      ? { ...plan, exists: true }
+      ? { ...plan, exists: true, binStopLabels: await binStopLabels(plan) }
       : { exists: false, savedAt: "", orders: [], trucks: [], planDate: req.query.date || new Date().toISOString().slice(0, 10) });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
@@ -14460,7 +14554,7 @@ app.get("/api/dispatch/plans/:id/shipped-orders.csv", async (req, res, next) => 
 app.get("/api/dispatch/plans/:id/executed-order-reviews", requireOperator, requireDispatcher, async (req, res, next) => {
   try {
     dispatchPrivateNoStore(res);
-    res.json(await getDispatchSourceReviewPayload(req.params.id, { baseRevision: req.query.baseRevision }));
+    res.json(await getDispatchSourceReviewPayload(req.params.id, { baseRevision: req.query.baseRevision, baseDigest: req.query.baseDigest }));
   } catch (error) { next(error); }
 });
 
@@ -14489,7 +14583,7 @@ app.get("/api/dispatch/plans/:id", async (req, res, next) => {
   try {
     const plan = await getDispatchPlan(req.params.id);
     if (!plan) return res.status(404).json({ error: "Dispatch plan not found" });
-    res.json(plan);
+    res.json({ ...plan, binStopLabels: await binStopLabels(plan) });
   } catch (error) {
     next(error);
   }
@@ -15237,22 +15331,14 @@ app.patch("/api/dispatch/setup/drivers/:id/active", requireDispatcher, async (re
       const current = drivers.find((driver) => String(driver.id) === String(req.params.id));
       if (!current) return { notFound: true };
       if (current.active === req.body.active) return { current, unchanged: true };
-      const conflicts = req.body.active ? [] : await dispatchFleetDisableConflicts({ driver: current });
-      if (conflicts.length) return { current, conflicts };
-      return { current, result: await setDispatchDriverActive(current.id, req.body.active) };
+      const result = await setDispatchDriverActive(current.id, req.body.active);
+      if (result && !result.driver.active) await revokeDispatchDriverSessions(result.driver.login);
+      return { current, result };
     });
     if (change.notFound) return res.status(404).json({ error: "Driver not found." });
     if (change.unchanged) return res.json({ driver: change.current, unchanged: true });
-    if (change.conflicts?.length) {
-      return res.status(409).json({
-        code: "DISPATCH_FLEET_IN_USE",
-        error: `Cannot disable ${change.current.name || change.current.login}. Reassign or finish the active work first. ${change.conflicts[0].message}`,
-        conflicts: change.conflicts
-      });
-    }
     const { result } = change;
     if (!result) return res.status(404).json({ error: "Driver not found." });
-    if (!result.driver.active) await revokeDispatchDriverSessions(result.driver.login);
     await writeDispatchAudit({
       action: result.driver.active ? "dispatch_driver_enabled" : "dispatch_driver_disabled",
       entityType: "dispatch_driver",
@@ -17813,9 +17899,13 @@ app.delete("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next
   }
 });
 
+const readPlannedAssignmentsResponse = createSharedJsonRead(listDispatchPlannedAssignments);
+
 app.get("/api/dispatch/planned-assignments", async (req, res, next) => {
   try {
-    res.json(await listDispatchPlannedAssignments({ includeSnapshots: req.query.includeSnapshots !== "false" }));
+    const response = await readPlannedAssignmentsResponse(req.query.includeSnapshots !== "false");
+    res.set("Content-Type", "application/json; charset=utf-8");
+    res.set("ETag", response.etag).send(response.body);
   } catch (error) {
     next(error);
   }
@@ -18945,6 +19035,7 @@ app.get("/api/photo-upload/config", requireOperator, (req, res) => {
 app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res, next) => {
   try {
     let ref = String(req.query.ref || req.query.key || "");
+    if (normalizeR2Key(ref).startsWith('repair/')) return res.status(403).json({error:'Open Repair evidence through its authorized attachment download.'});
     const background = isBackgroundPhotoReference(ref) ? await getBackgroundPhoto(ref.slice(17)) : null;
     if (background) {
       const viewer = /** @type {any} */ (req).photoViewer;
@@ -22161,6 +22252,8 @@ app.get("/api/returns/customers/:customerId/pallet-balance", requireOperator, re
   }
 });
 
+mountReturnNotificationRoutes(app, { requireOperator, requireOperatorAccess, requireAdmin });
+
 app.get("/api/returns/operator/drafts", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority, async (req, res, next) => {
   try {
     assertReturnOperatorYard(req.operator, req.query.receivingLocationId || req.query.yardLocationId);
@@ -24210,6 +24303,14 @@ app.get("/api/delivery/notifications", async (req, res, next) => {
   }
 });
 
+app.post("/api/delivery/notification-events", async (req, res, next) => {
+  try {
+    res.json(await recordOperatorPopupEvent(req.operator, req.body));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/delivery/current-draft", async (req, res, next) => {
   try {
     res.json(await getCurrentOperatorDeliveryDraft(operatorId(req), {
@@ -25063,6 +25164,8 @@ async function scmReconciliationScheduledTick() {
         return;
       }
     }
+    const aggregate = await aggregateReconciliationNightlyTick({ operationalSyncRunning: anyNetSuiteSyncRunning });
+    if (aggregate.started) { return; }
     await scmReconciliationNightlyTick({
       operationalSyncRunning: anyNetSuiteSyncRunning
     });
@@ -25078,6 +25181,7 @@ async function returnPendingSyncTick() {
   returnPendingSyncTickRunning = true;
   try {
     await processPendingReturnSyncs({ limit: 25 });
+    await automaticReturnNotifications.process({ limit: 10 });
   } catch (error) {
     console.error("Scheduled pending return synchronization failed:", error.message);
   } finally {
@@ -25089,6 +25193,7 @@ async function returnReconciliationTick() {
   if (returnReconciliationTickRunning) return;
   returnReconciliationTickRunning = true;
   try {
+    if (await hasActiveScmReconciliationRun()) { return; }
     await reconcileReturnRecords({ limit: 100 });
   } catch (error) {
     console.error("Scheduled return reconciliation failed:", error.message);
@@ -25297,7 +25402,7 @@ export async function scmPurchaseOrderCatalogTick() {
     summary.claimed = refreshes.length;
     for (const refresh of refreshes) {
       try {
-        await catalogRefreshExecutor.run(async () => {
+        const processed = await catalogRefreshExecutor.run(() => processScmPurchaseOrderCatalogRefresh(refresh, async () => {
           if (refresh.orderRef) {
             const orders = await targetedScmPurchaseOrdersForResponse([refresh.orderRef], null, {
               includeRestricted: true
@@ -25320,12 +25425,11 @@ export async function scmPurchaseOrderCatalogTick() {
               source: refresh.source || "full-refresh"
             });
           }
-        });
-        await completeScmPurchaseOrderCatalogRefresh(refresh.id);
-        summary.completed += 1;
+        }));
+        if (processed) summary.completed += 1;
       } catch (error) {
         summary.failed += 1;
-        await failScmPurchaseOrderCatalogRefresh(refresh.id, error);
+        await failScmPurchaseOrderCatalogRefresh(refresh.id, error, refresh.claimToken);
         if (!refresh.orderRef) await markScmPurchaseOrderCatalogFailed(error);
         console.error(`SCM purchase-order catalog refresh ${refresh.id} failed:`, error.message);
       }
@@ -25451,6 +25555,7 @@ export async function startServer() {
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startNetSuiteMirrorWorkers();
+    startStockRequestSalesOrderRefresh({operationalSyncRunning:anyNetSuiteSyncRunning,emit:(/** @type {Record<string,any>} */ detail)=>{emitStockRequestUpdate('hourly-so-refresh',detail);emitSpecialStockUpdate('hourly-so-refresh',detail);}});
     setTimeout(() => void sorReturnTick(), 7000);
     setInterval(() => void sorReturnTick(), 30000);
     createSpecialExpiryRuntime({emit:requestIds=>emitSpecialStockUpdate('automatic-expiry',{requestIds})}).start();
@@ -25458,6 +25563,7 @@ export async function startServer() {
     waitlistRuntime.start();
     fieldSalesRuntime.start();
     mbrRuntime.start();
+    repairRuntime.start();
     stockCheckRuntime.start();
     startOperatorNetSuitePostingRuntime();
     deliveryOperationRuntime.start();
@@ -25474,13 +25580,13 @@ export async function startServer() {
     startSalesOrderAutoFulfillmentRuntime();
     bossApprovalRuntime.start();
     void delayedStatusRefreshTick();
-    setTimeout(() => void scmScheduleStatusRefreshTick(), 60_000);
+    setTimeout(() => void purchaseReceiptCatchupTick(), 30_000);
+    setInterval(() => void purchaseReceiptCatchupTick(), 15 * 60_000);
     autoSyncTick();
     photoArchiveAutoTick();
     void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error));
     setInterval(autoSyncTick, 60000);
     setInterval(() => void delayedStatusRefreshTick(), DELAYED_STATUS_REFRESH_POLL_INTERVAL_MS);
-    setInterval(() => void scmScheduleStatusRefreshTick(), SCM_SCHEDULE_STATUS_REFRESH_INTERVAL_MS);
     setInterval(photoArchiveAutoTick, 60000);
     setInterval(
       () => void smartScmAutoTick().catch((error) => console.error("Smart SCM scheduled tick failed:", error)),

@@ -17,6 +17,7 @@ function barcode(doc,value,x,y,width,height){
 const money=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD'}).format(n/100);
 const rate=n=>new Intl.NumberFormat('en-CA',{style:'currency',currency:'CAD',minimumFractionDigits:2,maximumFractionDigits:6}).format(Number(n));
 function quoteLineAmount(line){return line.grossAmountMinor??line.amountMinor;}
+function quotePackQuantity(value){return value==null||Number(value)===0?'':String(value);}
 function quoteTotalRows(totals){
  const rows=[['Subtotal',totals.subtotalMinor,false],[`HST (${totals.taxBps/100}%)`,totals.taxMinor,false],['Total CAD',totals.totalMinor,true]];
  if(Number.isSafeInteger(totals.discountMinor)&&totals.discountMinor>0){rows.splice(0,1,
@@ -78,7 +79,7 @@ function renderCompany(doc,quote){
   for(const line of s.lines){
    const hasSku=String(line.sku??'').trim().length>0,descriptionOffset=hasSku?14:0;
    const cells=[line.quantity,line.unit,line.description,rate(line.unitRate),money(quoteLineAmount(line)),
-    ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>String(line.packQuantities?.[field]??'')):[])];
+    ...(packing?['palletQty','sectionQty','layerQty','pieceQty'].map(field=>quotePackQuantity(line.packQuantities?.[field])):[])];
    doc.font('regular').fontSize(9);
    const height=packing?Math.max(30,...cells.map((value,i)=>{
     doc.font('regular').fontSize(i===2?9:8);

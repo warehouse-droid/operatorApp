@@ -1,0 +1,301 @@
+--- a/src/delivery-repository.js
++++ b/src/delivery-repository.js
+@@ -15,6 +15,7 @@
+ import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+ import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
+ import { assertNoCoSourcePacking } from "./co-source-packing-handoff.js";
++import { operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
+ import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { query, withTransaction } from "./db.js";
+@@ -1121,11 +1122,12 @@
+     linesByOrder.get(key).push(line);
+   }
+   const ordersByRef = new Map();
+-  for (const order of orderResult.rows) {
+-    const base = {
++  const routedOrders = await routeOperatorSalesOrders(orderResult.rows.map(order => ({
+       ...order,
+       lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
+-    };
++  })));
++  for (const base of routedOrders) {
++    const order = base;
+     if (isTransfer) {
+       ordersByRef.set(String(order.tranid), base);
+     } else {
+@@ -1173,6 +1175,8 @@
+     child_orders: childOrders,
+     child_order_refs: childOrders.map((order) => order.tranid),
+     child_order_ids: childOrders.map((order) => order.netsuite_id),
++    co_waiting_for_arrival: childOrders.some(order => order.co_waiting_for_arrival),
++    transit_co_ref: childOrders.find(order => order.co_waiting_for_arrival)?.transit_co_ref || base.transit_co_ref,
+     reload_authorized: reloadChildren.length > 0,
+     reload_child_order_refs: reloadChildren.map((order) => order.tranid),
+     reload_cycles: reloadChildren.map((order) => order.reload_cycle),
+@@ -1323,11 +1327,13 @@
+       if (!linesByOrder.has(key)) linesByOrder.set(key, []);
+       linesByOrder.get(key).push(line);
+     }
+-    for (const order of orderResult.rows) {
++    const routedOrders = await routeOperatorSalesOrders(orderResult.rows.map(order => ({
++      ...order, lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
++    })));
++    for (const order of routedOrders) {
+       ordersByKey.set(String(order.netsuite_id), await decorateActiveSalesOrderReload({
+         ...order,
+-        testFixture: sandboxFixtures && order.is_test_fixture === true,
+-        lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
++        testFixture: sandboxFixtures && order.is_test_fixture === true
+       }));
+     }
+   }
+@@ -1484,10 +1490,32 @@
+   };
+ }
+ 
++function groupedLocalCoLines(co, lines) {
++  const byId = new Map(lines.map(line => [String(line.id), line]));
++  return aggregateGroupLines(co.co_ref, [{ netsuite_id: co.delivery_order_id || -Number(co.id),
++    tranid: co.co_ref, order_type: 'co_order', lines }]).map(line => {
++    const sources = line.source_lines.map(source => byId.get(String(source.lineId)));
++    if (sources.length === 1) return sources[0];
++    return { ...line, id: line.id.replace('GRPLINE-', 'COGRPLINE-'), co_source_lines: sources,
++      confirmed: sources.every(source => Boolean(source.confirmed || source.confirmed_at)),
++      confirmed_at: sources.every(source => source.confirmed_at) ? sources[0].confirmed_at : null };
++  });
++}
++
++function localCoSourceLines(order) {
++  return (order.lines || []).flatMap(line => line.co_source_lines || [line]);
++}
++
++function localCoOperatorLine(order, lineId) {
++  return (order.lines || []).find(line => String(line.id) === String(lineId))
++    || localCoSourceLines(order).find(line => String(line.id) === String(lineId));
++}
++
+ function mapLocalCoOrderForDelivery(co = {}, lines = []) {
+   const details = co.details && typeof co.details === "object" ? co.details : {};
+   const loaded = isLocalCoLoaded(co);
+-  const mappedLines = lines.map(line => projectCoOperatorLinkedSupply(mapLocalCoLineForDelivery(line), { loaded }));
++  const mappedLines = groupedLocalCoLines(co,
++    lines.map(line => projectCoOperatorLinkedSupply(mapLocalCoLineForDelivery(line), { loaded })));
+   const releasedPacking = co.status === "pending_load" && !co.preparing_operator_id && !co.preparing_started_at
+     && mappedLines.some(line => line.confirmed_at && lineHasPackedQuantity(line));
+   const status = releasedPacking ? "packed" : String(co.status || "pending_load");
+@@ -1900,8 +1928,8 @@
+   const result = await query(
+     `WITH delivery_order_source AS (
+        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+-              foreign_total, order_location_id, order_location, outbound_location_id,
+-              outbound_location, delivery_method_id, sales_order_type AS delivery_method,
++              foreign_total, order_location_id, order_location, ${operatorCoYardColumnsSql("sales_orders")},
++              delivery_method_id, sales_order_type AS delivery_method,
+                operator_status, local_yard_order_status, preparing_operator_id,
+                preparing_started_at, status_updated_at,
+                CASE WHEN ${sandboxSql} AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active,
+@@ -1912,7 +1940,7 @@
+               dispatch_instructions, memo, 'sales_order'::text AS order_type,
+               NULL::bigint AS source_location_id, NULL::text AS source_location,
+               NULL::bigint AS destination_location_id, NULL::text AS destination_location
+-	       FROM sales_orders
++	       FROM sales_orders ${operatorCoRouteJoinSql("sales_orders")}
+ 	       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+ 	         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
+ 	         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
+@@ -2067,7 +2095,8 @@
+         AND NOT EXISTS (
+           SELECT 1
+             FROM local_co_orders source_co
+-           WHERE source_co.source_order_ref = delivery_order_source.tranid
++           WHERE delivery_order_source.order_type <> 'sales_order'
++             AND source_co.source_order_ref = delivery_order_source.tranid
+              AND source_co.status IN ('pending_load', 'preparing', 'packed', 'planned')
+              AND (
+                source_co.from_location_id IS NULL
+@@ -2132,7 +2161,8 @@
+   const locationClause = locationId ? `AND outbound_location_id = ANY($${params.push(outboundLocationIds(locationId))}::bigint[])` : "";
+   const result = await query(
+     `WITH planned_delivery_orders AS (
+-       SELECT dispatch_truck_plate, dispatch_load_name, outbound_location_id, operator_status,
++       SELECT dispatch_truck_plate, dispatch_load_name,
++              COALESCE(operator_co_route.route_location_id,sales_orders.outbound_location_id) AS outbound_location_id, operator_status,
+               local_yard_order_status, 'sales_order'::text AS order_type,
+               EXISTS (
+                 SELECT 1
+@@ -2141,7 +2171,7 @@
+                    AND reload_cycle.status = ANY($2::text[])
+                    AND reload_cycle.workflow_kind <> 'sales_order_reattempt'
+               ) AS reload_authorized
+-         FROM sales_orders
++         FROM sales_orders ${operatorCoRouteJoinSql("sales_orders")}
+ 	         WHERE dispatch_plan_date = $1
+ 	           AND COALESCE(dispatch_truck_plate, '') <> ''
+ 	           AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
+@@ -2469,7 +2499,9 @@
+ 
+ /** @param {any} id @param {{includeNetSuiteClosed?: boolean}} [options] */
+ export async function getDeliveryOrder(id, options = {}) {
+-  return attachOperatorLoadState(await getDeliveryOrderData(id, options));
++  const order = await getDeliveryOrderData(id, options);
++  const [routed] = order ? await routeOperatorSalesOrders([order]) : [];
++  return attachOperatorLoadState(routed || null);
+ }
+ 
+ async function getDeliveryOrderData(id, { includeNetSuiteClosed = false } = {}) {
+@@ -3866,7 +3898,7 @@
+     photoDataUrls,
+     sourceTable: "local_co_orders",
+     sourceRecordId: order.local_co_id || Math.abs(Number(order.netsuite_id)),
+-    lineSnapshot: operatorLoadLineSnapshot(order.lines || []),
++    lineSnapshot: operatorLoadLineSnapshot(localCoSourceLines(order)),
+     response: {
+       localYardOrderStatus: "Loaded",
+       coStatus: "planned",
+@@ -4975,6 +5007,27 @@
+ }
+ 
+ async function updateLocalCoLinePackedQuantity(order, lineId, next) {
++  const line = localCoOperatorLine(order, lineId);
++  if (line?.co_source_lines) {
++    const remaining = { ...next };
++    const updates = line.co_source_lines.map(source => {
++      assertOperatorLinkedLineLoadable(source);
++      const available = remainingPackAvailability(source);
++      const allocated = capConvertedPackQuantities(source, {
++        ...Object.fromEntries(['pallets', 'layers', 'sections', 'pieces'].map(unit =>
++          [unit, Math.min(positiveQuantity(remaining[unit]), available[unit])])),
++        salesQty: Math.min(positiveQuantity(remaining.salesQty), Math.max(0,
++          lineRequiredSalesQuantity(source) - lineLoadedSalesQuantity(source)))
++      });
++      for (const unit of Object.keys(remaining)) remaining[unit] = roundQuantity(remaining[unit] - allocated[unit]);
++      return { source, allocated };
++    });
++    if (Object.values(remaining).some(value => value > 0.000001)) {
++      throw new Error('Combined CO packing exceeds the source lines remaining quantity.');
++    }
++    for (const { source, allocated } of updates) await updateLocalCoLinePackedQuantity(order, source.id, allocated);
++    return;
++  }
+   await query(
+     `UPDATE local_co_order_lines line
+         SET packed_pallet_qty = $3,
+@@ -4995,7 +5048,7 @@
+   const currentOrder = await getDeliveryOrder(orderId);
+   if (!currentOrder || !isLocalCoDeliveryOrder(currentOrder)) throw new Error("Local CO order not found.");
+   const order = await claimLocalCoPreparingOrder(currentOrder, operatorId);
+-  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
++  const line = localCoOperatorLine(order, lineId);
+   if (!line) throw new Error("Local CO line not found.");
+   assertOperatorLinkedLineLoadable(line);
+   const available = remainingPackAvailability(line);
+@@ -5043,8 +5096,10 @@
+     actorOperatorId: operatorId,
+     action: absolute ? "delivery.local_co.line.update_packed_quantity" : "delivery.local_co.line.confirm",
+     orderId: order.netsuite_id,
+-    lineId,
+-    details: { coRef: order.tranid, pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections, salesQty: next.salesQty }
++    lineId: line.co_source_lines ? null : lineId,
++    details: { coRef: order.tranid, operatorLineId: lineId,
++      sourceLineIds: (line.co_source_lines || [line]).map(source => source.id),
++      pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections, salesQty: next.salesQty }
+   });
+ }
+ 
+@@ -6333,7 +6388,7 @@
+     return;
+   }
+   if (isLocalCoDeliveryOrder(order)) {
+-    const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
++    const line = localCoOperatorLine(order, lineId);
+     if (!line) throw new Error("Local CO line not found.");
+     const packed = {
+       pallets: positiveQuantity(line.packed_pallet_qty),
+@@ -6347,9 +6402,10 @@
+     await writeAudit({
+       actorOperatorId: operatorId,
+       action: "delivery.local_co.line.unpack",
+-      orderId,
+-      lineId,
+-      details: { coRef: order.tranid, ...packed }
++      orderId: order.netsuite_id,
++      lineId: line.co_source_lines ? null : lineId,
++      details: { coRef: order.tranid, operatorLineId: lineId,
++        sourceLineIds: (line.co_source_lines || [line]).map(source => source.id), ...packed }
+     });
+     return;
+   }
+--- a/src/receiving-repository.js
++++ b/src/receiving-repository.js
+@@ -1,4 +1,5 @@
+ import { isBackgroundPhotoReference } from "./operator-background-photos.js";
++import { receiveCoSourceSalesOrders, withCoReceivingMutation } from './co-source-receipt.js';
+ import { query, withTransaction } from "./db.js";
+ import { enqueuePurchaseReceiptRefresh } from './purchase-receipt-refresh-repository.js';
+ import { captureTransferPosting,readTransferReceiptProgress,applyTransferReceiptProgress,
+@@ -1111,7 +1112,11 @@
+   return { ...order.rows[0], lines: lines.rows };
+ }
+ 
+-export async function confirmLocalCoReceivingLine(coRefOrId, lineRowId, values, operatorId) {
++export function confirmLocalCoReceivingLine(...args) {
++  return withCoReceivingMutation(args[0], () => confirmLocalCoReceivingLineUnlocked(...args));
++}
++
++async function confirmLocalCoReceivingLineUnlocked(coRefOrId, lineRowId, values, operatorId) {
+   await assertLocalCoReceivingSourceEditable(coRefOrId, "confirm a local CO Receiving line");
+   const line = await query(
+     `SELECT line.*
+@@ -1155,7 +1160,11 @@
+   return getLocalCoReceivingOrder(coRefOrId);
+ }
+ 
+-export async function unconfirmLocalCoReceivingLine(coRefOrId, lineRowId, operatorId) {
++export function unconfirmLocalCoReceivingLine(...args) {
++  return withCoReceivingMutation(args[0], () => unconfirmLocalCoReceivingLineUnlocked(...args));
++}
++
++async function unconfirmLocalCoReceivingLineUnlocked(coRefOrId, lineRowId, operatorId) {
+   await assertLocalCoReceivingSourceEditable(coRefOrId, "unconfirm a local CO Receiving line");
+   const line = await query(
+     `SELECT line.*
+@@ -1200,6 +1209,8 @@
+ export async function receiveLocalCoOrder(coRefOrId, operatorId, { photoDataUrls = [] } = {}) {
+   const photos = Array.isArray(photoDataUrls) ? photoDataUrls.filter(isPhotoReference) : [];
+   if (photos.length < 2) throw new Error("Two receiving photos are required.");
++  const sourceSalesReceipt = await receiveCoSourceSalesOrders(coRefOrId, operatorId, photos);
++  if (sourceSalesReceipt) return sourceSalesReceipt;
+   const co = await getLocalCoReceivingOrder(coRefOrId);
+   if (!co) throw new Error("Local CO not found.");
+   if (!["planned", "completed"].includes(String(co.status || "").toLowerCase())) {
+--- a/src/co-source-packing-handoff.js
++++ b/src/co-source-packing-handoff.js
+@@ -121,13 +121,13 @@
+   if (!sources.length) {return;}
+   const result = await query(`SELECT co.co_ref FROM local_co_orders co
+     JOIN sales_orders source ON (co.source_order_ref=source.tranid OR co.details->'childOrderIds' ? source.tranid)
+-    WHERE source.netsuite_id=ANY($1::bigint[]) AND co.status=ANY($2::text[])
+-      AND co.loaded_at IS NULL AND co.received_at IS NULL
++    WHERE source.netsuite_id=ANY($1::bigint[]) AND co.status<>'cancelled'
++      AND ${completedCoArrivalSql('co')} IS NULL
+       AND (co.from_location_id=source.outbound_location_id
+         OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(source.outbound_location,':',1))))
+-    ORDER BY co.id LIMIT 1`, [sources.map(row => row.netsuite_id), ACTIVE_CO_STATUSES]);
++    ORDER BY co.id LIMIT 1`, [sources.map(row => row.netsuite_id)]);
+   if (result.rowCount) {
+-    throw handoffError(`Packing has moved to ${result.rows[0].co_ref}. Open that CO to pack or load this cargo.`, "CO_SOURCE_PACKING_HANDOFF");
++    throw handoffError(`Waiting for ${result.rows[0].co_ref} to arrive at the destination yard. Open that CO to pack or load the transfer cargo.`, "CO_SOURCE_PACKING_HANDOFF");
+   }
+ }
+ 
+--- a/public/operator.js
++++ b/public/operator.js
+@@ -4896,6 +4896,7 @@
+           ${viewMode === "packed" && !isCustomerPickupMode() && !vrmaReferenceOnly ? `<button class="secondary-button danger-button compact-action" data-action="unpack-order" type="button">${t("operator.unpackWholeOrder", "Unpack whole order")}</button>` : ""}
+         </div>
+         <p class="muted">${order.customer || ""}</p>
++        ${order.co_waiting_for_arrival ? `<p class="dispatch-plan-note">Waiting for ${escapeHtml(order.transit_co_ref || "CO")} to arrive at ${escapeHtml(order.outbound_location || "this yard")}.</p>` : ""}
+         <p class="muted">${shouldShowDeliverySchedule() ? deliveryScheduleText(order) : formatDate(order.trandate)} | ${order.delivery_method || ""}</p>
+         ${order.dispatch_planned ? `<p class="dispatch-plan-note">${plannedOrderText(order, { spotLabel: "Parking spot" })}</p>` : ""}
+       </div>

@@ -70,12 +70,13 @@ export async function enqueueDelayedStatusRefresh(input = {}) {
                   WHEN status IN ('pending', 'retry') THEN LEAST(available_at, $3::timestamptz)
                   ELSE available_at
                 END,
+                receipt_refresh_requested = receipt_refresh_requested OR (status = 'running' AND $4),
                 updated_at = now()
           WHERE id = $1
           RETURNING id AS job_id, order_type, netsuite_order_id, tranid, status,
                     attempt_count, available_at, lease_owner, lease_token, lease_expires_at,
                     false AS created`,
-        [existing.rows[0].job_id, identity.tranid, availableAt]
+        [existing.rows[0].job_id, identity.tranid, availableAt, input.rerunIfRunning === true]
       );
       return jobFromRow(refreshed.rows[0]);
     }
@@ -153,6 +154,7 @@ export async function claimDueDelayedStatusRefreshJobs({
        ), claimed_jobs AS (
          UPDATE netsuite_delayed_status_refresh_jobs job
             SET status = 'running',
+                receipt_refresh_requested = false,
                 attempt_count = job.attempt_count + 1,
                 lease_owner = $3,
                 lease_token = gen_random_uuid(),
@@ -184,11 +186,17 @@ export async function claimDueDelayedStatusRefreshJobs({
   });
 }
 
+async function lockRefreshIdentity(jobId) {
+  const row=(await query('SELECT order_type,netsuite_order_id FROM netsuite_delayed_status_refresh_jobs WHERE id=$1',[jobId])).rows[0];
+  if(row) await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))',[`${row.order_type}:${row.netsuite_order_id}`]);
+}
+
 export async function lockDelayedStatusRefreshLease(input = {}) {
   const identity = leaseIdentity(input);
   if (!identity.leaseToken) {
     throw new TypeError("Delayed status refresh lease token is required.");
   }
+  await lockRefreshIdentity(identity.jobId);
   const result = await query(
     `SELECT id
        FROM netsuite_delayed_status_refresh_jobs
@@ -232,6 +240,13 @@ export async function renewDelayedStatusRefreshLease({
 }
 
 export async function finishDelayedStatusRefreshAttempt(input = {}) {
+  return withTransaction(async()=>{
+    await lockRefreshIdentity(leaseIdentity(input).jobId);
+    return finishRefreshAttemptUnlocked(input);
+  });
+}
+
+async function finishRefreshAttemptUnlocked(input = {}) {
   const identity = leaseIdentity(input);
   const outcome = String(input.outcome || "").trim();
   if (!FINISH_OUTCOMES.has(outcome)) {
@@ -248,7 +263,7 @@ export async function finishDelayedStatusRefreshAttempt(input = {}) {
   const details = JSON.stringify(input.details || {});
   const result = await query(
     `WITH owned AS MATERIALIZED (
-       SELECT id, lease_token
+       SELECT id, lease_token, receipt_refresh_requested
          FROM netsuite_delayed_status_refresh_jobs
         WHERE id = $1
           AND status = 'running'
@@ -279,7 +294,16 @@ export async function finishDelayedStatusRefreshAttempt(input = {}) {
          FROM owned
         WHERE job.id = owned.id
           AND EXISTS (SELECT 1 FROM finished_attempt)
-       RETURNING job.id
+       RETURNING job.id, job.order_type, job.netsuite_order_id, job.tranid
+     ), receipt_followup AS (
+       INSERT INTO netsuite_delayed_status_refresh_jobs (
+         order_type, netsuite_order_id, tranid, status, available_at
+       )
+       SELECT finished.order_type, finished.netsuite_order_id, finished.tranid,
+              'pending', $6::timestamptz + interval '10 seconds'
+         FROM finished_job finished JOIN owned ON owned.id = finished.id
+        WHERE owned.receipt_refresh_requested AND $3 IN ('succeeded', 'failed')
+       RETURNING id
      )
      SELECT id FROM finished_job`,
     [

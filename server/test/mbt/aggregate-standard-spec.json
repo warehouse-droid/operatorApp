@@ -1,0 +1,23 @@
+{
+  "title": "MBT aggregate identity and standard dispatch weight",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); latest user instruction supplies 2600 lb per cubic yard",
+  "setup": {"dependencies": "none", "gitCommits": "none", "runner": "bash docker/run-mbt-aggregate-checks.sh", "artifacts": "Only in the disposable runner artifact directory"},
+  "setupAmendment": "Browser verification uses the existing test-e2e build target with the standard isolated Compose limits, wrapped in the repository retention runner. No new packages.",
+  "scenarios": [
+    "An aggregate created without density receives 2600 lb per cubic yard; supplied historical positive density is normalized to that standard.",
+    "Local-item and Front Desk configuration display the same 2600 lb standard for existing material records, without rewriting historical charge snapshots.",
+    "The aggregate creation form supplies the standard automatically and does not require a density decision.",
+    "GRAVEL and other valid configured local item codes do not require an AGG_ prefix; malformed, overlong, and duplicate identities remain rejected.",
+    "Two yards of configured GRAVEL at CAD 60 per yard produce a CAD 120 material line and 5200 lb dispatch weight, including when its stored legacy density is 1300.",
+    "A material without an active per-yard price remains rejected; density does not bypass rate validation.",
+    "Existing quoted prices, tax calculation, payment rules, and already stored charge snapshots remain unchanged. The pure calculator can still replay an explicit historical density."
+  ],
+  "failureModel": [
+    {"risk": "wrong dispatch weight or pounds/kilograms confusion", "check": "exact 5200 lb integration assertion, randomized quantity properties"},
+    {"risk": "accepting an unpriced item or invalid identity", "check": "missing-price integration case and adversarial identity cases"},
+    {"risk": "changing financial totals", "check": "existing customer-charge calculator and workflow suites plus exact material-extension assertion"},
+    {"risk": "rewriting historical evidence", "check": "no database migration or snapshot mutation; pure calculator replay regression"},
+    {"risk": "frontend still asks for density", "check": "browser form assertions"}
+  ]
+}

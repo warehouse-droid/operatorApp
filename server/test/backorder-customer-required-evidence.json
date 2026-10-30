@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "failures": 0,
+  "groups": {
+    "api": {
+      "tests": 42,
+      "pass": 9,
+      "fail": 0,
+      "skipped": 33
+    },
+    "composer": {
+      "tests": 11,
+      "pass": 1,
+      "fail": 0,
+      "skipped": 10
+    },
+    "regressions": {
+      "tests": 66,
+      "pass": 66,
+      "fail": 0,
+      "skipped": 0
+    }
+  },
+  "sourceHashes": {
+    "src/special-stock-request-domain.js": "e33332b25e27d8143baf96cf048a09001411d5f95d02688a7dcd6c74b314aa7c",
+    "src/backorder-request-service.js": "75616e001ac61950904dbd669b4aa514b0f06533cef4b4e541c77a1825481913",
+    "src/stocking-backorder-conversion.js": "c74caf09ab4fe70d195a17b668e9680d67f5aad22ec1b46d3854d72506fcbd93",
+    "public/regular-stock-ui.js": "dd605b202cf923edc9ad07cc01b3dc2a6908f1f887e4b4d91e8fe4a70a926812",
+    "public/backorder-stock-requests.js": "ff86e6873317eb48833d695bcd3e7b30216373046272deb3ccecef8630807756",
+    "public/stocking-backorder-conversion-ui.js": "931e9852aa9018b490f89e717d58f05884eb1a28a60863db2b7c0671f8ef46f8",
+    "public/sales-stock-requests.js": "b34046fe968179e5a11a33565320520e02c252fb3c153b2428c507036243862e",
+    "public/scm-stock-requests.js": "96d5fd673ceee86baada0cd6bd3116ee634b297664ac9a0e690f18563eaae60e",
+    "public/sales-stock-requests.html": "890656ec8fb0dddfaf294116d03282d7f0738c4f65142ac1a25af2025b6b2ed4",
+    "public/scm-stock-requests.html": "503dd738a61a15c3c98256860d4ea87dc8e622abc66a9fa7908e492254089d3a"
+  },
+  "scope": "Required names on submission, header updates, and Stocking conversion; empty/whitespace rejection is atomic; existing customer preserved; other regular request types retain their rules.",
+  "historicalSuiteLimitations": "Exploratory full suite includes obsolete alert/filter assertions and a worker test requiring a historical source snapshot; these are outside this focused customer-name run."
+}

@@ -1,0 +1,35 @@
+{
+  "feature": "Faster pallet SO search and compact customer results",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "setup": "Existing Node, Playwright, fast-check, c8, ESLint and TypeScript only. No dependencies, migrations, commits or credential changes. Use the bounded disposable test runner and preserve unrelated workspace/live changes with an app-only overlay and rollback.",
+  "scenarios": [
+    "P1 Pallet-only SO lookup reads the current order header/customer without loading product descriptions, pricing, units or packing conversions. Stock lookup retains complete lines.",
+    "P2 Closed orders retain their existing per-line fulfillment check. Pending, partial and cancelled orders fail before reading the pallet balance. Unknown orders and malformed references fail safely.",
+    "P3 Every SO enquiry and submission still reads fresh balance data; customer identity, local reservations, credit reconciliation, cross-yard pallet acceptance and stock yard restrictions are preserved.",
+    "U1 One or a few customer matches remain compact and top-aligned at phone, tablet and desktop sizes. A long result list remains scrollable and selectable.",
+    "O1 Compare read-only live lookup timings and result identity; report NetSuite variability without promising a fixed response time. Keep concise audit evidence and remove all disposable test resources."
+  ],
+  "failureModel": {
+    "incorrectEligibility": "Closed/incomplete order and blocked-status integration regressions, including generated status/quantity cases and mutation.",
+    "wrongCustomerOrStaleBalance": "Fresh-report and customer identity tests, existing saved-search and reservation regressions.",
+    "stockRegression": "Default complete-line behavior and full return subsystem regression suite.",
+    "unusableCustomerList": "Real browser geometry checks for one, three and many results at multiple viewport widths.",
+    "deploymentDrift": "Three-way merge from task baseline onto captured live sources; validate candidate; verify hashes and health after deployment; automatic app-only rollback.",
+    "remoteLatency": "Operational timing samples; external NetSuite latency cannot be bounded by local tests."
+  },
+  "revision2": {
+    "supersedes": [
+      "P1 header-only optimization",
+      "P2 extra closed-order fetch"
+    ],
+    "reason": "Live header query experiments were slower (3.7\u201319s); retain the original SO query and all eligibility behavior.",
+    "scenarios": [
+      "P1 Run linked RA-credit lookup concurrently with fresh balance reads; resolve PALLET once before the concurrent work when links are needed.",
+      "P2 Preserve existing SO identity, complete line/status checks, and every fresh balance/credit reservation rule. New credits absent from the observed identity set remain reserved.",
+      "P4 No links require no extra PALLET resolution or link request. Either remote failure fails the lookup and leaves reservations unchanged.",
+      "O2 Successful SO lookups log order reference, mode and total elapsed milliseconds, without customer/contact data or credentials."
+    ],
+    "performance": "Only claim timing reductions supported by matched read-only live observations; external NetSuite variance remains."
+  }
+}

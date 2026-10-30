@@ -1,0 +1,97 @@
+[
+  {
+    "test": "All Already Ordered request shows Completed and no remaining SO/PO steps",
+    "error": "expect(locator).toHaveCount(expected) failed",
+    "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('[data-backorder-detail]').locator('form')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('[data-backorder-detail]').locator('form')\n        14 \u00d7 locator resolved to 1 element\n           - unexpected value \"1\""
+  },
+  {
+    "test": "Completing the last material after a PO was linked removes its remaining planning prompt",
+    "error": "expect(locator).toHaveCount(expected) failed",
+    "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('[data-backorder-detail] form')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('[data-backorder-detail] form')\n        14 \u00d7 locator resolved to 1 element\n           - unexpected value \"1\""
+  },
+  {
+    "test": "Mixed Backorder skips completed materials in PO readiness and finishes remaining normal workflow",
+    "error": "'false == true'",
+    "detail": "'false == true'"
+  },
+  {
+    "test": "Already Ordered clears an outstanding SCM review alert while the remaining material awaits PO linkage",
+    "error": "'false == true'",
+    "detail": "'false == true'"
+  },
+  {
+    "test": "Sales attaches the NetSuite quotation number before review and after closure with retained input on conflicts",
+    "error": "locator.selectOption: Timeout 10000ms exceeded.",
+    "detail": "|-\n    locator.selectOption: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for locator('[data-scm-stock-filter=\"backorderStageFilter\"]')"
+  },
+  {
+    "test": "SCM and Sales link orders while Confirmed, then queue the PO reference for Dispatch Arrangement",
+    "error": "expect(locator).toHaveCount(expected) failed",
+    "detail": "|-\n    expect(locator).toHaveCount(expected) failed\n    \n    Locator:  locator('dialog.regular-stock-popup[open]')\n    Expected: 0\n    Received: 1\n    Timeout:  5000ms\n    \n    Call log:\n      - Expect \"to.have.count\" with timeout 5000ms\n      - waiting for locator('dialog.regular-stock-popup[open]')\n        14 \u00d7 locator resolved to 1 element\n           - unexpected value \"1\""
+  },
+  {
+    "test": "Sales gets a PO-linked notification with its NetSuite number and Open request acknowledges it",
+    "error": "expect(locator).toContainText(expected) failed",
+    "detail": "|-\n    expect(locator).toContainText(expected) failed\n    \n    Locator: locator('dialog.regular-stock-popup[open]')\n    Expected substring: \"STREQ-000058\"\n    Received string:    \"Stock request needs your inputSTREQ-000056Review the SCM response and confirm your decision.Open requestView all updatesClose\"\n    Timeout: 5000ms\n    \n    Call log:\n      - Expect \"to.have.text\" with timeout 5000ms\n      - waiting for locator('dialog.regular-stock-popup[open]')\n        14 \u00d7 locator resolved to <dialog open=\"\" data-input-request-id=\"56\" class=\"regular-stock-popup\" data-notification-role=\"sales\" aria-labelledby=\"regular-stock-popup-title\" data-os-notification-id=\"regular-stock:input:56:sales_confirmation:2\">\u2026</dialog>\n           - unexpected value \"Stock request needs your inputSTREQ-000056Review the SCM response and confirm your decision.Open requestView all updatesClose\""
+  },
+  {
+    "test": "A pending Backorder save cannot replace another request selected by Sales",
+    "error": "locator.click: Timeout 10000ms exceeded.",
+    "detail": "|-\n    locator.click: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for getByText('Edit request header', { exact: true })\n        - locator resolved to <summary>Edit request header</summary>\n      - attempting click action\n        2 \u00d7 waiting for element to be visible, enabled and stable\n          - element is visible, enabled and stable\n          - scrolling into view if needed\n          - done scrolling\n          - <dialog open=\"\" data-input-request-id=\"56\" class=\"regular-stock-popup\" data-notification-role=\"sales\" aria-labelledby=\"regular-stock-popup-title\" data-os-notification-id=\"regular-stock:input:56:sales_confirmation:2\">\u2026</dialog> intercepts pointer events\n        - retrying click action\n        - waiting 20ms\n        2 \u00d7 waiting for element to be visible, enabled and stable\n          - element is visible, enabled and stable\n          - scrolling into view if needed\n  "
+  },
+  {
+    "test": "Backorder local editing, quote preview, information replies and closed-stage filters work in the browser",
+    "error": "locator.fill: Timeout 10000ms exceeded.",
+    "detail": "|-\n    locator.fill: Timeout 10000ms exceeded.\n    Call log:\n      - waiting for locator('[data-backorder-form][data-action=\"information/request\"]').locator('[name=\"question\"]')"
+  },
+  {
+    "test": "SCM Backorder case-stage and clear filters find closed requests without TO queues",
+    "error": "Expected values to be strictly equal:",
+    "detail": "|-\n    Expected values to be strictly equal:\n    + actual - expected\n    \n    + 'await_customer_confirmation'\n    - 'dispatch_arrangement'"
+  },
+  {
+    "test": "New Backorder enquiry hides order links in Sales and SCM",
+    "error": "expect(locator).toContainText(expected) failed",
+    "detail": "|-\n    expect(locator).toContainText(expected) failed\n    \n    Locator: locator('[data-backorder-detail]')\n    Timeout: 5000ms\n    - Expected substring  -  1\n    + Received string     + 16\n    \n    - New enquiry\n    + STREQ-000062 \u00b7 BackorderPending SCM\n    +       \n    +       \n    +       Review requiredConversationSales and SCMNo messages yet.MessageSend messageRefresh messagesCustomerTEST Backorder CustomerVendorTEST VendorFulfillmentPickupSOPendingPOPendingNetSuite quotation: \u2014Save quotation numberNetSuite quotation numberSave quotation numberSCM must review stock and Sales must accept every open material before linking an SO.\n    +       SCM review \u2192 Sales acceptance \u2192 Confirmed (Sales links SO; SCM links PO) \u2192 PO reference + Queued \u2192 Dispatch Arrangement.Edit request headerSave request headerCustomer name *Customer phoneFulfillmentPickupDelivery\n    +     \n    +     Delivery addre"
+  },
+  {
+    "test": "SCM Request information appears before the material lines",
+    "error": "expect(locator).toBeVisible() failed",
+    "detail": "|-\n    expect(locator).toBeVisible() failed\n    \n    Locator: locator('[data-backorder-form][data-action=\"information/request\"]')\n    Expected: visible\n    Timeout: 5000ms\n    Error: element(s) not found\n    \n    Call log:\n      - Expect \"to.be.visible\" with timeout 5000ms\n      - waiting for locator('[data-backorder-form][data-action=\"information/request\"]')"
+  },
+  {
+    "test": "SCM Regular queue filter supports multiple selections, persists them and clears with other filters",
+    "error": "expect(locator).toBeVisible() failed",
+    "detail": "|-\n    expect(locator).toBeVisible() failed\n    \n    Locator: locator('details[aria-label=\"Regular stock request queue\"]')\n    Expected: visible\n    Timeout: 5000ms\n    Error: element(s) not found\n    \n    Call log:\n      - Expect \"to.be.visible\" with timeout 5000ms\n      - waiting for locator('details[aria-label=\"Regular stock request queue\"]')"
+  },
+  {
+    "test": "SCM shows the vendor and receiving yard for each line even when the vendor directory is unavailable",
+    "error": "'false == true'",
+    "detail": "'false == true'"
+  },
+  {
+    "test": "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+    "error": "'false == true'",
+    "detail": "'false == true'"
+  },
+  {
+    "test": "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+    "error": "The input did not match the regular expression /pending update/. Input:",
+    "detail": "|-\n    The input did not match the regular expression /pending update/. Input:\n    \n    'SCM needs your update. Open the request to reply.'"
+  },
+  {
+    "test": "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+    "error": "The expression evaluated to a falsy value:",
+    "detail": "|-\n    The expression evaluated to a falsy value:\n    \n      assert.ok(alert.body.requests.some(r=>r.id===d.id && r.action==='backorder'))"
+  },
+  {
+    "test": "Manual Backorder links keep revised material confirmations in Sales notifications",
+    "error": "The expression evaluated to a falsy value:",
+    "detail": "|-\n    The expression evaluated to a falsy value:\n    \n      assert.ok(alerts.body.requests.some(row=>row.id===d.id && row.action==='backorder'))"
+  },
+  {
+    "test": "backorder browser: transfer without date, Sales acceptance, then actual SO ETA",
+    "error": "'page.waitForResponse: Timeout 8000ms exceeded while waiting for event \"response\"'",
+    "detail": "'page.waitForResponse: Timeout 8000ms exceeded while waiting for event \"response\"'"
+  }
+]

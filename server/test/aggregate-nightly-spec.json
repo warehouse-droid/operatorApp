@@ -1,0 +1,37 @@
+{
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "request": "Nightly reconciliation for pending fulfillment SOs containing aggregate materials, with Admin reconciliation controls",
+  "schedule": "Separate enable switch and time, default 21:30 America/Toronto; existing broad nightly and disabled 15-minute scheduler unchanged",
+  "behaviors": {
+    "A1": "Only active, real, positive-ID Pending Fulfillment SOs with active positive-quantity aggregate material lines qualify; both Delivery and Pick-Up; mixed material orders qualify once.",
+    "A2": "Exact catalog material names/prefixes include bulk and bagged aggregates; reject polymeric sand, sand-colored pavers, roofing gravel stops, packaging, inactive/zero-quantity lines and PO/TO.",
+    "S1": "Disabled, before-time, unapproved SO scope, or busy operational work creates no run.",
+    "S2": "Persist at most one aggregate nightly run per Toronto date across concurrent workers, failure, interruption, and restart; retain ordinary manual resume for unfinished targets.",
+    "S3": "Freeze the selection filter and schedule date in the run; selection and resume never broaden into non-aggregate orders; successful aggregate runs never consume the broad nightly date.",
+    "U1": "Admin sees a dedicated form with enable, time, fixed scope, next run, last run/status; saving persists through the existing admin-only settings endpoint and reload.",
+    "U2": "Invalid times/flags rejected; unauthenticated and non-admin writes denied; history labels aggregate scope explicitly.",
+    "I1": "Existing packing-draft, local reopen, operational priority, frozen-target resume, manual reconciliation and response-sharing protections remain. No NetSuite financial writes added."
+  },
+  "failureModel": {
+    "wrong_scope": "SQL fixtures plus material classifier properties and service wiring regression",
+    "duplicate_runs": "real database concurrent creation and restart tests with unique constraint",
+    "lost_settings": "row-locked updates with concurrent patch tests",
+    "dry_run_or_review_applied": "existing reconciliation tests, selected scope uses existing executor",
+    "time_zone": "Toronto DST and midnight schedule property tests",
+    "unauthorized_settings": "real HTTP authorization tests",
+    "deployment_regression": "overlay only task delta on current live image, health and source hash verification, rollback available"
+  },
+  "setup": {
+    "newDependencies": [],
+    "tests": "standard bounded disposable Compose runner",
+    "git": "preserve unrelated uncommitted changes; no commits",
+    "evidence": "test/aggregate-nightly-evidence.json"
+  },
+  "amendments": [
+    {
+      "reason": "User asked why SOB122244 remained pending after full SO reconciliation; live evidence found 105 applied Billed results ignored by Operator.",
+      "O1": "Operator pending lists and Billed family checks honor fresh, applied, current Billed reconciliation results; never proposals, reviews, locally reopened work or results older than newer canonical sync. Canonical headers/packing data stay intact."
+    }
+  ]
+}

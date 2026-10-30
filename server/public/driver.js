@@ -3117,6 +3117,7 @@ function renderNoJob() {
       <div class="empty-actions">
         <button class="primary" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
         <button class="secondary" data-action="open-history" type="button">${t("common.history", "History")}</button>
+        <button class="secondary compact" data-action="repair-requests" type="button" style="grid-column:1/-1">Repair requests</button>
       </div>
     </section>
     ${activeRest ? renderRestModal() : ""}
@@ -3199,6 +3200,8 @@ function renderOrders(job) {
     <section class="order-card">
       <div>
         <h3>${escapeHtml(order.orderRef)}</h3>
+        ${job.stopType === "pickup" && order.poRefs?.length
+          ? `<p class="pickup-po-refs"><strong>${t("driver.poRef", "PO Ref")}:</strong> ${order.poRefs.map(escapeHtml).join(", ")}</p>` : ""}
       </div>
       <div class="item-list">
         ${items.map((item) => `
@@ -3760,6 +3763,7 @@ function binAssetRoleLabel(role) {
 }
 
 function driverBinActionLabel(job) {
+  if (job?.mbt?.actionName) return job.mbt.actionName;
   const action = String(job?.mbt?.serviceAction || job?.mbt?.actionCode || "").toLowerCase();
   const labels = {
     delivery: t("driver.binActionDelivery", "Delivery"),
@@ -3913,11 +3917,10 @@ function renderDriverBinEvidence(job) {
 }
 
 function renderDriverBinSummary(job) {
-  const seen=new Set();
-  const assets = Object.entries(job.mbt?.exactAssets || {}).filter(([, asset]) => {
-    if (!asset?.assetId || seen.has(asset.assetId)) return false;
-    seen.add(asset.assetId);return true;
-  });
+  const exact=job.mbt?.exactAssets || {};
+  const collection=/^(pickup|dump|return)/.test(job.mbt?.actionCode || "");
+  const role=collection && exact.incoming?.assetId ? "incoming" : exact.outgoing?.assetId ? "outgoing" : "expected";
+  const assets=exact[role]?.assetId ? [[role,exact[role]]] : [];
   const requirements = window.DriverBinUI.requirements(job);
   return `
     <section class="driver-bin-work-order" data-driver-bin-job>
@@ -3929,6 +3932,7 @@ function renderDriverBinSummary(job) {
         <div><span>${t("driver.binAction", "Action")}</span><strong>${escapeHtml(driverBinActionLabel(job))}</strong></div>
         <div><span>${t("driver.binVisit", "Visit")}</span><strong>${escapeHtml(job.mbt?.displayReference || job.mbt?.visitReference || "-")}</strong></div>
       </div>
+      ${[job.mbt?.cargo,...(job.mbt?.cargoDropoffs || [])].filter(Boolean).map(item=>`<p class="driver-bin-cargo"><strong>${escapeHtml(item.description)}</strong> · ${escapeHtml(item.weightLbs)} lb${item.quantityMilliYards?` · ${Number(item.quantityMilliYards)/1000} yd³`:''}</p>`).join('')}
       ${assets.length ? `<div class="driver-bin-assets">${assets.map(([role, asset]) => `
         <div data-bin-asset-role="${escapeHtml(role)}">
           <span>${escapeHtml(binAssetRoleLabel(role))}</span>
@@ -5545,10 +5549,10 @@ function renderDriverHistory() {
             <p>${escapeHtml(driver?.name || t("stats.driver", "Driver"))}</p>
             <h2>${t("driver.personalHistory", "Personal History")}</h2>
           </div>
-          <button class="secondary compact history-back-button" data-action="back-job" type="button">${t("common.back", "Back")}</button>
+          <div class="empty-actions"><button class="secondary compact" data-action="repair-requests" type="button">Repair requests</button><button class="secondary compact history-back-button" data-action="back-job" type="button">${t("common.back", "Back")}</button></div>
         </div>
         <div class="history-filter">
-          <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
+            <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
           <button class="secondary compact" data-action="refresh-history" type="button">${t("common.refresh", "Refresh")}</button>
         </div>
       </div>
@@ -5911,6 +5915,7 @@ function disconnectEvents() {
 
 app.addEventListener("click", async (event) => {
   const button = event.target.closest("button");
+  if (button?.dataset.action === "repair-requests") { location.assign("/driver/repair"); return; }
   if (!button) return;
   const action = button.dataset.action;
   if (action === 'start-job' && currentJob?.sorReturnReadiness?.some(state => !state.allowed)) {
@@ -7297,7 +7302,7 @@ if ("serviceWorker" in navigator) {
     window.setTimeout(requestDriverWorkerVersion, 0);
     window.setTimeout(publishDriverOfflineMode, 0);
   });
-  navigator.serviceWorker.register("/driver-service-worker.js?v=20261020-bin-workflows", {
+  navigator.serviceWorker.register("/driver-service-worker.js?v=20261028-repair-pwa", {
     scope: "/driver",
     updateViaCache: "none"
   })

@@ -1,0 +1,121 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "tier": 3,
+  "red": {
+    "tests": 8,
+    "passed": 1,
+    "failed": 7,
+    "note": "One initial HTTP failure was a test-client issue: fetch adds Cache-Control: no-cache to conditional requests. Replaced that transport with raw HTTP; retained the 304 expectation and added the baseline 304 assertion."
+  },
+  "skipped": {
+    "repositoryWideSuite": "Six directly related suites run; unrelated application suites omitted on the shared host.",
+    "legacyServerTypes": "Strict types cover the new module; legacy server syntax, lint baseline and the actual route are checked.",
+    "dependencyAudit": "No dependencies added or changed.",
+    "clientDisconnectStress": "No cancellation coupling was introduced; pending work belongs to the shared read, not a client."
+  },
+  "versions": {
+    "node": "v20.20.2",
+    "c8": "12.0.0",
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0"
+  },
+  "sourceHashes": {
+    "src/shared-json-read.js": "c493b60187bdee1dee37131d042e6f2968f1d1492f7c1731b3d32160cf994217",
+    "src/server.js": "1afa005e04180bf6e313db00f322698c4873dce9e4e8f9c132a6afc3b5480566",
+    "test/mbt/unit/shared-json-read.test.js": "48d6fab7729e011653a67e9f8a4f127056d7b54231e736935898120ec92ecb96",
+    "test/mbt/unit/shared-json-read-http.test.js": "844770a91dc40e131492643987bc873f6c25b7ca286247477449a6f3eeab11a5"
+  },
+  "harnessCorrections": [
+    "Enabled the already installed Node type definitions explicitly for TypeScript 7.",
+    "Moved mutation copies into the disposable artifact directory because test container source is read-only."
+  ],
+  "lint": {
+    "baseline": 818,
+    "final": 818,
+    "added": 0
+  },
+  "static": {
+    "strictModuleTypes": "passed",
+    "syntax": "passed",
+    "newSourceLint": "passed"
+  },
+  "suite": {
+    "tests": 22,
+    "pass": 22,
+    "fail": 0,
+    "skipped": 0
+  },
+  "coverage": {
+    "lines": {
+      "total": 26,
+      "covered": 26,
+      "skipped": 0,
+      "pct": 100
+    },
+    "statements": {
+      "total": 26,
+      "covered": 26,
+      "skipped": 0,
+      "pct": 100
+    },
+    "functions": {
+      "total": 2,
+      "covered": 2,
+      "skipped": 0,
+      "pct": 100
+    },
+    "branches": {
+      "total": 8,
+      "covered": 8,
+      "skipped": 0,
+      "pct": 100
+    },
+    "branchesTrue": {
+      "total": 0,
+      "covered": 0,
+      "skipped": 0,
+      "pct": "Unknown"
+    }
+  },
+  "routeCoverage": "Actual server route extracted and executed by real Express HTTP tests, including 200, 304, full/light modes and 500/recovery.",
+  "mutation": [
+    {
+      "name": "duplicate-work",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "stale-success",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "mixed-modes",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "wrong-json",
+      "killed": true,
+      "propertyOnlyKilled": true
+    },
+    {
+      "name": "wrong-etag",
+      "killed": true,
+      "propertyOnlyKilled": false
+    },
+    {
+      "name": "poisoned-retry",
+      "killed": true,
+      "propertyOnlyKilled": false
+    }
+  ],
+  "reorderedSuite": {
+    "tests": 22,
+    "pass": 22,
+    "fail": 0,
+    "skipped": 0
+  },
+  "completedAt": "2026-10-22T02:37:29.117Z"
+}

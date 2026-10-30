@@ -207,6 +207,7 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
   );
   const fetchPurchaseOrderLines = dependencies.fetchPurchaseOrderLines || (async () => []);
   const applyPurchaseOrderWeights = dependencies.applyPurchaseOrderWeights || (async () => {});
+  const applyPurchaseOrderLines = dependencies.applyPurchaseOrderLines || (async () => {});
   const runInTransaction = requiredFunction(dependencies.withTransaction, "withTransaction");
   const writeAudit = requiredFunction(dependencies.writeAudit, "writeAudit");
   const emitEvents = requiredFunction(dependencies.emitEvents, "emitEvents");
@@ -275,6 +276,9 @@ export function createDelayedStatusRefreshWorker(dependencies = {}) {
   async function applyRemoteState({ job, remoteStatus, lines }) {
     if (!remoteStatus) {
       return null;
+    }
+    if (job.orderType === "purchase_order" && lines.length > 0) {
+      await applyPurchaseOrderLines({ netsuiteOrderId: job.netsuiteOrderId, lines });
     }
     const updated = await applyStatus({
       orderType: job.orderType,

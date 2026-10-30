@@ -14,6 +14,7 @@ const NORMALIZED_HASH = "a".repeat(64);
 const TARGET_REVISION_HASH = "b".repeat(64);
 const ACTORS = Object.freeze({
   admin: Object.freeze({ id: "p35-csv-http-admin", role: "admin", roles: Object.freeze(["admin"]), homeRoute: "/admin" }),
+  operator: Object.freeze({id:"permission-denied-operator",role:"operator",roles:["operator"]}),
   dispatcher: Object.freeze({ id: "p35-csv-http-dispatcher", role: "dispatcher", roles: Object.freeze(["dispatcher"]), homeRoute: "/dispatch" })
 });
 const TEMPLATE = Object.freeze({
@@ -126,7 +127,7 @@ after(async () => {
 test("P3-F11 CSV HTTP: template is authenticated Admin/asset-gated, no-store, and downloadable", async () => {
   const anonymous = await request("/api/mbt/assets/import/template");
   assert.equal(anonymous.response.status, 401);
-  const dispatcher = await request("/api/mbt/assets/import/template", { actor: "dispatcher" });
+  const dispatcher = await request("/api/mbt/assets/import/template", { actor: "operator" });
   assert.equal(dispatcher.response.status, 403);
   assert.match(dispatcher.response.headers.get("cache-control") || "", /no-store/u);
 

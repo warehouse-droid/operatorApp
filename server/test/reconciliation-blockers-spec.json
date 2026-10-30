@@ -1,0 +1,24 @@
+{
+  "date": "2026-10-22",
+  "tier": 3,
+  "authorization": "User requested stopping the 15-minute automatic reconciliation and resolving its blockers.",
+  "specApproval": "not obtained (autonomous run)",
+  "setup": {"dependencies": [], "tests": "repository disposable runner with isolated synthetic database", "git": "preserve existing workspace changes; no commits", "deployment": "overlay only tested changes on the current live image; preserve rollback image and operational audit"},
+  "behaviors": [
+    "S1: Application startup registers neither the startup nor recurring stale PO/TO refresh; manual, webhook and approved nightly dispatch remain available.",
+    "C1: An already-verified, identified, finalized credit memo may reconcile additional NetSuite Subtotal and nonpositive Discount accounting rows while all original material lines still match exactly.",
+    "C2: New postings, staged drafts and manual links retain strict item-row verification; unexpected inventory/service rows, changed quantities/rates/units/reasons/source evidence/identity still fail.",
+    "R1: Permanent batch CM/RA verification failures remain visibly failed and are excluded from automatic pending and draft recovery; explicit retry can recover the same transaction after correction.",
+    "R2: Transient failures retain recovery and cannot create duplicate financial transactions; successful recovery clears a prior automatic retry block.",
+    "R3: Scheduled return reconciliation defers while a manual/queued SCM reconciliation is active.",
+    "P1: Reconcile SR-000007/CMM02514 locally from verified NetSuite evidence without editing the credit memo or its fee; verify scheduled PO/TO runs cease."
+  ],
+  "failureModel": {
+    "accept_changed_financial_material": "strict identity/material assertions, adversarial fixtures, properties and mutation checks",
+    "duplicate_credit_memo": "existing parallel/idempotency/rollback integration suites and no-write live recovery",
+    "stuck_retry_or_draft": "database integration tests for blocked and transient errors, manual recovery",
+    "migration_or_deployment_failure": "additive migration, rollback image, health and source-hash verification",
+    "unexpected_background_run": "startup wiring contract and live history observation",
+    "test_host_load_or_residue": "bounded isolated Compose and unconditional teardown"
+  }
+}

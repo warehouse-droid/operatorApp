@@ -1,4 +1,5 @@
 const destinations=[
+  ['repair',['repair_technician','repair_office','operator','dispatcher','yard_manager','mbr_sales','admin']],
   ['boss',['boss']],['admin',['admin']],['control',['admin','yard_manager']],
   ['operator',['operator','admin']],['delivery',['operator','admin']],
   ['dispatch',['dispatcher','admin']],['scm',['scm','scm_staff','admin']],

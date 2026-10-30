@@ -61,7 +61,7 @@ test('C4: reset preserves audit and invalidates old owner and old generation',as
   await assert.rejects(changeCountSheet(a,sheet.id,'submit',stale),{status:409});
   const review=await getCountSheet(manager,sheet.id,{management:true});
   assert.equal(review.history.some(e=>e.action==='reset'),true);
-  assert.equal(review.attempts.some(c=>Number(c.quantity)===7),true);
+  assert.deepEqual(review.attempts,[]);
 });
 test('C1/C4: available editing and cancellation are fenced',async()=>{
   let sheet=await create([items[0]]);

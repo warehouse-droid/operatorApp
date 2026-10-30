@@ -1,7 +1,7 @@
-import crypto from 'node:crypto';
 import {query,withTransaction} from './db.js';
 import {DISPATCH_FLEET_PLANNING_LOCK} from './dispatch-fleet-status.js';
 import {projectSorOrder,rentalItemDecision,isSorDeliveryRef} from './sor-rental-policy.js';
+import {sorReturnSourceFingerprint,sorStoredReturnDraft} from './sor-return-source.js';
 
 const conflict = () => Object.assign(new Error('This setting changed. Refresh before saving.'),{status:409,code:'SOR_SETTING_STALE'});
 function policy(row) {
@@ -90,11 +90,17 @@ export async function decorateSorOrders(orders=[]) {
   const policies=new Map(rows.map(row=>[String(row.item_id),policy(row)]));
   return orders.map(order=>projectSorOrder(order,policies));
 }
-export async function sorReturnActivity(ref) {
+async function sorReturnExecutionState(ref) {
   const row=(await query(`SELECT EXISTS(SELECT 1 FROM dispatch_plan_order_assignments a
-      JOIN dispatch_plans p ON p.id=a.plan_id WHERE p.status<>'cancelled' AND lower(a.order_ref)=lower($1)) AS assigned,
+      JOIN dispatch_plans p ON p.id=a.plan_id WHERE p.status<>'cancelled' AND lower(a.order_ref)=lower($1))
+      OR EXISTS(SELECT 1 FROM mbt_transport_trips t WHERE t.source_key=lower($1) AND t.status<>'cancelled') AS assigned,
     EXISTS(SELECT 1 FROM driver_job_records j WHERE j.order_refs @> jsonb_build_array($1::text)
-      AND (j.started_at IS NOT NULL OR j.status='complete')) AS started`,[ref])).rows[0];
+      AND (j.started_at IS NOT NULL OR j.status IN ('in_progress','complete')))
+      OR EXISTS(SELECT 1 FROM mbt_transport_trips t WHERE t.source_key=lower($1) AND t.actual_started_at IS NOT NULL) AS started`,[ref])).rows[0];
+  return row;
+}
+export async function sorReturnActivity(ref) {
+  const row=await sorReturnExecutionState(ref);
   return row.assigned || row.started;
 }
 export async function reconcileSorReturnDrafts(baseRef,drafts=[],{preserveMissing=false}={}) {
@@ -108,16 +114,24 @@ export async function reconcileSorReturnDrafts(baseRef,drafts=[],{preserveMissin
     for(const ref of new Set([...byRef.keys(),...requested.keys()])) {
       const previous=byRef.get(ref); const draft=requested.get(ref);
       if(previous?.status==='completed' || (!draft && (!previous || preserveMissing))){continue;}
-      const fingerprint=draft?crypto.createHash('sha256').update(JSON.stringify(draft)).digest('hex'):'';
-      if(previous?.sor_source_fingerprint===fingerprint && previous.status===(draft?'open':'cancelled') && !previous.sor_review_reason){continue;}
-      if(previous && await sorReturnActivity(ref)) {
-        await query("UPDATE dispatch_custom_orders SET sor_review_reason=$2 WHERE id=$1",[previous.id,'Source items, address, or auto-return policy changed. Unassign untouched work to refresh.']);
+      const fingerprint=sorReturnSourceFingerprint(draft);
+      const unchanged=previous && previous.status===(draft?'open':'cancelled') && (
+        previous.sor_source_fingerprint===fingerprint || (draft && sorReturnSourceFingerprint(sorStoredReturnDraft(previous))===fingerprint));
+      if(unchanged && !previous.sor_review_reason){continue;}
+      const activity=previous ? await sorReturnExecutionState(ref) : {assigned:false,started:false};
+      if(previous && !unchanged && (activity.started || (!draft && activity.assigned))) {
+        const reason=activity.started ? 'Source changed after return work started. Dispatch must review the recorded equipment.'
+          : 'Source no longer requires this return. Dispatch must remove its assignment before cancellation.';
+        await query("UPDATE dispatch_custom_orders SET sor_review_reason=$2 WHERE id=$1",[previous.id,reason]);
         result.review++;continue;
       }
+      const {refreshSorReturnProjections}=await import('./sor-return-projection-repository.js');
       if(!draft) {
         await query("UPDATE dispatch_custom_orders SET status='cancelled',cancelled_at=now(),cancelled_by='sor-automation',sor_source_fingerprint='',sor_review_reason='',updated_at=now() WHERE id=$1",[previous.id]);
+        await refreshSorReturnProjections(ref);
         result.cancelled++;continue;
       }
+      try {await withTransaction(async()=>{
       const totals=['pallets','layers','sections','pieces'].map(key=>draft.lineSnapshot.reduce((sum,line)=>sum+Number(line[key]||0),0));
       const written = await query(`INSERT INTO dispatch_custom_orders(ref_number,pickup_location,dropoff_location,order_details,weight_lbs,
         order_kind,system_managed,parent_sales_order_id,parent_order_ref,line_snapshot,sales_qty,pallet_qty,layer_qty,section_qty,piece_qty,
@@ -133,6 +147,12 @@ export async function reconcileSorReturnDrafts(baseRef,drafts=[],{preserveMissin
       [ref,draft.pickupLocation,draft.dropoffLocation,draft.orderDetails,draft.weightLbs,draft.parentSalesOrderId,draft.parentOrderRef,
         JSON.stringify(draft.lineSnapshot),draft.salesQty,...totals,fingerprint,draft.customer]);
       if(!written.rowCount){throw new Error(`Return reference ${ref} already exists for another order. Review the collision in Dispatch.`);}
+      await refreshSorReturnProjections(ref);
+      });} catch(error) {
+        if(!previous || !['SOR_RETURN_EXECUTION_PROTECTED','SOR_RETURN_ADDRESS_REQUIRED'].includes(error.code)){throw error;}
+        await query('UPDATE dispatch_custom_orders SET sor_review_reason=$2 WHERE id=$1',[previous.id,error.message]);
+        result.review++;continue;
+      }
       if(!previous){result.created++;}else {result.updated++;}
     }
     if(Object.values(result).some(Boolean)){await query('INSERT INTO sor_configuration_audit(actor,subject,before_state,after_state) VALUES($1,$2,$3,$4)',

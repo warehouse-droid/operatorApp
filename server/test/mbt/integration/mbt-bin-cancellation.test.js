@@ -78,9 +78,17 @@ test('cancel Bin 1, remove its 110000 cents, preserve Bin 2 and confirmed eviden
   assert.equal(amendment.status, 'approved');
   const currentContract = (await query('SELECT * FROM mbt_contracts WHERE contract_id=$1', [f.contract.contractId])).rows[0];
   assert.equal(await chargeService.currentFrontdeskContractTotal(currentContract), 55000);
-  const feed = await getMbtBinPlanning({ planDate: '2037-08-03', search: f.contract.contractNumber }, boundary);
+  // Search deliberately includes history; the unfiltered active pool must not
+  // contain the cancelled bin. Historical search must keep it non-dispatchable.
+  const feed = await getMbtBinPlanning({ planDate: '2037-08-03' }, boundary);
   assert.equal(feed.pool.total, 1);
   assert.equal(feed.pool.items[0].mbt.serviceLineId, f.second.serviceLineId);
+  const history = await getMbtBinPlanning({ planDate: '2037-08-03', search: f.contract.contractNumber }, boundary);
+  assert.equal(history.pool.total, 2);
+  const cancelled = history.pool.items.find(card => card.mbt.serviceLineId === f.first.serviceLineId);
+  assert.equal(cancelled.mbt.status, 'cancelled');
+  assert.equal(cancelled.mbt.frontLeg.dispatchable, false);
+  assert.equal(cancelled.dispatchPlanned, false);
   assert.equal((await cancelUndeliveredBin(f.input)).replayed, true);
   assert.deepEqual(await snapshot(f), after);
 });

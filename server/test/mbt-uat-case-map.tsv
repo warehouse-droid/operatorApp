@@ -1,0 +1,153 @@
+Case ID	Scenario	Evidence test basenames	Remaining verification
+H01	Delivery to explicit collection, dump and yard return	bin-collection-request;bin-order-workflow;driver-bin-loaded-exchange	Components execute against the real app; the complete Front Desk-to-Driver browser journey has not been run in one session.
+H02	Garbage deposit and deferred collection charge	bin-garbage-deposit;bin-dump-charge;bin-uat-garbage-charge	Complete deposit-to-collection browser journey remains manual.
+H03	Same-bin collection-first exchange	bin-order-workflow;bin-order-workflow-browser	Full physical scanning and camera journey on a driver device remains manual.
+H04	Changed-size delivery-first exchange	bin-order-workflow-material;driver-bin-loaded-exchange	Configuration and two-bin execution are covered separately; complete 14YD-to-20YD journey remains manual.
+H05	Delivery containing multiple purchased materials	bin-cargo-browser;bin-cargo-contract;bin-cargo-driver	Mixed-material routing and driver cargo execution are covered separately; combined journey remains manual.
+H06	Collection automatically feeds another cargo delivery	bin-linked-delivery;bin-linked-delivery-browser;bin-order-workflow	Combined collection, dump, cargo and receiving-delivery Driver browser journey remains manual.
+H07	Fractional aggregate trips complete the original source	bin-transport-trips;bin-transport-driver	API lifecycle verified; full multi-trip browser journey remains manual.
+H08	SOR BIN delivery and return to 3445	bin-transport-source-routes;bin-transport-driver;sor-return-lifecycle	Source route and Driver lifecycle verified separately; full SOR outbound-and-return browser journey remains manual.
+A01	Dispatch can manage assets	asset-registry-http;asset-registry-hardening	
+A02	Dispatch can manage rate cards	dispatch-management-permissions;rate-card-configuration-http	
+A03	Other roles cannot change assets or rates	asset-registry-http;rate-card-configuration-http	
+A04	Other configuration remains Admin-only	bin-transport-http;item-owned-dump-site	Every configuration tab has not been traversed in the browser for every role.
+A05	Numeric dump-site code 3445 can be saved and edited	dump-site-create-browser;dump-site-code	
+A06	Dump-site code normalization	dump-site-code	
+A07	Invalid codes and opening hours retain useful errors	dump-site-create-browser;dump-site-hours-and-bin-estimate	
+A08	Dump-site material and active-state filtering	bin-order-workflow-material;driver-bin-manifest-integrity;item-owned-dump-site	
+A09	Valid and invalid asset/rate imports	asset-csv-import;asset-csv-import-http;rate-card-csv-import;rate-card-csv-import-http	
+A10	Rate changes preserve used versions and history	rate-card-version-cutover;rate-card-configuration-hardening	
+F01	New order creates delivery only	bin-collection-request	
+F02	Multiple bins remain independent	bin-collection-request;frontdesk-multibin-workflow	
+F03	Front Desk shows no duplicated initial delivery	bin-collection-request-browser	
+F04	Stable D, C and numbered exchange references	bin-order-workflow;bin-order-workflow-domain	
+F05	Explicit Collect Bin after delivery	bin-collection-request;bin-collection-request-browser	
+F06	Repeated collection and rescheduling do not duplicate C	bin-collection-request;frontdesk-workflow	Exact repeated collection-window adjustment sequence still needs a dedicated check.
+F07	Overdue reminder creates no collection	bin-collection-request	
+F08	Extension clears overdue reminder	bin-collection-request	
+F09	Overdue eligibility and collection-requested label	bin-collection-request;bin-collection-request-browser	All cancelled and inactive combinations have not been exhaustively exercised.
+F10	Delivery-time change needs no reason	bin-collection-request-browser;bin-collection-request	
+F11	Invalid delivery windows fail without writes	bin-order-window;bin-collection-request	
+F12	Planning locks order adjustments and unplanning unlocks eligible work	frontdesk-adversarial;frontdesk-bin-dispatch-seam;bin-workflow-edit-locks	Exact Front Desk reschedule-after-unplan browser sequence remains manual.
+P01	Soil, Concrete and Asphalt fixed charge is 300	bin-fixed-dump-rates;bin-collection-request	
+P02	Switching between the three fixed materials adds no charge	bin-collection-request	
+P03	Garbage to soil creates positive adjustment	bin-collection-request;bin-collection-request-browser	
+P04	Soil to garbage retains negative adjustment and adds deposit	bin-collection-request;bin-garbage-deposit	
+P05	Signed adjustment plus deposit gives correct amount due	bin-garbage-deposit;customer-charge-calculator-boundaries	The exact no-other-charges -300 plus 500 equals 200 integration fixture is not exercised.
+P06	Size change charges only the price difference	bin-collection-request;customer-charge-request-workflow	
+P07	Garbage deposit is 500 for both sizes	bin-garbage-deposit	
+P08	Deposit precedence, fallback and ambiguous configuration	bin-garbage-deposit;customer-charge-calculator-boundaries	Missing-rule and fallback combinations are not exhaustively tested for both incoming sizes.
+P09	Preview/cancel and confirmation retry preserve billing	customer-charge-request-workflow;customer-charge-confirmation-races;bin-collection-request	Browser cancellation of each material/size combination remains manual.
+P10	Resizing clears incompatible assigned bin and keeps D identity	bin-collection-request	
+P11	Garbage charged after collection completion; fixed materials prepaid	bin-dump-charge;bin-uat-garbage-charge	
+P12	Weight units, tax and rounding handling	bin-dump-charge;customer-charge-calculator-boundaries;dump-site-hours-and-bin-estimate	
+PL01	Delivery, Exchange, Collection and MBR/Agg tabs	bin-planning-browser;bin-transport-browser	
+PL02	Toolbar actions and drag-and-drop assignment	bin-transport-browser;bin-order-workflow-browser	
+PL03	Search planned and completed orders across dates	bin-planning-search-browser;bin-planning-corrections	
+PL04	Search ignores withdrawn or missing loads	bin-planning-corrections	
+PL05	Save route then drag to load or empty lane	bin-order-workflow-browser;bin-planning-browser;bin-transport-browser	
+PL06	Drag moves the complete visit	bin-planning-browser;bin-planning-domain	
+PL07	Save does not publish; Confirm releases driver work	bin-planning-driver;bin-planning-commands	
+PL08	Changed released plans need confirmation	bin-planning-adversarial;bin-planning-returns	
+PL09	Automatic/fixed load starts and service-duration overrides	bin-planning-browser;bin-planning-board	
+PL10	Dispatch cannot alter requested order windows	bin-order-window;bin-planning-corrections;bin-order-workflow-browser	
+PL11	Driver and truck changes respect compatibility and occupancy	bin-planning-browser;bin-planning-adversarial	
+PL12	Empty loads, manual returns and cross-planner read-only work	bin-planning-returns;bin-planning-readonly-browser;bin-planning-empty-drafts	
+AV01	Bin can be reselected repeatedly	bin-selection;bin-selection-browser	
+AV02	Pre-start reselection republishes only affected released work	bin-selection	
+AV03	First physical BIN step locks reselection	bin-selection	
+AV04	Reservation without planned return prevents reuse	bin-availability	
+AV05	Planned 10:00 return permits 10:30 reuse without driver proof	bin-transport-source-routes;bin-availability	
+AV06	Overlapping or unsubstantiated availability is rejected	bin-transport-source-routes;bin-availability	Unsaved browser-only return is not an independently exercised scenario.
+AV07	Planned availability carries across dates	bin-availability;bin-transport-dependencies	
+AV08	Breaking an availability predecessor fails atomically	bin-transport-source-routes;bin-transport-dependencies	
+AV09	Inactive, maintenance, wrong-size and loaded bins excluded	bin-order-workflow;bin-dispatch-hardening;asset-registry-hardening	Every combination has not been checked in each selector's browser UI.
+AV10	Bin already on truck skips redundant yard pickup	bin-order-workflow;bin-selection	
+AV11	Different-truck reuse needs physical handoff	bin-order-workflow	
+AV12	Cross-date changes require all date leases and commit together	bin-selection	
+EX01	Same-bin collection-first exchange and same-day rule	bin-order-workflow	
+EX02	Different-bin collection-first allows later dump	bin-order-workflow	
+EX03	Delivery-first exchange can collect on a later day	bin-order-workflow-domain;bin-order-workflow-browser	Exact overnight two-bin Driver completion journey remains manual.
+EX04	Changed size requires another bin and delivery first	bin-order-workflow-material;bin-order-workflow-domain	
+EX05	Invalid changed-size alternatives are rejected	bin-order-workflow-material;bin-order-workflow-browser	
+EX06	Collected contents stay tied to the outgoing order	bin-order-workflow-material	
+EX07	Both unplanned legs unlock sequence and dump controls	bin-workflow-edit-locks;bin-workflow-edit-browser	
+EX08	Planned delivery locks sequence but leaves unplanned collection route editable	bin-workflow-edit-locks;bin-workflow-edit-browser	
+EX09	Planned collection locks its route while eligible replacement edits remain	bin-workflow-edit-locks;bin-workflow-edit-browser	
+EX10	Unplanning both unstarted legs restores editing	bin-workflow-edit-locks	
+EX11	Invalid same-day plans rejected; actual lateness retained with exception	bin-order-workflow	
+EX12	Multiple exchanges retain old-bin obligations	bin-order-workflow	
+CL01	Final C is visible red and cannot be dragged while work is pending	bin-final-collection-browser	
+CL02	Pending final C remains editable but stale assignment fails	bin-final-collection;bin-final-collection-browser	
+CL03	Replacement delivery alone does not unlock final collection	bin-final-collection	
+CL04	Unconfigured exchange blocks; cancelled/unrelated work does not	bin-final-collection	
+CL05	Completing all prerequisites unlocks final C using current bin	bin-final-collection;bin-final-collection-browser	
+CL06	Collection dumps then returns to approved yard	bin-order-workflow;driver-bin-loaded-exchange	
+CL07	Receiving delivery chooses an order with matching bin type	bin-order-workflow-material;bin-order-workflow-browser	
+CL08	Collection auto-plans linked delivery and its cargo	bin-linked-delivery;bin-linked-delivery-browser	
+CL09	Move, optimize and unplan retain the linked pair	bin-linked-delivery;bin-linked-delivery-browser;bin-linked-delivery.property	
+CL10	Unlink/relink preserves receiving order and protects started work	bin-workflow-edit-locks	
+CG01	Cargo editor belongs in Plan Delivery	bin-cargo-browser	
+CG02	Purchased cargo requires pickup route before planning	bin-cargo-plan;bin-cargo-routing	
+CG03	Dispatch cannot remove or replace Front Desk purchased material	bin-cargo-plan;bin-cargo-browser;bin-cargo-contract	
+CG04	Mixed materials allowed in one bin	bin-cargo-browser;bin-cargo-contract	
+CG05	Cargo pickups support all three yards and custom address	bin-cargo-browser;bin-cargo-domain	All four pickup choices have not each been followed through Driver completion.
+CG06	Same-yard pickup avoids invented travel	bin-order-workflow-browser;bin-planning-board	Exact same-yard material-pickup travel case needs a dedicated assertion.
+CG07	Cargo drop can share destination or use separate address	bin-cargo-browser;bin-cargo-driver	
+CG08	Dispatch may add optional material cargo	bin-cargo-browser;bin-cargo-routing	
+CG09	Existing Custom Order is exclusively claimed	bin-cargo-routing;bin-cargo-contract	
+CG10	One-off custom cargo supports manual pickup/drop	bin-cargo-browser;bin-cargo-domain	
+CG11	Two Custom Orders or material-plus-Custom cannot share a bin	bin-cargo-domain;bin-cargo.property;bin-cargo-browser	
+CG12	Invalid or independently assigned Custom Orders rejected	bin-cargo-contract	
+CG13	Unstarted cargo edits republish; started work stays immutable	bin-cargo-routing;bin-selection	
+CG14	After-dump cargo respects sequencing and completes Custom Order once	bin-order-workflow;bin-cargo-driver	
+TR01	SOR and SOR-return shared between planners until claimed	bin-transport-ownership;bin-transport-source-routes	
+TR02	Flatbed and BIN cannot both claim the same source	bin-transport-ownership;bin-cargo-contract	
+TR03	Aggregate item makes whole order BIN-only	bin-transport-ownership;aggregate-routing	
+TR04	Aggregate routing uses item identity and preserves overrides	aggregate-routing;aggregate-routing-browser	
+TR05	Standalone aggregate and attached BIN cargo do not duplicate	bin-transport-frontdesk;bin-cargo-contract	
+TR06	Grouped independent source orders need separate planning	bin-transport-ownership	
+TR07	Plan Transport saves route for drag-and-drop	bin-transport-browser	
+TR08	Fractional trips retain original reference and progress	bin-transport-trips;bin-transport-read	
+TR09	Invalid quantities and concurrent over-allocation rejected	bin-transport-trips;bin-transport.property;bin-transport-errors	
+TR10	Mixed aggregate weight is 17350 lb; half is 8675 lb	bin-transport-errors-browser	
+TR11	Missing weight requires manual entry; known weight cannot be understated	bin-transport-errors;bin-transport-domain	
+TR12	SOR return picks up at customer and drops at resolved 3445 yard	bin-transport-source-routes	
+TR13	After cargo drop: yard return or linked delivery including its cargo	bin-transport-linked-delivery;bin-transport-planning	
+TR14	Cargo-drop quantity controls source completion before bin return	bin-transport-driver	
+TR15	Source changes invalidate unstarted work; started route stays frozen	bin-transport-fresh-source;bin-transport-source-routes;bin-transport-driver	
+TR16	Cancel releases quantities and claims while retaining searchable history	bin-transport-trips;bin-transport-read;bin-transport-planning	Completed/cancelled trip navigation has not been traversed for every historical status.
+WT01	Below truck weight limit saves normally	bin-planning-domain;bin-uat-weight-boundaries;bin-planning-properties	
+WT02	Exactly at truck limit has no overweight warning	bin-planning-domain;bin-uat-weight-boundaries;bin-planning-properties	
+WT03	Above truck limit warns and saves/confirms	bin-weight-warning;bin-weight-warning-browser;bin-uat-weight-boundaries	
+WT04	Bin tare is included in carried weight	bin-weight-warning	
+WT05	Unknown collected load uses labelled estimate	bin-weight-warning	
+WT06	Warning on one load does not block another load	bin-weight-warning;bin-weight-warning-browser;bin-uat-weight-boundaries	
+WT07	Weight warning survives confirmation and reload	bin-weight-warning;bin-weight-warning-browser	
+WT08	Removing heavy work clears its warning	bin-weight-warning-browser	
+WT09	Sequential trips use peak load, not daily sum	bin-planning-domain;bin-planning-properties	
+WT10	Pickup and drop sequence determines peak weight	bin-planning-domain;bin-planning-properties	
+WT11	Bin payload and missing capacity remain hard validation	bin-transport-errors;bin-cargo-routing	
+WT12	Slot count, movement order and compatibility remain hard validation	bin-planning-domain;bin-weight-warning;bin-dispatch-hardening	
+DR01	Driver sees order reference, physical bin and cargo/address	bin-cargo-driver-browser;bin-order-workflow;bin-transport-driver	
+DR02	Correct scan accepted; wrong bin rejected	driver-bin-execution;driver-bin-loaded-exchange	Physical scanner/camera hardware has not been exercised.
+DR03	Required photos and dump receipt enforced	driver-bin-execution;driver-bin-loaded-exchange;driver-bin-signature-photo	Real phone capture, permission prompts and upload network conditions remain manual.
+DR04	Driver cannot skip start or physical prerequisites	driver-bin-manifest-integrity;driver-bin-loaded-exchange	
+DR05	Delivery completion updates current bin once	bin-order-workflow;driver-bin-execution	
+DR06	Offline events retain occurrence times and replay in order	driver-bin-offline-queue;bin-transport-offline;driver-bin-time-evidence	Airplane-mode workflow on real supported phones remains manual.
+DR07	Photo must be durably uploaded before completion applies	driver-bin-execution;driver-bin-offline-queue	Full device loss/restart while media is uploading remains manual.
+DR08	Exact retry is quiet; conflicting event gets review	driver-bin-sync-races;driver-bin-execution	
+DR09	Old manifest after bin change cannot execute stale instructions	bin-selection;driver-bin-execution	
+DR10	Cross-device predecessor completion is durably enforced	driver-bin-manifest-integrity;driver-bin-sync-races	Two real driver devices have not been used simultaneously.
+DR11	Older manifest or event cannot regress physical state	driver-bin-manifest-integrity	
+DR12	SOR optional signature stays separate; deactivated bin cannot start	bin-transport-driver	
+ER01	Only current date editor can change the plan	bin-planning-commands;bin-planning-http;bin-planning-browser	
+ER02	Concurrent collections, selection, allocations and claims have one winner	bin-collection-request;bin-selection;bin-transport-trips;bin-cargo-contract	
+ER03	Driver start versus reselection commits one winner	bin-selection	
+ER04	Stale revisions cannot overwrite current state	bin-planning-board;bin-selection;bin-cargo-plan	
+ER05	Lost response and retries are idempotent	bin-selection;bin-transport-trips;customer-charge-request-workflow	Browser transport interruption has not been injected into every mutation endpoint.
+ER06	Injected failures roll back all linked state	bin-planning-commands;bin-linked-delivery;bin-order-workflow;driver-bin-execution	
+ER07	Controlled undelivered-bin cancellation preserves billing history	mbt-bin-cancellation	
+ER08	Search/date navigation races cannot show or save wrong plan	bin-planning-search-browser;bin-planning-events	Full delayed-response race matrix is not automated.
+ER09	Cards contain content at five desktop/mobile widths	bin-uat-layout-browser	Long translated names and all order types still need visual review.
+ER10	Actionable errors, access denial and read-only/disabled fallback	bin-transport-errors;bin-planning-readonly-browser;dispatch-bin-disabled	

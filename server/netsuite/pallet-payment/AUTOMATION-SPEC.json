@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "date": "2026-10-21",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run); transaction-triggered updates explicitly requested by user",
+  "confirmedSchemaCorrection": "User confirmed custrecord_ppa_method was List/Record Transaction; changed to Payment Method. Keep native payment method IDs; no fallback or ID remapping.",
+  "setup": "Extend the isolated SuiteScript bundle and existing disposable test runner. No new dependencies, commits, application changes, remote deployment or financial writes. New scripts: queue library, User Event, scheduled queue dispatcher. One new custom queue record with three fields, one MR parameter, and UE/dispatcher deployments require NetSuite UI installation.",
+  "scenarios": [
+    "After create/edit/xedit/delete/approve/cancel/reject of SO, Invoice, Customer Payment, Customer Deposit, Deposit Application, Credit Memo or Customer Refund, enqueue affected customer IDs before attempting background submission.",
+    "Customer reassignment enqueues both previous and current customers. Partial xedit records load current values when required; delete resolves from oldRecord without loading the deleted transaction.",
+    "Manual pallet refund allocation changes enqueue the customer of both old and new allocation lots; generated PRA1 records are ignored to prevent recursion.",
+    "Each captured event has its own durable queue record. MR groups tokens by customer and acknowledges only captured tokens after a successful persistent rebuild, including persisted REVIEW results. Later tokens survive an earlier rebuild.",
+    "A failed rebuild retains its captured tokens with an error and a 15-minute retry delay. A retry or partial acknowledgement is idempotent. Another customer's tokens cannot be removed.",
+    "One designated MR deployment is the only allocation writer. Submission explicitly sets queue-only true, preview false, customer blank. A busy or failed submission leaves all queue rows intact; errors remain visible.",
+    "A scheduled dispatcher checks every 15 minutes for pending work; the MR also checks for new work at completion. Thus events arriving during an active run or after its final check remain durable for a later dispatch.",
+    "Queue input is bounded to 50 events per run, sorted by internal ID; failed tokens are deferred so other customers progress. All captured customer tokens together fit the reserved governance margin.",
+    "Existing full/single-customer preview and backfill remain compatible when Queue Only is unchecked. Preview never acknowledges or defers queue tokens.",
+    "Summary counts successful VERIFIED/REVIEW customers and failed stage entries. Any stage error produces an error completion entry, never an unqualified finished message.",
+    "Transaction saves are not rolled back by capture/dispatch errors: errors are logged with record type/ID. Installation or permission failure can prevent capture and requires repair/backfill. Other User Event scripts cannot trigger nested UEs; integration callers must invoke the queue helper explicitly or use a full backfill.",
+    "Cash-flooring, tax basis, card grouping and all existing financial calculations remain unchanged. All existing tests must pass. No financial record is saved, deleted or refunded by these scripts. Only completed custom queue rows are deleted."
+  ],
+  "scopeAdditions": {
+    "allCustomerDiscovery": "User clearing 5240 exposed SSS_SEARCH_ERROR_OCCURRED in the legacy UNION SuiteQL paging fetch. Replace that input discovery with two independently paged native N/search summary searches: pallet Invoice/Credit Memo customers and existing allocation customers. Group/sort by customer, merge/deduplicate IDs in JavaScript, preserve targeted-customer bypass, include every fetched page, and do no writes during discovery.",
+    "cashSummary": "User confirmed all cash should combine into one line per customer. Search groups only customer, subsidiary, currency, method and last4; quantities sum across source invoices. No change to source-level lot provenance.",
+    "historicalFullCashCredits": "User reported refunded pallets remain zero. Confirmed native example: credit 188388 has 10 pallets, net 400, tax 52; cash refund 188630 applied 452. A posted single cash refund that exactly settles the gross amount of a pure-pallet credit, with no manual allocations or on-account applications, deducts the credit's pallet quantity. Cash lot rate and recorded pallet principal remain net; generated return reference explicitly marks historical tax-included settlement. Partial, mixed, multiple-leg, unknown-card or insufficient original-cash-capacity cases still require review.",
+    "xeditBoundary": "Some partial native records may return empty strings for missing fields. Use getFields membership as well as null/undefined checks to decide whether to load current values."
+  },
+  "failureModel": {
+    "lostConcurrentEvent": "captured-token acknowledgement tests and generated queue interleavings",
+    "duplicateDeduction": "existing deterministic rebuild/idempotence tests plus duplicate queue delivery tests",
+    "wrongCustomer": "old/new customer, xedit, delete and cross-customer acknowledgement tests",
+    "permanentRetryLoopOrStarvation": "15-minute failure deferral, bounded sorted input and scheduled recovery tests",
+    "silentFailure": "capture/submission errors and truthful MR summary assertions",
+    "eventRecursion": "generated PRA1 exclusion and no deployment on allocation cache records",
+    "permissionsAndNativeContexts": "documented deployment permissions/context checklist; native execution not available locally"
+  }
+}

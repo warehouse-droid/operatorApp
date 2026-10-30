@@ -1,0 +1,51 @@
+{
+  "specApproval": "not obtained (autonomous run)",
+  "newFailures": [
+    {
+      "file": "test/mbt/infrastructure/test-foundation.test.js",
+      "failures": [
+        "the real full baseline freezes 134 exhaustive harnesses plus documented exclusions"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/special-discount-summary.test.js",
+      "failures": [
+        "property: the final SO discount equals the exact sum of independently rounded material discounts"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/stock-request-view-browser.test.js",
+      "failures": [
+        "/app/test/mbt/integration/stock-request-view-browser.test.js"
+      ]
+    }
+  ],
+  "passed": false,
+  "candidateExitCode": 1,
+  "baselineExitCode": 1,
+  "sourceTreeHash": "20fd555f7e49e520ff10702cbd8955004651ed59736cfe90254aa65daebda4bf",
+  "cleanup": {
+    "exitCode": 0,
+    "leftovers": {
+      "container": [],
+      "volume": [],
+      "network": []
+    }
+  },
+  "candidate": {
+    "fileCount": 1253,
+    "tests": 7577,
+    "pass": 6985,
+    "fail": 590,
+    "cancelled": 1,
+    "skipped": 1
+  },
+  "baseline": {
+    "fileCount": 155,
+    "tests": 1077,
+    "pass": 474,
+    "fail": 602,
+    "cancelled": 1,
+    "skipped": 0
+  }
+}

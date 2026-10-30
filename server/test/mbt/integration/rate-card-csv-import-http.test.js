@@ -15,6 +15,7 @@ const TARGET_TOKEN = "b".repeat(64);
 const VERSION_ID = "44444444-4444-4444-8444-444444444446";
 const ACTORS = Object.freeze({
   admin: Object.freeze({ id: "p36-csv-http-admin", role: "admin", roles: Object.freeze(["admin"]), homeRoute: "/admin" }),
+  operator: Object.freeze({id:"permission-denied-operator",role:"operator",roles:["operator"]}),
   dispatcher: Object.freeze({ id: "p36-csv-http-dispatch", role: "dispatcher", roles: Object.freeze(["dispatcher"]), homeRoute: "/dispatch" })
 });
 const PREVIEW = Object.freeze({
@@ -111,7 +112,7 @@ test("P3-F12 CSV HTTP: preview is live-session Admin/master-data only before ser
   assert.equal(anonymous.response.status, 401);
 
   const dispatcher = await request("/api/mbt/config/rate-card-imports/preview", {
-    actor: "dispatcher",
+    actor: "operator",
     method: "POST",
     headers: { "x-mbbs-role": "admin" },
     body: { files }

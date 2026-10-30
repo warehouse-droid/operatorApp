@@ -5,7 +5,7 @@
   const state={vendors:[],accounts:[],products:[],jobs:[],vendorId:null,offset:0,total:0,selected:null,job:null,timer:null,blobs:new Map(),jobVersion:0,historyVersion:0,contentVersion:0};
   const escape=value=>String(value??'').replace(/[&<>"']/gu,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const labels={queued:'Queued',running:'Running',completed:'Completed',failed:'Failed',cancelled:'Cancelled',stock_confirmed:'Stock confirmed',stock_available:'Available',low_stock:'Low stock',in_production:'In production',availability_unverified:'Availability not verified · SCM review',insufficient_stock:'Insufficient stock',scrape_failure:'Scrape failure · SCM review',catalog_refreshed:'Catalog refreshed',partial:'Catalog saved · review needed',login_verified:'Login verified'};
-  const stamp=value=>value?new Date(value).toLocaleString():'—';
+  const stamp=value=>value?new Date(value).toLocaleString(undefined,{timeZone:'America/Toronto'}):'—';
   const byId=id=>document.getElementById(id);
   async function api(url,method='GET',body) {
     const response=await fetch(base+url,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});

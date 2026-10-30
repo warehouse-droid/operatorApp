@@ -1,4 +1,5 @@
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
+import { assertCustomOrderNotInBin } from "./mbt/bin-cargo-repository.js";
 import {
   listLatestSalesOrderReattemptItemCorrections,
   projectSalesOrderReattemptLineSnapshot
@@ -241,6 +242,7 @@ export async function listDispatchCustomOrders({
           LIMIT 1
        ) active_co ON true
       WHERE ($1::boolean OR custom_order.status <> 'cancelled')
+        AND NOT EXISTS (SELECT 1 FROM mbt_bin_cargo_plans cargo WHERE cargo.custom_order_id=custom_order.id AND cargo.completed_at IS NULL)
         AND ($4::boolean OR custom_order.status <> 'completed')
         AND (
           $2::text = ''
@@ -305,8 +307,13 @@ export async function createDispatchCustomOrder(input = {}, actor = "") {
 }
 
 export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
-  const current = await getDispatchCustomOrder(id);
+  return withTransaction(()=>updateUnclaimedCustomOrder(id,input,actor));
+}
+
+async function updateUnclaimedCustomOrder(id, input, actor) {
+  const current = await getDispatchCustomOrderForUpdate(id);
   if (!current) return null;
+  await assertCustomOrderNotInBin(id);
   if (current.systemManaged || current.orderKind === "sales_order_reattempt") {
     throw conflictError(
       "Sales Order re-attempt children are system-managed. Change them through the linked re-attempt workflow.",
@@ -361,8 +368,13 @@ export async function updateDispatchCustomOrder(id, input = {}, actor = "") {
 }
 
 export async function cancelDispatchCustomOrder(id, actor = "") {
-  const current = await getDispatchCustomOrder(id);
+  return withTransaction(()=>cancelUnclaimedCustomOrder(id,actor));
+}
+
+async function cancelUnclaimedCustomOrder(id, actor) {
+  const current = await getDispatchCustomOrderForUpdate(id);
   if (!current) return null;
+  await assertCustomOrderNotInBin(id);
   if (current.systemManaged || current.orderKind === "sales_order_reattempt") {
     throw conflictError(
       "Sales Order re-attempt children are system-managed. Cancel them from the linked re-attempt workflow.",
@@ -912,6 +924,7 @@ export async function canonicalizeDispatchCustomOrdersInPlan(plan = {}, {
     const customOrder = byId.get(stableId);
     const canonicalAliases = [...new Set([...aliases, customOrder?.refNumber].filter(Boolean))];
     const nextWork = customWorkSignature(plan, canonicalAliases);
+    if (customOrder && nextWork.assigned) await assertCustomOrderNotInBin(customOrder.id);
     if (!customOrder) {
       if (nextWork.assigned) {
         throw new DispatchCustomOrderPlanError(
@@ -1056,4 +1069,13 @@ export async function canonicalizeDispatchCustomOrdersInPlan(plan = {}, {
     ...plan,
     orders: canonicalOrders
   }, nextMappings);
+}
+
+// Source automation refreshes one existing order without rewriting other work.
+export function refreshDispatchCustomOrderInPlan(plan, customOrder) {
+  const aliases = [customOrder.refNumber];
+  const assigned = customWorkSignature(plan, aliases).assigned;
+  const orders = plan.orders.map(order => normalizedRef(order.id) === normalizedRef(customOrder.refNumber)
+    ? canonicalCustomOrderSnapshot(customOrder, order, assigned) : order);
+  return canonicalizeCustomStops({...plan, orders}, [{aliases, assigned, customOrder}]);
 }

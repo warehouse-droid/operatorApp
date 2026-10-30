@@ -1,5 +1,8 @@
+import { isStockExchange, assertStockExchange, buildExchangeIntent } from "./stock-exchange-domain.js";
+import { admitStockExchange, synchronizeStockExchange, assertExchangeCanVoid } from "./stock-exchange-service.js";
 import { assertOperatorYard } from "./operator-yard-access.js";
 import crypto from "node:crypto";
+import { resolvePalletItemFromNetSuite } from "./netsuite.js";
 import { query, withTransaction, withIndependentTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import {
@@ -90,8 +93,8 @@ function cleanText(value, label, maxLength, { required = false } = {}) {
   return text;
 }
 
-function cleanVehiclePlate(value) {
-  return cleanText(value, "Vehicle plate", 32, { required: true }).toUpperCase();
+function cleanVehiclePlate(value, { required = true } = {}) {
+  return cleanText(value, "Vehicle plate", 32, { required }).toUpperCase();
 }
 
 function quantity(value, label, { whole = false, positive = false } = {}) {
@@ -197,6 +200,7 @@ function normalizedIdempotencyKey(input = {}, operatorId = "") {
       customerId: input.customerId,
       vehiclePlate: input.vehiclePlate,
       stockReturnType: input.stockReturnType || input.type,
+      ...(isStockExchange(input) ? { exchange: true } : {}),
       lines: input.lines,
       palletQuantity: input.palletQuantity,
       photos: input.photos,
@@ -439,13 +443,8 @@ function palletBalanceSource(remote) {
   } : {};
 }
 
-async function customerPalletBalance(customer, remoteBalance = null, { force = true } = {}) {
-  const customerId = customer.id || customer.internalId;
-  const remote = remoteBalance || await fetchPalletBalanceFromNetSuite(
-    customerId,
-    { force, includeCreditIdentity: await customerHasLocalPalletReturns(customerId) }
-  );
-  await reconcileMissingPalletCreditMemos(customerId, remote);
+/** @param {number} customerId */
+async function customerPalletAuthorizationIds(customerId) {
   const authorizations = await query(
     `SELECT COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) AS netsuite_transaction_id
        FROM return_records r LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
@@ -458,9 +457,29 @@ async function customerPalletBalance(customer, remoteBalance = null, { force = t
          AND COALESCE(a.intent_snapshot->>'transactionType','return_authorization') <> 'credit_memo'`,
     [customerId]
   );
-  const linkedCredits = await fetchPalletReturnCreditsFromNetSuite(
-    authorizations.rows.map(row => Number(row.netsuite_transaction_id)), remote.item?.id || remote.item?.itemId
-  );
+  return authorizations.rows.map(row => Number(row.netsuite_transaction_id));
+}
+
+async function customerPalletRemoteReads(customerId, remoteBalance, force) {
+  const [includeCreditIdentity, authorizationIds] = await Promise.all([
+    remoteBalance ? false : customerHasLocalPalletReturns(customerId),
+    customerPalletAuthorizationIds(customerId)
+  ]);
+  // Resolve once before concurrent reads so a cold item cache does not send
+  // duplicate PALLET requests. Customers without RA links keep the usual path.
+  const pallet = remoteBalance?.item || (authorizationIds.length ? await resolvePalletItemFromNetSuite() : null);
+  return Promise.all([
+    remoteBalance || fetchPalletBalanceFromNetSuite(customerId, { force, includeCreditIdentity }),
+    fetchPalletReturnCreditsFromNetSuite(authorizationIds, pallet?.id || pallet?.itemId)
+  ]);
+}
+
+async function customerPalletBalance(customer, remoteBalance = null, { force = true } = {}) {
+  const customerId = customer.id || customer.internalId;
+  const [remote, linkedCredits] = await customerPalletRemoteReads(customerId, remoteBalance, force);
+  // The balance adapter still observes credit identities BEFORE its report.
+  // Local reservations only release linked credits in that observed ID set.
+  await reconcileMissingPalletCreditMemos(customerId, remote);
   const externalIds = remote.externalIds || [];
   const transactionIds = remote.transactionIds || [];
   const localReserved = await localPalletReserved(customerId, externalIds, transactionIds, linkedCredits);
@@ -539,6 +558,16 @@ export function assertReturnOrderFullyFulfilled(order = {}) {
   );
 }
 
+/** Record lookup duration without customer or credential data.
+ * @param {string} orderRef
+ * @param {boolean} includeStockReturns
+ * @param {number} startedAt
+ */
+function logReturnOrderLookup(orderRef, includeStockReturns, startedAt) {
+  console.info(JSON.stringify({ event: "return_order_lookup", orderRef,
+    mode: includeStockReturns ? "stock" : "pallet", durationMs: Math.round(performance.now() - startedAt) }));
+}
+
 export async function lookupReturnSalesOrder({
   code,
   receivingLocationId,
@@ -548,6 +577,7 @@ export async function lookupReturnSalesOrder({
   enforceYardRestriction = true,
   forcePalletBalance = true
 } = {}) {
+  const lookupStartedAt = performance.now();
   const receiving = yard(receivingLocationId);
   let [order, settings] = await Promise.all([
     fetchReturnSalesOrderFromNetSuite(code, {
@@ -673,6 +703,7 @@ export async function lookupReturnSalesOrder({
     })
     .filter((line) => line.returnPolicy.effective !== "NOT_RETURNABLE")
     .filter((line) => Number(line.remainingReturnable) > QUANTITY_EPSILON);
+  logReturnOrderLookup(order.tranid, includeStockReturns, lookupStartedAt);
   return {
     order: { ...order, lines: undefined },
     customer: order.customer,
@@ -940,7 +971,9 @@ export async function listReturnDraftsForControl({
     )`);
   }
   const cleanType = String(returnType || "").trim().toLowerCase();
-  if (cleanType === "pallet") {
+  if (cleanType === "exchange") {
+    clauses.push("d.draft_type = 'exchange'");
+  } else if (cleanType === "pallet") {
     clauses.push("d.draft_type IN ('pallet', 'combined')");
   } else if (["normal_stock", "quality_stock", "stock"].includes(cleanType)) {
     clauses.push("d.draft_type IN ('stock', 'combined')");
@@ -1046,15 +1079,15 @@ export async function saveReturnDraft({ operatorId, input = {} } = {}) {
   }
   const id = suppliedId || crypto.randomUUID();
   await assertReturnDraftMutable(id);
-  const requestedType = String(input.draftType || input.type || "").toLowerCase();
-  const type = ["stock", "pallet", "combined"].includes(requestedType)
+  const requestedType = isStockExchange(input) ? "exchange" : String(input.draftType || input.type || "").toLowerCase();
+  const type = ["stock", "pallet", "combined", "exchange"].includes(requestedType)
     ? requestedType
     : input.orderId && Number(input.palletQuantity) > 0
       ? "combined"
       : input.orderId
         ? "stock"
         : "pallet";
-  if (!["stock", "pallet", "combined"].includes(type)) throw httpError(400, "Select a valid return draft type.");
+  if (!["stock", "pallet", "combined", "exchange"].includes(type)) throw httpError(400, "Select a valid return draft type.");
   const draftLines = Array.isArray(input.lines)
     ? input.lines.map((line, index) => ({
         ...line,
@@ -1179,6 +1212,7 @@ async function replayReturnSubmission(prior, input, operatorId) {
   if (prior.staged) { return resumeStagedReturnSubmission(prior, input, operatorId); }
   const records = prior.records || [];
   return { idempotentReplay: true, batchReference: records[0]?.batchReference || "",
+    stockExchange: records.find(record => record.recordType === "exchange") || null,
     stockReturn: records.find(record => record.recordType === "stock") || null,
     palletReturn: records.find(record => record.recordType === "pallet") || null, records };
 }
@@ -1205,6 +1239,7 @@ async function finishStagedReturnSubmission(batchId, operatorId, idempotentRepla
   const result = await listReturnRecords({ batchId, limit: 10 });
   const records = await Promise.all((result.records || []).map(record => getReturnRecordDetail(record.id)));
   return { idempotentReplay, batchReference: records[0]?.batchReference || "",
+    stockExchange: records.find(record => record.recordType === "exchange") || null,
     stockReturn: records.find(record => record.recordType === "stock") || null,
     palletReturn: records.find(record => record.recordType === "pallet") || null, records };
 }
@@ -1313,9 +1348,10 @@ async function insertStockReturn({
   photos,
   submittedAt,
   automation,
-  note = ""
+  note = "",
+  exchange = false
 }) {
-  const reference = await nextReference("stock_return_reference_seq", "SR");
+  const reference = await nextReference(exchange ? "stock_exchange_reference_seq" : "stock_return_reference_seq", exchange ? "SE" : "SR");
   const businessStatus = deriveStockReturnStatus(validatedLines.map((line) => ({
     approvalStatus: line.approvalStatus
   })));
@@ -1338,7 +1374,7 @@ async function insertStockReturn({
        vehicle_plate, note, balance_snapshot, estimated_credit, external_id,
        netsuite_sync_status, submitted_at
      ) VALUES (
-       $1, $2, 'stock', $3, $4, $5, $6, $7,
+       $1, $2, $27, $3, $4, $5, $6, $7,
        $8::jsonb, $9, $10, $11, $12, $13, $14::jsonb,
        $15, $16, $17, $18, $19, $20, $21, $22::jsonb, $23, $24, $25, $26
      )
@@ -1375,15 +1411,16 @@ async function insertStockReturn({
           available: item.line.available
         }))
       }),
-      Math.round(potentialEstimate * 100) / 100,
+      exchange ? null : Math.round(potentialEstimate * 100) / 100,
       externalId,
       syncStatus,
-      submittedAt
+      submittedAt,
+      exchange ? "exchange" : "stock"
     ]
   );
   const record = result.rows[0];
   for (const item of validatedLines) {
-    const estimate = item.canonical.salesQuantity * Number(item.line.rate || 0);
+    const estimate = exchange ? null : item.canonical.salesQuantity * Number(item.line.rate || 0);
     const lineResult = await query(
       `INSERT INTO return_record_lines (
          return_record_id, source_sales_order_line_id, netsuite_order_line_id,
@@ -1434,7 +1471,7 @@ async function insertStockReturn({
         item.reason.label,
         item.note,
         item.line.rate,
-        Math.round(estimate * 100) / 100,
+        exchange ? null : Math.round(estimate * 100) / 100,
         JSON.stringify(item.line),
         JSON.stringify({
           lookedUpAt: lookup.lookedUpAt,
@@ -1581,17 +1618,20 @@ export async function submitReturnBatch({
     };
   }
   const receiving = yard(input.receivingLocationId);
+  const exchange = isStockExchange(input);
+  if (exchange) assertStockExchange(input);
+  const stockFunction = exchange ? "stock_exchange" : "stock_return";
   const idempotencyKey = normalizedIdempotencyKey(input, operatorId);
   const prior = await existingBatchByIdempotency(idempotencyKey, operator);
   if (prior) {
     return replayReturnSubmission(prior, input, operatorId);
   }
-  const vehiclePlate = cleanVehiclePlate(input.vehiclePlate);
   const hasStock = Array.isArray(input.lines) && input.lines.length > 0;
+  const vehiclePlate = cleanVehiclePlate(input.vehiclePlate, { required: false });
   const palletQuantity = quantity(input.palletQuantity || 0, "PALLET quantity", { whole: true });
   const hasPallet = palletQuantity > 0;
   if (!hasStock && !hasPallet) throw httpError(400, "Add stock or PALLET quantities before confirming the return.");
-  const postingFunctions = [hasStock && "stock_return", hasPallet && "pallet_return"].filter(Boolean);
+  const postingFunctions = [hasStock && stockFunction, hasPallet && "pallet_return"].filter(Boolean);
   const postingPolicies = async (lock = false) => {
     const policies = {};
     for (const functionKey of postingFunctions) {
@@ -1659,9 +1699,6 @@ export async function submitReturnBatch({
   const returnNote = cleanText(input.note, "Return note", 1000);
   if (hasStock && stockReturnType === "normal" && !stockPhotos.length) {
     throw httpError(400, "Normal Stock Return requires at least one live-camera photo.");
-  }
-  if (hasPallet && !palletPhotos.length) {
-    throw httpError(400, "PALLET Return requires at least one live-camera photo.");
   }
   await verifyReturnPhotos([
     ...stockPhotos,
@@ -1777,7 +1814,8 @@ export async function submitReturnBatch({
       validatedLines,
       photos: stockPhotos,
       submittedAt,
-      automation: admittedPolicies.stock_return.effective,
+      automation: admittedPolicies[stockFunction].effective,
+      exchange,
       note: returnNote
     }) : null;
     const palletRecord = hasPallet ? await insertPalletReturn({
@@ -1795,7 +1833,7 @@ export async function submitReturnBatch({
     for (const record of [stockRecord, palletRecord].filter(Boolean)) {
       await query(
         `UPDATE return_records SET workflow_version = 2, netsuite_posting_policy = $2::jsonb WHERE id = $1`,
-        [record.id, JSON.stringify(admittedPolicies[`${record.record_type}_return`])]
+        [record.id, JSON.stringify(admittedPolicies[record.record_type === "exchange" ? "stock_exchange" : `${record.record_type}_return`])]
       );
     }
     const batchIntents = [];
@@ -1803,9 +1841,16 @@ export async function submitReturnBatch({
     for (const record of batchIntents) {
       if (record.recordType === "pallet") {record.palletItemId = record.balanceSnapshot?.item?.id || record.balanceSnapshot?.item?.itemId;}
     }
-    await admitReturnBatchAuthorization({ records: batchIntents, postingPolicies: admittedPolicies });
-    const admission = await retainReturnAdmissionDraft({ autoSync, batchIntents, admittedPolicies, operatorId,
-      input, draftState, hasStock, hasPallet, batchId: batch.id });
+    let admission;
+    if (exchange) {
+      await admitStockExchange(stockRecord.id, buildExchangeIntent(batchIntents[0]));
+      if (draftState) await query("DELETE FROM return_drafts WHERE id=$1::uuid AND operator_id=$2", [draftState.id, operatorId]);
+      admission = { staged: false, auditAction: "returns.exchange.submit" };
+    } else {
+      await admitReturnBatchAuthorization({ records: batchIntents, postingPolicies: admittedPolicies });
+      admission = await retainReturnAdmissionDraft({ autoSync, batchIntents, admittedPolicies, operatorId,
+        input, draftState, hasStock, hasPallet, batchId: batch.id });
+    }
     await writeAudit({
       actorOperatorId: operatorId,
       source: "returns",
@@ -1830,6 +1875,7 @@ export async function submitReturnBatch({
     return {
       idempotentReplay: true,
       batchReference: replay.records[0]?.batchReference || "",
+      stockExchange: replay.records.find(record => record.recordType === "exchange") || null,
       stockReturn: replay.records.find((record) => record.recordType === "stock") || null,
       palletReturn: replay.records.find((record) => record.recordType === "pallet") || null,
       records: replay.records
@@ -1839,14 +1885,15 @@ export async function submitReturnBatch({
   if (transactionResult.staged) { return finishStagedReturnSubmission(transactionResult.batch.id, operatorId); }
   const result = {
     batchReference: transactionResult.batch.batchReference,
-    stockReturn: transactionResult.stockRecord
+    stockExchange: exchange && transactionResult.stockRecord ? await getReturnRecordDetail(transactionResult.stockRecord.id) : null,
+    stockReturn: !exchange && transactionResult.stockRecord
       ? await getReturnRecordDetail(transactionResult.stockRecord.id)
       : null,
     palletReturn: transactionResult.palletRecord
       ? await getReturnRecordDetail(transactionResult.palletRecord.id)
       : null
   };
-  result.records = [result.stockReturn, result.palletReturn].filter(Boolean);
+  result.records = [result.stockReturn, result.stockExchange, result.palletReturn].filter(Boolean);
 
   if (autoSync && result.records.some(record => record.workflowVersion === 3)) {
     const pending = result.records.find(record => record.netSuiteSyncStatus === "pending");
@@ -1855,7 +1902,7 @@ export async function submitReturnBatch({
     }
     result.stockReturn = result.stockReturn ? await getReturnRecordDetail(result.stockReturn.id) : null;
     result.palletReturn = result.palletReturn ? await getReturnRecordDetail(result.palletReturn.id) : null;
-    result.records = [result.stockReturn, result.palletReturn].filter(Boolean);
+    result.records = [result.stockReturn, result.stockExchange, result.palletReturn].filter(Boolean);
     return result;
   }
 
@@ -1864,15 +1911,17 @@ export async function submitReturnBatch({
       if (record.netSuiteSyncStatus !== "pending") continue;
       try {
         const synced = await syncReturnRecord({ recordId: record.id, actorOperatorId: operatorId });
-        if (record.recordType === "stock") result.stockReturn = synced;
+        if (record.recordType === "exchange") result.stockExchange = synced;
+        else if (record.recordType === "stock") result.stockReturn = synced;
         else result.palletReturn = synced;
       } catch {
         const failed = await getReturnRecordDetail(record.id);
-        if (record.recordType === "stock") result.stockReturn = failed;
+        if (record.recordType === "exchange") result.stockExchange = failed;
+        else if (record.recordType === "stock") result.stockReturn = failed;
         else result.palletReturn = failed;
       }
     }
-    result.records = [result.stockReturn, result.palletReturn].filter(Boolean);
+    result.records = [result.stockReturn, result.stockExchange, result.palletReturn].filter(Boolean);
   }
   return result;
 }
@@ -1896,12 +1945,16 @@ function publicReturnRecord(row = {}) {
     status: row.status,
     operatorId: row.operator_id,
     operatorName: row.operator_name || "",
+    operatorAccount: row.operator_account || "",
     sourceSalesOrderId: row.source_sales_order_id === null ? null : Number(row.source_sales_order_id),
     sourceSalesOrderRef: row.source_sales_order_ref || "",
     customerId: Number(row.customer_id),
     customerCode: row.customer_code || "",
     customerName: row.customer_name || "",
     customerPhone: row.customer_phone || "",
+    customerEmail: row.customer_snapshot?.email || "",
+    customerNotification: row.automatic_notification_status ? { status: row.automatic_notification_status,
+      channel: row.automatic_notification_channel || "", recipient: row.automatic_notification_recipient || "" } : null,
     customerAddress: row.customer_address || "",
     orderingLocationId: row.ordering_location_id === null ? null : Number(row.ordering_location_id),
     orderingLocationName: row.ordering_location_name || "",
@@ -2017,12 +2070,14 @@ export async function listReturnRecords(filters = {}) {
   );
   const rowsParams = [...params, limit, offset];
   const result = await query(
-    `SELECT r.*, b.batch_reference, op.display_name AS operator_name,
+    `SELECT r.*, b.batch_reference, op.display_name AS operator_name, op.username AS operator_account,
+            n.status AS automatic_notification_status,n.channel AS automatic_notification_channel,n.recipient AS automatic_notification_recipient,
             a.batch_id AS shared_authorization_batch_id, a.netsuite_transaction_id AS shared_netsuite_transaction_id,
             a.attempted_at AS shared_ra_attempted_at
        FROM return_records r
        INNER JOIN return_batches b ON b.id = r.batch_id
        LEFT JOIN operators op ON op.id = r.operator_id
+       LEFT JOIN return_automatic_notifications n ON n.batch_id=r.batch_id
        LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
       WHERE ${clauses.join(" AND ")}
       ORDER BY r.submitted_at DESC, r.id DESC
@@ -2105,12 +2160,14 @@ export async function getReturnRecordDetail(recordId, {
     clauses.push(`r.operator_id = $${params.length}`);
   }
   const recordResult = await query(
-    `SELECT r.*, b.batch_reference, op.display_name AS operator_name,
+    `SELECT r.*, b.batch_reference, op.display_name AS operator_name, op.username AS operator_account,
+            n.status AS automatic_notification_status,n.channel AS automatic_notification_channel,n.recipient AS automatic_notification_recipient,
             a.batch_id AS shared_authorization_batch_id, a.netsuite_transaction_id AS shared_netsuite_transaction_id,
             a.attempted_at AS shared_ra_attempted_at
        FROM return_records r
        INNER JOIN return_batches b ON b.id = r.batch_id
        LEFT JOIN operators op ON op.id = r.operator_id
+       LEFT JOIN return_automatic_notifications n ON n.batch_id=r.batch_id
        LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
       WHERE ${clauses.join(" AND ")}`,
     params
@@ -2236,6 +2293,10 @@ export async function syncReturnRecord(options = {}) {
 
 async function synchronizeReturnRecord({ recordId, actorOperatorId = null, force = false } = {}) {
   const id = positiveId(recordId, "return record ID");
+  if ((await query("SELECT record_type FROM return_records WHERE id=$1", [id])).rows[0]?.record_type === "exchange") {
+    await synchronizeStockExchange(id, { actorOperatorId });
+    return getReturnRecordDetail(id);
+  }
   if (await findReturnBatchAuthorization(id)) {
     await synchronizeReturnBatchAuthorization({ recordId: id, actorOperatorId });
     return getReturnRecordDetail(id);
@@ -2541,6 +2602,7 @@ export async function voidReturnRecord({
   return withTransaction(async () => {
     const id = positiveId(recordId, "return record ID");
     await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`return-sync:${id}`]);
+    await assertExchangeCanVoid(id);
     await assertSharedReturnCanVoid(id);
     const params = [id];
     const yardClause = receivingYardFilter(params, allowedReceivingLocationIds);
@@ -2609,6 +2671,8 @@ export async function linkReturnNetSuiteTransaction({
 } = {}) {
   const type = String(transactionType || "").trim().toLowerCase().replaceAll("-", "_");
   const recordKey = positiveId(recordId, "return record ID");
+  if ((await query("SELECT record_type FROM return_records WHERE id=$1", [recordKey])).rows[0]?.record_type === "exchange")
+    throw httpError(409, "Stock exchanges use their monthly Inventory Transfer; use posting retry to reconcile it.");
   const id = positiveId(netsuiteId, "NetSuite transaction ID");
   const batch = await findReturnBatchAuthorization(recordKey);
   if (batch) {
@@ -2801,7 +2865,8 @@ export async function processPendingReturnSyncs({ limit = 25 } = {}) {
       WHERE r.status NOT IN ('voided', 'rejected')
         AND (a.batch_id IS NULL OR r.id=(SELECT min(member.id) FROM return_records member WHERE member.batch_id=r.batch_id))
         AND (
-          (a.posting_policy->>'effective' = 'true' AND (a.sync_status='pending'
+          (r.record_type='exchange' AND r.netsuite_posting_policy->>'effective'='true' AND r.netsuite_sync_status IN ('pending','failed'))
+          OR (a.posting_policy->>'effective' = 'true' AND a.automatic_retry_blocked = false AND (a.sync_status='pending'
             OR (a.sync_status='failed' AND a.attempted_at IS NOT NULL)))
           OR (a.batch_id IS NULL AND r.workflow_version = 2 AND r.netsuite_posting_policy->>'effective' = 'true'
             AND (r.netsuite_sync_status = 'pending'
@@ -2825,7 +2890,7 @@ export async function processPendingReturnSyncs({ limit = 25 } = {}) {
       summary.failed += 1;
     }
   }
-  const staged = await query(`SELECT batch_id FROM return_batch_authorizations WHERE draft_id IS NOT NULL
+  const staged = await query(`SELECT batch_id FROM return_batch_authorizations WHERE draft_id IS NOT NULL AND automatic_retry_blocked = false
     AND (sync_status IN ('pending','succeeded') OR (sync_status='failed' AND (attempted_at IS NOT NULL OR netsuite_transaction_id IS NOT NULL)))
     ORDER BY updated_at,batch_id LIMIT $1`, [Math.min(100, Math.max(1, Number(limit) || 25))]);
   summary.queued += staged.rowCount;
@@ -2844,7 +2909,7 @@ export async function reconcileReturnRecords({ limit = 50, actorOperatorId = nul
   const records = await query(
     `SELECT r.id, a.batch_id AS shared_batch_id
        FROM return_records r LEFT JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
-      WHERE COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NOT NULL
+      WHERE r.record_type <> 'exchange' AND COALESCE(a.netsuite_transaction_id,r.netsuite_transaction_id) IS NOT NULL
         AND r.netsuite_sync_status IN ('succeeded', 'manual_linked')
         AND (a.batch_id IS NULL OR r.id=(SELECT min(member.id) FROM return_records member WHERE member.batch_id=r.batch_id))
       ORDER BY r.netsuite_last_synced_at NULLS FIRST, r.id
@@ -3005,6 +3070,7 @@ export async function admitExistingReturnBatchAuthorization({ batchReference, ac
     const policies = {};
     const records = [];
     for (const row of rows.rows) {
+      if (row.record_type === "exchange") throw httpError(409, "Stock exchanges use Inventory Transfers.");
       const functionKey = `${row.record_type}_return`;
       const policy = await getOperatorNetSuitePostingPolicy({ functionKey, locationId: row.receiving_location_id, lock: true });
       if (!policy.effective) {throw httpError(409, "Enable Return Authorization posting for the receiving yard before recovery.");}

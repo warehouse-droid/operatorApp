@@ -2,8 +2,10 @@
 
 import crypto from "node:crypto";
 import express from "express";
+import {installTransportRoutes} from './bin-transport-router.js';
 
 import { config } from "../config.js";
+import { isIfirPostingDeploymentReady } from "../netsuite-ifir-posting-policy.js";
 import { getDispatchOrderCatalogState } from "../dispatch-order-catalog-repository.js";
 import {
   DISPATCH_OPTIMIZED_ORDER_POOL_FLAG_KEY,
@@ -559,6 +561,8 @@ function mbtErrorHandler(error, req, res, _next) {
  * @param {CustomerChargeService} [dependencies.customerChargeService]
  * @param {BinDispatchService} [dependencies.binDispatchService]
  * @param {(change: Record<string, any>) => void} [dependencies.planningChanged]
+ * @param {(input: any) => Promise<any>} [dependencies.binSelectionRouteEstimator]
+ * @param {(input: any) => Promise<any[]>} [dependencies.transportSourceLoader]
  * @param {import("express").RequestHandler} [dependencies.confirmPlanningDay]
  * @param {ShadowBillingService} [dependencies.billingService]
  * @param {MbbsBillingCandidateService} [dependencies.billingCandidateService]
@@ -663,6 +667,7 @@ export function createMbtRouter(dependencies = {}) {
           ...config.mbtPhase3,
           netSuiteWritesEnabled: config.mbt.netSuiteWritesEnabled,
           netSuiteDirectAccessEnabled: config.netsuite.directAccessEnabled,
+          ifirPostingReady: isIfirPostingDeploymentReady(config.netsuite),
           dispatchOrderPoolMode: config.dispatch?.plannerOrderPoolMode || "off",
           dispatchOrderPoolReady: dispatchOrderPoolPolicy.readModelReady,
           dispatchOrderPoolActivationReady: dispatchOrderPoolPolicy.activationReady,
@@ -814,7 +819,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.get("/config/local/items", requireMbtAdmin, async (_req, res, next) => {
+  router.get("/config/local/items", requireMbtSurface("dispatcher", "MBT rate-card lookup"), async (_req, res, next) => {
     try {
       noStore(res);
       res.json({
@@ -938,8 +943,8 @@ export function createMbtRouter(dependencies = {}) {
     };
   }
 
-  router.get("/config/materials", requireMbtAdmin, localMasterListHandler("materials"));
-  router.get("/config/dump-sites", requireMbtAdmin, localMasterListHandler("dump_sites"));
+  router.get("/config/materials", requireMbtSurface("dispatcher", "MBT rate-card lookup"), localMasterListHandler("materials"));
+  router.get("/config/dump-sites", requireMbtSurface("dispatcher", "MBT rate-card lookup"), localMasterListHandler("dump_sites"));
   router.get(
     "/config/service-templates",
     requireMbtAdmin,
@@ -999,7 +1004,7 @@ export function createMbtRouter(dependencies = {}) {
     localMasterDirectHandler("dump_sites", "delete")
   );
 
-  router.get("/config/customer-charges/:versionId", requireMbtAdmin, async (req, res, next) => {
+  router.get("/config/customer-charges/:versionId", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const service = await resolveCustomerChargeService();
       const result = await service.getFrontdeskCustomerChargeAdminConfiguration({
@@ -1017,7 +1022,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.put("/config/customer-charges/:versionId", requireMbtAdmin, async (req, res, next) => {
+  router.put("/config/customer-charges/:versionId", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       const idempotencyKey = requiredRequestText(
@@ -1051,7 +1056,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.get("/config/rate-cards", requireMbtAdmin, async (req, res, next) => {
+  router.get("/config/rate-cards", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const service = await resolveRateCardService();
       const result = await service.listLocalRateCards({
@@ -1067,7 +1072,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.get("/config/rate-cards/:versionId", requireMbtAdmin, async (req, res, next) => {
+  router.get("/config/rate-cards/:versionId", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const service = await resolveRateCardService();
       const result = await service.getLocalRateCardGraph(requiredRequestText(
@@ -1119,16 +1124,16 @@ export function createMbtRouter(dependencies = {}) {
 
   router.patch(
     "/config/rate-cards/:versionId/state",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     rateCardDirectHandler("state")
   );
   router.delete(
     "/config/rate-cards/:versionId",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     rateCardDirectHandler("delete")
   );
 
-  router.put("/config/rate-cards/:versionId", requireMbtAdmin, async (req, res, next) => {
+  router.put("/config/rate-cards/:versionId", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       const idempotencyKey = requiredRequestText(
@@ -1161,7 +1166,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.post("/config/rate-cards", requireMbtAdmin, async (req, res, next) => {
+  router.post("/config/rate-cards", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       const idempotencyKey = requiredRequestText(
@@ -1231,16 +1236,16 @@ export function createMbtRouter(dependencies = {}) {
 
   router.post(
     "/config/rate-cards/:versionId/validate",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     rateCardLifecycleHandler("validate")
   );
   router.post(
     "/config/rate-cards/:versionId/activate",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     rateCardLifecycleHandler("activate")
   );
 
-  router.post("/config/rate-cards/:versionId/clone", requireMbtAdmin, async (req, res, next) => {
+  router.post("/config/rate-cards/:versionId/clone", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       const idempotencyKey = requiredRequestText(
@@ -1271,7 +1276,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.post("/config/rate-card-imports/preview", requireMbtAdmin, async (req, res, next) => {
+  router.post("/config/rate-card-imports/preview", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       await authorizePhase3Capability({ capability: "masterData" });
@@ -1289,7 +1294,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   });
 
-  router.post("/config/rate-card-imports/apply", requireMbtAdmin, async (req, res, next) => {
+  router.post("/config/rate-card-imports/apply", requireMbtSurface("dispatcher", "MBT management"), async (req, res, next) => {
     try {
       const body = requestObject(req.body);
       const idempotencyKey = requiredRequestText(
@@ -1440,7 +1445,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.get(
     "/assets/import/template",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     authorizeAssetImport,
     async (_req, res, next) => {
       try {
@@ -1461,7 +1466,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.post(
     "/assets/import/preview",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     authorizeAssetImport,
     boundedImportBody,
     async (req, res, next) => {
@@ -1484,7 +1489,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.post(
     "/assets/import/:batchId/apply",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     authorizeAssetImport,
     async (req, res, next) => {
       try {
@@ -1574,7 +1579,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.post(
     "/assets",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     async (req, res, next) => {
       try {
         const body = requestObject(req.body);
@@ -1605,7 +1610,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.patch(
     "/assets/:assetId",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     async (req, res, next) => {
       try {
         const body = requestObject(req.body);
@@ -1640,7 +1645,7 @@ export function createMbtRouter(dependencies = {}) {
 
   router.delete(
     "/assets/:assetId",
-    requireMbtAdmin,
+    requireMbtSurface("dispatcher", "MBT management"),
     async (req, res, next) => {
       try {
         const body = requestObject(req.body);
@@ -2077,6 +2082,15 @@ export function createMbtRouter(dependencies = {}) {
     }
   );
 
+  router.get('/frontdesk/overdue-bins', requireMbtSurface('mbt_frontdesk', 'MBT Front Desk'), async (req, res, next) => {
+    try {
+      await authorizePhase3Capability({ capability: 'frontdeskOperations' });
+      const service = await resolveFrontdeskService();
+      const result = await service.getFrontdeskOverdueBins({ actor: commandActor(req) });
+      noStore(res); res.json(result);
+    } catch (error) { next(error); }
+  });
+
   router.get(
     "/frontdesk/configuration",
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
@@ -2102,6 +2116,7 @@ export function createMbtRouter(dependencies = {}) {
         const service = await resolveCustomerChargeService();
         const result = await service.getFrontdeskCustomerChargeConfiguration({
           actor: commandActor(req),
+          contractId: req.query.contractId,
           rateCardVersionId: requiredRequestText(
             req.query.rateCardVersionId,
             "MBT_FRONTDESK_RATE_CARD_REQUIRED",
@@ -2123,7 +2138,7 @@ export function createMbtRouter(dependencies = {}) {
       try {
         await authorizePhase3Capability({ capability: "frontdeskOperations" });
         const body = requestObject(req.body);
-        const rawDistance = await frontdeskPricing.resolveDistance({
+        const rawDistance = body.kind === 'change_bin' ? {providerMetres:0} : await frontdeskPricing.resolveDistance({
           serviceAddressText: body.serviceAddressText,
           originYardCode: body.orderFrom150 === true ? "150" : "3445",
           orderFrom150: body.orderFrom150 === true
@@ -2239,6 +2254,7 @@ export function createMbtRouter(dependencies = {}) {
         const service = await resolveFrontdeskService();
         const result = await service.getFrontdeskCustomerContracts({
           actor: commandActor(req),
+          summary: req.query.summary === 'true',
           customerNetsuiteId: requiredRequestText(
             req.params.customerNetsuiteId,
             "MBT_FRONTDESK_CUSTOMER_REQUIRED",
@@ -2255,7 +2271,7 @@ export function createMbtRouter(dependencies = {}) {
   );
 
   router.post(
-    "/frontdesk/quotes",
+    ["/frontdesk/quotes", "/frontdesk/quotes/:quoteId"],
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
     async (req, res, next) => {
       try {
@@ -2264,6 +2280,7 @@ export function createMbtRouter(dependencies = {}) {
         const service = await resolveFrontdeskService();
         const result = await service.createFrontdeskQuote({
           actor: commandActor(req),
+          ...(req.params.quoteId ? { quoteId: req.params.quoteId, expectedRevision: body.expectedRevision } : {}),
           customerNetsuiteId: body.customerNetsuiteId,
           siteProfileId: body.siteProfileId,
           site: body.site,
@@ -2479,7 +2496,7 @@ export function createMbtRouter(dependencies = {}) {
     }
   );
 
-  /** @param {"extend" | "exchange" | "collect" | "confirm"} action */
+  /** @param {"extend" | "exchange" | "collect" | "confirm" | "delivery"} action */
   function frontdeskServiceLineMutation(action) {
     /** @type {import("express").RequestHandler} */
     return async (req, res, next) => {
@@ -2487,7 +2504,7 @@ export function createMbtRouter(dependencies = {}) {
         await authorizePhase3Capability({ capability: "frontdeskOperations" });
         const body = requestObject(req.body);
         const service = await resolveFrontdeskService();
-        const operation = action === "extend"
+        const operation = action === "delivery" ? service.rescheduleFrontdeskDelivery : action === "extend"
           ? service.extendFrontdeskServiceLine
           : action === "exchange"
             ? service.exchangeFrontdeskServiceLine
@@ -2507,6 +2524,7 @@ export function createMbtRouter(dependencies = {}) {
             "A Front Desk service-line ID is required."
           ),
           expectedRevision: body.expectedRevision,
+          ...(action === "delivery" ? { deliveryWindow: body.deliveryWindow } : {}),
           ...(action === "extend" ? { returnWindow: body.returnWindow } : {}),
           ...(action === "exchange" ? {
             exchangeWindow: body.exchangeWindow,
@@ -2534,6 +2552,8 @@ export function createMbtRouter(dependencies = {}) {
     };
   }
 
+  router.post('/frontdesk/contracts/:contractId/service-lines/:serviceLineId/delivery-window',
+    requireMbtSurface('mbt_frontdesk', 'MBT Front Desk'), frontdeskServiceLineMutation('delivery'));
   router.post(
     "/frontdesk/contracts/:contractId/service-lines/:serviceLineId/extensions",
     requireMbtSurface("mbt_frontdesk", "MBT Front Desk"),
@@ -2615,6 +2635,11 @@ export function createMbtRouter(dependencies = {}) {
       noStore(res); res.json(result);
     } catch (error) {next(error);}
   });
+  installTransportRoutes(router,{authorize:binDispatchCapability,loadOrders:dependencies.transportSourceLoader,
+    dispatcher:requireMbtSurface('dispatcher','Dispatcher'),admin:requireMbtSurface('admin','Admin'),
+    command:/** @param {import('express').Request} req */ req=>({actor:commandActor(req),
+      idempotencyKey:requiredRequestText(req.get('idempotency-key'),'MBT_IDEMPOTENCY_KEY_REQUIRED','An Idempotency-Key header is required.'),
+      correlationId:correlationId(req),requestId:requestId(req)})});
   router.get("/planning/visits/:visitId", requireMbtSurface("dispatcher", "Dispatcher"), async (req, res, next) => {
     try {
       const capability = await binDispatchCapability(req);
@@ -2654,6 +2679,57 @@ export function createMbtRouter(dependencies = {}) {
           "MBT_IDEMPOTENCY_KEY_REQUIRED","An Idempotency-Key header is required."),
         correlationId:correlationId(req),requestId:requestId(req)});
       noStore(res);res.status(result.status).json(result.body);
+    } catch(error) {next(error);}
+  });
+
+  router.get('/planning/workflows/:visitId/time-window', requireMbtSurface('dispatcher', 'Dispatcher'), async (req,res,next) => {
+    try {
+      await binDispatchCapability(req);
+      const service = await import('./bin-order-window-service.js');
+      noStore(res); res.json(await service.getBinOrderWindow(String(req.params.visitId)));
+    } catch (error) { next(error); }
+  });
+  router.post('/planning/workflows/:visitId/time-window', requireMbtSurface('dispatcher', 'Dispatcher'), async (req,res,next) => {
+    try {
+      const capability = await binDispatchCapability(req);
+      const service = await import('./bin-order-window-service.js');
+      await service.changeBinOrderWindow({...requestObject(req.body), visitId:req.params.visitId,
+        actor:commandActor(req),idempotencyKey:requiredRequestText(req.get('idempotency-key'),
+          'MBT_IDEMPOTENCY_KEY_REQUIRED','An Idempotency-Key header is required.'),
+        correlationId:correlationId(req),requestId:requestId(req)},
+        {capability,onCommitted:dependencies.planningChanged});
+    } catch (error) { next(error); }
+  });
+
+  router.post("/planning/workflows/:visitId/bin-selection", requireMbtSurface("dispatcher", "Dispatcher"), async (req,res,next) => {
+    try {
+      const capability=await binDispatchCapability(req);
+      const service=await import("./bin-selection-service.js");
+      const result=await service.changeAssignedBin({...requestObject(req.body),visitId:req.params.visitId,
+        actor:commandActor(req),idempotencyKey:requiredRequestText(req.get("idempotency-key"),
+          "MBT_IDEMPOTENCY_KEY_REQUIRED","An Idempotency-Key header is required."),
+        correlationId:correlationId(req),requestId:requestId(req)},
+      {capability,onCommitted:dependencies.planningChanged,routeEstimator:dependencies.binSelectionRouteEstimator});
+      noStore(res);res.setHeader("x-mbt-idempotent-replay",String(result.replayed));
+      res.status(result.status).json(result.body);
+    } catch(error) {next(error);}
+  });
+
+  router.get('/planning/workflows/:visitId/cargo',requireMbtSurface('dispatcher','Dispatcher'),async(req,res,next)=>{
+    try {
+      await binDispatchCapability(req);
+      const service=await import('./bin-cargo-service.js');
+      noStore(res);res.json(await service.getBinCargoOptions(String(req.params.visitId)));
+    } catch(error) {next(error);}
+  });
+  router.post('/planning/workflows/:visitId/cargo',requireMbtSurface('dispatcher','Dispatcher'),async(req,res,next)=>{
+    try {
+      const capability=await binDispatchCapability(req),service=await import('./bin-cargo-service.js');
+      const result=await service.saveBinCargo({...requestObject(req.body),visitId:req.params.visitId,actor:commandActor(req),
+        idempotencyKey:requiredRequestText(req.get('idempotency-key'),'MBT_IDEMPOTENCY_KEY_REQUIRED','An Idempotency-Key header is required.'),
+        correlationId:correlationId(req),requestId:requestId(req)},
+      {capability,onCommitted:dependencies.planningChanged,routeEstimator:dependencies.binSelectionRouteEstimator});
+      noStore(res);res.setHeader('x-mbt-idempotent-replay',String(result.replayed));res.status(result.status).json(result.body);
     } catch(error) {next(error);}
   });
 

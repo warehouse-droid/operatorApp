@@ -1,0 +1,27 @@
+.request-unread-card { position:relative; overflow:visible; }
+.request-unread-badge {
+  position:absolute;
+  top:-1px;
+  right:-1px;
+  transform:translate(50%,-50%);
+  z-index:1;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  box-sizing:border-box;
+  min-width:22px;
+  height:22px;
+  padding:0 5px;
+  border-radius:999px;
+  background:#dc2626;
+  color:#fff;
+  box-shadow:0 0 0 2px #fff;
+  font:700 12px/1 system-ui,sans-serif;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+  pointer-events:none;
+}
+/* Leave room inside the scrolling lists for the badge's outer three quarters. */
+.stock-request-list { padding:16px 24px 8px 8px; }
+.stock-request-list .stock-request-card { margin-bottom:16px; }
+.dr-list { padding:14px 24px 4px 2px; gap:16px; }

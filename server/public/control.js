@@ -4,6 +4,8 @@ const STAFF_TOKEN_KEY = "mbbs.staff.token"; // secret-scan: allow non-secret bro
 const STAFF_ROLE_KEY = "mbbs.staff.role";
 const STAFF_ROLES_KEY = "mbbs.staff.roles";
 const ACCOUNT_ROLE_OPTIONS = [
+  { value: "repair_technician", labelKey: "control.roleRepairTechnician", label: "Repair Technician" },
+  { value: "repair_office", labelKey: "control.roleRepairOffice", label: "Repair Office" },
   { value: "boss", labelKey: "control.roleBoss", label: "BOSS" },
   { value: "operator", labelKey: "control.roleOperator", label: "Operator" },
   { value: "dispatcher", labelKey: "control.roleDispatcher", label: "Dispatcher" },
@@ -23,6 +25,7 @@ const SALES_YARD_OPTIONS = [
   { locationId: 26, yardCode: "150" }
 ];
 const IS_ADMIN_PAGE = window.location.pathname.startsWith("/admin");
+let returnNotificationSettings = {};
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
 const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
@@ -269,6 +272,8 @@ let orderLocks = [];
 let loadedOrders = [];
 let loadedSearchResults = [];
 let loadedOrderDetail = null;
+let loadedDetailLoading = false;
+const loadedReads = window.MBBSMovementReads.create(request);
 let loadedDriverOptions = [];
 let selectedLoadedOrderKey = "";
 let syncSettings = { mode: "manual", running: false, lastStatus: "idle" };
@@ -383,7 +388,6 @@ const loadedTypeByDirection = {
     : "sales_order"
 };
 let loadedSearchTimer = null;
-let loadedSearchSeq = 0;
 let loadedSearchLoading = false;
 let auditFilters = {
   from: localStorage.getItem("mbbs.control.audit.from") || "",
@@ -1205,6 +1209,23 @@ async function selectScmReconciliationRun(runId) {
   }
 }
 
+async function saveAggregateNightlySettings(form) {
+  if (!scmReconciliationSettingsLoaded) { throw new Error('Reconciliation settings are not loaded. Refresh before saving.'); }
+  const aggregateNightlyEnabled = Boolean(form.elements.aggregateNightlyEnabled?.checked);
+  const aggregateNightlyTime = String(form.elements.aggregateNightlyTime?.value || '').trim();
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(aggregateNightlyTime)) { throw new Error('Enter a valid nightly start time.'); }
+  scmReconciliationBusy = true;
+  render();
+  try {
+    const payload = await request('/api/control/scm-reconciliation/settings', {
+      method: 'PUT', body: JSON.stringify({ aggregateNightlyEnabled, aggregateNightlyTime })
+    });
+    scmReconciliationSettings = normalizeScmReconciliationSettings(payload);
+    scmReconciliationLoadError = '';
+    alert('Aggregate nightly reconciliation settings saved.');
+  } finally { scmReconciliationBusy = false; render(); }
+}
+
 async function saveScmReconciliationSettings(form) {
   if (!scmReconciliationSettingsLoaded) {
     throw new Error("Reconciliation settings are not loaded. Refresh before saving.");
@@ -1977,6 +1998,10 @@ function returnStatus(record) {
   if (firstDefined(record, ["draftId", "draft_id"], "")) return "draft";
   const syncStatus = String(firstDefined(record, ["netSuiteSyncStatus", "netsuite_sync_status"], "")).toLowerCase();
   const creditMemo = firstDefined(record, ["netSuiteStage", "netsuite_stage"], "") === "credit_memo";
+  if (returnType(record) === "exchange") {
+    if (["voided", "rejected"].includes(record.status)) return record.status;
+    return { disabled: "local_only", failed: "exchange_failed", pending: "exchange_pending", succeeded: "exchange_posted" }[syncStatus] || record.status;
+  }
   if (syncStatus === "failed") {
     return creditMemo || (returnType(record) === "pallet" && Number(record.workflowVersion || 1) < 2) ? "credit_memo_creation_failed" : "ra_creation_failed";
   }
@@ -1996,6 +2021,7 @@ function returnType(record) {
   const recordType = String(firstDefined(record, ["returnType", "return_type", "recordType", "record_type", "type"], "stock")).trim().toLowerCase();
   const stockType = String(firstDefined(record, ["stockReturnType", "stock_return_type"], "")).trim().toLowerCase();
   if (recordType.includes("pallet")) return "pallet";
+  if (recordType.includes("exchange")) return "exchange";
   if (recordType.includes("combined")) return stockType.includes("quality") ? "combined_quality" : "combined_normal";
   if (stockType.includes("quality") || recordType.includes("quality")) return "quality_stock";
   if (stockType.includes("normal") || recordType.includes("normal") || recordType.includes("good")) return "normal_stock";
@@ -2005,6 +2031,7 @@ function returnType(record) {
 function returnTypeLabel(record) {
   const type = returnType(record);
   if (type === "pallet") return "PALLET Return";
+  if (type === "exchange") return "Stock exchange";
   if (type === "quality_stock") return "Quality Stock Return";
   if (type === "normal_stock") return "Normal Stock Return";
   if (type === "combined_quality") return "Combined Quality Stock + PALLET Draft";
@@ -2025,6 +2052,9 @@ function returnStatusLabel(value) {
     voided: "Voided",
     draft: "Draft",
     local_only: "Local only",
+    exchange_pending: "Inventory Transfer Pending",
+    exchange_posted: "Inventory Transfer Posted",
+    exchange_failed: "Inventory Transfer Failed",
     ra_pending: "RA Pending",
     ra_created: "RA Created",
     ra_creation_failed: "RA Creation Failed",
@@ -2379,7 +2409,7 @@ function renderReturnDetail() {
     <section class="return-detail-section">
       <div class="return-subheading"><h4>NetSuite reconciliation</h4></div>
       ${isDraft ? `<span class="muted">Drafts reserve no quantity and cannot be linked to NetSuite. Only the creating operator can resume this draft in the Operator PWA.</span>` : renderReturnLinks(returnLinks(), header)}
-      ${!isDraft && hasStaffAuthority(operator, ["admin"]) ? `
+      ${!isDraft && returnType(header) !== "exchange" && hasStaffAuthority(operator, ["admin"]) ? `
         <form class="return-link-form" data-form="manual-return-link" data-id="${escapeHtml(id)}">
           <label><span>Transaction type</span><select name="transactionType"><option value="return_authorization">Return Authorization</option><option value="credit_memo">Credit Memo</option></select></label>
           <label><span>NetSuite internal ID</span><input name="netsuiteId" inputmode="numeric" required /></label>
@@ -2439,6 +2469,7 @@ function renderReturnManagementSection() {
         </select></label>
         <label><span>Return type</span><select data-return-filter="type">
           <option value="">Stock + PALLET</option>
+          <option value="exchange" ${returnFilters.type === "exchange" ? "selected" : ""}>Stock exchange</option>
           <option value="normal_stock" ${returnFilters.type === "normal_stock" ? "selected" : ""}>Normal Stock</option>
           <option value="quality_stock" ${returnFilters.type === "quality_stock" ? "selected" : ""}>Quality Stock</option>
           <option value="pallet" ${returnFilters.type === "pallet" ? "selected" : ""}>PALLET</option>
@@ -2455,12 +2486,38 @@ function renderReturnManagementSection() {
     </section>`;
 }
 
+function renderReturnNotificationSettings() {
+  const settings = returnNotificationSettings;
+  return `<section class="panel return-notification-settings">
+    <div class="section-heading"><div><h2>Return customer email / SMS</h2>
+      <p class="muted">Operators can send a confirmation with the NetSuite Credit Memo / RA number after posting a stock or pallet return.</p></div></div>
+    ${settings.error ? `<p role="alert">${escapeHtml(settings.error)}</p>` : ''}
+    <p>Email: ${settings.emailConfigured ? 'Existing email service configured' : 'Configure the existing SMTP email service on the server'}.</p>
+    <div class="form-grid">
+      <label><span>Telnyx API key</span><input type="password" data-field="telnyx-api-key" maxlength="512" autocomplete="new-password"
+        placeholder="${settings.hasApiKey ? 'Key saved — leave blank to keep it' : 'Enter Telnyx API key'}" />
+        <small>The saved key is encrypted and is never displayed.</small></label>
+      <label><span>Telnyx sender number</span><input type="tel" data-field="telnyx-from-number" maxlength="16"
+        value="${escapeHtml(settings.fromNumber || '')}" placeholder="+14165550123" autocomplete="off" />
+        <small>Use your SMS-enabled Telnyx number, assigned to a messaging profile, with +country code.</small></label>
+    </div>
+    <div class="actions"><button class="primary" data-action="save-return-notifications" type="button">Save email / SMS settings</button>
+      ${settings.hasApiKey ? '<button data-action="remove-return-notification-key" type="button">Remove Telnyx API key</button>' : ''}</div>
+    <p class="muted">SMS: ${settings.configured ? 'Configured' : 'API key and sender number required'}. Messages are sent only when an operator clicks Send.</p>
+  </section>`;
+}
+
+async function loadReturnNotificationSettings() {
+  try { returnNotificationSettings = await request('/api/admin/return-notifications'); }
+  catch (error) { returnNotificationSettings = { error: error.message }; }
+}
+
 function renderReturnAutomationSection() {
-  return `<section class="panel return-automation">
+  return `${renderReturnNotificationSettings()}<section class="panel return-automation">
     <div class="section-heading">
       <div>
         <h2>Legacy Return NetSuite Automation</h2>
-        <p class="muted">These settings apply to earlier return records. For new stock and pallet returns, use the per-yard RA and CM columns in <a href="/mbt-gates.html">Feature Gates</a>. Enabled CM gates create Credit Memos directly and take priority over RA.</p>
+        <p class="muted">These settings apply to earlier return records. For new stock and pallet returns, use the per-yard Stock Return → CM and Pallet Return → CM controls in <a href="/mbt-gates.html">Feature Gates</a> to create Credit Memos.</p>
       </div>
       <button data-action="refresh-return-automation" type="button">Refresh</button>
     </div>
@@ -2820,14 +2877,35 @@ function findSelectedLoadedOrder() {
 
 async function loadLoadedOrderDetailForSelection() {
   loadedOrderDetail = null;
-  if (!selectedLoadedOrderKey) return;
   const selected = findSelectedLoadedOrder();
-  if (!selected) return;
+  if (!selected) {
+    loadedReads.cancel("detail");
+    loadedDetailLoading = false;
+    refreshLoadedPanels({ detailOnly: true });
+    return;
+  }
+  loadedDetailLoading = true;
+  refreshLoadedPanels({ detailOnly: true });
   const detailParams = new URLSearchParams(isLoadedSearchActive() ? loadedSearchQuery() : loadedOrdersQuery());
   detailParams.set("direction", selected.direction);
   detailParams.set("orderType", selected.order_type);
   detailParams.set("orderId", selected.order_id);
-  loadedOrderDetail = await request(`/api/control/loaded-orders/detail?${detailParams.toString()}`);
+  try {
+    await loadedReads.run("detail", `/api/control/loaded-orders/detail?${detailParams.toString()}`, (detail) => {
+      loadedOrderDetail = detail;
+    });
+  } finally {
+    loadedDetailLoading = loadedReads.pending("detail");
+    refreshLoadedPanels({ detailOnly: true });
+  }
+}
+
+function cancelLoadedSearch() {
+  clearTimeout(loadedSearchTimer);
+  for (const channel of ["list", "search", "detail"]) loadedReads.cancel(channel);
+  loadedSearchLoading = false;
+  loadedDetailLoading = false;
+  loadedOrderDetail = null;
 }
 
 async function loadLoadedDriverOptions() {
@@ -2841,40 +2919,45 @@ async function loadLoadedDriverOptions() {
 }
 
 async function loadLoadedOrders(options = {}) {
+  cancelLoadedSearch();
   const params = loadedOrdersQuery();
-  loadedOrders = await request(`/api/control/loaded-orders?${params.toString()}`);
-  if (!options.keepSelection || !loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
-    selectedLoadedOrderKey = loadedOrders[0] ? loadedOrderKey(loadedOrders[0]) : "";
-  }
-  loadedOrderDetail = null;
   refreshLoadedPanels();
-  await loadLoadedOrderDetailForSelection();
+  await loadedReads.run("list", `/api/control/loaded-orders?${params.toString()}`, async (orders) => {
+    loadedOrders = orders;
+    if (isLoadedSearchActive()) return;
+    if (!options.keepSelection || !loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
+      selectedLoadedOrderKey = loadedOrders[0] ? loadedOrderKey(loadedOrders[0]) : "";
+    }
+    refreshLoadedPanels();
+    await loadLoadedOrderDetailForSelection();
+  });
 }
 
 async function loadLoadedSearchResults() {
   const term = loadedSearchTerm.trim();
   const itemTerm = loadedItemSearchTerm.trim();
-  const seq = ++loadedSearchSeq;
   if (!term && !itemTerm) {
+    loadedReads.cancel("search");
     loadedSearchResults = [];
     loadedSearchLoading = false;
     if (!loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
       selectedLoadedOrderKey = loadedOrders[0] ? loadedOrderKey(loadedOrders[0]) : "";
     }
+    refreshLoadedPanels();
     await loadLoadedOrderDetailForSelection();
     return;
   }
   loadedSearchLoading = true;
-  const results = await request(`/api/control/loaded-orders?${loadedSearchQuery().toString()}`);
-  if (seq !== loadedSearchSeq) return;
-  loadedSearchResults = results;
-  loadedSearchLoading = false;
-  if (!loadedSearchResults.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
-    selectedLoadedOrderKey = loadedSearchResults[0] ? loadedOrderKey(loadedSearchResults[0]) : "";
-  }
-  loadedOrderDetail = null;
   refreshLoadedPanels();
-  await loadLoadedOrderDetailForSelection();
+  await loadedReads.run("search", `/api/control/loaded-orders?${loadedSearchQuery().toString()}`, async (results) => {
+    loadedSearchResults = results;
+    loadedSearchLoading = false;
+    if (!loadedSearchResults.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
+      selectedLoadedOrderKey = loadedSearchResults[0] ? loadedOrderKey(loadedSearchResults[0]) : "";
+    }
+    refreshLoadedPanels();
+    await loadLoadedOrderDetailForSelection();
+  });
 }
 
 function replaceSecurePhotoHtml(element, html) {
@@ -2883,9 +2966,14 @@ function replaceSecurePhotoHtml(element, html) {
   hydrateSecurePhotoImages(element);
 }
 
-function refreshLoadedPanels() {
+function refreshLoadedPanels({ detailOnly = false } = {}) {
   const list = document.getElementById("loadedOrderList");
-  if (list) replaceSecurePhotoHtml(list, renderLoadedOrderList());
+  if (list && !detailOnly) replaceSecurePhotoHtml(list, renderLoadedOrderList());
+  if (list && detailOnly) {
+    for (const card of list.querySelectorAll('[data-action="select-loaded-order"]')) {
+      card.classList.toggle("active", card.dataset.key === selectedLoadedOrderKey);
+    }
+  }
   const detail = document.getElementById("loadedDetailPanel");
   if (detail) replaceSecurePhotoHtml(detail, renderLoadedOrderDetail());
 }
@@ -3048,6 +3136,7 @@ function renderSalesOrderLoadAttempts(loadAttempts = []) {
 }
 
 function renderLoadedOrderDetail() {
+  if (loadedDetailLoading) return `<div class="empty-detail" role="status"><strong>${t("common.loading", "Loading...")}</strong></div>`;
   if (!loadedOrderDetail) {
     return `<div class="empty-detail"><strong>${t("common.selectOrder", "Select an order")}</strong><span>${t("yard.selectMovementHelp", "Yard processing, driver delivery details, timestamps, and photo proof will show here.")}</span></div>`;
   }
@@ -3669,6 +3758,11 @@ function renderScmReconciliationRunTargets(runId) {
 }
 
 function scmReconciliationRunScopeLabel(run) {
+  if (firstDefined(run, ['sourceFilter', 'source_filter'], '') === 'pending_fulfillment_aggregate') { return 'SO · Pending aggregate'; }
+  return scmReconciliationStandardScopeLabel(run);
+}
+
+function scmReconciliationStandardScopeLabel(run) {
   const scope = String(firstDefined(run, ["scope"], "all"));
   const soOrderType = String(firstDefined(
     run,
@@ -3793,6 +3887,38 @@ function renderScmReconciliationSelectedRun(run) {
   `;
 }
 
+function renderAggregateNightlySettings() {
+  const settings = scmReconciliationSettings;
+  const disabled = scmReconciliationBusy || !scmReconciliationSettingsLoaded;
+  const schedule = settings.aggregateNightlySchedule;
+  const next = schedule?.nextRun;
+  const last = settings.aggregateNightlyLastRun;
+  function nextLabel() { return next
+    ? `${next.localDate} at ${next.localTime} (America/Toronto)${schedule.reason === 'due' ? ' — due now; waiting for an available NetSuite slot' : ''}`
+    : schedule?.reason === 'initial_so_not_approved' ? 'Waiting for initial SO reconciliation approval' : 'Disabled'; }
+  return `<section class="scm-reconciliation-manual-bar" aria-label="Aggregate nightly reconciliation">
+    <div>
+      <h3>Nightly reconciliation · Pending-fulfillment aggregate orders</h3>
+      <strong class="scm-reconciliation-settings-state">Aggregate orders only</strong>
+    </div>
+    <p><strong>Scope: Pending Fulfillment sales orders containing aggregate materials.</strong> Includes Delivery and Pick-Up orders with bulk or bagged gravel, HPB, screening, crusher run, sand, river rock, or concrete stone. Saved packing work is held for review.</p>
+    <form class="scm-reconciliation-settings" data-form="aggregate-nightly-settings">
+      <label class="scm-reconciliation-toggle">
+        <input name="aggregateNightlyEnabled" type="checkbox" ${settings.aggregateNightlyEnabled ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
+        <span><strong>Enable nightly reconciliation for aggregate orders</strong><small>Pending Fulfillment only · one run per Toronto date. Waits for operational work to finish.</small></span>
+      </label>
+      <label><span>Aggregate nightly start time · Toronto</span>
+        <input name="aggregateNightlyTime" type="time" required value="${escapeHtml(settings.aggregateNightlyTime || '21:30')}" ${disabled ? 'disabled' : ''} />
+      </label>
+      <button type="submit" ${disabled ? 'disabled' : ''}>Save aggregate schedule</button>
+    </form>
+    <p><strong>Aggregate schedule:</strong> ${settings.aggregateNightlyEnabled ? 'Enabled' : 'Disabled'}</p>
+    <p><strong>Next run:</strong> ${escapeHtml(nextLabel())}</p>
+    <p><strong>Last run:</strong> ${last ? `#${escapeHtml(last.id)} · ${escapeHtml(last.status)}` : 'No aggregate nightly run yet'}</p>
+    <p class="muted">Interrupted runs retain their progress. Select the run below to resume remaining orders. Disabling this schedule stops future starts.</p>
+  </section>`;
+}
+
 function renderScmReconciliationSection() {
   if (!hasStaffAuthority(operator, ["admin"])) return "";
   const poToInitialApproved = scmReconciliationInitialApproved();
@@ -3831,6 +3957,7 @@ function renderScmReconciliationSection() {
           <span>${escapeHtml(scmReconciliationLoadError)}</span>
         </div>
       ` : ""}
+      ${renderAggregateNightlySettings()}
       <div class="scm-reconciliation-manual-bar">
         <div>
           <h3>Manual reconciliation</h3>
@@ -3893,16 +4020,16 @@ function renderScmReconciliationSection() {
       </div>
       <details class="scm-reconciliation-settings-disclosure">
         <summary>
-          <span><strong>Nightly reconciliation settings</strong><small>Runs after operational hours and waits when another NetSuite task is active.</small></span>
+          <span><strong>Full SO / PO / TO nightly settings</strong><small>Separate schedule for all Delivery SO, PO and TO orders.</small></span>
           <span class="scm-reconciliation-settings-state">${scmReconciliationSettings.nightlyEnabled ? "Enabled" : "Disabled"}</span>
         </summary>
         <form class="scm-reconciliation-settings" data-form="scm-reconciliation-settings" aria-busy="${scmReconciliationBusy ? "true" : "false"}">
           <label class="scm-reconciliation-toggle">
             <input name="nightlyEnabled" type="checkbox" ${scmReconciliationSettings.nightlyEnabled ? "checked" : ""} ${settingsDisabled ? "disabled" : ""} />
-            <span><strong>Enable nightly reconciliation</strong><small>Apply future unambiguous results on schedule.</small></span>
+            <span><strong>Enable full SO / PO / TO nightly reconciliation</strong><small>All Delivery SO, PO and TO orders. Apply future unambiguous results on schedule.</small></span>
           </label>
           <label>
-            <span>Nightly start time</span>
+            <span>Full reconciliation start time · Toronto</span>
             <input name="nightlyTime" type="time" required value="${escapeHtml(scmReconciliationSettings.nightlyTime || "21:30")}" ${settingsDisabled ? "disabled" : ""} />
           </label>
           <label>
@@ -3913,7 +4040,7 @@ function renderScmReconciliationSection() {
             <span>Initial backfill since</span>
             <input name="initialBackfillSince" type="date" required value="${escapeHtml(scmReconciliationSettings.initialBackfillSince || "2026-01-01")}" ${settingsDisabled ? "disabled" : ""} />
           </label>
-          <button type="submit" ${settingsDisabled ? "disabled" : ""}>Save settings</button>
+          <button type="submit" ${settingsDisabled ? "disabled" : ""}>Save full reconciliation schedule</button>
         </form>
       </details>
       <div class="control-visually-hidden" role="status" aria-live="polite">${latestRun
@@ -4866,6 +4993,12 @@ async function loadControlData() {
   if (!IS_ADMIN_PAGE && activeSection === "reopen") return controlOrderReopen.load();
   if (!IS_ADMIN_PAGE && activeSection === "count-sheets") return controlCountSheets.load();
   if (!IS_ADMIN_PAGE && activeSection === "damage-stock") return controlDamage.load();
+  if (!IS_ADMIN_PAGE && activeSection === "loaded-export") {
+    await loadLoadedDriverOptions();
+    await loadLoadedOrders({ keepSelection: true });
+    if (isLoadedSearchActive()) await loadLoadedSearchResults();
+    return render();
+  }
   if (IS_ADMIN_PAGE) {
     const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage, nextAggregateAccess] = await Promise.all([
       request("/api/operators"),
@@ -4893,6 +5026,7 @@ async function loadControlData() {
     mapsUsage = nextMapsUsage;
     await Promise.all([
       loadAdminReturnSettings(),
+      loadReturnNotificationSettings(),
       loadScmReconciliationControl()
     ]);
   } else {
@@ -4918,6 +5052,10 @@ app.addEventListener("submit", async (event) => {
   if (!form) return;
   event.preventDefault();
   try {
+    if (form.dataset.form === 'aggregate-nightly-settings') {
+      await saveAggregateNightlySettings(form);
+      return;
+    }
     if (form.dataset.form === "scm-reconciliation-settings") {
       await saveScmReconciliationSettings(form);
       return;
@@ -5217,8 +5355,22 @@ app.addEventListener("click", async (event) => {
       await loadControlReturnSettings();
       return render();
     }
+    if (["save-return-notifications", "remove-return-notification-key"].includes(button.dataset.action)) {
+      const keyInput = app.querySelector('[data-field="telnyx-api-key"]');
+      const body = button.dataset.action === "remove-return-notification-key" ? { clearApiKey: true } : {
+        apiKey: keyInput?.value || '',
+        fromNumber: (app.querySelector('[data-field="telnyx-from-number"]')?.value || '').trim()
+      };
+      button.disabled = true;
+      try {
+        returnNotificationSettings = await request('/api/admin/return-notifications', { method: 'PUT', body: JSON.stringify(body) });
+        render();
+        alert('Return notification settings saved.');
+      } finally { if (keyInput) keyInput.value = ''; button.disabled = false; }
+      return;
+    }
     if (button.dataset.action === "refresh-return-automation") {
-      await loadAdminReturnSettings();
+      await Promise.all([loadAdminReturnSettings(), loadReturnNotificationSettings()]);
       return render();
     }
     if (button.dataset.action === "save-return-automation") {
@@ -5401,7 +5553,6 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "select-loaded-order") {
       selectedLoadedOrderKey = button.dataset.key || "";
       await loadLoadedOrderDetailForSelection();
-      refreshLoadedPanels();
       return;
     }
     if (button.dataset.action === "authorize-sales-order-reload") {
@@ -5905,29 +6056,21 @@ app.addEventListener("input", (event) => {
   if (event.target.id === "loadedSearch") loadedSearchTerm = event.target.value || "";
   if (event.target.id === "loadedItemSearch") loadedItemSearchTerm = event.target.value || "";
   saveLoadedSearch();
-  clearTimeout(loadedSearchTimer);
+  cancelLoadedSearch();
   if (!isLoadedSearchActive()) {
-    loadedSearchResults = [];
-    loadedSearchLoading = false;
-    if (!loadedOrders.some((order) => loadedOrderKey(order) === selectedLoadedOrderKey)) {
-      selectedLoadedOrderKey = loadedOrders[0] ? loadedOrderKey(loadedOrders[0]) : "";
-    }
-    loadLoadedOrderDetailForSelection()
-      .then(refreshLoadedPanels)
-      .catch((error) => alert(error.message));
+    loadLoadedSearchResults().catch((error) => alert(error.message));
     return;
   }
   loadedSearchLoading = true;
   refreshLoadedPanels();
   loadedSearchTimer = setTimeout(() => {
     loadLoadedSearchResults()
-      .then(refreshLoadedPanels)
       .catch((error) => {
         loadedSearchLoading = false;
         refreshLoadedPanels();
         alert(error.message);
       });
-  }, 250);
+  }, 150);
 });
 
 const controlOrderReopen = (/** @type {any} */ (window)).MBBSControlOrderReopen?.create({ root: app, request, escape: escapeHtml, render, active: () => activeSection === "reopen" });

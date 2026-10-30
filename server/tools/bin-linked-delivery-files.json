@@ -1,0 +1,9 @@
+[
+  "src/mbt/bin-linked-delivery-planning.js",
+  "src/mbt/bin-planning-board.js",
+  "src/mbt/bin-planning-service.js",
+  "src/mbt/bin-order-workflow-read.js",
+  "src/mbt/bin-planning-read.js",
+  "public/mbt-planning.js",
+  "public/mbt-planning.html"
+]

@@ -1,0 +1,16 @@
+{
+  "testedBase": {
+    "imageId": "sha256:fe6d0858dddcc511ab2fabedd6705954babf9f174d145c3340c3c4eeee5a6144",
+    "containerId": "5db1fbd7a5f6bd8638f1ced54b30e2bc05207b61c0fd467d74c392daa6a8fde4"
+  },
+  "deploymentBase": {
+    "imageId": "sha256:830c602eda3867a396b0bba6d589413f1ae2cbbb93bf7d805e56178acbb654ed",
+    "containerId": "7d25215ecaa9efa868cb47a7623be87ae1f620ca973eb11099da841833b48e79"
+  },
+  "disjointFilesPreserved": {
+    "src/delivery-request-documents.js": "b20cdf0df6425e8bcf530f0730c098b491f52f7051e4fe521ac78d8b85a76b04",
+    "public/delivery-requests.js": "ca66aa339b2d3650f8b2dc471d21cec6ca406cb8bbc9e2483c2073a29334c615",
+    "public/delivery-requests.html": "acd4afc1440af488c91ce4b661f58f39317f8d90405c1048be0b5ab814bf6f36"
+  },
+  "allReopenRuntimeBaselinesUnchanged": true
+}

@@ -1,0 +1,17 @@
+[
+  "test/dispatch/unit/split-quantity-validation.test.js",
+  "test/dispatch/frontend/split-quantity-validation.test.js",
+  "test/dispatch/integration/split-quantity-validation.test.js",
+  "test/dispatch/integration/split-quantity-validation-http.test.js",
+  "test/dispatch/unit/unfinished-sales-resplit.test.js",
+  "test/dispatch/unit/sales-unsplit.test.js",
+  "test/dispatch/integration/unfinished-sales-resplit.test.js",
+  "test/dispatch/integration/unfinished-sales-resplit-http.test.js",
+  "test/dispatch/integration/sales-split-allocation-unsplit.test.js",
+  "test/dispatch/integration/dispatch-registered-split-planning.test.js",
+  "test/dispatch/integration/dispatch-split-address.test.js",
+  "test/dispatch/integration/dispatch-driver-completion-split-isolation.red.test.js",
+  "test/dispatch/integration/retained-history-save.test.js",
+  "test/dispatch/integration/dispatch-save-recovery.red.test.js",
+  "test/dispatch/frontend/unfinished-sales-resplit.browser.test.mjs"
+]

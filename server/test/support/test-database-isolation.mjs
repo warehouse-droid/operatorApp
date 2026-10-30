@@ -143,6 +143,9 @@ function runNodeTestFile(file, environment) {
       "--test",
       "--test-concurrency=1",
       "--test-reporter=spec",
+      ...(environment.MBBS_TEST_FILE_TIMEOUT_MS
+        ? [`--test-timeout=${Number(environment.MBBS_TEST_FILE_TIMEOUT_MS)}`]
+        : []),
       file
     ], {
       env: environment,

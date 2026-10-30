@@ -2,12 +2,28 @@
 (() => {
   if (window.StockRequestConversationAlerts) return;
   const token = () => ['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'].map(key => localStorage.getItem(key)).find(Boolean) || '';
-  let session = '', actor = null, generation = 0, checking = false, refreshing = false, stream = null, badge = null, notice = null, rows = [];
+  let session = '', actor = null, generation = 0, checking = false, refreshing = false, stream = null, badge = null, notice = null, rows = [], unread = 0;
   const shown = new Set();
+  let allUpdates = null;
+  function messageRows(items) {
+    return items.map(row=>({requestRef:row.requestRef,category:`${row.audience==='scm'?'SCM':'Sales'} · ${row.tab==='special'?'Special':'Regular'}`,
+      summary:[row.actorName,row.message,`${row.unreadCount || 1} unread messages`].filter(Boolean).join(' · '),href:link(row)}));
+  }
+  async function openAllUpdates() {
+    const current=session;
+    const ui=await import('/stock-request-alert-list.js?v=20261022-v1');
+    if(!actor||!current||token()!==current)return;
+    allUpdates=ui.openStockRequestAlertList({title:'Unread request messages',session:current,rows:messageRows(rows),
+      load:async signal=>{
+        const results=await Promise.all(audiences(actor).map(async audience=>({audience,...await ui.getAlertData(`/api/${audience}/stock-request-conversation-alerts?includeRequests=1`,current,signal)})));
+        return messageRows(results.flatMap(result=>(result.requests||[]).map(row=>({...row,audience:result.audience}))));
+      }});
+  }
   const link = row => `/${row.audience}/stock-requests?tab=${row.tab}&requestId=${row.id}&requestRef=${encodeURIComponent(row.requestRef)}`;
   const text = (tag, value) => {const node = document.createElement(tag); node.textContent = value; return node;};
   const key = row => `mbbs.stock.conversation.${actor.id}.${row.audience}.${row.id}.${row.latestEventId}`;
   function stop() {
+    allUpdates?.close();allUpdates=null;
     generation++; actor = null; rows = []; checking = false; refreshing = false; stream?.close(); stream = null;
     badge?.remove(); badge = null; notice?.remove(); notice = null; shown.clear();
   }
@@ -16,20 +32,24 @@
   function visible(row) {const displayed = window.StockRequestConversation?.displayed(); return displayed?.id === row.id && displayed.audience === row.audience && displayed.eventId >= row.latestEventId;}
   function paint(count) {
     if (!actor) return;
-    if (!badge) {badge = text('a',''); badge.dataset.stockConversationAlert = ''; badge.className = 'stock-conversation-alert';}
+    if (!badge) {badge = text('a',''); badge.dataset.stockConversationAlert = ''; badge.className = 'stock-conversation-alert';
+      badge.addEventListener('click',event=>{if(event.button||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)return;event.preventDefault();void openAllUpdates();});}
     const host = document.querySelector('.topbar .topbar-actions,.dispatch-topbar .topbar-actions,.topbar > .actions') || document.body;
     if (badge.parentElement !== host) host.append(badge);
     badge.classList.toggle('stock-conversation-alert-floating', host === document.body);
     badge.hidden = !count; badge.textContent = `Messages ${count}`; badge.setAttribute('aria-label', `${count} unread conversation messages`);
     if (rows[0]) badge.href = link(rows[0]);
+    if(notice && window.MBBSOSNotifications?.allowsRole(notice.dataset.notificationRole)===false) {notice.remove();notice=null;}
     if (document.hidden || notice) return;
-    const row = rows.find(item => !visible(item) && !seen(item));
+    const row = rows.find(item => window.MBBSOSNotifications?.allowsRole(item.audience)!==false && !visible(item) && !seen(item));
     if (!row) return;
     notice = text('aside',''); notice.dataset.stockConversationNotice = ''; notice.className = 'stock-conversation-notice'; notice.setAttribute('role','status');
+    notice.dataset.notificationRole=row.audience;notice.dataset.messageKey=key(row);
     notice.append(text('strong','New message'), text('p',`${row.requestRef} · ${row.actorName}`), text('p',row.message));
     const open = text('a','Open conversation'); open.href = link(row);
     const dismiss = text('button','Dismiss'); dismiss.type = 'button'; dismiss.addEventListener('click', () => {notice?.remove(); notice = null; paint(count);});
-    notice.append(open,dismiss); document.body.append(notice); remember(row);
+    const all=text('button','View all messages');all.type='button';all.addEventListener('click',()=>void openAllUpdates());
+    notice.append(open,all,dismiss); document.body.append(notice); remember(row);
   }
   async function get(path, current) {
     const response = await fetch(path, {cache:'no-store', headers:{Authorization:`Bearer ${current}`, Accept:'application/json'}, signal:AbortSignal.timeout(10000)});
@@ -52,11 +72,10 @@
       for (const row of rows) {
         if (visible(row) || seen(row)) continue;
         void window.MBBSOSNotifications?.notify({id:`stock-conversation:${row.audience}:${row.id}:${row.latestEventId}`, title:'New conversation message',
-          body:`${row.requestRef} · ${row.actorName}: ${row.message}`, url:link(row), session});
+          body:`${row.requestRef} · ${row.actorName}: ${row.message}`, url:link(row), role:row.audience, session});
       }
       if (notice && !rows.some(row => notice.dataset.messageKey === key(row))) {notice.remove(); notice = null;}
-      paint(results.reduce((sum, result) => sum + Number(result.count || 0), 0));
-      if (notice && !notice.dataset.messageKey) {const row = rows.find(item => shown.has(key(item))); if (row) notice.dataset.messageKey = key(row);}
+      unread=results.reduce((sum, result) => sum + Number(result.count || 0), 0);paint(unread);
     } catch (error) {if (version === generation && [401,403].includes(error.status)) stop();}
     finally {if (version === generation) refreshing = false;}
   }
@@ -86,6 +105,7 @@
   window.addEventListener('stock-conversation-read', () => void refresh());
   window.addEventListener('storage', () => void checkSession(true));
   window.addEventListener('mbbs-auth-operator-changed', () => void checkSession(true));
+  window.addEventListener('mbbs-notification-preferences-changed', () => {paint(unread);void refresh();});
   window.addEventListener('focus', () => void checkSession(true));
   document.addEventListener('visibilitychange', () => {if (!document.hidden) void checkSession(true);});
   window.addEventListener('pagehide', stop);

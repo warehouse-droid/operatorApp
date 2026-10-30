@@ -64,7 +64,7 @@ x-test-service: &test-service
     - /app/data:uid=1000,gid=1000,mode=0700,size=128m
     - /tmp:uid=1000,gid=1000,mode=1777,size=512m
   volumes:
-    - ./server/test-artifacts:/app/test-artifacts
+    - ${MBBS_TEST_ARTIFACT_DIR:-./server/test-artifacts}:/app/test-artifacts
     - ./.github/workflows:/workspace/.github/workflows:ro
     - ./docker-compose.yml:/workspace/docker-compose.yml:ro
     - ./docker-compose.mbt-test.yml:/workspace/docker-compose.mbt-test.yml:ro
@@ -132,7 +132,7 @@ services:
       MBBS_REPO_ROOT: /workspace
       MBBS_SERVER_ROOT: /app
     volumes:
-      - ./server/test-artifacts:/app/test-artifacts
+      - ${MBBS_TEST_ARTIFACT_DIR:-./server/test-artifacts}:/app/test-artifacts
       - ./docker-compose.v2.yml:/workspace/docker-compose.v2.yml:ro
       - ./docker/v2.env.example:/workspace/docker/v2.env.example:ro
     profiles: ["tools"]
@@ -154,7 +154,7 @@ services:
         aliases:
           - mbt-web
     volumes:
-      - ./server/test-artifacts:/app/test-artifacts
+      - ${MBBS_TEST_ARTIFACT_DIR:-./server/test-artifacts}:/app/test-artifacts
     profiles: ["runtime"]
     healthcheck:
       test:
@@ -197,7 +197,7 @@ services:
       db:
         condition: service_healthy
     volumes:
-      - ./server/test-artifacts:/app/test-artifacts
+      - ${MBBS_TEST_ARTIFACT_DIR:-./server/test-artifacts}:/app/test-artifacts
     profiles: ["e2e"]
 
 networks:

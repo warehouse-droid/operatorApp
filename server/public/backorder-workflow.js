@@ -15,7 +15,7 @@ export function backorderPurchaseReady(detail, {allowPendingSalesDecision = fals
 export function canLinkBackorderOrder(detail, kind) {
   // Stock updates reset Sales decisions; an existing SO keeps the subsequent PO reference link available.
   return ['sales_order','purchase_order'].includes(kind) && backorderPurchaseReady(detail, {
-    allowPendingSalesDecision: kind === 'purchase_order' && Boolean(detail.salesOrderId)
+    allowPendingSalesDecision: kind === 'sales_order' || kind === 'purchase_order' && Boolean(detail.salesOrderId)
   });
 }
 /** @param {Record<string,any>} detail @param {'sales_order'|'purchase_order'} kind */

@@ -1,3 +1,4 @@
+import { addLegacyCollection } from "../support/legacy-bin-collection-fixture.js";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
@@ -48,8 +49,8 @@ function atHour(date, hour) {
   return `${date}T${String(hour).padStart(2, "0")}:00:00.000Z`;
 }
 
-/** @param {string} label @param {string} date @param {{quantity?: number}} [options] */
-async function convertedFrontdeskContract(label, date, { quantity = 1 } = {}) {
+/** @param {string} label @param {string} date @param {{quantity?: number, legacyCollection?: boolean}} [options] */
+async function convertedFrontdeskContract(label, date, { quantity = 1, legacyCollection = true } = {}) {
   const fixture = await createFrontdeskPrerequisites({ label });
   const created = await createFrontdeskQuote({
     ...quoteCommand(fixture, { actor: ACTOR, identity: `${label}-${crypto.randomUUID()}` }),
@@ -81,6 +82,7 @@ async function convertedFrontdeskContract(label, date, { quantity = 1 } = {}) {
     quoteId,
     expectedRevision: 3
   }));
+  if (quantity === 1 && legacyCollection) await addLegacyCollection(converted, ACTOR);
   return { fixture, quoteId, converted };
 }
 
@@ -198,6 +200,21 @@ after(async () => {
   await closeDb();
 });
 
+test('initial delivery binds its bin without generating a dependent collection',async()=>{
+  const date=planDate(60),created=await convertedFrontdeskContract('explicit-return',date,{legacyCollection:false});
+  const selected=await insertAsset({label:'explicit-return'}),plan=await insertPlan(date,'explicit-return');
+  const visitId=created.converted.body.visits[0].visitId;
+  const result=await assignMbtBinFrontLeg({actor:DISPATCHER,planId:plan.planId,planDate:date,loadId:plan.loadId,visitId,
+    expectedVisitRevision:1,expectedPlanRevision:1,
+    assetAssignments:[{reservationSlot:'outgoing',assetId:selected.assetId,expectedStateRevision:selected.stateRevision}],
+    reason:'Assign initial delivery before collection is requested',idempotencyKey:crypto.randomUUID(),correlationId:crypto.randomUUID(),requestId:crypto.randomUUID()},
+    {capability:enabledBinDispatchBoundary});
+  assert.equal(result.status,201);
+  assert.deepEqual(result.body.assetReservations.map(r=>r.assetId),[selected.assetId]);
+  const visits=(await query('SELECT service_action,expected_asset_id FROM mbt_service_visits WHERE contract_id=$1',[created.converted.body.contract.contractId])).rows;
+  assert.deepEqual(visits,[{service_action:'delivery',expected_asset_id:selected.assetId}]);
+});
+
 test("multi-bin Front Desk contract exposes one independent ready Dispatch card per physical bin", async () => {
   const date = planDate(9);
   const created = await convertedFrontdeskContract("multi-bin-feed", date, { quantity: 2 });
@@ -214,10 +231,10 @@ test("multi-bin Front Desk contract exposes one independent ready Dispatch card 
   assert.equal(cards.length, 2);
   assert.equal(new Set(cards.map((item) => item.mbt.serviceLineId)).size, 2);
   assert.equal(cards.every((item) => item.mbt.timeline[0]?.relation === "current"), true);
-  assert.equal(cards.every((item) => item.mbt.timeline[1]?.relation === "future"), true);
+  assert.equal(cards.every((item) => item.mbt.timeline.length === 1), true);
 });
 
-test("P3-F13/F15 seam: conversion freezes the shared-yard route, configured steps/evidence, visit distance, and delivery billing owner", async () => {
+test("P3-F13/F15 seam: legacy conversion retains the shared-yard route, configured steps/evidence, visit distance, and delivery billing owner", async () => {
   const date = planDate(10);
   const ordinaryBefore = await ordinaryDispatchSideEffects();
   const created = await convertedFrontdeskContract("materialized-route", date);
@@ -509,7 +526,9 @@ test("P3-F16 seam: stale, wrong-yard, and changed dependent-return revisions fai
       asset: {},
       code: "MBT_BIN_ASSET_MISMATCH"
     },
-    { label: "stale-return", mutate: async ({ returnVisitId }) => query("UPDATE mbt_service_visits SET revision = revision + 1 WHERE service_visit_id = $1", [returnVisitId]), asset: {}, code: "MBT_BIN_DEPENDENT_VISIT_CHANGED" }
+    { label: "stale-return", mutate: async ({ returnVisitId }) => query("UPDATE mbt_service_visits SET revision = revision + 1 WHERE service_visit_id = $1", [returnVisitId]), asset: {}, code: "MBT_BIN_DEPENDENT_VISIT_CHANGED" },
+    { label: "missing-return-link", mutate: async ({ deliveryVisitId }) => query("UPDATE mbt_service_visits SET service_snapshot=service_snapshot-'dependentReturnVisitId'-'collectionOnRequest' WHERE service_visit_id=$1",[deliveryVisitId]), asset: {}, code: "MBT_BIN_DEPENDENT_VISIT_CHANGED" },
+    { label: "invalid-return-revision", mutate: async ({ deliveryVisitId }) => query("UPDATE mbt_service_visits SET service_snapshot=service_snapshot||'{\"dependentReturnVisitRevision\":\"invalid\"}'::jsonb WHERE service_visit_id=$1",[deliveryVisitId]), asset: {}, code: "MBT_BIN_DEPENDENT_VISIT_CHANGED" }
   ];
   for (let index = 0; index < cases.length; index += 1) {
     const candidate = cases[index];
@@ -518,7 +537,7 @@ test("P3-F16 seam: stale, wrong-yard, and changed dependent-return revisions fai
     const { deliveryVisitId, returnVisitId } = visitIds(created);
     const asset = await insertAsset({ label: candidate.label, ...candidate.asset });
     const plan = await insertPlan(date, candidate.label);
-    await candidate.mutate({ asset, returnVisitId });
+    await candidate.mutate({ asset, returnVisitId, deliveryVisitId });
     const before = await query(
       `SELECT visit.status, visit.revision::int, visit.expected_asset_id::text,
               plan.revision::int AS plan_revision, snapshot.trucks,

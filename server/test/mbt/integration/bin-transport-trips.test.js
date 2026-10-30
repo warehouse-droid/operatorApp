@@ -1,0 +1,36 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import {query,closeDb} from '../../../src/db.js';
+import {transportFixture as fixture,transportInput as input} from '../support/bin-transport-fixtures.js';
+import {yard150} from '../support/bin-cargo-fixtures.js';
+import {upsertDispatchOrderCatalog} from '../../../src/dispatch-order-catalog-repository.js';
+import {getTransportOptions,saveTransportTrip,cancelTransportTrip} from '../../../src/mbt/bin-transport-service.js';
+after(closeDb);
+test('MBR/Agg trips: fractional allocation, original reference, mandatory cargo route, remaining quantity and exact replay',async()=>{
+  const f=await fixture(),request=await input(f,[{lineKey:'loose-1',quantity:'1.25'}]);
+  const saved=await saveTransportTrip(request),trip=saved.body.trip;
+  assert.equal(trip.sourceRef,f.sourceRef);assert.equal(trip.tripNumber,1);
+  assert.equal(trip.allocations[0].quantity,'1.25');
+  assert.deepEqual(trip.route.stops.map(s=>s.actionCode),['collect_empty_bin','cargo_pickup_1','cargo_dropoff_1','return_bin']);
+  assert.equal(trip.route.stops[1].location.id,yard150);assert.equal(trip.route.stops[2].location.address,f.order.address);
+  const replay=await saveTransportTrip(request);assert.deepEqual(replay.body,saved.body);assert.equal(replay.replayed,true);
+  const options=await getTransportOptions({sourceRef:f.sourceRef,planDate:f.planDate});
+  assert.equal(options.lines.find(l=>l.key==='loose-1').remaining,'1.25');
+  assert.equal(options.lines.find(l=>l.key==='machine-2').remaining,'1');
+  const more=await input(f,[{lineKey:'loose-1',quantity:'1.250001'}]);
+  await assert.rejects(saveTransportTrip(more),e=>e.code==='MBT_TRANSPORT_ALLOCATION_INVALID');
+  assert.equal((await query('SELECT count(*)::int AS n FROM mbt_transport_trips WHERE source_key=lower($1)',[f.sourceRef])).rows[0].n,1);
+  assert.equal((await query('SELECT count(*)::int AS n FROM mbt_service_visits WHERE visit_reference=$1',[f.sourceRef])).rows[0].n,0);
+});
+test('MBR/Agg trips: concurrent allocation has one winner, cancellation releases quantity and stale source fails',async()=>{
+  const f=await fixture(),first=await input(f,[{lineKey:'loose-1',quantity:'2'}]),second={...first,idempotencyKey:crypto.randomUUID()};
+  const results=await Promise.allSettled([saveTransportTrip(first),saveTransportTrip(second)]);
+  assert.equal(results.filter(r=>r.status==='fulfilled').length,1);
+  const trip=results.find(r=>r.status==='fulfilled').value.body.trip;
+  await cancelTransportTrip({...first,tripId:trip.tripId,expectedRevision:trip.revision,idempotencyKey:crypto.randomUUID()});
+  assert.equal((await getTransportOptions({sourceRef:f.sourceRef,planDate:f.planDate})).lines[0].remaining,'2.5');
+  const stale=await input(f,[{lineKey:'loose-1',quantity:'2'}]);
+  await upsertDispatchOrderCatalog({orders:[{...f.order,items:[{...f.order.items[0],quantity:1},f.order.items[1]]}],source:'test-sync'});
+  await assert.rejects(saveTransportTrip(stale),/source|changed|refresh/i);
+});

@@ -2,6 +2,8 @@
 import {createHash} from 'node:crypto';
 import {query} from './db.js';
 import {purchaseOrderArrived} from './backorder-arrival-status.js';
+import {readSpecialDispatchPlans} from './special-stock-planning.js';
+import {activeBackorderPurchaseOrder,backorderPurchaseOrderProgress} from './backorder-po-progress.js';
 /** @typedef {Record<string,any>} Row */
 /** @param {unknown} value */
 const reference=value=>String(value || '').trim().toUpperCase();
@@ -18,7 +20,7 @@ export async function backorderArrivals(details,lineRows) {
   const result=new Map();
   if (!refs.length) return result;
   /** @type {Row[]} */
-  const orders=(await query('SELECT netsuite_id,tranid,status_text,netsuite_active FROM purchase_orders WHERE upper(btrim(tranid))=ANY($1::text[])',[refs])).rows;
+  const orders=(await query('SELECT netsuite_id,tranid,dispatch_ref,status_text,netsuite_active FROM purchase_orders WHERE upper(btrim(tranid))=ANY($1::text[])',[refs])).rows;
   /** @type {Row[]} */
   const lines=orders.length?(await query('SELECT purchase_order_id,quantity,netsuite_received_qty,netsuite_active,item_type FROM purchase_order_lines WHERE purchase_order_id=ANY($1::bigint[])',[orders.map(order=>order.netsuite_id)])).rows:[];
   /** @type {Map<string,Row[]>} */
@@ -27,12 +29,14 @@ export async function backorderArrivals(details,lineRows) {
     const key=reference(order.tranid);
     matches.set(key,[...(matches.get(key)||[]),order]);
   }
+  const plans=await readSpecialDispatchPlans({orderRefs:orders.filter(activeBackorderPurchaseOrder).flatMap(order=>[order.tranid,order.dispatch_ref])});
   for (const [id,detail] of eligible) {
     const materials=ordered.filter(line=>Number(line.request_id)===id);
     if (!materials.length) continue;
     const tracked=[...new Set(materials.map(line=>reference(line.backorder_po_number)))].map(ref=>{
       const found=matches.get(ref)||[],order=found.length===1?found[0]:null;
       return {reference:ref,purchaseOrderId:order?Number(order.netsuite_id):null,
+        ...backorderPurchaseOrderProgress(order,plans),
         arrived:purchaseOrderArrived(order,lines.filter(line=>String(line.purchase_order_id)===String(order?.netsuite_id))),
         lineIds:materials.filter(line=>reference(line.backorder_po_number)===ref).map(line=>Number(line.id))};
     });
@@ -64,12 +68,18 @@ export async function backorderArrivalAlerts(operatorId,yards) {
       alreadyOrderedSalesOrderRef:row.regular_details?.alreadyOrderedSalesOrderRef,salesOrderRef:row.sales_order_ref}));
     const lines=(await query('SELECT id,request_id,supply_status,backorder_po_number FROM sales_special_stock_lines WHERE request_id=ANY($1::bigint[]) AND removed_at IS NULL',[rows.map(row=>row.id)])).rows;
     const arrivals=await backorderArrivals(details,lines);
+    const seenPoNotices=new Set((await query('SELECT request_id,notice_key FROM backorder_po_alert_receipts WHERE operator_id=$1 AND request_id=ANY($2::bigint[])',[operatorId,rows.map(row=>row.id)])).rows.map(row=>`${row.request_id}:${row.notice_key}`));
     for (const row of rows) {
       const arrival=arrivals.get(Number(row.id));
-      if (!arrival?.key || arrival.key===row.backorder_arrival_key) continue;
-      const purchaseOrderRef=arrival.orders.filter((/** @type {Row} */ order)=>order.arrived).map((/** @type {Row} */ order)=>order.reference).join(', ');
-      requests.push({id:Number(row.id),requestRef:row.request_ref,eventId:1,action:'arrival',arrivalKey:arrival.key,
-        purchaseOrderRef,message:`Stock arrived · ${purchaseOrderRef} fully received${arrival.salesOrderRef?' · SO: '+arrival.salesOrderRef:''}`});
+      if (!arrival) continue;
+      if (arrival.key && arrival.key!==row.backorder_arrival_key) {
+        const purchaseOrderRef=arrival.orders.filter((/** @type {Row} */ order)=>order.arrived).map((/** @type {Row} */ order)=>order.reference).join(', ');
+        requests.push({id:Number(row.id),requestRef:row.request_ref,eventId:1,action:'arrival',arrivalKey:arrival.key,
+          purchaseOrderRef,message:`Stock arrived · ${purchaseOrderRef} fully received${arrival.salesOrderRef?' · SO: '+arrival.salesOrderRef:''}`});
+      }
+      for (const order of arrival.orders) for (const notice of order.notices) {
+        if (!seenPoNotices.has(`${row.id}:${notice.noticeKey}`)) requests.push({id:Number(row.id),requestRef:row.request_ref,eventId:1,...notice});
+      }
     }
     after=Number(rows[rows.length-1].id);
   }

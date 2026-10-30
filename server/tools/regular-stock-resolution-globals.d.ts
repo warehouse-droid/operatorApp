@@ -1,5 +1,5 @@
 export type RegularResolutionReply={purchaseOrderId:number,purchaseOrderRef:string,eta:string,resolvedAt:string,resolvedBy:string};
-export type RegularResolutionLine={id:number,itemName?:string,status:string,resolution?:RegularResolutionReply|null,purchase?:{demandId?:number},transferId?:number|null};
+export type RegularResolutionLine={id:number,itemName?:string,status:string,yardStock?:Record<string,unknown>|null,resolution?:RegularResolutionReply|null,purchase?:{demandId?:number},transferId?:number|null};
 export type RegularResolutionRequest={id:number,revision:number,workflowVersion:number,status:string,regular?:{deliveryMethod?:string,resolution?:RegularResolutionReply,pickupTransfer?:unknown,handoffStatus?:string},lines?:RegularResolutionLine[],transfers?:{lines?:{id:number}[]}[]};
 export type RegularResolutionDraft={requestId:number,lineId?:number,expectedRevision:number,purchaseOrderRef:string,eta:string};
 export type StockingReplyDraft={requestId:number,lineId?:number,expectedRevision:number,message:string,eta?:string,salesOrderRef?:string};
@@ -23,6 +23,7 @@ declare global {
       decision:(value:unknown)=>string;
       safety:(request:unknown,line:unknown)=>string;
       stocking:(request:unknown)=>boolean;
+      approvalExpired:(request:unknown)=>boolean;
       stockingResult:(request:unknown)=>string;
       summary:(request:unknown)=>string;
     };

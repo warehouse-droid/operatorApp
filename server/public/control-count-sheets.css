@@ -13,6 +13,8 @@
 .count-sheet-suggestions { display:grid;max-height:240px;overflow:auto; }
 .count-sheet-suggestions button { text-align:left;min-height:44px; }
 .count-sheet-table { overflow:auto; }
+.count-sheet-control-grid>section { min-width:0; }
+.count-sheet-control input.count-sheet-adjusting { width:100px;box-sizing:border-box;padding:8px; }
 .count-sheet-table table { width:100%;border-collapse:collapse;margin:12px 0; }
 .count-sheet-table td,.count-sheet-table th { padding:10px;text-align:left;border-bottom:1px solid #d5e0e2; }
 .count-sheet-table small { display:block;color:#53686c; }

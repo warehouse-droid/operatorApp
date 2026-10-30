@@ -1,5 +1,6 @@
-/* global HTMLElement */
+/* global HTMLElement, MutationObserver */
 import { poReferenceAlertAudiences } from './special-stock-po-reference.js';
+import {openStockRequestAlertList,requestAlertLink} from './stock-request-alert-list.js?v=20261022-v1';
 
 const appWindow=/** @type {Window & Record<string,any>} */ (window);
 const tokenKeys=['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'];
@@ -12,6 +13,12 @@ let session='', generation=0, checking=false, refreshing=false, again=false;
 /** @type {{requestId:number,noticeKey:string}|null} */ let shown=null;
 /** @type {EventSource|null} */ let events=null;
 let timer=0;
+let allUpdates=null;
+function openAllUpdates() {
+  allUpdates=openStockRequestAlertList({title:'Special PO reference updates',session,rows:alerts.map(notice=>({
+    requestRef:notice.requestRef,category:'Special',summary:[notice.displayRef,notice.audience==='sales'?salesInstruction(notice.fulfillmentMethod):'Dispatch: arrange pickup or delivery.'].join(' · '),
+    href:notice.audience==='sales'?requestAlertLink('sales','special',notice.requestId,notice.requestRef):'/dispatch/special-stock?requestId='+notice.requestId}))});
+}
 const headers=()=>({ Accept:'application/json',Authorization:`Bearer ${session}` });
 
 function removeDialog() {
@@ -20,6 +27,7 @@ function removeDialog() {
   previousFocus=null;
 }
 function stop() {
+  allUpdates?.close();allUpdates=null;
   generation++; checking=false; refreshing=false; again=false; audiences=[]; alerts=[];
   window.clearInterval(timer); timer=0; events?.close(); events=null;
   removeDialog();
@@ -39,16 +47,18 @@ function salesInstruction(method) {
   return 'Your special order is queued for delivery.';
 }
 function paint() {
-  for(const notice of alerts) {
+  if(dialog && appWindow.MBBSOSNotifications?.allowsRole(dialog.dataset.notificationRole)===false) {removeDialog();}
+  const eligible=alerts.filter(notice=>appWindow.MBBSOSNotifications?.allowsRole(notice.audience)!==false);
+  for(const notice of eligible) {
     void appWindow.MBBSOSNotifications?.notify({id:`special-po-reference:${notice.audience}:${notice.requestId}:${notice.noticeKey}`,title:'PO Ref received',
       body:`${notice.requestRef} · ${notice.displayRef} · ${notice.audience==='sales'?salesInstruction(notice.fulfillmentMethod):'Dispatch: arrange pickup or delivery.'}`,
-      url:notice.audience==='sales'?'/sales/stock-requests?tab=special&search='+encodeURIComponent(notice.requestRef):'/dispatch/special-stock',session});
+      url:notice.audience==='sales'?'/sales/stock-requests?tab=special&search='+encodeURIComponent(notice.requestRef):'/dispatch/special-stock',role:notice.audience,session});
   }
-  if (document.hidden || dialog || !alerts.length || document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
-  const notice=alerts[0], ownGeneration=generation; shown=notice;
+  if (document.hidden || dialog || !eligible.length || document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
+  const notice=eligible[0], ownGeneration=generation; shown=notice;
   previousFocus=document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const modal=document.createElement('dialog'); dialog=modal;
-  modal.className='special-po-reference-dialog';modal.dataset.osNotificationId=`special-po-reference:${notice.audience}:${notice.requestId}:${notice.noticeKey}`; modal.setAttribute('aria-labelledby','special-po-reference-title');
+  modal.className='special-po-reference-dialog';modal.dataset.osNotificationId=`special-po-reference:${notice.audience}:${notice.requestId}:${notice.noticeKey}`;modal.dataset.notificationRole=notice.audience; modal.setAttribute('aria-labelledby','special-po-reference-title');
   const title=document.createElement('h2'); title.id='special-po-reference-title'; title.textContent='PO Ref received';
   const reference=document.createElement('p'); reference.className='special-po-reference-value';
   reference.textContent=notice.requestRef+' · '+notice.displayRef;
@@ -82,7 +92,8 @@ function paint() {
     finally { button.disabled=false; }
   });
   modal.addEventListener('cancel',event=>event.preventDefault());
-  actions.append(link,button); modal.append(title,reference,instruction,message,actions); document.body.append(modal); modal.showModal();
+  const all=document.createElement('button');all.type='button';all.textContent='View all updates';all.addEventListener('click',openAllUpdates);
+  actions.append(link,all,button); modal.append(title,reference,instruction,message,actions); document.body.append(modal); modal.showModal();
 }
 
 /** @returns {Promise<void>} */
@@ -148,6 +159,8 @@ const style=document.createElement('style');
 style.textContent=`.special-po-reference-dialog{box-sizing:border-box;width:min(520px,calc(100% - 32px));max-height:85vh;overflow:auto;border:1px solid #7c3aed;border-radius:14px;padding:24px;color:#172033;background:white;font:16px/1.5 system-ui,sans-serif}.special-po-reference-dialog::backdrop{background:rgb(15 23 42 / 45%)}.special-po-reference-dialog h2{margin:0 0 14px;font-size:21px}.special-po-reference-value{font-weight:700;overflow-wrap:anywhere}.special-po-reference-actions{display:flex;align-items:center;justify-content:flex-end;gap:16px;flex-wrap:wrap}.special-po-reference-actions button{border:0;border-radius:8px;background:#7c3aed;color:white;padding:10px 16px;font:inherit;cursor:pointer}.special-po-reference-actions button:disabled{opacity:.6}.special-po-reference-actions a{color:#5b21b6}.special-po-reference-dialog [role=status]{color:#b91c1c}`;
 document.head.append(style);
 appWindow.MBBSPoReferenceAlert={refresh};
+new MutationObserver(paint).observe(document.body,{childList:true,subtree:true,attributes:true,attributeFilter:['open','aria-modal']});
+window.addEventListener('mbbs-notification-preferences-changed',paint);
 window.addEventListener('mbbs-auth-operator-changed',()=>{stop();void checkSession();});
 window.addEventListener('storage',event=>{if (!event.key || tokenKeys.includes(event.key)) void checkSession();});
 window.addEventListener('focus',()=>void checkSession());

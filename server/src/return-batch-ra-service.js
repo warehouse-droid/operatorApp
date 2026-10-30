@@ -7,6 +7,9 @@ import { findReturnTransactionByExternalId } from "./return-netsuite.js";
 import { withNetSuiteOperationalWork } from "./netsuite-operational-work.js";
 import { buildReturnBatchIntent, buildReturnBatchPayload, verifyReturnBatchSnapshot, hydrateReturnBatchSourceLinks } from "./return-batch-ra-domain.js";
 import { assertStagedReturnBatch, finalizeStagedReturnBatch } from "./return-submission-draft.js";
+import { prepareReturnAccounting } from './return-accounting.js';
+import { queueReturnAutomaticNotification } from './return-automatic-notifications.js';
+import { returnCreditMemoReconciliationIntent } from './return-credit-memo-adjustment.js';
 
 function error(message, code = "RETURN_BATCH_RA_BLOCKED") {
   return Object.assign(new Error(message), { status: 409, code });
@@ -39,6 +42,7 @@ export async function admitReturnBatchAuthorization({ records, postingPolicies }
     throw error("Stock and PALLET posting modes differ. Enable both Credit Memo gates or both RA modes before confirming a combined return.", "RETURN_POSTING_TYPE_MISMATCH");
   }
   intent.transactionType = types.size === 1 && types.has("CM") ? "credit_memo" : "return_authorization";
+  if (effective) await prepareReturnAccounting(intent);
   if (records.some(record => record.netSuiteTransactionId || record.netSuiteRaAttemptedAt)) {
     throw error("A return already has a NetSuite transaction or an uncertain creation attempt.");
   }
@@ -61,7 +65,7 @@ function transactionStatusOf(snapshot) {
 
 function transactionRefOf(snapshot) { return snapshot?.tranId || snapshot?.tranid || null; }
 
-async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null } = {}) {
+async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null, errorCode = null } = {}) {
   const reference = transactionRefOf(snapshot);
   const remoteStatus = transactionStatus || transactionStatusOf(snapshot);
   await checkpoint(async q => {
@@ -69,8 +73,9 @@ async function setState(batchId, status, { message = null, snapshot = null, rese
       netsuite_transaction_ref=COALESCE($4,netsuite_transaction_ref),
       netsuite_transaction_status=COALESCE($5,netsuite_transaction_status),
       netsuite_snapshot=COALESCE($6::jsonb,netsuite_snapshot),
-      attempted_at=CASE WHEN $7 THEN NULL ELSE attempted_at END,last_synced_at=now(),updated_at=now()
-      WHERE batch_id=$1`, [batchId, status, message, reference, remoteStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt]);
+      attempted_at=CASE WHEN $7 THEN NULL ELSE attempted_at END,last_synced_at=now(),updated_at=now(),
+      sync_error_code=$8,automatic_retry_blocked=COALESCE($8 IN ('RETURN_CM_VERIFICATION_FAILED','RETURN_RA_VERIFICATION_FAILED'),false)
+      WHERE batch_id=$1`, [batchId, status, message, reference, remoteStatus, snapshot ? JSON.stringify(snapshot) : null, resetAttempt, errorCode]);
     await q(`UPDATE return_records r SET netsuite_sync_status=a.sync_status,netsuite_sync_error=a.sync_error,
       netsuite_transaction_ref=a.netsuite_transaction_ref,netsuite_transaction_status=a.netsuite_transaction_status,
       netsuite_stage=COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),
@@ -203,7 +208,7 @@ async function recordSynchronizationFailure(batch, problem, { manualTransactionI
   // transaction or remove it from the reconciliation queue.
   if (manualTransactionId && ["succeeded", "manual_linked", "cancelled"].includes(batch.sync_status)) { return; }
   await setState(batch.batch_id, "failed", { message: String(problem.message || problem).slice(0, 4000),
-    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId });
+    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId, errorCode: problem.code || null });
 }
 
 function alreadyDeletedCreditMemo(batch, manualTransactionId) {
@@ -212,6 +217,12 @@ function alreadyDeletedCreditMemo(batch, manualTransactionId) {
 
 function canReuseVerifiedBatch(batch, reconcile, manualTransactionId) {
   return !reconcile && !manualTransactionId && ["succeeded", "manual_linked"].includes(batch.sync_status);
+}
+
+function hasVerifiedCreditMemo(batch) {
+  return returnBatchTransactionType(batch) === "credit_memo" && !batch.draft_id
+    && Number(batch.netsuite_transaction_id) > 0
+    && Number(batch.netsuite_snapshot?.id) === Number(batch.netsuite_transaction_id);
 }
 
 async function recordDeletedCreditMemo(batch, actorOperatorId) {
@@ -256,6 +267,7 @@ export async function synchronizeReturnBatchAuthorization({ recordId, batchId = 
     }
     if (canReuseVerifiedBatch(batch, reconcile, manualTransactionId)) {
       await finalizeStagedReturnBatch(batch);
+      await queueReturnAutomaticNotification(batch);
       return {};
     }
     if (batch.posting_policy.effective !== true) {return { error: error("This return was saved locally and was not admitted for NetSuite posting.") };}
@@ -264,11 +276,15 @@ export async function synchronizeReturnBatchAuthorization({ recordId, batchId = 
       const { transactionId, snapshot } = await withNetSuiteOperationalWork(
         reconcile ? "returns.reconcile" : "returns.pending", () => manualTransactionId
           ? verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) : postOrRecover(batch));
-      verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: transactionId }, snapshot,
-        { allowInactive: allowInactiveBatch(batch, reconcile) });
+      const verificationIntent = !manualTransactionId && hasVerifiedCreditMemo(batch)
+        ? await returnCreditMemoReconciliationIntent(batch) : batch.intent_snapshot;
+      verifyReturnBatchSnapshot({ ...verificationIntent, netSuiteTransactionId: transactionId }, snapshot,
+        { allowInactive: allowInactiveBatch(batch, reconcile),
+          allowAccountingAdjustments: !manualTransactionId && hasVerifiedCreditMemo(batch) });
       const inactive = /cancel|void|reject/i.test(transactionStatusOf(snapshot));
       await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId });
       await finalizeStagedReturnBatch(batch);
+      await queueReturnAutomaticNotification(batch);
       await writeAudit({ actorOperatorId, source: "returns",
         action: returnBatchTransactionType(batch) === "credit_memo" ? "returns.netsuite.batch_cm.linked" : "returns.netsuite.batch_ra.linked",
         orderId: batch.intent_snapshot.sourceSalesOrderId,

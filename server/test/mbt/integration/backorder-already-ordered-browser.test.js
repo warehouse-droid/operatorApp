@@ -40,7 +40,7 @@ test('SCM can complete Already Ordered with required PO, optional ref and no ven
     const response=p.waitForResponse(r=>r.url().endsWith(`/lines/${d.lines[0].id}/response`)&&r.request().method()==='POST');
     await form.locator('button[type="submit"]').click();assert.equal((await response).status(),200);
     await expect(line).toContainText('Already Ordered · Completed');await expect(line).toContainText('PO-<browser>');await expect(line.locator('form')).toHaveCount(0);
-    await expect(p.locator(`[data-backorder-line="${d.lines[1].id}"] form`)).toHaveCount(1);
+    await expect(p.locator(`[data-backorder-line="${d.lines[1].id}"] form[data-action$="/response"]`)).toHaveCount(1);
     await ui.capture();await p.reload();await expect(line).toContainText('PO-<browser>');
   }finally{await ui.close();}
   const sales=await pageFor('sales',d,480);
@@ -52,13 +52,20 @@ test('SCM can complete Already Ordered with required PO, optional ref and no ven
   }finally{await sales.close();}
 });
 test('All Already Ordered request shows Completed and no remaining SO/PO steps',async()=>{
-  const d=await f.ordered(await f.create(1)),ui=await pageFor('scm',d);
+  let d=await f.create(1);d=await f.action(d,'sales','header',{salesInternalRemark:'TEST retained completed note'});
+  d=await f.ordered(d);const ui=await pageFor('scm',d);
   try {
     const detail=ui.page.locator('[data-backorder-detail]');await expect(detail).toContainText('Completed');
-    await expect(detail.locator('form')).toHaveCount(0);await expect(detail).not.toContainText('SO link → Completed');
+    await expect(detail.locator('form[data-backorder-form]')).toHaveCount(0);await expect(detail).not.toContainText('SO link → Completed');
     await expect(detail).toContainText('Not required');await expect(detail).not.toContainText('PO planning');
     await ui.page.screenshot({path:out+'/scm-completed-request.png',fullPage:true});
   }finally{await ui.close();}
+  const sales=await pageFor('sales',d);
+  try {
+    await expect(sales.page.locator('[data-backorder-sales-note]')).toBeVisible();
+    await expect(sales.page.locator('[data-backorder-sales-note]')).toContainText('TEST retained completed note');
+    await expect(sales.page.locator('[data-action="header"]')).toHaveCount(0);
+  }finally{await sales.close();}
 });
 test('Already Ordered completion removes an outstanding information reply from Sales actions',async()=>{
   let d=await f.create(1);d=await f.action(d,'scm','information/request',{question:'TEST confirm stock requirements'});
@@ -77,7 +84,7 @@ test('Completing the last material after a PO was linked removes its remaining p
     d=await f.ordered(d);assert.equal(d.stage,'completed');const ui=await pageFor('scm',d);
     try {
       await expect(ui.page.locator('[data-backorder-detail]')).not.toContainText('Not planned');
-      await expect(ui.page.locator('[data-backorder-detail] form')).toHaveCount(0);
+      await expect(ui.page.locator('[data-backorder-detail] form[data-backorder-form]')).toHaveCount(0);
       await expect(ui.page.locator('[data-backorder-line]')).toContainText('Already Ordered · Completed');
     }finally{await ui.close();}
   }finally{await f.query('DELETE FROM sales_stock_requests WHERE id=$1',[d.id]);await f.query('DELETE FROM purchase_orders WHERE netsuite_id=88999721');}

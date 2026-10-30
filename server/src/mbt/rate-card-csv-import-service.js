@@ -36,24 +36,24 @@ function sha256(value, code) {
 }
 
 /** @param {unknown} value @returns {MbtActor} */
-function adminActor(value) {
+function managementActor(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return importError("MBT_ADMIN_REQUIRED", "Admin account required.", 403);
+    return importError("MBT_ADMIN_REQUIRED", "Admin or Dispatcher account required.", 403);
   }
   const actor = /** @type {{operatorId?: unknown, roles?: unknown}} */ (value);
   const operatorId = String(actor.operatorId ?? "").trim();
   const roles = Array.isArray(actor.roles)
     ? actor.roles.map((role) => String(role).trim()).filter(Boolean)
     : [];
-  if (!operatorId || !roles.some((role) => role.toLowerCase() === "admin")) {
-    return importError("MBT_ADMIN_REQUIRED", "Admin account required.", 403);
+  if (!operatorId || !roles.some((role) => ["admin","dispatcher"].includes(role.toLowerCase()))) {
+    return importError("MBT_ADMIN_REQUIRED", "Admin or Dispatcher account required.", 403);
   }
   return { operatorId, roles };
 }
 
 /** @param {MbtActor} actor */
 async function authorizeImport(actor) {
-  const authorized = adminActor(actor);
+  const authorized = managementActor(actor);
   await authorizeMbtPhase3Capability({ capability: "masterData", pilotAuthorized: true });
   return authorized;
 }

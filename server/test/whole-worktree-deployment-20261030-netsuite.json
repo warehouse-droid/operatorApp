@@ -1,0 +1,410 @@
+{
+  "at": "2026-10-30T05:05:16.670Z",
+  "readOnly": true,
+  "endpoints": {
+    "smartScm": {
+      "configured": true,
+      "reachable": true,
+      "ok": true,
+      "version": "3.3.0",
+      "environment": "PRODUCTION",
+      "sandbox": false,
+      "capabilities": {
+        "health": true,
+        "pickingTicket": true,
+        "purchaseOrderPdf": true,
+        "salesOrderPdf": true,
+        "updatePurchaseOrder": true,
+        "createSpecialSalesOrder": true,
+        "createSpecialPurchaseOrder": true,
+        "specialOrderAdjustment": true,
+        "locationFilter": true,
+        "metadataOnly": true,
+        "methods": [
+          "GET",
+          "POST"
+        ]
+      }
+    },
+    "ifirPosting": {
+      "configured": true,
+      "reachable": true,
+      "ok": true,
+      "contractVersion": 1,
+      "environment": "PRODUCTION",
+      "writesEnabled": true,
+      "productionAllowed": true,
+      "savedRecordReadback": true,
+      "supportedTransforms": [
+        "PO:IR",
+        "SO:IF",
+        "TO:IF",
+        "TO:IR"
+      ],
+      "explicitInventoryAssignments": false,
+      "kits": false,
+      "quantityPolicies": [
+        "sqft_remaining_v1"
+      ]
+    },
+    "fieldSales": {
+      "configured": false
+    },
+    "palletBalance": {
+      "configured": true,
+      "reachable": true,
+      "version": 1,
+      "savedSearchId": "customsearch503"
+    }
+  },
+  "inventory": [
+    {
+      "path": "netsuite/pallet-payment/ppa_config.js",
+      "name": "ppa_config.js",
+      "type": "library",
+      "status": "supporting-file-present",
+      "uploadedFiles": [
+        {
+          "id": "185827",
+          "name": "ppa_config.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_core.js",
+      "name": "ppa_core.js",
+      "type": "library",
+      "status": "supporting-file-present",
+      "uploadedFiles": [
+        {
+          "id": "185830",
+          "name": "ppa_core.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_dispatch_ss.js",
+      "name": "ppa_dispatch_ss.js",
+      "type": "ScheduledScript",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_netsuite.js",
+      "name": "ppa_netsuite.js",
+      "type": "library",
+      "status": "supporting-file-present",
+      "uploadedFiles": [
+        {
+          "id": "185828",
+          "name": "ppa_netsuite.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_rebuild_mr.js",
+      "name": "ppa_rebuild_mr.js",
+      "type": "MapReduceScript",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "185831",
+          "name": "ppa_rebuild_mr.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "508",
+          "scriptId": "customscript_ppa_rebuild",
+          "name": "Pallet Payment Allocation Rebuild",
+          "inactive": false,
+          "file": "ppa_rebuild_mr.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy_ppa_rebuild",
+              "deployed": true,
+              "status": "NOTSCHEDULED",
+              "recordType": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_refresh_queue.js",
+      "name": "ppa_refresh_queue.js",
+      "type": "library",
+      "status": "supporting-file-missing",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_service.js",
+      "name": "ppa_service.js",
+      "type": "library",
+      "status": "supporting-file-present",
+      "uploadedFiles": [
+        {
+          "id": "185829",
+          "name": "ppa_service.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": []
+    },
+    {
+      "path": "netsuite/pallet-payment/ppa_watch_ue.js",
+      "name": "ppa_watch_ue.js",
+      "type": "UserEventScript",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite-customer-webhook-user-event.js",
+      "name": "netsuite-customer-webhook-user-event.js",
+      "type": "UserEventScript",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "182803",
+          "name": "netsuite-customer-webhook-user-event.js",
+          "modified": "10/9/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "495",
+          "scriptId": "customscript495",
+          "name": "MB Customer Webhook",
+          "inactive": false,
+          "file": "netsuite-customer-webhook-user-event.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy1",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": "CUSTOMER"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite-field-sales-restlet.js",
+      "name": "netsuite-field-sales-restlet.js",
+      "type": "Restlet",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite-ifir-posting-restlet.js",
+      "name": "netsuite-ifir-posting-restlet.js",
+      "type": "Restlet",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "185517",
+          "name": "netsuite-ifir-posting-restlet.js",
+          "modified": "10/21/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "507",
+          "scriptId": "customscriptifirposting",
+          "name": "IF IR Posting Return",
+          "inactive": false,
+          "file": "netsuite-ifir-posting-restlet.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy1",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite-ifir-reconciliation-webhook-user-event.js",
+      "name": "netsuite-ifir-reconciliation-webhook-user-event.js",
+      "type": "UserEventScript",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite-order-webhook-scheduled.js",
+      "name": "netsuite-order-webhook-scheduled.js",
+      "type": "ScheduledScript",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    },
+    {
+      "path": "netsuite-order-webhook-user-event-direct.js",
+      "name": "netsuite-order-webhook-user-event-direct.js",
+      "type": "UserEventScript",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "175439",
+          "name": "netsuite-order-webhook-user-event-direct_0916.js",
+          "modified": "9/16/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "485",
+          "scriptId": "customscript_mbbs_webhook_url",
+          "name": "App Outbound Webhook",
+          "inactive": false,
+          "file": "netsuite-order-webhook-user-event-direct_0916.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy_app_outbound_webhook_so",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": "SALESORDER"
+            },
+            {
+              "id": "2",
+              "scriptId": "customdeploy_app_outbound_webhook_po",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": "PURCHASEORDER"
+            },
+            {
+              "id": "3",
+              "scriptId": "customdeploy_app_outbound_webhook_to",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": "TRANSFERORDER"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite-order-webhook-user-event.js",
+      "name": "netsuite-order-webhook-user-event.js",
+      "type": "UserEventScript",
+      "status": "uploaded-without-script-record",
+      "uploadedFiles": [
+        {
+          "id": "152656",
+          "name": "netsuite-order-webhook-user-event.js",
+          "modified": "6/29/2026"
+        }
+      ],
+      "scripts": []
+    },
+    {
+      "path": "netsuite-pallet-balance-search-restlet.js",
+      "name": "netsuite-pallet-balance-search-restlet.js",
+      "type": "Restlet",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "185233",
+          "name": "netsuite-pallet-balance-search-restlet.js",
+          "modified": "10/20/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "505",
+          "scriptId": "customscriptpalletbalance",
+          "name": "palletBalance",
+          "inactive": false,
+          "file": "netsuite-pallet-balance-search-restlet.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy1",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite-smart-scm-picking-ticket-restlet.js",
+      "name": "netsuite-smart-scm-picking-ticket-restlet.js",
+      "type": "Restlet",
+      "status": "deployed",
+      "uploadedFiles": [
+        {
+          "id": "160155",
+          "name": "netsuite-smart-scm-picking-ticket-restlet.js",
+          "modified": "7/22/2026"
+        },
+        {
+          "id": "179215",
+          "name": "netsuite-smart-scm-picking-ticket-restlet_0928.js",
+          "modified": "9/28/2026"
+        }
+      ],
+      "scripts": [
+        {
+          "id": "486",
+          "scriptId": "customscript_mbbs_picking_ticket_restlet",
+          "name": "MBBS Picking Ticket",
+          "inactive": false,
+          "file": "netsuite-smart-scm-picking-ticket-restlet_0928.js",
+          "deployments": [
+            {
+              "id": "1",
+              "scriptId": "customdeploy1",
+              "deployed": true,
+              "status": "RELEASED",
+              "recordType": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "netsuite-transaction-pdf-suitelet.js",
+      "name": "netsuite-transaction-pdf-suitelet.js",
+      "type": "Suitelet",
+      "status": "no-matching-file-or-script",
+      "uploadedFiles": [],
+      "scripts": []
+    }
+  ],
+  "metadata": {
+    "complete": true,
+    "scriptRecordsChecked": 406,
+    "deploymentRecordsChecked": 507,
+    "matchingAndReferencedFilesChecked": 407,
+    "sourceContentCompared": false,
+    "sourceFileRead": {
+      "status": 400,
+      "available": false,
+      "errors": [
+        {
+          "code": "USER_ERROR",
+          "detail": "Error while accessing a resource. That operation is not supported for this record type: file."
+        }
+      ]
+    }
+  }
+}

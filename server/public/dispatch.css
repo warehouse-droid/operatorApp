@@ -10586,6 +10586,8 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 .dispatch-planning-shell { display: flex; flex-direction: column; }
 .dispatch-planning-shell > .dispatch-topbar { flex: 0 0 auto; }
 .dispatch-planning-shell > .dispatch-grid { flex: 1 1 auto; min-height: 0; }
+.dispatch-planning-shell > [data-dispatch-route-notice] { flex: 0 0 0; height: 0; min-height: 0; }
+.dispatch-planning-shell .dispatch-save-notice { max-height: min(45vh, 420px); overflow-y: auto; }
 .dispatch-planning-shell .date-filter[hidden] { display: none; }
 .dispatch-planning-shell .driver-label { min-width: 0; }
 .dispatch-planning-shell .driver-label strong { overflow-wrap: anywhere; }

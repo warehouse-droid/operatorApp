@@ -14,14 +14,16 @@ function record(kind) {
  return {...basic,requestType:'regular',workflowVersion:2,regular:{deliveryMethod:kind==='purchase'?'stocking':kind,stockingType:kind==='purchase'?'purchase':'transfer',requestingLocationId:1,approval:{automatic:false,lines:[]}},
    lines:[{id:10,itemId:101,itemName:'Stone',salesQty:20,salesUom:'EA',toPcs:1,toPlt:100,pieces:20,sourceLocationId:28,sourceName:'2967',destinationLocationId:1,destinationName:'3445',status:'submitted'}]};
 }
-async function fixture(audience,kind,{alert=false,empty=false,hold=false,multiple=false}={}) {
+async function fixture(audience,kind,{alert=false,empty=false,hold=false,multiple=false,badges=false}={}) {
  const context=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:'block'});
  await context.addInitScript(()=>{localStorage.setItem('mbbs.staff.token','conversation-test');localStorage.setItem('mbbs.sales.stockRequests.bucket','pending');localStorage.setItem('mbbs.scm.stockRequests.queue','request');
   window.streams=[];window.EventSource=class extends EventTarget{constructor(){super();window.streams.push(this);}close(){this.closed=true;}};});
  const page=await context.newPage();page.setDefaultTimeout(3500);await page.coverage.startJSCoverage({resetOnNavigation:false});
  const state={record:record(kind),messages:[{id:'stock:1',eventId:1,audience:audience==='sales'?'scm':'sales',actorName:'Other user',message:'Please confirm <blue>.',createdAt:'2026-10-16T12:00:00Z'}],calls:[],fail:false,errors:[],alert,queueGate:Promise.resolve(),queueFailure:false};
  if(empty)state.messages=[];
- state.requests=multiple?[state.record,{...record(kind),id:2,requestRef:'REQ-2',quantityReviewPending:true}]:[state.record];
+ state.badges=badges?new Map([[2,125]]):null;
+ state.unreadGate=Promise.resolve();
+ state.requests=multiple?[state.record,{...record(kind),id:2,requestRef:'REQ-2',quantityReviewPending:true,quantityReview:{mode:'pending',lines:[]}}]:[state.record];
  state.gate=hold?new Promise(resolve=>{state.release=resolve;}):Promise.resolve();
  page.on('pageerror',e=>state.errors.push(e.message));
  await page.route('**/*',async route=>{
@@ -29,8 +31,15 @@ async function fixture(audience,kind,{alert=false,empty=false,hold=false,multipl
   if(path.startsWith('/api/')) {
    const body=route.request().postDataJSON();state.calls.push({path,method,body,url:route.request().url()});
    if(path==='/api/auth/me')return route.fulfill({json:{operator:{id:'viewer',display_name:'Viewer',role:audience,roles:[audience],yardLocationIds:[1]}}});
-   if(path.endsWith('/stock-request-conversation-alerts'))return route.fulfill({json:{count:state.alert?1:0,requests:state.alert?[{id:2,requestRef:'REQ-2',tab:kind==='special'?'special':'regular',unreadCount:1,latestEventId:11,message:'A new message <safe>',actorName:'Alex'}]:[]}});
-   if(path.endsWith('/conversation/read'))return route.fulfill({json:{ok:true}});
+   if(path.endsWith('/stock-request-conversation-alerts')) {
+    if(state.badges) {
+     const requests=[...state.badges].filter(([,count])=>count>0).map(([id,unreadCount])=>({id,requestRef:'REQ-'+id,tab:kind==='special'?'special':'regular',unreadCount,latestEventId:11,message:'Unread reply',actorName:'Alex'}));
+     if(new URL(route.request().url()).searchParams.get('includeRequests')==='1')await state.unreadGate;
+     return route.fulfill({json:{count:requests.reduce((sum,row)=>sum+row.unreadCount,0),requests}});
+    }
+    return route.fulfill({json:{count:state.alert?1:0,requests:state.alert?[{id:2,requestRef:'REQ-2',tab:kind==='special'?'special':'regular',unreadCount:1,latestEventId:11,message:'A new message <safe>',actorName:'Alex'}]:[]}});
+   }
+   if(path.endsWith('/conversation/read')) {state.badges?.delete(Number(path.split('/').at(-3)));return route.fulfill({json:{ok:true}});}
    if(path.endsWith('/conversation')) {
     await state.gate;
     if(method==='POST') {
@@ -80,6 +89,36 @@ test('empty conversation has no loading label and accepts its first message',asy
 async function activity(page,id,eventId) {
  await page.evaluate(({id,eventId})=>{for(const stream of window.streams)if(!stream.closed)stream.dispatchEvent(new MessageEvent('app-event',{data:JSON.stringify({type:'stock-request.updated',payload:{source:'stock-conversation',requestId:id,conversationEventId:eventId}})}));},{id,eventId});
 }
+for(const audience of ['sales','scm'])for(const kind of ['special','backorder','stocking','purchase','delivery'])test(`unread card badge on ${audience} ${kind} updates, stays outside the corner and clears when read`,async()=>{
+ const f=await fixture(audience,kind,{multiple:true,badges:true});try {
+  const card=f.page.locator('.stock-request-card[data-id="2"]'),badge=card.locator('[data-request-unread-badge]');
+  await expect(badge).toHaveText('99+');await expect(badge).toHaveAttribute('aria-label','125 unread messages');
+  await expect(f.page.locator('.stock-request-card[data-id="1"] [data-request-unread-badge]')).toHaveCount(0);
+  assert.ok(f.state.calls.some(call=>call.url.includes('stock-request-conversation-alerts?includeRequests=1')));
+  const input=f.page.locator('[data-stock-conversation="1"]').getByLabel('Message',{exact:true});await input.fill('Keep this draft');
+  f.state.badges.set(2,3);await activity(f.page,2,12);await expect(badge).toHaveText('3');await expect(input).toHaveValue('Keep this draft');await expect(input).toBeFocused();
+  for(const width of [1440,390]) {
+   await f.page.setViewportSize({width,height:900});await card.scrollIntoViewIfNeeded();
+   const geometry=await card.evaluate(card=>{
+    const badge=card.querySelector('[data-request-unread-badge]'),b=badge.getBoundingClientRect(),c=card.getBoundingClientRect(),l=card.closest('.stock-request-list').getBoundingClientRect();
+    const overlap=Math.max(0,c.right-b.left)*Math.max(0,b.bottom-c.top)/(b.width*b.height);
+    return {overlap,visible:b.top>=l.top && b.right<=l.right,color:getComputedStyle(badge).backgroundColor,overflow:document.documentElement.scrollWidth>window.innerWidth+1};
+   });
+   assert.ok(Math.abs(geometry.overlap-.25)<.02,JSON.stringify(geometry));assert.equal(geometry.visible,true);assert.equal(geometry.color,'rgb(220, 38, 38)');assert.equal(geometry.overflow,false);
+  }
+  await card.click();await expect(badge).toHaveCount(0);assert.deepEqual(f.state.errors,[]);
+ } finally {await f.close();}
+});
+test('unread card badges discard a late count after logout',async()=>{
+ const f=await fixture('sales','special',{multiple:true,badges:true});let release;try {
+  await expect(f.page.locator('[data-request-unread-badge]')).toHaveText('99+');
+  f.state.unreadGate=new Promise(resolve=>{release=resolve;});
+  const pending=f.page.waitForRequest(request=>request.url().includes('stock-request-conversation-alerts?includeRequests=1'));
+  await activity(f.page,2,12);await pending;
+  await f.page.evaluate(()=>{for(const key of ['mbbs.staff.token','mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token'])localStorage.removeItem(key);window.dispatchEvent(new Event('storage'));});
+  release();await expect(f.page.locator('[data-request-unread-badge]')).toHaveCount(0);
+ } finally {release?.();await f.close();}
+});
 for(const audience of ['sales','scm'])for(const kind of ['special','backorder','stocking','purchase','delivery'])test(`new conversation message sorts ${audience} ${kind} without losing selected detail or drafts`,async()=>{
  const f=await fixture(audience,kind,{multiple:true});try{
   const panel=f.page.locator('[data-stock-conversation="1"]'),cards=f.page.locator('.stock-request-list .stock-request-card');

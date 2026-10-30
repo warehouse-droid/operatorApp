@@ -1,0 +1,253 @@
+PALLET PAYMENT v3 — UPGRADE FROM YOUR WORKING v2 UPLOAD
+Account 6518947 | 21 October 2026
+
+This package fixes the all-customer input error and the identified historical
+cash refund case, and adds automatic refresh after transaction saves. It is
+ready for upload; it has not been deployed to your NetSuite account by this
+workspace.
+
+The 5:13 PM PALLET INPUT FAILED error occurred in the old customers() UNION
+SuiteQL paging lookup after Customer Internal ID was cleared. The replacement
+ppa_netsuite.js uses two separately paged native summary searches, then merges
+unique customer IDs: customers with pallet Invoice/Credit Memo history and
+customers with existing allocation rows. It reads all returned pages. Keeping
+5240 in the old deployment only bypassed the failing lookup; it was not an
+all-customer solution. Upload the replacement before retrying with a blank ID.
+
+A. Correct the field and upload the replacement files
+
+You have already corrected the field that caused INVALID_FLD_VALUE:
+  Field ID: custrecord_ppa_method
+  Type: List/Record
+  List/Record: Payment Method
+  Store Value: checked
+Keep its ID. Transaction was the wrong List/Record source for this field.
+
+Wait until any existing pallet Map/Reduce run has finished. Upload all eight
+ppa_*.js files into the SAME SuiteScripts/PalletPayment folder, replacing matching
+filenames. Preserve any evidence-backed cardOverrides you entered in your live
+ppa_config.js; copy those entries into the replacement config before uploading.
+
+The three script entry points are:
+  ppa_rebuild_mr.js  -> existing customscript_ppa_rebuild (keep this script record)
+  ppa_watch_ue.js    -> new User Event script, installed in section D
+  ppa_dispatch_ss.js -> new Scheduled script, installed in section E
+The other five files are libraries. Do not create script records for libraries.
+
+B. Rebuild all customers once with the refund correction
+
+On the existing script customscript_ppa_rebuild, add a parameter:
+  Label: Queue Only
+  ID: custscript_ppa_queue_only
+  Type: Check Box
+  Default: unchecked
+
+Keep the existing Preview Only and Customer Internal ID parameters.
+On the existing deployment customdeploy_ppa_rebuild set:
+  Deployed: checked
+  Status: Not Scheduled
+  Concurrency Limit: 1
+  Buffer Size: 1
+  Log Level: Audit
+  Parameters > Queue Only: unchecked
+  Parameters > Preview Only: unchecked
+  Parameters > Customer Internal ID: completely blank
+
+Save and Execute once. This populates existing history for ALL eligible customers.
+Removing a customer filter from a search alone does not populate other customers.
+Blank Customer Internal ID is essential: 5240 restricts the rebuild to that one
+customer. Queue Only unchecked selects full history instead of pending events.
+
+The corrected historical case is:
+  Credit 188388: 10 pallets, net $400, tax $52.
+  Cash refund 188630: $452 applied in full to that credit.
+The script now deducts 10 matching cash pallets. Cash lot rate stays $40 and the
+Pallet Refund Allocation amount records $400 pallet principal. The linked native
+refund retains its actual $452. The generated Return Reference ends with
+FULL-CREDIT-TAX-INCLUDED so the historical tax treatment is visible.
+
+This inference requires a posted, single cash refund for exactly the gross value
+of a pallet-only credit, no manual quantity already allocated and no invoice
+applications of that credit. It also requires sufficient matching original cash
+pallets. It does not treat $452 / $40 as 11.3 pallets or change any tax transaction.
+
+Open the Execution Log. REBUILT customer <ID> gives counts and remaining issues.
+The completion entry now distinguishes finished with errors from a successful
+run and shows verified/review/error counts. A failed customer or REVIEW result
+is not a verified zero balance. Missing card evidence, partial refunds, mixed
+goods credits and on-account settlements may still need explicit review.
+
+C. Create the durable refresh queue
+
+Customization > Lists, Records & Fields > Record Types > New:
+  Name: Pallet Refresh Queue
+  Final ID: customrecord_pallet_refresh_queue
+  Include Name Field: checked (the script supplies the name)
+  Enable Optimistic Locking: checked
+  Keep system notes enabled.
+  Use the permission list for access; ordinary report viewers do not need to edit it.
+
+Add these fields. Keep Store Value checked, no sourcing/filter restrictions:
+
+Label                  Final field ID                 Type          List/Record
+Customer               custrecord_ppq_customer         List/Record   Customer
+Retry Minute (System)  custrecord_ppq_retry_minute     Integer Number —
+Last Error             custrecord_ppq_error            Long Text     —
+
+Default Retry Minute (System) to 0. It is an internal UTC-minute retry marker,
+not an amount or a date to enter manually. Do not configure Customer as Transaction.
+Keep Record Is Parent unchecked. Do not deploy the watcher onto this queue record.
+
+The automation execution role needs Full access to this queue (including delete),
+Edit/create access to Pallet Payment Allocation and Pallet Refund Allocation,
+View access to customers, currencies and the relevant financial transactions,
+access to customsearch503 across the intended subsidiaries, and SuiteScript plus
+SuiteScript Scheduling permissions. Completed queue entries are deleted; native
+transactions and the pallet allocation/refund history are never deleted.
+
+D. Install the User Event watcher
+
+Customization > Scripting > Scripts > New > select ppa_watch_ue.js > Create Script Record:
+  Name: Pallet Transaction Refresh
+  Final script ID: customscript_ppa_watch
+
+Create one deployment for EACH row below. These are deployments of the SAME
+User Event script, not extra deployments of the Map/Reduce writer.
+
+Applies To                   Final deployment ID
+Sales Order                  customdeploy_ppa_watch_so
+Invoice                      customdeploy_ppa_watch_invoice
+Customer Payment             customdeploy_ppa_watch_payment
+Customer Deposit             customdeploy_ppa_watch_deposit
+Deposit Application          customdeploy_ppa_watch_depappl
+Credit Memo                  customdeploy_ppa_watch_credit
+Customer Refund              customdeploy_ppa_watch_refund
+Pallet Refund Allocation     customdeploy_ppa_watch_manual
+
+For each deployment:
+  Deployed: checked
+  Status: Released
+  Event Type: leave unrestricted (do not limit to Create)
+  Log Level: Audit
+  Execute As Role: the automation role with the permissions listed in section C
+  Audience: include all transaction-entry and integration roles that need updates
+  Context Filtering: include User Interface, CSV Import, REST Web Services,
+    SOAP Web Services, RESTlet, Scheduled Script, Map/Reduce and other applicable
+    contexts available in your account. Do not restrict it to User Interface.
+
+This watches create, edit, inline edit, delete, approve, cancel and reject where
+supported. Both customers are queued when a transaction is reassigned. Invoice,
+deposit and deposit-application changes matter because they change funding links.
+Manual pallet allocation changes also refresh balances. Generated PRA1 refund
+allocation rows are ignored so the rebuild cannot trigger itself endlessly.
+
+CSV imports must have Run Server SuiteScript and Trigger Workflows enabled.
+SOAP integrations must not disable server SuiteScript triggers. NetSuite does
+not chain one User Event into another User Event. If an existing User Event
+creates/changes a relevant transaction, have that script call the queue library
+after its successful write:
+  queue.enqueue(String(customerInternalId), 'invoice:' + invoiceId + ':edit');
+  queue.kick();
+Load it as ./ppa_refresh_queue or the correct relative module path. Customer
+reassignment must enqueue both customers. Do not add financial saves to the
+watcher itself. Source changes made while triggers were disabled need a backfill.
+
+E. Install the scheduled queue dispatcher
+
+Create a new Script record from ppa_dispatch_ss.js:
+  Name: Pallet Refresh Dispatcher
+  Final script ID: customscript_ppa_dispatch
+Deploy it:
+  Final deployment ID: customdeploy_ppa_dispatch
+  Deployed: checked
+  Status: Scheduled
+  Log Level: Audit
+  Schedule: Daily Event, repeat every 1 day
+  Start Date: today
+  Start Time: 12:00 am
+  Repeat: every 15 minutes
+  No End Date: checked
+Save. It only checks and submits queued work; it does not rebuild every customer
+every 15 minutes. NetSuite processor load can delay execution.
+
+Keep the Map/Reduce writer customdeploy_ppa_rebuild at NOT SCHEDULED. The watcher
+and dispatcher submit it programmatically. Do not create a second writer
+deployment or put this writer on a recurring schedule at the same time.
+Programmatic submissions explicitly use Queue Only=true, Preview Only=false and
+blank Customer Internal ID; they are not restricted by the old 5240 test value.
+
+Each transaction change first saves a queue entry, then attempts immediate
+submission. If the writer is busy, the entry waits. The worker processes up to
+50 events per run, groups them by customer and checks for more after completion.
+The 15-minute dispatcher catches events arriving after that last check or a
+submission failure. Rebuild failures retain their queue entries for retry after
+15 minutes. A successful rebuild, including a persisted REVIEW result, removes
+only the events it actually captured; newer events remain queued.
+
+For queue visibility, create a Pallet Refresh Queue saved search with Inactive=No,
+showing Name, Customer, Date Created, Retry Minute (System), Last Error. It should
+normally drain after rebuilding. Repeated Last Error values indicate a source,
+schema, role or governance problem to resolve; the scheduler cannot repair those.
+
+F. Configure one Cash line and separate card suffixes
+
+Edit Pallet Balance by Payment Method (search 1196).
+Criteria: Inactive=No, Allocation Verified=Yes. Remove fixed customer criteria.
+
+Results — use exactly these grouping dimensions:
+  Customer                         GROUP
+  Invoice Fields... > Subsidiary   GROUP
+  Currency                         GROUP
+  Payment Method                   GROUP
+  Card Last 4                      GROUP
+
+Results — quantities:
+  Allocated Pallets                 SUM
+  Pending Pallets                   SUM
+  Refunded Pallets                  SUM (label: Refunded / Settled Pallets)
+
+Formula (Numeric), Summary Type SUM, label Available Pallets:
+  NVL({custrecord_ppa_alloc_qty},0)
+  -NVL({custrecord_ppa_pending_qty},0)
+  -NVL({custrecord_ppa_refunded_qty},0)
+
+Remove Invoice, SO, Invoice Line, Original Payments, Rate, Name and Last Modified
+from these summary results. Any of them set to GROUP can split Cash into rows.
+Keep source IDs in the separate detail search instead. Do not join child refund
+records into the summary because that can multiply parent quantities.
+
+For each customer/currency/subsidiary this gives:
+  Cash           [blank last4]   -> one Cash line across all invoices/payments
+  VISA           4570            -> one VISA 4570 line
+  VISA           1234            -> a separate VISA 1234 line
+  Debit Card     4570            -> separate from VISA 4570
+Different currencies/subsidiaries remain separate. This is grouping for display;
+each underlying lot still records its invoice, SO and original payment IDs.
+
+Review search 1197 should keep Inactive=No and Allocation Verified=No, remove
+fixed customer criteria and show source details without summaries. Missing last4
+cannot be combined into one unknown card. Do not interpret a REVIEW row's
+Available Pallets as a confirmed refundable balance or manually tick Verified.
+
+G. Check automatic operation after installation
+
+Use the next normal transaction save for a known pallet customer. Look for a
+queue row or a PALLET REFRESH SUBMITTED / PALLET REFRESH WAITING log. Then check
+the MR log for REBUILT customer <ID> and refresh the report. Its deduction should
+change after a credit/refund change is reconciled. Reports are background-updated,
+not recalculated synchronously on every page load. Viewing the report requires
+no Save and Execute action.
+
+If no event is captured, inspect the watcher deployment's status, audience,
+execution context and permissions. PALLET REFRESH CAPTURE FAILED means the
+transaction is already saved but refresh capture failed; repair it and backfill
+the affected customer. If a queue row exists but does not drain, inspect its Last
+Error and both the dispatcher and writer logs. The dispatcher must be Scheduled
+and the single writer must be Not Scheduled.
+
+Oracle references
+https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4407992281.html
+https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_453639770507.html
+https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_1508887826.html
+https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_1508948660.html
+https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/chapter_N3361453.html

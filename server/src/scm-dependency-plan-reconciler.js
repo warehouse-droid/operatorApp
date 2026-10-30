@@ -239,11 +239,57 @@ function reconcilePurchaseOrderResidualDrops({ trucks = [], orders = [], affecte
   return nextTrucks;
 }
 
+/**
+ * @typedef {{type?: string, pickupAddressOverride?: string, poPickupManifest?: object[],
+ * items?: Array<{quantity?: number|string|null, salesQty?: number|string|null, poAllocatedSalesQty?: number|string|null}>,
+ * sourceYard?: string, outboundLocation?: string, childOrderDetails?: Array<{transitCo?: {toYard?: string}, sourceYard?: string}>}} LinkedPickupOrder
+ * @typedef {{id?: string, type?: string, orderRefs?: string[], orderId?: string, dependencyTargetRefs?: string[], location?: string}} LinkedPickupStop
+ * @param {LinkedPickupOrder|undefined} order
+ * @param {string|undefined} location
+ * @param {object} plan
+ */
+function emptyLinkedSourcePickup(order, location, plan) {
+  if (!order || text(order.type).toUpperCase() !== "SO" || text(order.pickupAddressOverride)) {return false;}
+  if (!order.poPickupManifest?.length || !order.items?.length) {return false;}
+  // Unknown legacy packing is not evidence of zero cargo. Known quantities and
+  // PO allocations share the sales UOM; packing must not revive a zero balance.
+  const knownSales = order.items.every(item => {
+    const quantity = item.quantity ?? item.salesQty;
+    return quantity !== null && quantity !== undefined && Number.isFinite(Number(quantity)) && Number(quantity) >= 0;
+  });
+  if (!knownSales || !order.items.some(item => Number(item.poAllocatedSalesQty) > 0)) {return false;}
+  const sources = [order.sourceYard, order.outboundLocation,
+    ...(order.childOrderDetails || []).map(child => child.transitCo?.toYard || child.sourceYard)];
+  return sources.some(source => samePlace(source, location))
+    && !dispatchRequiredPickupVisitLocations(order, plan).some(required => samePlace(required, location));
+}
+
+/**
+ * @param {LinkedPickupStop} stop
+ * @param {Map<string, LinkedPickupOrder>} ordersByRef
+ * @param {Set<string>} affected
+ * @param {object} plan
+ */
+function pruneEmptyLinkedPickup(stop, ordersByRef, affected, plan) {
+  if (stop?.type !== "pick" || !Array.isArray(stop.orderRefs) || !stop.orderRefs.length) {return stop;}
+  const retained = stop.orderRefs.filter(ref => !affected.has(text(ref).toLowerCase())
+    || !emptyLinkedSourcePickup(ordersByRef.get(text(ref).toLowerCase()), stop.location, plan));
+  if (retained.length === stop.orderRefs.length) {return stop;}
+  if (!retained.length) {return null;}
+  return { ...stop, orderRefs: retained,
+    orderId: stop.orderId && retained.includes(stop.orderId) ? stop.orderId : retained[0],
+    ...(Array.isArray(stop.dependencyTargetRefs)
+      ? { dependencyTargetRefs: stop.dependencyTargetRefs.filter(ref => retained.includes(ref)) } : {}) };
+}
+
 function reconcileLoad(load = {}, ordersByRef, affected, plan, activity) {
   let stops = Array.isArray(load.stops) ? load.stops.map((stop) => ({ ...stop })) : [];
   const boundary = dispatchLoadProtectedBoundary(load, activity);
   const protectedIds = new Set(stops.slice(0, boundary + 1).map(stop => text(stop.id)));
   const requirements = requirementsForStops(stops, ordersByRef);
+
+  stops = stops.map(/** @param {LinkedPickupStop} stop */ stop => protectedIds.has(text(stop.id))
+    ? stop : pruneEmptyLinkedPickup(stop, ordersByRef, affected, plan)).filter(Boolean);
 
   stops = stops.filter((stop) => {
     if (protectedIds.has(text(stop.id))) {return true;}

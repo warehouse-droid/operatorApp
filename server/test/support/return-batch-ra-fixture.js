@@ -21,7 +21,13 @@ function fixtureRows(sql, remoteLines, created, control) {
         items = [{ transaction_type: "ItemShip", quantity: 20, transaction_count: 1 },
           ...control.credits.map(c => ({ transaction_type: "CustCred", transaction_id: c.transaction_id, quantity: c.quantity }))];
       } else if (/FROM item\b/.test(sql) && /PALLET/.test(sql)) {items = [{ id: "99091704", itemid: "PALLET", itemtype: "NonInvtPart" }];}
-      else if (/FROM customer c/.test(sql)) {items = [{ id: "99091702", entityid: "TEST", companyname: "Return test" }];}
+      else if (sql.includes('return_restocking_fee')) {items = [{ id: '3015', itemid: 'Restocking Fee', itemtype: 'Discount' }];}
+      else if (/FROM location l/.test(sql)) {items = control.locations || [
+        { id: '9', name: '3445 Return', parent: '1', isinactive: 'F' },
+        { id: '39', name: '2967 Return', parent: '28', isinactive: 'F' },
+        { id: '42', name: '150 Return', parent: '26', isinactive: 'F' },
+        { id: '46', name: '12441 Return', parent: '15', isinactive: 'F' }];}
+      else if (/FROM customer c/.test(sql)) {items = [{ id: "99091702", entityid: "TEST", companyname: "Return test", ...control.customer }];}
   return control.duplicateExternalIds && sql.includes("t.externalid =") ? [{ id: 44 }, { id: 45 }] : items;
 }
 
@@ -65,6 +71,7 @@ export async function fixture(t, { enabled = true } = {}) {
     Object.assign(config.photoUpload, previous.photo); });
   await query("DELETE FROM return_batch_authorizations WHERE intent_snapshot->>'customerId'='99091702'");
   await query("DELETE FROM return_records WHERE operator_id=$1 OR customer_id=99091702", [actor]);
+  await query('DELETE FROM return_customer_notifications WHERE batch_id IN (SELECT id FROM return_batches WHERE operator_id=$1)', [actor]);
   await query("DELETE FROM return_batches WHERE operator_id=$1", [actor]);
   await query("DELETE FROM return_drafts WHERE operator_id=$1", [actor]);
   await query(`INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,yard_location_ids)
@@ -87,7 +94,10 @@ export async function fixture(t, { enabled = true } = {}) {
     const address = String(url);
     if (address.startsWith("https://photo.return-ra.invalid")) {return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });}
     const body = options.body ? JSON.parse(options.body) : {};
-    requests.push({ address, method: options.method, body });
+    requests.push({ address, method: options.method, body: structuredClone(body) });
+    if (address.includes('/discountItem/3015') && options.method === 'GET') {
+      return Response.json({ id: '3015', itemId: 'Restocking Fee', itemType: { id: 'Discount' }, isInactive: false, rate: control.feePercent ?? 35 });
+    }
     if (address.includes("/query/")) {
       const items = fixtureRows(body.q, remoteLines, created, control);
       return Response.json({ items, hasMore: false });

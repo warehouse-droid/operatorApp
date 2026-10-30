@@ -37,7 +37,7 @@ test('Mixed Backorder skips completed materials in PO readiness and finishes rem
   d=await f.review(d,1);assert.equal(d.stage,'await_customer_confirmation');
   d=await f.action(d,'sales',`lines/${d.lines[1].id}/decision`,{decision:'accepted'});
   assert.equal(d.stage,'confirmed');assert.equal(await state(d),'confirmed');assert.equal(backorderPurchaseReady(d),true);
-  assert.ok(!(await f.http('sales','/api/sales/stock-requests/alerts')).body.requests.some(row=>row.id===d.id));
+  assert.ok((await f.http('sales','/api/sales/stock-requests/alerts')).body.requests.some(row=>row.id===d.id&&row.action==='input_required'&&row.reason==='awaiting_so'));
   const po=88999710,so=88999711;
   await f.query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,netsuite_active) VALUES($1,'TEST-ALREADY-PO',331,1,true)",[po]);
   await f.query("INSERT INTO sales_orders(netsuite_id,tranid,customer_id,order_location_id,netsuite_active) VALUES($1,'TEST-ALREADY-SO',18,1,true)",[so]);
@@ -124,7 +124,7 @@ test('Already Ordered clears an outstanding SCM review alert while the remaining
   const before=(await f.http('scm','/api/scm/stock-requests/alerts')).body.manualReview;
   d=await f.ordered(d);assert.equal(d.stage,'confirmed');assert.equal(await state(d),'confirmed');
   assert.equal((await f.http('scm','/api/scm/stock-requests/alerts')).body.manualReview,before-1);
-  assert.ok(!(await f.http('sales','/api/sales/stock-requests/alerts')).body.requests.some(row=>row.id===d.id));
+  assert.ok((await f.http('sales','/api/sales/stock-requests/alerts')).body.requests.some(row=>row.id===d.id&&row.action==='input_required'&&row.reason==='awaiting_so'));
 });
 
 test('Concurrent SCM completions commit exactly once and another line can finish with the fresh revision',async()=>{

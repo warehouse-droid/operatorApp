@@ -1,0 +1,7 @@
+[
+  "src/return-batch-ra-domain.js",
+  "src/return-credit-memo.js",
+  "src/return-accounting.js",
+  "src/return-batch-ra-service.js",
+  "src/return-credit-memo-adjustment.js"
+]

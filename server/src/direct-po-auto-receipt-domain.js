@@ -17,7 +17,8 @@ export function buildDirectPoReceiptDraft(input) {
   if (source.sourceOrderKind !== 'PO' || Number(source.sourceNetSuiteId) !== parent) {throw invalid('The live PO parent identity does not match.');}
   if (isCompletedNetSuitePostingOrder('PO',source)) {throw invalid('The live NetSuite PO is already complete.');}
   const key=`receiving:purchase_order:${order.netsuite_id}`;
-  const selectedLines=(input.lines || []).filter(isFulfillableNetSuiteLine).map((/** @type {Record<string,any>} */ line)=>{
+  const selectedSourceLines=selectedReceiptLines(input);
+  const selectedLines=selectedSourceLines.filter(isFulfillableNetSuiteLine).map((/** @type {Record<string,any>} */ line)=>{
     const stable=String(line.source_line_key ?? line.line_id);
     const matches=(source.lines || []).filter((/** @type {Record<string,any>} */ live)=>live.sourceLineKey===stable || (live.sourceLineAliases || []).includes(stable));
     if(matches.length!==1 || matches[0].identityStatus!=='exact'){throw invalid('The direct PO line mapping is not unique and exact.');}
@@ -30,7 +31,8 @@ export function buildDirectPoReceiptDraft(input) {
     if(Number(line.location_id)!==Number(live.location)){throw invalid('The direct PO line location changed.');}
     return {orderLine:sourceId(live.restOrderLine),quantity,location:Number(live.location),sourceLineKey:stable,
       ...(salesUom ? {salesUom} : {}),
-      itemId:Number(line.item_id),localOrderKey:key,localLineId:String(line.id),directCompletionEventId:sourceId(evidence.completionEventId)};
+      itemId:Number(line.item_id),localOrderKey:key,localLineId:String(line.id),
+      ...(evidence.receiptJobId ? {directReceiptJobId:evidence.receiptJobId} : {directCompletionEventId:sourceId(evidence.completionEventId)})};
   });
   if(!selectedLines.length){throw invalid('No receivable direct PO lines are available.');}
   const availableLines=(source.lines || []).filter((/** @type {Record<string,any>} */ line)=>Number.isSafeInteger(Number(line.restOrderLine)) && Number(line.restOrderLine)>0).map((/** @type {Record<string,any>} */ line)=>({
@@ -49,6 +51,19 @@ export function buildDirectPoReceiptDraft(input) {
     directDeliveryEvidence:evidence,localPayload,
     targets:[{sourceOrderKind:'PO',sourceNetSuiteId:parent,sourceOrderRef:order.source_po_ref || order.tranid,
       memo:order.dispatch_ref || order.tranid,selectedLines,availableLines}]});
+}
+
+/** @param {Record<string,any>} input */
+function selectedReceiptLines(input) {
+  const lines=input.lines || [];
+  if(input.receiptQuantities===undefined) {return lines;}
+  return Object.entries(input.receiptQuantities).map(([id,amount])=>{
+    const matches=lines.filter((/** @type {any} */ line)=>String(line.id)===id);
+    if(matches.length!==1) {throw invalid('The allocated receipt line is unavailable or ambiguous.');}
+    const quantity=positive(amount),line=matches[0];
+    if(quantity>Number(line.quantity)+0.000001) {throw invalid('Allocated receipt quantity exceeds its PO line quantity.');}
+    return {...line,quantity};
+  });
 }
 
 /** @param {Record<string,any>} step @param {Record<string,any>} live */

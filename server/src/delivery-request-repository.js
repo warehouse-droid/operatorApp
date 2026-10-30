@@ -382,6 +382,28 @@ export function createDeliveryRequestService({ resolveDistance, emit = () => {},
   async function get(id,actor,audience) {
     return withTransaction(async () => detail(await expireLocked(await load(id,actor,audience,true))));
   }
+  async function unreadMessageCounts(rows, actor, audience) {
+    const counts = new Map();
+    if (!rows.length) return counts;
+    const revisions = new Map(rows.map(row => [Number(row.id), row.revision]));
+    const result = await query(`SELECT event.request_id,event.revision,event.action,event.actor_name,event.message,event.created_at,
+      event.snapshot->>'eventAudience' AS audience,event.snapshot->>'conversationMessage' AS conversation_message,
+      event.snapshot,previous.snapshot AS previous_snapshot FROM delivery_request_events event
+      LEFT JOIN delivery_request_reads receipt ON receipt.request_id=event.request_id AND receipt.operator_id=$2
+      LEFT JOIN delivery_request_events previous ON previous.request_id=event.request_id AND previous.revision=event.revision-1
+        AND NOT(event.snapshot ? 'conversationMessage')
+      WHERE event.request_id=ANY($1::bigint[]) AND event.revision>COALESCE(receipt.read_revision,0)
+        AND event.actor_id IS DISTINCT FROM $2 AND event.action NOT IN ('instructions','remind','expire')
+        AND btrim(COALESCE(event.snapshot->>'conversationMessage',event.message))<>''`, [[...revisions.keys()],actor.id]);
+    const incoming = audience === 'sales' ? 'dispatch' : 'sales';
+    for (const event of result.rows) {
+      const id = Number(event.request_id);
+      if (event.revision <= revisions.get(id) && mapConversationEvent(event)?.audience === incoming) {
+        counts.set(id, (counts.get(id) || 0) + 1);
+      }
+    }
+    return counts;
+  }
   async function list(actor,audience,filters = {}) {
     const yards = requireAudience(actor,audience);
     await tick();
@@ -390,7 +412,8 @@ export function createDeliveryRequestService({ resolveDistance, emit = () => {},
     const result = await query(`SELECT * FROM delivery_requests WHERE requesting_yard_location_id=ANY($1::int[])
       AND (cardinality($2::text[])=0 OR status=ANY($2::text[])) AND ($3='' OR ('DR-'||lpad(id::text,6,'0')||' '||data::text) ILIKE '%'||$3||'%')
       ORDER BY updated_at DESC,id DESC LIMIT 200`, [yards,statuses,search]);
-    return { requests:result.rows.map(mapRequest) };
+    const unread = await unreadMessageCounts(result.rows, actor, audience);
+    return { requests:result.rows.map(row => ({...mapRequest(row), unreadMessageCount:unread.get(Number(row.id)) || 0})) };
   }
   async function alerts(actor,audience) {
     const yards = requireAudience(actor,audience);

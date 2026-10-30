@@ -2,6 +2,11 @@ import {isSpecialTransferEta,specialSupplyEtaLabel,SPECIAL_TRANSFER_ETA_LABEL} f
 import {isBackorder,canLinkBackorderOrder} from './backorder-workflow.js';
 import {SPECIAL_STAGES,specialStockAvailable} from './special-stock-workflow.js';
 import {specialPlanningStatus,specialSupplyWaitingStatus} from './special-stock-case-status.js';
+import {canAttachBackorderSalesOrder,hasBackorderScmReply,hasBackorderSalesReply} from './backorder-review-policy.js';
+import {previewDialog} from './special-stock-documents.js';
+import {specialPurchaseOrderDisplayRef} from './special-stock-po-reference.js';
+import {canAddBackorderItems,backorderAddItemsButton} from './backorder-add-items.js';
+import {createBackorderPoRouting} from './backorder-po-routing.js';
 
 /** @typedef {import('./backorder-workflow.js').BackorderRequest} BackorderRequest */
 /** @param {unknown} value */
@@ -57,6 +62,17 @@ function composerPayload(d) {
 /** @param {{mount:HTMLElement,audience:string,api:(path:string,init?:RequestInit)=>Promise<any>,getDetail:()=>BackorderRequest|null,setDetail:(request:BackorderRequest)=>void,render:()=>void,getYards?:()=>Array<{locationId:number,yardCode:string}>,getDefaultDestination?:()=>number|string}} options */
 export function createBackorderUI({mount,audience,api,getDetail,setDetail,render,getYards=()=>[],getDefaultDestination=()=>''}) {
   let busy=false;
+  const poRouting=audience==='scm'?createBackorderPoRouting({mount,api,getDetail,setDetail,render,isBusy:()=>busy,setBusy:value=>{busy=value;}}):null;
+  const openedEditors=new Set();
+  /** @param {BackorderRequest} d @param {Record<string,any>} line @param {string} kind @param {string} content */
+  function reviewEditor(d,line,kind,content) {
+    const saved=kind==='response'?hasBackorderScmReply(line):hasBackorderSalesReply(line);
+    if (!saved) return content;
+    const key=`${d.id}:lines/${line.id}/${kind}`,id=`backorder-${d.id}-${line.id}-${kind}`,opened=openedEditors.has(key);
+    const title=kind==='response'?'Edit material review':'Edit Sales confirmation';
+    return `<div class="stock-request-actions"><button type="button" data-backorder-edit="${esc(key)}" aria-expanded="${opened}" aria-controls="${id}">${title}</button></div>
+      <div id="${id}" data-backorder-editor="${esc(key)}" ${opened?'':'hidden'}>${content}</div>`;
+  }
   const vendors=/** @type {Map<string,Array<{id:number|string,name:string}>>} */ (new Map());
   /** @param {Record<string,any>} line @param {boolean} [composer] */
   function yardField(line,composer=false) {
@@ -91,16 +107,18 @@ export function createBackorderUI({mount,audience,api,getDetail,setDetail,render
   }
   /** @param {BackorderRequest} d @param {Record<string,any>} line */
   function material(d,line) {
-    const ordered=line.supplyStatus==='already_ordered',terminal=!active(d) || ordered, scm=audience==='scm',inStock=!line.supplyStatus || line.supplyStatus==='in_stock',transfer=line.supplyStatus==='vendor_transfer',pendingTransfer=isSpecialTransferEta(line) && !d.salesOrderId;
+    const ordered=line.supplyStatus==='already_ordered',terminal=!active(d) || ordered || !!line.yardStock, scm=audience==='scm',inStock=!line.supplyStatus || line.supplyStatus==='in_stock',transfer=line.supplyStatus==='vendor_transfer',pendingTransfer=isSpecialTransferEta(line) && !d.salesOrderId;
     const liveSummary=scm?`<p class="stock-live-summary"><span>ETA: ${esc(specialSupplyEtaLabel(line, 'Not available'))} · Pickup: ${esc(line.vendorYard || 'Awaiting check')}</span>${window.SCMStockCheckLines?.line(d,line)||''}</p>`:'';
     const summary=`<header><strong>${esc(line.itemName)} · ${esc(line.productName)}</strong></header><p>${esc(line.quantity)} ${esc(line.uom)} · ${esc(line.detailSpec)}</p>
-      <p>${esc(supply[line.supplyStatus] || 'Await SCM review')} · ${ordered?'Completed':esc(line.salesDecision)}${line.availableDate || isSpecialTransferEta(line)?` · ETA ${esc(specialSupplyEtaLabel(line))}`:''}${line.reminderDueDate?` · Review due ${esc(line.reminderDueDate)}`:''}</p>
-      ${ordered?`<p>PO number: <strong>${esc(line.poNumber)}</strong>${line.poRefNumber?` · PO ref number: ${esc(line.poRefNumber)}`:''}</p><p>${line.arrivalStatus==='arrived'?'Arrived':line.arrivalStatus==='arrival'?'Waiting for arrival':'Request work completed.'}</p>`:''}
+      <p>${line.yardStock?'Stock available at destination yard · Completed':`${esc(supply[line.supplyStatus] || 'Await SCM review')} · ${ordered?'Completed':esc(line.salesDecision)}`}${line.availableDate || isSpecialTransferEta(line)?` · ETA ${esc(specialSupplyEtaLabel(line))}`:''}${line.reminderDueDate?` · Review due ${esc(line.reminderDueDate)}`:''}</p>
+      ${ordered?`<p>PO number: <strong>${esc(specialPurchaseOrderDisplayRef({purchaseOrderRef:line.poNumber,purchaseOrderReference:line.poRefNumber}))}</strong></p>${line.poPlanning?.planned?`<p>PO planned · ${esc([...new Set(line.poPlanning.plans.map(plan=>plan.planDate))].sort().join(', '))}</p>`:''}<p>${line.arrivalStatus==='arrived'?'Arrived':line.arrivalStatus==='arrival'?'Waiting for arrival':'Request work completed.'}</p>`:''}
       <p>Vendor: ${esc(line.vendorName)} · Destination yard: ${esc(line.destinationName)}</p>
       ${line.salesVisibleNote?`<p>${esc(line.salesVisibleNote)}</p>`:''}${line.customerNote?`<p>${esc(line.customerNote)}</p>`:''}`;
     let controls='';
     if (!terminal && scm) {
-      controls+=form(d,`lines/${line.id}/response`,'Save material review',`<label><span>Supply status</span><select name="supplyStatus">${options(supply,line.supplyStatus || 'in_stock')}</select></label>
+      const canUseYardStock=!d.purchaseOrderId&&!d.purchaseOrderRef&&!d.handoff&&!['closed','declined'].includes(line.salesDecision);
+      const supplyChoices={...supply,...(canUseYardStock?{yard_stock:'Stock available at destination yard'}:{})};
+      controls+=reviewEditor(d,line,'response',form(d,`lines/${line.id}/response`,'Save material review',`<label><span>Supply status</span><select name="supplyStatus">${options(supplyChoices,line.supplyStatus || 'in_stock')}</select></label>
         <fieldset class="stock-request-line-fields backorder-fields stock-request-wide" data-backorder-ordered-fields hidden disabled>
         ${label('poNumber','PO number (required)','','text','required maxlength="120"')}${label('poRefNumber','PO ref number (optional)','','text','maxlength="200"')}
         <p class="stock-request-wide">Saving Already Ordered completes this material. No Sales confirmation, SO link, PO link or planning is required.</p></fieldset>
@@ -109,27 +127,37 @@ export function createBackorderUI({mount,audience,api,getDetail,setDetail,render
         <fieldset class="stock-request-line-fields backorder-fields stock-request-wide" data-backorder-projection-fields ${inStock || transfer?'hidden disabled':''}>
         <label><span>Projection</span><select name="availabilityMode">${options({no_projection:'No projection',dated:'Dated ETA'},line.availabilityMode || 'no_projection')}</select></label>
         ${label('availableDate','ETA',line.availableDate,'date')}</fieldset><p data-backorder-transfer-eta ${transfer?'':'hidden'}>ETA: ${SPECIAL_TRANSFER_ETA_LABEL}</p>
-        ${label('salesVisibleNote','Note for Sales',line.salesVisibleNote)}${label('scmInternalNote','SCM private note',line.scmInternalNote)}</fieldset>`);
+        ${label('salesVisibleNote','Note for Sales',line.salesVisibleNote)}${label('scmInternalNote','SCM private note',line.scmInternalNote)}</fieldset>`));
       if (line.salesDecision==='accepted') controls+=`<details><summary>Check readiness</summary>${form(d,`lines/${line.id}/readiness`,'Check readiness',`<label><span>Ready</span><select name="ready">${options({true:'Ready',false:'Not ready'},String(specialStockAvailable(line.supplyStatus)))}</select></label><fieldset class="stock-request-line-fields backorder-fields" data-backorder-readiness-eta data-transfer-pending="${pendingTransfer}" ${specialStockAvailable(line.supplyStatus) || pendingTransfer?'hidden disabled':''}>${label('eta','Revised ETA',line.availableDate,'date')}</fieldset><p data-backorder-readiness-transfer ${pendingTransfer?'':'hidden'}>${SPECIAL_TRANSFER_ETA_LABEL}</p>`)}</details>`;
     }
     if (!terminal && !scm) {
-      if (line.supplyStatus) controls+=form(d,`lines/${line.id}/decision`,'Save Sales confirmation',`<label><span>Decision</span><select name="decision">${options({accepted:'Accept / wait for ETA',request_update:'Request update',declined:'Decline',closed:'Close material'},line.salesDecision)}</select></label>${label('reason','Reason',line.salesDecisionReason)}${label('customerNote','Confirmation note',line.salesCustomerNote)}`);
+      if (line.supplyStatus) controls+=reviewEditor(d,line,'decision',form(d,`lines/${line.id}/decision`,'Save Sales confirmation',`<label><span>Decision</span><select name="decision">${options({accepted:'Accept / wait for ETA',request_update:'Request update',declined:'Decline',closed:'Close material'},line.salesDecision)}</select></label>${label('reason','Reason',line.salesDecisionReason)}${label('customerNote','Confirmation note',line.salesCustomerNote)}`));
       controls+=`<details><summary>Edit request material</summary>${form(d,`lines/${line.id}/edit`,'Save material changes',`${label('quantity',`Quantity (${esc(line.uom)})`,line.quantity,'number','min="0" step="any" required')}${label('productName','Description',line.productName,'text','required maxlength="500"')}${label('vendorName','Vendor',line.vendorName,'text','required maxlength="200"')}${yardField(line)}${label('detailSpec','Specifications',line.detailSpec)}${label('customerNote','Material note',line.customerNote)}`)}</details>`;
     }
     const html = `<article class="stock-request-line backorder-material" data-backorder-line="${line.id}"><div class="backorder-material-heading"><div class="backorder-material-summary">${summary}</div>${materialStock(line)}</div>${liveSummary}${controls}</article>`;
     return scm ? window.SCMRequestLineVisibility?.wrap(d, line, html) || html : html;
   }
   /** @param {BackorderRequest} d */
-  function scmLiveHeader(d) { return audience==='scm'?(window.SCMStockCheckLines?.header(d)||'<h3>Line responses</h3>'):'<h3>Materials</h3>'; }
+  function scmLiveHeader(d) {
+    if (audience!=='scm') return '<h3>Materials</h3>';
+    return `${window.SCMStockCheckLines?.header(d)||'<h3>Line responses</h3>'}<div class="stock-request-actions"><button data-scm-stock-action="refresh-evidence" type="button" ${busy?'disabled':''}>${window.RegularStockUI?.t('Refresh stock evidence','刷新库存数据')||'Refresh stock evidence'}</button></div>`;
+  }
   /** @param {BackorderRequest} d */
   function detail(d) {
     if (audience==='scm' && active(d)) d.lines.filter(line=>line.supplyStatus!=='already_ordered').forEach(line=>void vendorChoices(d,line));
     const ordered=d.lines.some(line=>line.supplyStatus==='already_ordered');
     const noFurtherOrders=ordered && d.lines.every(line=>line.supplyStatus==='already_ordered' || ['declined','closed'].includes(line.salesDecision));
     const names=[...new Set(d.lines.map(line=>line.vendorName))];
-    const so=audience==='sales', links=`<div class="stock-request-summary"><span><small>Customer</small><strong>${esc(d.customerName || '—')}</strong></span><span><small>Vendor</small><strong>${esc(names.length>1?'Multiple vendors':names[0])}</strong></span><span><small>Fulfillment</small><strong>${esc(fulfillment[d.fulfillmentMethod] || 'Pickup at vendor')}</strong></span><span><small>SO</small><strong>${esc(d.alreadyOrderedSalesOrderRef || d.salesOrderRef || (noFurtherOrders?'Not required':'Pending'))}</strong><small>${esc(d.salesOrderStatus)}</small></span><span><small>PO</small><strong>${esc(d.purchaseOrderRef || (noFurtherOrders?'Not required':'Pending'))}</strong><small>${esc(d.purchaseOrderStatus)}</small></span></div>`;
-    const quotation=ordered
-      ? (so && d.stage!=='closed'?form(d,'already-ordered/sales-order','Save sales order number',label('salesOrderRef','Sales order number',d.alreadyOrderedSalesOrderRef || d.salesOrderRef,'text','required maxlength="120"')+'<p class="stock-request-wide">Optional: attach the SO for these materials. Adding it keeps the request status unchanged. Supply waiting tracks PO receipt progress.</p>'):'')
+    const so = audience === 'sales';
+    const soReference = esc(d.alreadyOrderedSalesOrderRef || d.salesOrderRef || (noFurtherOrders ? 'Not required' : 'Pending'));
+    const soPreview = d.salesOrderId ? '<button type="button" data-backorder-document="sales-order/document.pdf">Preview SO</button>' : '';
+    const soSummary = so && d.salesOrderId
+      ? `<span class="stock-request-inline-order"><small>SO</small><span class="stock-request-order-reference"><strong>${soReference}</strong>${soPreview}</span><small>${esc(d.salesOrderStatus)}</small></span>`
+      : `<span><small>SO</small><strong>${soReference}</strong><small>${esc(d.salesOrderStatus)}</small>${soPreview}</span>`;
+    const links=`<div class="stock-request-summary"><span><small>Customer</small><strong>${esc(d.customerName || '—')}</strong></span><span><small>Vendor</small><strong>${esc(names.length>1?'Multiple vendors':names[0])}</strong></span><span><small>Fulfillment</small><strong>${esc(fulfillment[d.fulfillmentMethod] || 'Pickup at vendor')}</strong></span>${soSummary}<span><small>PO</small><strong>${esc(specialPurchaseOrderDisplayRef(d) || (noFurtherOrders?'Not required':'Pending'))}</strong><small>${esc(d.purchaseOrderStatus)}</small>${!so && d.purchaseOrderId?'<button type="button" data-backorder-document="purchase-order/document.pdf">Preview PO</button>':''}</span></div>`;
+    const canAttachSO=canAttachBackorderSalesOrder(d);
+    const quotation=ordered || canAttachSO
+      ? (so && canAttachSO?form(d,'already-ordered/sales-order','Save sales order number',label('salesOrderRef','Sales order number',d.alreadyOrderedSalesOrderRef || d.salesOrderRef,'text','required maxlength="120"')+'<p class="stock-request-wide">Saving the SO number confirms customer acceptance of the reviewed materials.</p>'):'')
       : `<p>NetSuite quotation: <strong>${esc(d.estimateNumber || '—')}</strong></p>${so?form(d,'quotation/link','Save quotation number',label('quotationNumber','NetSuite quotation number',d.estimateNumber,'text','required maxlength="100"')):''}`;
     const unlinked=active(d) && !(so?d.salesOrderId:d.purchaseOrderId),canLink=canLinkBackorderOrder(d,so?'sales_order':'purchase_order');
     const manual=unlinked && canLink ? form(d,so?'sales-order/link':'purchase-order/link',so?'Manual SO link':'Manual PO link',label(so?'salesOrderRef':'purchaseOrderRef','Existing synced order number','','text','required maxlength="120"')) : '';
@@ -140,18 +168,19 @@ export function createBackorderUI({mount,audience,api,getDetail,setDetail,render
     const ask=!window.StockRequestConversation && !so && active(d) && !d.salesOrderId && !d.purchaseOrderId && d.informationRequest?.status!=='pending'?form(d,'information/request','Request information',label('question','Question for Sales','','text','required')):'';
     const acknowledge=!so && active(d) && d.postPoChangePending?form(d,'changes/acknowledge','Acknowledge revised ETA',label('acknowledgement','Acknowledgement','','text','required')):'';
     const delivery=d.fulfillmentMethod==='mbt_delivery'?`<div class="stock-request-line-fields backorder-fields"><span><small>Delivery address</small><strong>${esc(d.deliveryAddress)}</strong></span><span><small>Delivery date</small><strong>${esc(d.deliveryDate || '—')}</strong></span><span><small>Delivery window</small><strong>${esc(d.windowStart || '—')} – ${esc(d.windowEnd || '—')}</strong></span><span><small>Delivery contact</small><strong>${esc(d.deliveryContactName)} ${esc(d.deliveryContactPhone)}</strong></span></div>${d.deliveryInstructions?`<p>Delivery instructions: ${esc(d.deliveryInstructions)}</p>`:''}`:'';
-    const header=delivery+(so && active(d)?`<details><summary>Edit request header</summary>${form(d,'header','Save request header',label('customerName','Customer (optional)',d.customerName)+label('customerPhone','Customer phone',d.customerPhone)+fulfillmentFields(d)+noteFields(d))}</details>`:'');
-    const close=active(d)?`<details><summary>Close Backorder</summary>${form(d,'close','Close request',label('reason','Reason','','text','required maxlength="2000"'))}</details>`:'';
-    return `<div data-backorder-detail data-backorder-id="${d.id}"><div class="stock-request-heading"><div><h2>${esc(d.requestRef)} · Backorder</h2><p>${window.RegularStockStatus?.render(d) || esc(stages[d.stage] || d.stage)}</p></div>${so && d.lines.every(line=>line.originalRate!==null)?`<button type="button" data-backorder-document="quote.pdf">Preview quote</button>`:''}${d.salesOrderId?'<button type="button" data-backorder-document="sales-order/document.pdf">Preview SO</button>':''}${!so && d.purchaseOrderId?'<button type="button" data-backorder-document="purchase-order/document.pdf">Preview PO</button>':''}</div><div data-backorder-error class="stock-request-error" role="status"></div>${links}${quotation}${manual}${linkNotice}
-      ${ordered?'<p>Already Ordered materials are complete. Their PO references are shown below.</p>':''}${noFurtherOrders?'':'<p>SCM review → Sales acceptance → Confirmed (Sales links SO; SCM links PO) → PO reference + Queued → Dispatch Arrangement.</p>'}${noFurtherOrders?'':specialPlanningStatus(d,false,{audience,showOrderPreviews:false,showApprovalNotice:false})}${d.remarks?`<p>${esc(d.remarks)}</p>`:''}${information}${header}${ask}
-      <section class="stock-request-section" data-scm-line-visibility="${d.id}">${scmLiveHeader(d)}${audience==='scm'?window.SCMRequestLineVisibility?.controls(d)||'':''}<div id="scm-request-lines-${d.id}">${d.lines.map(line=>material(d,line)).join('')}</div></section>${pickup}${acknowledge}${close}
-      <section class="stock-request-section"><h3>History</h3>${(d.events || []).map(event=>`<p>${esc(event.actorName)} · ${esc(event.eventType.replace(/^special_/,'backorder_').replaceAll('_',' '))} · ${esc(event.createdAt)}</p>`).join('')}</section></div>`;
+    const header=delivery+(so && active(d)?`<details><summary>Edit request header</summary>${form(d,'header','Save request header',label('customerName','Customer name *',d.customerName,'text','required maxlength="500"')+label('customerPhone','Customer phone',d.customerPhone)+fulfillmentFields(d)+noteFields(d))}</details>`:'');
+    const internalNote=so && String(d.salesInternalRemark || '').trim()?`<section class="stock-request-section" data-backorder-sales-note><h3>Sales internal note</h3><div class="special-sales-internal-remark-content">${esc(d.salesInternalRemark)}</div></section>`:'';
+    const close=active(d)?`<form class="stock-request-line-fields special-inline-form" data-backorder-form data-action="close" data-revision="${d.revision}">${label('reason','Close reason','','text','required maxlength="2000"')}<button class="danger" type="submit">Close request</button></form>`:'';
+    return `<div data-backorder-detail data-backorder-id="${d.id}"><div class="stock-request-heading"><div><h2>${esc(d.requestRef)} · Backorder</h2><p>${window.RegularStockStatus?.render(d) || esc(stages[d.stage] || d.stage)}</p></div>${so && d.lines.every(line=>line.originalRate!==null)?`<button type="button" data-backorder-document="quote.pdf">Preview quote</button>`:''}</div><div data-backorder-error class="stock-request-error" role="status"></div>${links}${quotation}${manual}${linkNotice}${poRouting?.detail(d) || ''}
+      ${ordered?'<p>Already Ordered materials are complete. Their PO references are shown below.</p>':''}${noFurtherOrders?'':'<p>SCM review → Sales acceptance → Confirmed (Sales links SO; SCM links PO) → PO reference + Queued → Dispatch Arrangement.</p>'}${noFurtherOrders?'':specialPlanningStatus(d,false,{audience,showOrderPreviews:false,showApprovalNotice:false})}${d.remarks?`<p>${esc(d.remarks)}</p>`:''}${internalNote}${information}${header}${ask}
+      <section class="stock-request-section" data-scm-line-visibility="${d.id}">${scmLiveHeader(d)}${audience==='scm'?window.SCMRequestLineVisibility?.controls(d)||'':''}<div id="scm-request-lines-${d.id}">${d.lines.map(line=>material(d,line)).join('')}</div>${so?backorderAddItemsButton(d,busy):''}</section>${pickup}${acknowledge}${close}
+      <section class="stock-request-section"><h3>History</h3><small>Toronto time</small>${(d.events || []).map(event=>`<p>${esc(event.actorName)} · ${esc(event.eventType.replace(/^special_/,'backorder_').replaceAll('_',' '))} · ${esc(window.MBBS_I18N?.displayDateTime(event.createdAt) || new Date(event.createdAt).toLocaleString(undefined,{timeZone:'America/Toronto'}))}</p>`).join('')}</section></div>`;
   }
   mount.addEventListener('change',event=>{
     const select=/** @type {HTMLSelectElement} */ (event.target);
     if (select.matches('[data-backorder-form] [name="supplyStatus"]')) {
-      const form=/** @type {HTMLFormElement} */ (select.closest('form')),ordered=select.value==='already_ordered';
-      for (const [selector,show] of /** @type {Array<[string,boolean]>} */ ([['[data-backorder-ordered-fields]',ordered],['[data-backorder-review-fields]',!ordered],['[data-backorder-projection-fields]',!ordered && !['in_stock','vendor_transfer'].includes(select.value)]])) {
+      const form=/** @type {HTMLFormElement} */ (select.closest('form')),ordered=select.value==='already_ordered',vendorReview=!ordered && select.value!=='yard_stock';
+      for (const [selector,show] of /** @type {Array<[string,boolean]>} */ ([['[data-backorder-ordered-fields]',ordered],['[data-backorder-review-fields]',vendorReview],['[data-backorder-projection-fields]',vendorReview && !['in_stock','vendor_transfer'].includes(select.value)]])) {
         const fields=/** @type {HTMLFieldSetElement} */ (form.querySelector(selector));fields.hidden=!show;fields.disabled=!show;
       }
       const transferLabel=/** @type {HTMLElement} */ (form.querySelector('[data-backorder-transfer-eta]'));
@@ -184,7 +213,10 @@ export function createBackorderUI({mount,audience,api,getDetail,setDetail,render
     const d=getDetail();
     if(!d){busy=false;return;}
     try {
-      const saved=await api(`/api/${audience}/stock-requests/${d.id}/backorder/${target.dataset.action}`,{method:'POST',body:JSON.stringify(fields)});
+      const action=target.dataset.action || '',yardStock=fields.supplyStatus==='yard_stock' && action.endsWith('/response');
+      const endpoint=yardStock?action.replace(/\/response$/,'/yard-stock'):action;
+      const saved=await api(`/api/${audience}/stock-requests/${d.id}/backorder/${endpoint}`,{method:'POST',body:JSON.stringify(yardStock?{expectedRevision:fields.expectedRevision}:fields)});
+      openedEditors.delete(`${d.id}:${target.dataset.action}`);
       const current=getDetail();
       if(current?.id===d.id && current.revision<=saved.revision){setDetail(saved);render();}
       void window.MBBSRegularStockAlert?.refresh();
@@ -192,14 +224,28 @@ export function createBackorderUI({mount,audience,api,getDetail,setDetail,render
     finally{busy=false;buttons.forEach(button=>button.disabled=false);inputs.forEach(input=>input.disabled=false);}
   });
   mount.addEventListener('click',async event=>{
+    const edit=/** @type {HTMLButtonElement|null} */ ((/** @type {HTMLElement} */ (event.target)).closest('[data-backorder-edit]'));
+    if (edit) {
+      if (busy) return;
+      const key=edit.dataset.backorderEdit;
+      const panel=/** @type {HTMLElement|null} */ (mount.querySelector(`[data-backorder-editor="${key}"]`));
+      if (!panel) return;
+      const opened=panel.hidden;
+      if (opened) openedEditors.add(key); else openedEditors.delete(key);
+      panel.hidden=!opened;edit.setAttribute('aria-expanded',String(opened));
+      if (opened) panel.querySelector(/** @type {'input'} */ ('input,select,textarea'))?.focus();
+      return;
+    }
     const button=/** @type {HTMLButtonElement|null} */ ((/** @type {HTMLElement} */ (event.target)).closest('[data-backorder-document]'));
-    if (!button) return;
+    if (!button || audience==='sales' && button.dataset.backorderDocument==='purchase-order/document.pdf') return;
+    const preview=previewDialog(button.dataset.backorderDocument==='quote.pdf'?'MBBS quote preview':button.dataset.backorderDocument==='sales-order/document.pdf'?'Sales Order preview':'Purchase Order preview',button);
     try {
-      const response=await fetch(`/api/${audience}/stock-requests/${getDetail()?.id}/backorder/${button.dataset.backorderDocument}`,{headers:{Authorization:'Bearer '+localStorage.getItem('mbbs.staff.token')}});
+      const response=await fetch(`/api/${audience}/stock-requests/${getDetail()?.id}/backorder/${button.dataset.backorderDocument}`,{cache:'no-store',signal:preview.signal,headers:{Authorization:'Bearer '+localStorage.getItem('mbbs.staff.token'),Accept:'application/pdf'}});
       if (!response.ok) throw new Error('Document preview is unavailable. Check the saved prices or linked order.');
-      const url=URL.createObjectURL(await response.blob());window.open(url,'_blank','noopener');window.setTimeout(()=>URL.revokeObjectURL(url),60000);
-    }catch(caughtError){const errorNode=mount.querySelector('[data-backorder-error]');if(errorNode)errorNode.textContent=(/** @type {Error} */ (caughtError)).message;}
+      if (!response.headers.get('content-type')?.includes('application/pdf')) throw new Error('The preview did not return a PDF.');
+      const blob=await response.blob();if(preview.dialog.isConnected)preview.showPdf(blob,'MBBS-document.pdf');
+    }catch(caughtError){if(preview.dialog.isConnected){preview.body.setAttribute('role','alert');preview.body.textContent=(/** @type {Error} */ (caughtError)).message;}}
   });
-  return {isBackorder,detail,composerFields,composerLine,composerPayload,linePayload,waitingStatus:specialSupplyWaitingStatus,
+  return {isBackorder,canAddItems:canAddBackorderItems,detail,composerFields,composerLine,composerPayload,linePayload,waitingStatus:specialSupplyWaitingStatus,
     filter:(/** @type {string} */ type,/** @type {string} */ stage,/** @type {string} */ attribute,allStagesLabel='All active stages')=>`<label><span>Request type</span><select ${attribute}="requestTypeFilter">${options({'':'All Regular',backorder:'Backorder'},type)}</select></label>${type==='backorder'?`<label><span>Case stage</span><select ${attribute}="backorderStageFilter">${options({'':allStagesLabel,...stages},stage)}</select></label>`:''}`};
 }

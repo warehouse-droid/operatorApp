@@ -29,7 +29,7 @@ export function createStockingBackorderUI({api,onConverted}) {
       if (!dialog.isConnected) return;
       dialog.innerHTML=`<form class="stock-request-form"><h2>Convert ${esc(preview.requestRef)} to Backorder</h2>
         <p>Convert the whole request and keep its request number. SCM will review the stock, then Sales accepts or rejects each material.</p>
-        <div class="stock-request-summary"><span><small>Customer</small><strong>${esc(preview.customerName || 'Optional')}</strong></span><span><small>Request remark</small><strong>${esc(preview.remarks)}</strong></span></div>
+        <div class="stock-request-summary"><span><small>Customer</small>${String(preview.customerName || '').trim()?`<strong>${esc(preview.customerName)}</strong>`:'<label><span>Customer name *</span><input name="customerName" required maxlength="500" /></label>'}</span><span><small>Request remark</small><strong>${esc(preview.remarks)}</strong></span></div>
         <div class="stock-request-line-fields backorder-fields">${fulfillmentFields(preview)}<label><span>Required date</span><input name="requiredDate" type="date" value="${esc(preview.requiredDate)}" min="${esc(preview.requiredDate)}" required /></label></div>
         <h3>Materials</h3>${preview.lines.map((/** @type {any} */ line)=>`<article class="stock-request-line"><div class="stock-request-line-fields backorder-fields">
           <div><strong>${esc(line.itemName)}</strong><p>${esc(line.description)}</p></div><div><small>Quantity</small><p>${esc(line.quantity)} ${esc(line.uom)}</p></div>

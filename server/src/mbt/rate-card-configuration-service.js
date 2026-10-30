@@ -532,9 +532,9 @@ export function normalizeLocalRateCardGraph(value, { sourceKind } = {}) {
 
 /** @param {MbtActor} actor */
 async function assertMasterDataCommand(actor) {
-  const admin = actor?.roles?.some((role) => String(role).trim().toLowerCase() === "admin") === true;
-  if (!admin) {
-    throw new MbtError({ status: 403, code: "MBT_ADMIN_REQUIRED", message: "Admin account required." });
+  const manager = actor?.roles?.some((role) => ["admin","dispatcher"].includes(String(role).trim().toLowerCase())) === true;
+  if (!manager) {
+    throw new MbtError({ status: 403, code: "MBT_ADMIN_REQUIRED", message: "Admin or Dispatcher account required." });
   }
   await authorizeMbtPhase3Capability({ capability: "masterData", pilotAuthorized: true });
 }
@@ -1796,6 +1796,12 @@ export async function getLocalRateCardGraph(rawVersionId) {
         WHERE tariff.rate_card_version_id = $1
         ORDER BY tariff.item_code NULLS FIRST, material.material_code NULLS FIRST, tariff.tariff_code`, [versionId]
   );
+  const deposits = await query(`SELECT rule.rule_code AS "ruleCode",rule.rule_type AS "ruleType",
+      bin.type_code AS "binTypeCode",rule.service_code AS "serviceCode",
+      rule.fixed_amount_minor AS "fixedAmountMinor",rule.percentage_basis_points AS "percentageBasisPoints",
+      rule.currency,rule.liability_account_mapping_key AS "liabilityAccountMappingKey",rule.active,rule.description
+    FROM mbt_deposit_rules rule LEFT JOIN mbt_bin_types bin ON bin.bin_type_id=rule.bin_type_id
+    WHERE rule.rate_card_version_id=$1 ORDER BY rule.rule_code`,[versionId]);
   const vendorRouteRates = await query(
     `SELECT route_rate.rate_name AS "rateName",
             route_rate.display_name AS "displayName",
@@ -1896,7 +1902,9 @@ export async function getLocalRateCardGraph(rawVersionId) {
       })),
       components: (/** @type {Array<Record<string, any>>} */ (components.rows)).map((row) => ({ ...row, amountMinor: row.amountMinor === null ? null : Number(row.amountMinor), percentageBasisPoints: row.percentageBasisPoints === null ? null : Number(row.percentageBasisPoints), defaultQuantity: Number(row.defaultQuantity) })),
       dumpTariffs: (/** @type {Array<Record<string, any>>} */ (tariffs.rows)).map((row) => ({ ...row, amountMinor: Number(row.amountMinor), minimumAmountMinor: Number(row.minimumAmountMinor) })),
-      depositRules: [],
+      depositRules: (/** @type {Array<Record<string, any>>} */ (deposits.rows)).map(row=>({...row,
+        fixedAmountMinor:row.fixedAmountMinor===null ? null : Number(row.fixedAmountMinor),
+        percentageBasisPoints:row.percentageBasisPoints===null ? null : Number(row.percentageBasisPoints)})),
       mbbsChargingPolicy: policyInput === null ? null : normalizeMbbsRateCardPolicy(policyInput),
       mbbsVendorRouteRates: normalizeMbbsVendorRouteRates(
         (/** @type {Array<Record<string, any>>} */ (vendorRouteRates.rows)).map((row) => ({

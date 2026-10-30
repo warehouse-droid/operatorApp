@@ -156,7 +156,7 @@ test("receiving evidence and completed NetSuite steps prevent resetting an outbo
   await assert.rejects(() => reopenOperatorOrder(resetInput(f, preview)), { code: "OPERATOR_REOPEN_RECEIVED" });
 }));
 
-test("legacy failed-fulfillment photo remains retained while a verified fulfillment blocks reset", () => rollback(async () => {
+test("legacy fulfillment photos remain retained whether an old IF was recorded or not", () => rollback(async () => {
   const f = await reopenFixture();
   const record = (await query(`INSERT INTO delivery_fulfillment_records(order_id,operator_id,fulfillment_status,photo_data_url,photo_data_urls)
     VALUES($1,$2,'failed','data:image/jpeg;base64,AAAA','["data:image/jpeg;base64,AAAA"]') RETURNING id`, [f.id, f.packer.id])).rows[0];
@@ -165,10 +165,13 @@ test("legacy failed-fulfillment photo remains retained while a verified fulfillm
   assert.equal(preview.allowed, true);
   await query("UPDATE delivery_fulfillment_records SET item_fulfillment_id=123 WHERE id=$1", [record.id]);
   const verified = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-  assert.ok(verified.blockers.some(row => row.code === "OPERATOR_REOPEN_NETSUITE_EVIDENCE"));
+  assert.equal(verified.allowed, true, JSON.stringify(verified.blockers));
+  assert.equal(verified.retainedPhotoCount, 3);
+  await reopenOperatorOrder(resetInput(f, verified));
+  assert.equal((await query("SELECT item_fulfillment_id FROM delivery_fulfillment_records WHERE id=$1", [record.id])).rows[0].item_fulfillment_id, "123");
 }));
 
-test("verified NetSuite transaction on a released claim cannot be silently reset", () => rollback(async () => {
+test("verified historical NetSuite transaction on a released claim permits an audited local reset", () => rollback(async () => {
   const f = await reopenFixture();
   const id = crypto.randomUUID();
   await query(`INSERT INTO operator_netsuite_posting_commands(id,request_id,actor_operator_id,function_key,transaction_type,
@@ -180,8 +183,9 @@ test("verified NetSuite transaction on a released claim cannot be silently reset
     source_order_ref,transaction_type,external_id,payload_hash,payload,line_snapshot,netsuite_transaction_id)
     VALUES($1,1,'SO',$2,$3,'IF',$4,$5,'{}','[]',123)`, [id, f.id, f.ref, `reopen-${id}`, "0".repeat(64)]);
   const preview = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-  assert.ok(preview.blockers.some(row => row.code === "OPERATOR_REOPEN_POSTING"));
-  await assert.rejects(() => reopenOperatorOrder(resetInput(f, preview)), { code: "OPERATOR_REOPEN_POSTING" });
+  assert.equal(preview.allowed, true, JSON.stringify(preview.blockers));
+  await reopenOperatorOrder(resetInput(f, preview));
+  assert.equal((await query("SELECT netsuite_transaction_id FROM operator_netsuite_posting_steps WHERE command_id=$1", [id])).rows[0].netsuite_transaction_id, "123");
 }));
 
 test("the additive correction migration is idempotent and a failed application rolls back", () => rollback(async () => {

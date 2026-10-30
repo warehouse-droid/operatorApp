@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import {transportOfflineSnapshot} from "./mbt/bin-transport-offline.js";
 import { sanitizeSorSignature } from "./sor-signature-evidence.js";
 import { query, withTransaction } from "./db.js";
 import { normalizeDispatchPlanLoadAssignments } from "./dispatch-load-assignment.js";
@@ -250,9 +251,14 @@ function sanitizeItem(item = {}) {
   });
 }
 
+/** @param {{orderRef?: unknown, id?: unknown, poRefs?: unknown[], orderType?: unknown, type?: unknown,
+ * party?: unknown, customer?: unknown, vendor?: unknown, source?: unknown, items?: object[]}} order */
 function sanitizeOrder(order = {}) {
   return compactObject({
     orderRef: optionalText(order.orderRef ?? order.id, { maxLength: 180 }),
+    poRefs: Array.isArray(order.poRefs)
+      ? [...new Set(order.poRefs.slice(0, 500).map(value => optionalText(value, { maxLength: 180 })).filter(Boolean))]
+      : [],
     orderType: optionalText(order.orderType ?? order.type, { maxLength: 40 }),
     party: optionalText(order.party ?? order.customer ?? order.vendor, { maxLength: 300 }),
     source: optionalText(order.source, { maxLength: 80 }),
@@ -383,11 +389,13 @@ function sanitizeMbtDriverJob(value) {
     : [];
   return stripEmptyMbtValues(compactObject({
     schemaVersion: MBT_DRIVER_BIN_JOB_SCHEMA,
+    ...transportOfflineSnapshot(value),
     minimumClientVersion: optionalText(value.minimumClientVersion, { maxLength: 80 }),
     contractId: optionalText(value.contractId, { maxLength: 64 }),
     contractNumber: optionalText(value.contractNumber, { maxLength: 180 }),
     visitId: optionalText(value.visitId, { maxLength: 64 }),
     visitReference: optionalText(value.visitReference, { maxLength: 180 }),
+    displayReference: optionalText(value.displayReference, { maxLength: 180 }),
     visitNumber: Number.isSafeInteger(Number(value.visitNumber)) ? Number(value.visitNumber) : undefined,
     issuedVisitRevision: Number.isSafeInteger(Number(value.issuedVisitRevision))
       ? Number(value.issuedVisitRevision)
@@ -589,6 +597,8 @@ export function sanitizeDriverOfflineJob(job = {}) {
  */
 function stableMbtOfflineFingerprint(mbt) {
   const stable = structuredClone(mbt);
+  // A readable alias may be backfilled without changing an issued execution identity.
+  delete stable.displayReference;
   const exactAssets = stable.exactAssets && typeof stable.exactAssets === "object"
     ? stable.exactAssets
     : {};

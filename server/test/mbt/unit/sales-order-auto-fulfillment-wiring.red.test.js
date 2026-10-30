@@ -6,15 +6,15 @@ import test from "node:test";
 
 const source = (relativePath) => readFile(new URL(`../../../${relativePath}`, import.meta.url), "utf8");
 
-test("L5/L12 Sales Order delivery defers to Driver completion; TO milestones use background posting", async () => {
+test("L5/L12 Sales Order loads and TO milestones use background posting", async () => {
   const [admission, targets] = await Promise.all([
     source("src/operator-netsuite-posting-admission.js"),
     source("src/operator-netsuite-posting-targets.js")
   ]);
-  assert.match(admission, /resolution\.netSuitePostingOwner === "driver_completion"/u);
-  assert.match(admission, /reason: "driver_completion_owned"/u);
+  assert.match(admission, /resolution\.netSuitePostingOwner === "sales_load_background"/u);
+  assert.match(admission, /reason: "sales_load_background_owned"/u);
   assert.match(targets, /const netSuitePostingOwner = functionKey === "delivery_prep"/u);
-  assert.match(targets, /\? "driver_completion"[\s\S]*: "operator"/u);
+  assert.match(targets, /"sales_load_background"/u);
   assert.match(targets, /"transfer_background"/u);
 });
 

@@ -1,24 +1,49 @@
 /* BIN domain adapter. Dispatch owns the complete planner/pool layout, timing,
  * maps, edit lease, save queue and journal. Ordinary Dispatch never loads this. */
+/* global saveCurrentPlanNow, planEditLeaseToken, dispatchSessionId, currentPlanDate,
+  localPlanDirty, dispatchAuthHeaders, escapeHtml, isDispatchPlanEditor,
+  mbtBinAssetSelectionByVisit, ensureDispatchPlanEditor, render */
+/* global routeNotice: writable, applyPlannedAssignments: writable, jumpToPlannedOrder: writable */
+/* global searchText, mbtBinDispatchError: writable, saveQueued, saveInFlight, orderById, selectedOrder, mbtEligibleAssetChoice, mbtSelectedEligibleAsset */
+/* global mbtBinFrontLegDraggable */
+/* exported routeNotice */
 (() => {
   const state = { ready: false, cards: new Map(), pool: [], nextOffset: null,
-    total: 0, filter: "all", request: 0, navigation: 0, loadingDate: false, truckIds: new Set(), rawPlan: null };
-  const filters = [["all", "BIN"], ["delivery", "Delivery"], ["exchange", "Exchange"], ["collection", "Collection"]];
+    total: 0, search: "", filter: "delivery", request: 0, navigation: 0, loadingDate: false, truckIds: new Set(), rawPlan: null,capacityWarnings:[] };
+  const filters = [["delivery", "Delivery"], ["exchange", "Exchange"], ["collection", "Collection"], ["mbr_agg", "MBR/Agg"]];
   const localTime = value => value ? new Intl.DateTimeFormat("en-GB", { timeZone: "America/Toronto", hour: "2-digit", minute: "2-digit" }).format(new Date(value)) : "";
   const visitId = stop => String(stop?.mbt?.visitId || "");
   const compatibleTruck = truck => state.truckIds.has(String(truck.id));
   const groups = load => [...new Set((load.stops || []).map(visitId).filter(Boolean))];
   const assigned = () => new Set(trucks.flatMap(t => t.loads || []).flatMap(groups));
+  const linkedCollection = card => card?.workflow?.linkedCollection && !["completed","cancelled"].includes(card.workflow.linkedCollection.status)
+    ? card.workflow.linkedCollection : null;
+
+  function linkedRouteCards(card) {
+    const predecessor=linkedCollection(card);
+    const collection=predecessor ? state.cards.get(predecessor.visitId) : card;
+    const deliveryId=collection?.workflow?.linkedDeliveryVisitId || collection?.transport?.linkedDeliveryVisitId;
+    return deliveryId ? [collection,state.cards.get(deliveryId)].filter(Boolean) : [card];
+  }
 
   function orderForCard(card) {
-    return { ...card, pallets: 0, weightLbs: 0, items: [], travelMinutes: 30,
+    const collectionHold=card.workflow?.collectionHold;
+    return { ...card, pallets: 0, weightLbs: card.transport?.weightLbs || 0, items: [], travelMinutes: 30,
       pickupLocations: pickupLocationsForCard(card),
-      windowStart: localTime(card.scheduledWindow?.startAt), windowEnd: localTime(card.scheduledWindow?.endAt),
-      localDispatchStatus: "open", planOwned: true, catalogHydrated: true };
+      windowStart: card.transport?.windowStart ?? localTime(card.scheduledWindow?.startAt), windowEnd: card.transport?.windowEnd ?? localTime(card.scheduledWindow?.endAt),
+      localDispatchStatus: card.mbt.status === "completed" ? "completed" : "open",
+      dispatchCompletionStatus: card.mbt.status === "completed" ? "completed" : "",
+      dispatchPlanningRestricted: ["completed","cancelled"].includes(card.mbt.status) || Boolean(linkedCollection(card)) || Boolean(collectionHold),
+      dispatchPlanningRestrictionReason: collectionHold ? collectionHold.reason : linkedCollection(card) ? `Planned with ${linkedCollection(card).reference}` : "",
+      planOwned: true, catalogHydrated: true };
   }
   function pickupLocationsForCard(card) {
+    if (card.transport) {return [...new Set(card.stops.filter(stop=>stop.type==='pickup').map(stop=>stop.planningAddress))];}
     const locations=(card.workflow ? card.stops.filter(stop=>stop.type==="pickup") : card.stops)
       .map(stop=>(card.workflow && stop.planningAddress) || stop.yardCode || card.address).filter(Boolean);
+    if (card.workflow?.source?.planned && card.workflow.source.address) {
+      return [`${card.workflow.source.availabilityPredecessorId?'Planned return':'After dumping'}: ${card.workflow.source.address}`,...[...new Set(locations)].map(address=>`Material pickup: ${address}`)];
+    }
     if (locations.length) {return [...new Set(locations)];}
     const source=card.workflow?.source;
     if (source?.address) {return [`${source.planned ? "After dumping: " : ""}${source.address}`];}
@@ -26,13 +51,14 @@
   }
   function adoptCards() {
     const binOrders = [...state.cards.values()].map(orderForCard);
-    orders = [...orders.filter(order => order.type !== "BIN"), ...binOrders]; orderCatalog = binOrders;
+    const binIds=new Set(binOrders.map(order=>order.id));
+    orders = [...orders.filter(order => order.type !== "BIN" && !binIds.has(order.id)), ...binOrders]; orderCatalog = binOrders;
     mbtBinDispatchFeed = { planDate: currentPlanDate, items: [...state.cards.values()] };
   }
   function visualStop(stop, loadId, card, index) {
     return { ...stop, id: stop.id || `BIN-draft-${card.mbt.visitId}-${stop.sequence || index + 1}`,
-      loadId, orderId: card.id, type: ["collect_empty_bin", "pickup_bin"].includes(stop.actionCode) ? "pick" : "drop",
-      location: (card.workflow && (stop.planningAddress || stop.location?.address)) || stop.yardCode || card.address,
+      loadId, orderId: card.id, type: ["collect_empty_bin", "pickup_bin"].includes(stop.actionCode) || stop.actionCode?.startsWith('cargo_pickup_') ? "pick" : "drop",
+      location: ((card.workflow || card.transport) && (stop.planningAddress || stop.location?.address)) || stop.yardCode || card.address,
       mbt: { ...stop.mbt, visitId: card.mbt.visitId, stopSequence: Number(stop.mbt?.stopSequence || stop.sequence || index + 1), mandatory: true } };
   }
   function decoratePlan() {
@@ -72,21 +98,29 @@
   }
   async function refreshFeed({ append = false, renderAfter = true, adopt = false } = {}) {
     if (state.loadingDate && !adopt) {return false;}
-    const date = currentPlanDate; const sequence = ++state.request; mbtBinDispatchLoading = true;
+    const date = currentPlanDate, term = searchText.trim(); const sequence = ++state.request; mbtBinDispatchLoading = true;
     try {
-      const params = new URLSearchParams({ planDate: date, search: searchText, limit: "100", offset: String(append ? state.nextOffset || 0 : 0) });
-      const response = await fetch(`/api/mbt/planning?${params}`, { headers: dispatchAuthHeaders() }); const data = await response.json();
-      if (!response.ok) {throw new Error(data.error || "BIN orders could not be loaded.");}
-      if (sequence !== state.request || date !== currentPlanDate) {return false;}
+      const params = new URLSearchParams({ planDate: date, search: term, limit: "100", offset: String(append ? state.nextOffset || 0 : 0) });
+      const [data,transport]=await Promise.all(['/api/mbt/planning','/api/mbt/planning/transport'].map(async path=>{
+        const response=await fetch(`${path}?${params}`,{headers:dispatchAuthHeaders()}),body=await response.json();
+        if (!response.ok) {throw new Error(body.error || 'Planning orders could not be loaded.');}return body;
+      }));
+      data.pool.items.push(...transport.pool.items);data.assigned.push(...transport.assigned);
+      data.linked=[...(data.linked || []),...(transport.linked || [])];
+      data.pool.total+=transport.pool.total;
+      const offsets=[data.pool.nextOffset,transport.pool.nextOffset].filter(value=>value!==null);
+      data.pool.nextOffset=offsets.length?Math.min(...offsets):null;
+      if (sequence !== state.request || date !== currentPlanDate || term !== searchText.trim()) {return false;}
+      state.capacityWarnings=data.capacityWarnings || [];
       state.truckIds = new Set(data.trucks.map(truck => String(truck.id)));
       mergePlanningFleet(data.trucks);
-      for (const card of [...data.pool.items, ...data.assigned]) {
+      for (const card of [...data.pool.items, ...data.assigned, ...(data.linked || [])]) {
         if (card.workflow?.role) {state.cards.delete(card.workflow.orderId);}
         const prior = state.cards.get(card.mbt.visitId);
         if (!prior || card.mbt.visitRevision >= prior.mbt.visitRevision) {state.cards.set(card.mbt.visitId, card);}
       }
       state.pool = append ? [...new Set([...state.pool, ...data.pool.items.map(card => card.mbt.visitId)])] : data.pool.items.map(card => card.mbt.visitId);
-      state.total = data.pool.total; state.nextOffset = data.pool.nextOffset;
+      state.search = term; state.total = data.pool.total; state.nextOffset = data.pool.nextOffset;
       if (adopt && data.plan && !localPlanDirty) { applySavedPlan(data.plan); currentPlan = compactCurrentPlan(data.plan); }
       else {decoratePlan();}
       state.ready = true; mbtBinDispatchError = ""; return true;
@@ -98,11 +132,19 @@
     }
   }
   function poolCards() {
+    const term=searchText.trim();
+    if (state.search!==term) return [];
     const placed = assigned();
-    const ids = new Set([...state.pool, ...[...state.cards.values()].filter(card => card.loadId && !searchText).map(card => card.mbt.visitId)]);
-    return [...ids].map(id => state.cards.get(id)).filter(card => card && !placed.has(card.mbt.visitId)
-      && !["completed", "cancelled"].includes(card.mbt.status) && (state.filter === "all"
-        || (card.serviceAction==="return_bin" ? "collection" : card.serviceAction) === state.filter));
+    const ids = new Set([...state.pool, ...[...state.cards.values()].filter(card => card.loadId && !term).map(card => card.mbt.visitId)]);
+    return [...ids].map(id => state.cards.get(id)).filter(card => card
+      && (term || (!placed.has(card.mbt.visitId) && (!card.dispatchPlanned || card.dispatchPlanDate===currentPlanDate)
+        && !["completed", "cancelled"].includes(card.mbt.status)))
+      && (term || (card.serviceAction==="return_bin" ? "collection" : card.serviceAction) === state.filter));
+  }
+  function capacityWarningsForLoad(load) {
+    const visits=new Set((load.stops || []).map(visitId));
+    return state.capacityWarnings.filter(warning=>String(warning.loadId)===String(load.id)
+      && (!load.truckId || String(warning.truckId)===String(load.truckId)) && visits.has(warning.visitId));
   }
   function orderList() {
     const cards = poolCards().map(card => renderOrderCard(orderForCard(card))).join("");
@@ -113,26 +155,77 @@
   }
   function cardActions(order) {
     if (order.type !== "BIN") {return "";}
-    const card = state.cards.get(order.mbt.visitId); const choices = mbtEligibleAssetChoice(card); const selected = mbtSelectedEligibleAsset(card);
-    return `<div class="bin-card-actions">${choices.length ? `<label>Bin<select data-bin-asset="${escapeHtml(card.mbt.visitId)}" aria-label="Bin for ${escapeHtml(card.id)}"><option value="">Choose bin</option>${choices.map(asset => `<option value="${escapeHtml(asset.assetId)}" ${selected?.assetId === asset.assetId ? "selected" : ""}>${escapeHtml(asset.assetCode)}</option>`).join("")}</select></label>` : `<span>${escapeHtml((card.mbt.assetRequirements || []).map(asset => asset.exactAssetCode).join(", "))}</span>`}
-      ${card.workflow?.configurationRequired ? `<button data-action="bin-workflow" data-visit="${escapeHtml(card.mbt.visitId)}" type="button">Configure ${escapeHtml(card.workflow.kind)}</button>` : ""}
-      <button data-action="bin-details" data-visit="${escapeHtml(card.mbt.visitId)}" type="button">Details</button></div>
-      ${card.workflow?.role && !card.loadId ? `<button data-action="bin-workflow" data-visit="${escapeHtml(card.workflow.orderId)}" type="button">Edit workflow</button>` : ""}
+    const card = state.cards.get(order.mbt.visitId);
+    const codes=(card.mbt.assetRequirements || []).map(asset=>asset.exactAssetCode).filter(Boolean);
+    return `${codes.length ? `<span>Bin ${escapeHtml(codes.join(", "))}</span>` : ""}
+      ${card.workflow?.configurationRequired ? '<span>Route setup required</span>' : ""}
+      ${card.transport ? `<p class="bin-workflow-note">${escapeHtml(card.displayReference)}${card.transport.allocations.map(line=>` · ${escapeHtml(line.quantity)} ${escapeHtml(line.unit)} ${escapeHtml(line.description)}`).join('')}</p>
+        ${card.transport.sourceOnly?`<p class="bin-workflow-note">${card.transport.lines.map(line=>`${escapeHtml(line.description)}: ${escapeHtml(line.remaining)} remaining · ${escapeHtml(line.planned)} planned · ${escapeHtml(line.delivered)} delivered`).join('<br>')}</p>`:''}`:''}
+      ${linkedCollection(card) ? `<p class="bin-workflow-note">Planned automatically with ${escapeHtml(linkedCollection(card).reference)}</p>` : ""}
       ${card.workflow?.role ? `<p class="bin-workflow-note">${escapeHtml(card.workflow.reference)} · ${escapeHtml(card.workflow.role)}
         ${card.workflow.dependencies.map(d=>` · after ${escapeHtml(d.display_reference)} (${escapeHtml(d.status)})`).join("")}</p>` : ""}
       ${card.workflow?.pendingCollections.length ? `<p class="bin-workflow-note">Pending: ${card.workflow.pendingCollections.map(p=>`${escapeHtml(p.asset_code)} · ${escapeHtml(p.display_reference)}`).join("; ")}</p>` : ""}
-      ${card.blockedReason ? `<span class="chip warn">${escapeHtml(card.blockedReason)}</span>` : ""}`;
+      ${card.blockedReason ? `<span class="chip warn" ${card.workflow?.collectionHold?'data-bin-collection-waiting':''}>${escapeHtml(card.blockedReason)}</span>` : ""}`;
   }
   function selectedActions() {
     const order = selectedOrder(); if (order?.type !== "BIN") {return "";}
-    return `<div class="selected-order-actions"><span>${escapeHtml(order.id)}</span><button data-action="bin-assign-selected" type="button" ${isDispatchPlanEditor() && isMbtPlanningLoad(selectedLoad().load) && !assigned().has(order.mbt.visitId) ? "" : "disabled"}>Assign to selected load</button><button data-action="bin-details" data-visit="${escapeHtml(order.mbt.visitId)}" type="button">Details</button></div>`;
+    if (order.transport) {return `<div class="selected-order-actions"><span>${escapeHtml(order.displayReference)}</span>
+      <button data-action="bin-transport" data-visit="${escapeHtml(order.mbt.visitId)}" type="button">Plan transport</button></div>`;}
+    const editable=!["completed","cancelled","in_progress","evidence_pending"].includes(order.mbt.status);
+    const setup=editable && order.workflow;
+    const change=editable && !order.workflow?.configurationRequired && order.workflow?.role!=="collection"
+      && (order.mbt.assetRequirements || []).length;
+    const choices=editable && !order.workflow ? mbtEligibleAssetChoice(order) : [];
+    const selected=mbtSelectedEligibleAsset(order);
+    return `<div class="selected-order-actions"><span>${escapeHtml(order.displayReference || order.id)}</span>
+      ${setup ? `<button data-action="bin-workflow" data-visit="${escapeHtml(order.mbt.visitId)}" type="button" ${isDispatchPlanEditor() ? "" : "disabled"}>Plan ${escapeHtml(order.workflow.kind)}</button>` : ""}
+      ${choices.length ? `<label>Bin<select data-bin-asset="${escapeHtml(order.mbt.visitId)}" aria-label="Bin for ${escapeHtml(order.id)}"><option value="">Choose bin</option>${choices.map(asset=>`<option value="${escapeHtml(asset.assetId)}" ${selected?.assetId===asset.assetId ? "selected" : ""}>${escapeHtml(asset.assetCode)}</option>`).join("")}</select></label>` : ""}
+      ${change ? changeBinButton(order.mbt.visitId) : ""}
+      <button data-action="bin-details" data-visit="${escapeHtml(order.mbt.visitId)}" type="button">Details</button></div>`;
+  }
+  function changeBinButton(id) {
+    return `<button data-action="bin-selection" data-visit="${escapeHtml(id)}" type="button" ${isDispatchPlanEditor() ? "" : "disabled"}>Change bin</button>`;
+  }
+  async function withPlanLeases(plans,save) {
+    const acquired=[],fences=[];
+    try {
+      for (const plan of plans) {
+        if (plan.planDate===currentPlanDate) {
+          fences.push({...plan,sessionId:dispatchSessionId,editLeaseToken:planEditLeaseToken});continue;
+        }
+        const sessionId=crypto.randomUUID();
+        const response=await fetch("/api/dispatch/plan-edit-lease/acquire",{method:"POST",
+          headers:{...dispatchAuthHeaders(),"Content-Type":"application/json"},body:JSON.stringify({planDate:plan.planDate,sessionId})});
+        const result=await response.json();if (!response.ok) throw new Error(result.error || `Cannot edit the affected plan on ${plan.planDate}.`);
+        const fence={...plan,sessionId,editLeaseToken:result.editLeaseToken};acquired.push(fence);fences.push(fence);
+      }
+      await save(fences);
+    } finally {
+      await Promise.allSettled(acquired.map(fence=>fetch("/api/dispatch/plan-edit-lease/release",{method:"POST",
+        headers:{...dispatchAuthHeaders(),"Content-Type":"application/json"},body:JSON.stringify(fence)})));
+    }
+  }
+  async function changeBin(id) {
+    if (!ensureDispatchPlanEditor()) return;
+    await saveCurrentPlanNow();
+    if (localPlanDirty) throw new Error("Wait for the current plan changes to save before selecting another bin.");
+    await window.BinOrderWorkflowUI.selectBin(id,{headers:dispatchAuthHeaders,withPlanLeases,onSaved:async()=>{
+      mbtBinAssetSelectionByVisit.delete(id);await refreshFeed({adopt:true});
+      routeNotice="Assigned bin updated. Released driver instructions have been refreshed.";render({save:false});
+    }});
   }
   function physicalVisits(load, rows) {
-    return (load.stops || []).flatMap((stop, index) => {
-      const order = stopOrder(stop);
-      return order ? [{ type: stop.type, address: stopAddress(stop, order), addressKey: `${visitId(stop)}:${stop.mbt.stopSequence}`,
-        entries: [{ stop, order, index, row: rows[index] || null }] }] : [];
-    });
+    const visits=[];
+    for (const [index,stop] of (load.stops || []).entries()) {
+      const order=stopOrder(stop);if (!order) continue;
+      const address=stopAddress(stop,order),addressKey=address.trim().replace(/\s+/g,' ').toLowerCase();
+      const previous=visits.at(-1),entry={stop,order,index,row:rows[index] || null};
+      const transport=Boolean(stop.mbt?.transportTripId);
+      if (addressKey && previous?.addressKey===addressKey && (transport || previous.transport)) {
+        previous.entries.push(entry);previous.transport=true;
+      } else {visits.push({type:stop.type,address,addressKey,transport,entries:[entry]});}
+    }
+    return visits;
   }
   function stopPlace(stop, order) {
     const place = stop.yardCode ? placeForLocation(stop.yardCode) : null;
@@ -214,7 +307,16 @@
     if (!mbtBinFrontLegDraggable(card) || assigned().has(card.mbt.visitId)) {
       routeNotice = card.blockedReason || "Choose an available bin before assigning this visit."; return false;
     }
-    const steps = card.stops.map((stop, index) => visualStop(stop, loadId, card, index));
+    if (linkedCollection(card)) {
+      routeNotice = `Plan ${linkedCollection(card).reference}; its linked delivery is included automatically.`; return false;
+    }
+    const route=linkedRouteCards(card);
+    if ((card.workflow?.linkedDeliveryVisitId && route.length!==2) || route.some(member=>!mbtBinFrontLegDraggable(member)
+      || ["completed","cancelled"].includes(member.mbt.status)
+      || assigned().has(member.mbt.visitId) || (member.dispatchPlanned && member.dispatchPlanDate!==currentPlanDate))) {
+      routeNotice = "The linked delivery is unavailable or already planned. Refresh the linked route."; return false;
+    }
+    const steps = route.flatMap(member=>member.stops.map((stop,index)=>visualStop(stop,loadId,member,index)));
     const targetId = visitId(found.load.stops[insertIndex]);
     const at = targetId ? found.load.stops.findIndex(stop => visitId(stop) === targetId) : found.load.stops.length;
     found.load.stops.splice(at, 0, ...steps); selectedOrderId = order.id; selectedOrderIds = new Set([order.id]); selectedLoadId = loadId;
@@ -229,9 +331,10 @@
     if (!target || !isMbtPlanningLoad(target) || loadHasDriverActivity(source.load) || loadHasDriverActivity(target)) { dragged = null; return true; }
     const targetCard = event.target.closest('[data-stop]'); const targetStop = targetCard ? findStop(targetCard.dataset.stop)?.stop : null;
     const id = visitId(source.stop); const beforeId = visitId(targetStop);
-    if (beforeId === id) { dragged = null; return true; }
-    const moved = source.load.stops.filter(stop => visitId(stop) === id).map(stop => ({ ...stop, loadId: target.id }));
-    source.load.stops = source.load.stops.filter(stop => visitId(stop) !== id);
+    const routeIds=new Set(linkedRouteCards(state.cards.get(id)).map(card=>card.mbt.visitId));
+    if (routeIds.has(beforeId)) { dragged = null; return true; }
+    const moved = source.load.stops.filter(stop => routeIds.has(visitId(stop))).map(stop => ({ ...stop, loadId: target.id }));
+    source.load.stops = source.load.stops.filter(stop => !routeIds.has(visitId(stop)));
     let at = beforeId ? target.stops.findIndex(stop => visitId(stop) === beforeId) : target.stops.length;
     if (targetCard && event.clientY > targetCard.getBoundingClientRect().top + targetCard.getBoundingClientRect().height * .66) {
       while (at < target.stops.length && visitId(target.stops[at]) === beforeId) {at++;}
@@ -240,10 +343,12 @@
   }
   function removeVisit(found) {
     if (!ensureDispatchPlanEditor() || loadHasDriverActivity(found.load)) {return;}
-    const id = visitId(found.stop); found.load.stops = found.load.stops.filter(stop => visitId(stop) !== id);
+    const routeIds=new Set(linkedRouteCards(state.cards.get(visitId(found.stop))).map(card=>card.mbt.visitId));
+    found.load.stops = found.load.stops.filter(stop => !routeIds.has(visitId(stop)));
     clearActiveRouteEstimates(); commitPlanMutation("bin_visit_unplanned");
   }
   async function details(id) {
+    if (state.cards.get(id)?.transport) {return planTransport(id);}
     const response = await fetch(`/api/mbt/planning/visits/${encodeURIComponent(id)}`, { headers: dispatchAuthHeaders() }); const data = await response.json();
     if (!response.ok) {throw new Error(data.error || "Visit details unavailable.");}
     const dialog = document.createElement("dialog"); dialog.className = "bin-visit-details"; dialog.setAttribute("aria-label", `BIN visit ${data.visit.id}`);
@@ -258,15 +363,37 @@
       dialog.close();await refreshFeed();
     }}).catch(error=>{routeNotice=error.message;render({save:false});});}
     dialog.querySelector("button").onclick = () => dialog.close(); dialog.onclose = () => dialog.remove(); document.body.append(dialog); dialog.showModal();
+
+  }
+  async function planTransport(id) {
+    const card=state.cards.get(id);
+    await saveCurrentPlanNow();
+    if (localPlanDirty) {throw new Error('Wait for the current plan to save before editing transport.');}
+    return window.BinTransportUI.open(card.transport.sourceRef,{headers:dispatchAuthHeaders,planDate:currentPlanDate,
+      canEdit:isDispatchPlanEditor(),onSaved:async()=>{await refreshFeed({adopt:true});routeNotice='Transport route saved. Drag the trip onto a load.';render({save:false});}},
+    {tripId:card.transport.sourceOnly?null:card.mbt.visitId});
   }
   function install() {
     activeOrderType = "BIN"; mbtBinDispatchEnabled = true;
+    const rawAssignments=applyPlannedAssignments;
+    applyPlannedAssignments=rows=>{rawAssignments(rows);adoptCards();};
+    const rawJump=jumpToPlannedOrder;
+    jumpToPlannedOrder=async id=>{
+      if (orderById(id)?.type!=="BIN") return rawJump(id);
+      if (localPlanDirty || saveQueued || saveInFlight) await saveCurrentPlanNow();
+      if (localPlanDirty) throw new Error("Save the current plan before opening another date.");
+      const path=orderById(id).transport?'transport/trips':'visits';
+      const response=await fetch(`/api/mbt/planning/${path}/${encodeURIComponent(orderById(id).mbt.visitId)}`,{headers:dispatchAuthHeaders()});
+      const data=await response.json();if(!response.ok) throw new Error(data.error || "The BIN order could not be refreshed.");
+      state.cards.set(data.visit.mbt.visitId,data.visit);adoptCards();
+      return rawJump(id);
+    };
     const rawLoadDate = loadPlanForDate; const rawApply = applySavedPlan; const rawConfig = loadDispatchConfig;
     loadDispatchConfig = async () => { await rawConfig(); dispatchConfig.driverOrientedPlanning = true; };
     loadPlanForDate = async (date, options) => {
       const navigation = ++state.navigation; ++state.request;
       state.loadingDate = true;
-      state.ready = false; state.rawPlan = null; state.cards.clear(); state.pool = []; state.nextOffset = null;
+      state.ready = false; state.rawPlan = null; state.cards.clear(); state.pool = []; state.nextOffset = null;state.capacityWarnings=[];
       let adoptingSearch;
       try {
         const result = await rawLoadDate(date, options);
@@ -282,7 +409,8 @@
         }
       }
     };
-    applySavedPlan = saved => { state.rawPlan = structuredClone(saved); const result = rawApply(saved); decoratePlan(); return result; };
+    applySavedPlan = saved => { state.rawPlan = structuredClone(saved); if (saved.binCapacityWarnings) {state.capacityWarnings=saved.binCapacityWarnings;}
+      const result = rawApply(saved); decoratePlan(); return result; };
     // Service templates already define complete routes. SO/PO pickup inference
     // and automatic return synthesis must not rewrite their required steps.
     syncPickupStops = () => {}; reconcilePickupStopRepresentatives = () => {}; syncReturnLoads = () => {};
@@ -319,7 +447,8 @@
       const { load } = selectedLoad(); if (!load || isPlanningLoadReadOnly(load) || loadHasDriverActivity(load)) {return;}
       const visits = groups(load).sort((a, b) => String(state.cards.get(a)?.scheduledWindow?.startAt || "9999")
         .localeCompare(String(state.cards.get(b)?.scheduledWindow?.startAt || "9999")));
-      load.stops = visits.flatMap(id => load.stops.filter(stop => visitId(stop) === id));
+      const route=[...new Set(visits.flatMap(id=>linkedRouteCards(state.cards.get(id)).map(card=>card?.mbt.visitId || id)))];
+      load.stops = route.flatMap(id => load.stops.filter(stop => visitId(stop) === id));
     };
     const rawEditor = isDispatchPlanEditor; isDispatchPlanEditor = () => state.ready && rawEditor();
     app.addEventListener("dragover", event => { if (dragged?.type === "stop" && event.target.closest('[data-dispatch-order-pool]')) {event.preventDefault();} });
@@ -339,18 +468,25 @@
       event.preventDefault(); event.stopImmediatePropagation();
       if (action === "bin-filter") { state.filter = button.dataset.filter; renderDispatchOrderPoolPatch(); }
       if (action === "bin-load-more") {void refreshFeed({ append: true });}
-      if (action === "bin-assign-selected" && ensureDispatchPlanEditor()) { if (addVisit(selectedOrderId, selectedLoadId)) {commitPlanMutation("bin_visit_assigned");} else {render({ save: false });} }
       if (action === "bin-details") {details(button.dataset.visit).catch(error => { routeNotice = error.message; render({ save: false }); });}
+      if (action === 'bin-transport') {planTransport(button.dataset.visit).catch(error=>{routeNotice=error.message;render({save:false});});}
+      if (action === "bin-selection") {changeBin(button.dataset.visit).catch(error=>{routeNotice=error.message;render({save:false});});}
       if (action === "bin-workflow") {
-        window.BinOrderWorkflowUI.open(button.dataset.visit,{headers:dispatchAuthHeaders,onSaved:async()=>{
-          await refreshFeed();routeNotice="BIN workflow saved. Assign its delivery and collection parts to loads.";
-        }}).catch(error=>{routeNotice=error.message;render({save:false});});
+        if (!ensureDispatchPlanEditor()) return;
+        (async()=>{
+          await saveCurrentPlanNow();
+          if (localPlanDirty) throw new Error('Wait for the current plan to save before editing this route.');
+          await window.BinOrderWorkflowUI.open(button.dataset.visit,{headers:dispatchAuthHeaders,withPlanLeases,onSaved:async()=>{
+            await refreshFeed({adopt:true});routeNotice="BIN route saved.";render({save:false});
+          }});
+        })().catch(error=>{routeNotice=error.message;render({save:false});});
       }
     }, true);
   }
   globalThis.MbbsBinPlanning = { install, compatibleTruck, payload, saveRequest, acknowledgeSave, orderList, cardActions, selectedActions, physicalVisits, stopPlace, drop,
+    capacityWarningsForLoad,
     navigation: () => state.navigation,
     stopWindow: (stop, order) => stop.yardCode ? { start: "", end: "" } : { start: order.windowStart, end: order.windowEnd },
-    poolSubtitle: () => mbtBinDispatchLoading ? "Loading BIN orders…" : mbtBinDispatchError || `${state.total} available visits · shared daily driver schedule`,
+    poolSubtitle: () => mbtBinDispatchLoading ? "Loading BIN orders…" : mbtBinDispatchError || `${state.total} ${searchText.trim() ? "matching visits · all plan dates" : "available visits · shared daily driver schedule"}`,
     tabs: () => filters.map(([key, label]) => `<button class="${state.filter === key ? "active" : ""}" data-action="bin-filter" data-filter="${key}" type="button">${label}</button>`).join("") };
 })();

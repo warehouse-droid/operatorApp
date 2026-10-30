@@ -1,0 +1,28 @@
+{
+  "specApproval": "not obtained (autonomous run); user confirmed sales line is 1 Yard and enabled the required Units View permission",
+  "tier": 3,
+  "acceptance": [
+    "Read each transaction line's native unit ID and its configured UnitsTypeUom conversion rate; never infer a rate from item names or apply 1.3 to all items.",
+    "SOM06812 base quantity -1.3 with unit 882 and rate 1.3 becomes positive 1 Yard in both single and batch sales order detail readers.",
+    "Ordered, fulfilled, received, committed and backordered quantities use the same transaction UOM in sync, reconciliation and fulfillment checks.",
+    "PO native prices multiply by the factor when quantities divide by it; monetary amounts, manual pack quantities, item conversions and identity stay unchanged.",
+    "NetSuite webhook and REST values already in native transaction units are never divided again.",
+    "Missing or invalid conversion evidence for an identified native unit fails before persisting a misleading quantity.",
+    "Read actual affected NetSuite orders using the candidate and verify the corrected SOM06812 remains 1 Yard after a refresh."
+  ],
+  "failureModel": {
+    "wrong direction": "concrete Yard/Ton examples and round-trip properties",
+    "double conversion": "boundary-specific wiring tests",
+    "progress mismatch": "all quantity fields and linked-IF source-unit fallback tested",
+    "unrelated release overwrite": "narrow per-service overlays over current images"
+  },
+  "setup": {
+    "newDependencies": [],
+    "migrations": [],
+    "gitCommits": false
+  },
+  "clarifications": [
+    "Live NetSuite rejected BUILTIN.DF(NVL(event_line.units, source_line.units)) with HTTP 500. Linked fulfillment/receipt base quantities must be converted to the originating source-line UOM, which is the quantity basis used for reconciliation; use source_line.units directly.",
+    "Refresh cached lines on positive SOs dated October 1 onward only when no operator confirmation, preparation, packing, loading or posting claim exists; exact source item/key/UOM and old-base-to-native ratio must match. Rehearse with rollback and audit every changed line."
+  ]
+}

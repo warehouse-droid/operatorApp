@@ -14,7 +14,7 @@
   function header(d) {
     const lines=d.lines.filter(line=>eligible(d,line));
     if(!lines.length) {return '<h3>Line responses</h3>';}
-    const signature=JSON.stringify(lines.map(line=>[line.id,line.productName,line.color,line.size,line.detailSpec,line.quantity,line.uom,line.responseVendorName,line.vendorName,line.brand,line.vendorReference]));
+    const signature=JSON.stringify(lines.map(line=>[line.id,line.productName,line.color,line.size,line.detailSpec,line.quantity,line.reviewedPackageQuantity,line.palletQty,line.layerQty,line.sectionQty,line.pieceQty,line.uom,line.responseVendorName,line.vendorName,line.brand,line.vendorReference]));
     return `<div class="stock-live-heading"><h3>Line responses</h3><button type="button" data-live-stock-start="${Number(d.id)}" data-live-stock-context="${esc(signature)}">Live Stock Check</button></div><p class="stock-live-feedback" data-live-stock-feedback="${Number(d.id)}" role="status"></p>`;
   }
   function line(d,item) {
@@ -43,7 +43,7 @@
     if(!row) {return 'Live stock: '+(current.loading?'Loading…':'Not checked');}
     const text=esc(label(row)),job=row.job;
     if(!job) {return 'Live stock: '+text;}
-    const title=[job.payload.product?.name,job.payload.product?.sku,'Checked '+new Date(job.finishedAt||job.createdAt).toLocaleString(),'Click to view evidence'].filter(Boolean).join(' · ');
+    const title=[job.payload.product?.name,job.payload.product?.sku,job.payload.quantity+' PLT requested','Checked '+new Date(job.finishedAt||job.createdAt).toLocaleString(undefined,{timeZone:'America/Toronto'}),'Click to view evidence'].filter(Boolean).join(' · ');
     return `Live stock: <a href="/scm/stock-check/history?vendorId=${Number(job.vendorId)}&amp;job=${esc(job.id)}" target="_blank" rel="noopener" title="${esc(title)}">${text}</a>`;
   }
   function paintLine(node) {
@@ -88,7 +88,7 @@
     closeDialog();dialog=document.createElement('dialog');dialog.className='stock-live-dialog';dialog.setAttribute('aria-labelledby','stockLiveDialogTitle');
     dialog.innerHTML=`<form><div class="stock-live-heading"><h2 id="stockLiveDialogTitle">Select Unilock variants</h2><button type="button" data-live-close aria-label="Close variant selection">Close</button></div><p>Choose the exact colour, size and pickup point. Leave a line blank to skip it.</p>${entry.data.lines.map(row=>{
       const products=row.product?[row.product,...row.candidates.filter(product=>product.id!==row.product.id)]:row.candidates;
-      return `<fieldset data-live-variant="${row.lineId}"><legend>${esc([row.productName||row.referenceItemCode||'Description unavailable',row.color,row.size].filter(Boolean).join(' · '))}</legend>${row.aiMatch?`<p class="stock-live-match-note">${esc(row.aiMatch.reason)}</p>`:''}<div class="stock-live-search"><label>Search catalogue<input type="search" value="${esc(row.productName)}"></label><button type="button" data-live-search>Search</button></div><label>Exact vendor variant<select>${choices(products,row.product?.id)}</select></label><p data-live-search-feedback role="status"></p></fieldset>`;
+      return `<fieldset data-live-variant="${row.lineId}"><legend>${esc([row.productName||row.referenceItemCode||'Description unavailable',row.color,row.size].filter(Boolean).join(' · '))}</legend>${row.aiMatch?`<p class="stock-live-match-note">${esc(row.aiMatch.reason)}</p>`:''}<div class="stock-live-search"><label>Search catalogue<input type="search" value="${esc(row.productName)}"></label><button type="button" data-live-search>Search</button></div><label>Exact vendor variant<select>${choices(products,row.product?.id)}</select></label><p>Expected order quantity: ${esc(row.quantity)} ${esc(row.uom)}</p><label>Quantity to check (PLT)<input data-live-quantity type="number" min="1" max="99999" step="1" value="${row.checkQuantity??''}" ${row.checkQuantity?'readonly':''}></label>${row.checkQuantity?'':'<small>No pallet conversion is saved. Enter the pallets needed for this order.</small>'}<p data-live-search-feedback role="status"></p></fieldset>`;
     }).join('')}<p data-live-dialog-error role="alert"></p><div class="stock-live-dialog-actions"><button type="button" data-live-close>Cancel</button><button type="submit" class="primary">Check selected lines</button></div></form>`;
     document.body.append(dialog);
     const node=dialog;
@@ -97,8 +97,9 @@
     node.querySelectorAll('[data-live-search]').forEach(button=>{button.onclick=()=>void searchVariant(button.closest('fieldset'),entry).catch(error=>{if(node.isConnected) {node.querySelector('[data-live-dialog-error]').textContent=error.message;}});});
     node.querySelector('form').onsubmit=event=>{
       event.preventDefault();
-      const selected=[...node.querySelectorAll('[data-live-variant]')].map(card=>({lineId:Number(card.dataset.liveVariant),productId:Number(card.querySelector('select').value)})).filter(row=>row.productId);
+      const selected=[...node.querySelectorAll('[data-live-variant]')].map(card=>({lineId:Number(card.dataset.liveVariant),productId:Number(card.querySelector('select').value),quantity:Number(card.querySelector('[data-live-quantity]').value)})).filter(row=>row.productId);
       if(!selected.length) {node.querySelector('[data-live-dialog-error]').textContent='Select at least one exact vendor variant.';return;}
+      if(selected.some(row=>!Number.isInteger(row.quantity)||row.quantity<1||row.quantity>99999)) {node.querySelector('[data-live-dialog-error]').textContent='Enter a whole pallet quantity between 1 and 99,999 for each selected line.';return;}
       closeDialog();void start(entry,version,selected);
     };
     node.showModal();
@@ -133,7 +134,7 @@
     const entry=current,version=generation;await load(entry,version);
     if(!same(entry,version) || !entry.data || entry.error || !await matchAmbiguous(entry,version)) {return;}
     if(!same(entry,version)) {return;}
-    if(entry.data.lines.some(line=>!line.product || line.product.pickupNeedsReview)) {showDialog(entry,version);}
+    if(entry.data.lines.some(line=>!line.product || line.product.pickupNeedsReview || !line.checkQuantity)) {showDialog(entry,version);}
     else {await start(entry,version,entry.data.lines.map(line=>({lineId:line.lineId,productId:line.product.id})));}
   });
   new MutationObserver(()=>{if(!scheduled) {scheduled=true;queueMicrotask(sync);}}).observe(mount,{childList:true,subtree:true});

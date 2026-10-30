@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import test, { after } from "node:test";
 
 import { closeDb, query } from "../../../src/db.js";
+import { listMbtLocalItemSettings } from "../../../src/mbt/local-item-settings-repository.js";
 import {
   acceptFrontdeskQuote,
   convertFrontdeskQuote,
@@ -179,6 +180,43 @@ async function configureActiveUnitTariff(input) {
   );
   return { rateCardId, rateCardVersionId, dumpTariffId };
 }
+
+test("configured local Gravel uses standard weight and requires an active material price", async (context) => {
+  const fixture = await createFrontdeskPrerequisites({ label: "standard-aggregate" });
+  await configureCustomerChargeRates(fixture);
+  const materialCode = `GRAVEL_${crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase()}`;
+  const rate = await configureActiveUnitTariff({
+    itemCode: materialCode, itemType: "aggregate", amountMinor: 6000, densityLbsPerYard: 1300
+  });
+  context.after(async () => {
+    await query("UPDATE mbt_rate_cards SET active = false WHERE rate_card_id = $1", [rate.rateCardId]);
+  });
+  const items = await listMbtLocalItemSettings();
+  assert.equal(items.find((item) => item.itemCode === materialCode).densityLbsPerYard, 2600);
+  const configuration = await requiredOperation("getFrontdeskCustomerChargeConfiguration")({
+    actor: ACTOR, rateCardVersionId: fixture.rateCardVersionId
+  });
+  assert.equal(configuration.aggregateItems.find((item) => item.itemCode === materialCode).densityLbsPerYard, 2600);
+  const input = initialBinFields(fixture, {
+    kind: "aggregate_order", orderFrom150: true,
+    aggregateLines: [{ itemCode: materialCode, quantityYards: "2.000" }]
+  });
+  const preview = await requiredOperation("previewFrontdeskChargeRequest")(command("standard-aggregate", input));
+  const line = preview.body.request.lines.find((entry) => entry.lineType === "aggregate_material");
+  assert.equal(line.configuredAmountMinor, 12000);
+  const savedBefore = await query("SELECT pricing_snapshot FROM mbt_frontdesk_charge_requests WHERE charge_request_id=$1", [preview.body.request.chargeRequestId]);
+  assert.equal(savedBefore.rows[0].pricing_snapshot.aggregateLines[0].densityLbsPerYard, 2600);
+  const confirmed = await requiredOperation("confirmFrontdeskChargeRequest")(command("standard-aggregate-confirm", {
+    chargeRequestId: preview.body.request.chargeRequestId, expectedRevision: 1
+  }));
+  assert.equal(confirmed.body.dispatchOrder.weightLbs, 5200);
+  await query("UPDATE mbt_dump_tariffs SET active=false WHERE dump_tariff_id=$1", [rate.dumpTariffId]);
+  await assert.rejects(() => requiredOperation("previewFrontdeskChargeRequest")(command("standard-missing-price", input)), {
+    code: "MBT_FRONTDESK_AGGREGATE_RATE_MISSING"
+  });
+  const savedAfter = await query("SELECT pricing_snapshot FROM mbt_frontdesk_charge_requests WHERE charge_request_id=$1", [preview.body.request.chargeRequestId]);
+  assert.deepEqual(savedAfter.rows[0], savedBefore.rows[0]);
+});
 
 /** @param {string} label */
 async function convertedContract(label) {
@@ -481,7 +519,7 @@ test("confirming a standalone aggregate request creates one linked Dispatch orde
   assert.equal(confirmed.status, 201);
   assert.equal(confirmed.body.request.status, "confirmed");
   assert.equal(confirmed.body.request.netsuiteExportPolicy, "excluded_cash");
-  assert.equal(confirmed.body.dispatchOrder.weightLbs, 9_350);
+  assert.equal(confirmed.body.dispatchOrder.weightLbs, 9_100);
   assert.match(confirmed.body.dispatchOrder.orderDetails, /HPB · 2\.500 YARD/u);
   assert.match(confirmed.body.dispatchOrder.orderDetails, /Crusher Run · 1\.000 YARD/u);
   const retained = await query(

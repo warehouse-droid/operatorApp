@@ -98,7 +98,7 @@ async function seedDirectPoRoute() {
   };
 }
 
-test("L7/L11 migration gates new completions and records immutable allocation-scoped PO execution", async () => {
+test("L7/L11 loading queues only Operator quantity while immutable PO execution remains evidence", async () => {
   await inRollback(async () => {
     const fixture = await seedDirectPoRoute();
     const flagKey = "dispatch_netsuite_sales_order_if_12441";
@@ -203,10 +203,7 @@ test("L7/L11 migration gates new completions and records immutable allocation-sc
         WHERE lower(candidate.dispatch_order_ref) = lower($1)`,
       [fixture.salesOrderRef]
     );
-    assert.equal(candidate.rowCount, 1);
-    assert.equal(candidate.rows[0].status, "discovered");
-    assert.equal(String(candidate.rows[0].completion_event_id), String(candidate.rows[0].event_id));
-    assert.ok(Number(candidate.rows[0].completion_event_id) > Number(watermark.rows[0].activation_event_id));
+    assert.equal(candidate.rowCount, 0, 'Driver delivery is evidence only');
 
     await query(
       `INSERT INTO operator_load_records (
@@ -219,11 +216,13 @@ test("L7/L11 migration gates new completions and records immutable allocation-sc
       [
         fixture.salesOrderId,
         fixture.salesOrderRef,
-        JSON.stringify([{ lineId: fixture.salesOrderLine, loadedQty: 4, loadedUom: "EA" }]),
+        JSON.stringify([{ lineId: fixture.salesOrderLine, itemId:881001, loadedQty: 4, loadedUom: "EA" }]),
         JSON.stringify({ localOnly: true, netSuiteUpdated: false })
       ]
     );
-    const materialized = await prepareSalesOrderAutoFulfillmentCandidate(candidate.rows[0].id);
+    const loadedCandidate=await query('SELECT id FROM dispatch_sales_order_if_candidates WHERE dispatch_order_ref=$1 AND operator_load_record_id IS NOT NULL',[fixture.salesOrderRef]);
+    assert.equal(loadedCandidate.rowCount,1);
+    const materialized = await prepareSalesOrderAutoFulfillmentCandidate(loadedCandidate.rows[0].id);
     assert.equal(materialized.status, "queued");
     assert.equal(materialized.sourceSalesOrderId, fixture.salesOrderId);
     assert.equal(materialized.lineSnapshot.length, 1);
@@ -233,10 +232,9 @@ test("L7/L11 migration gates new completions and records immutable allocation-sc
       po: materialized.lineSnapshot[0].completedPoQuantity,
       directTo: materialized.lineSnapshot[0].completedDirectToQuantity,
       delivered: materialized.lineSnapshot[0].deliveredQuantity
-    }, { target: 10, operator: 4, po: 6, directTo: 0, delivered: 10 });
+    }, { target: 4, operator: 4, po: 0, directTo: 0, delivered: 4 });
     assert.match(materialized.lineSnapshot[0].operatorLoadRecordId, /^\d+$/u);
-    assert.equal(materialized.lineSnapshot[0].poEvidence[0].pickupLoadId, loadId);
-    assert.equal(materialized.lineSnapshot[0].poEvidence[0].deliveryLoadId, loadId);
+    assert.deepEqual(materialized.lineSnapshot[0].poEvidence,[]);
 
     await query(
       `UPDATE mbt_feature_flags
@@ -300,10 +298,7 @@ test("L7/L11 migration gates new completions and records immutable allocation-sc
         WHERE event.completion_evidence_id = $1`,
       [secondDropJobId]
     );
-    assert.equal(secondCandidate.rowCount, 1);
-    const contended = await prepareSalesOrderAutoFulfillmentCandidate(secondCandidate.rows[0].id);
-    assert.equal(contended.status, "waiting_evidence");
-    assert.match(contended.lastError, /already reserved/u);
+    assert.equal(secondCandidate.rowCount, 0, 'a repeated Driver drop never creates IF work');
 
     await assert.rejects(
       query(
@@ -317,7 +312,7 @@ test("L7/L11 migration gates new completions and records immutable allocation-sc
   });
 });
 
-test("L11 an activation watermark stops backlog until Admin selects an exact historical event", async () => {
+test("L11 legacy fulfillment stays stopped until Admin selects its exact historical event", async () => {
   await inRollback(async () => {
     const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
     const salesOrderId = 9_830_000_000 + Math.floor(Math.random() * 100_000);
@@ -370,8 +365,9 @@ test("L11 an activation watermark stops backlog until Admin selects an exact his
         WHERE flag_key = 'dispatch_netsuite_sales_order_if_12441'`
     );
     const candidate = await query(
-      `SELECT id FROM dispatch_sales_order_if_candidates WHERE completion_event_id = $1`,
-      [completion.rows[0].id]
+      `INSERT INTO dispatch_sales_order_if_candidates(id,completion_event_id,dispatch_order_ref,external_id,status)
+       VALUES($1,$2,$3,$4,'historical') RETURNING id`,
+      (()=>{const id=crypto.randomUUID();return [id,completion.rows[0].id,salesOrderRef,`MBBS-SOIF-${id}`];})()
     );
     const stopped = await prepareSalesOrderAutoFulfillmentCandidate(candidate.rows[0].id);
     assert.equal(stopped.status, "historical");
@@ -403,7 +399,7 @@ test("L11 an activation watermark stops backlog until Admin selects an exact his
   });
 });
 
-test("L2/L7 direct TO quantity requires the exact dependency pickup and customer-drop job", async () => {
+test("L2/L7 direct TO Driver evidence never adds quantity to the Operator-load IF", async () => {
   await inRollback(async () => {
     const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase();
     const salesOrderId = 9_850_000_000 + Math.floor(Math.random() * 100_000);
@@ -486,7 +482,7 @@ test("L2/L7 direct TO quantity requires the exact dependency pickup and customer
        ) VALUES (
          'sales_order_delivery_load', 'sales_order', $1, $2, $3::jsonb, '{}'::jsonb
        )`,
-      [salesOrderId, salesOrderRef, JSON.stringify([{ lineId: 991001, loadedQty: 4 }])]
+      [salesOrderId, salesOrderRef, JSON.stringify([{ lineId: 991001, itemId:993001, loadedQty: 4 }])]
     );
     await query(
       `INSERT INTO driver_job_records (
@@ -533,17 +529,12 @@ test("L2/L7 direct TO quantity requires the exact dependency pickup and customer
         WHERE event.order_kind = 'SO' AND event.completion_evidence_id = $1`,
       [exactDropJobId]
     );
-    const exact = await prepareSalesOrderAutoFulfillmentCandidate(exactCandidate.rows[0].id);
-    assert.equal(exact.status, "queued");
-    assert.deepEqual({
-      operator: exact.lineSnapshot[0].operatorLoadedQuantity,
-      directTo: exact.lineSnapshot[0].completedDirectToQuantity,
-      delivered: exact.lineSnapshot[0].deliveredQuantity
-    }, { operator: 4, directTo: 6, delivered: 10 });
-    assert.equal(exact.lineSnapshot[0].toEvidence[0].pickupJobId, pickupJobId);
-    assert.equal(exact.lineSnapshot[0].toEvidence[0].deliveryJobId, exactDropJobId);
-    assert.equal(exact.lineSnapshot[0].toEvidence[0].planId, planId);
-    assert.equal(exact.lineSnapshot[0].toEvidence[0].loadId, loadId);
+    assert.equal(exactCandidate.rowCount,0);
+    const loaded=await query('SELECT * FROM dispatch_sales_order_if_candidates WHERE dispatch_order_ref=$1 AND operator_load_record_id IS NOT NULL',[salesOrderRef]);
+    const exact = await prepareSalesOrderAutoFulfillmentCandidate(loaded.rows[0].id);
+    assert.equal(exact.status, "historical", 'loading occurred before the yard gate was enabled');
+    assert.equal(loaded.rows[0].operator_load_snapshot[0].quantity,4);
+    assert.equal(loaded.rows[0].operator_load_snapshot[0].itemId,993001);
 
     const wrongDropJobId = `DIRECT-TO-WRONG-DROP-${suffix}`;
     await query(
@@ -563,8 +554,8 @@ test("L2/L7 direct TO quantity requires the exact dependency pickup and customer
         WHERE event.order_kind = 'SO' AND event.completion_evidence_id = $1`,
       [wrongDropJobId]
     );
-    const rejected = await prepareSalesOrderAutoFulfillmentCandidate(wrongCandidate.rows[0].id);
-    assert.equal(rejected.status, "waiting_evidence");
-    assert.match(rejected.lastError, /does not conserve/u);
+    assert.equal(wrongCandidate.rowCount,0);
+    const evidence=await query('SELECT job_id FROM driver_job_records WHERE job_id=ANY($1::text[])',[[pickupJobId,exactDropJobId,wrongDropJobId]]);
+    assert.equal(evidence.rowCount,3,'all original Driver evidence survives');
   });
 });

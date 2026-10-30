@@ -144,7 +144,7 @@ const fleet = {
   trucks: [{ id: "9", plate: "AB123", active: false }]
 };
 const inactiveConflicts = dispatchFleetAssignmentStatusConflicts(statusPlan, fleet);
-assert(inactiveConflicts.some((conflict) => conflict.code === "DISPATCH_DRIVER_DISABLED"), "An active driver name can mask a disabled canonical login.");
+assert(!inactiveConflicts.some((conflict) => conflict.code === "DISPATCH_DRIVER_DISABLED"), "A known inactive driver must not block planning.");
 assert(inactiveConflicts.some((conflict) => conflict.code === "DISPATCH_TRUCK_DISABLED"), "Disabled truck assignment was accepted.");
 assert(dispatchFleetAssignmentStatusConflicts(statusPlan, {
   drivers: [{ id: "1", login: "driver-1", name: "Primary Driver", active: true }],

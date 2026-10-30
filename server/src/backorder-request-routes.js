@@ -1,11 +1,30 @@
 import {getBackorderRequest,runBackorderAction} from './backorder-request-service.js';
-import {searchSpecialVendors,searchSpecialOrderLinks} from './special-stock-request-repository.js';
+import {searchSpecialVendors,searchSpecialOrderLinks,listSpecialPurchaseOrderSplits} from './special-stock-request-repository.js';
+import {withBackorderWorkflow} from './stock-case-workflow.js';
+import {readSpecialPurchaseOrderNote,saveSpecialPurchaseOrderRouting} from './special-stock-purchase-order-routing.js';
 import {createSpecialQuoteService,createSpecialOrderDocumentService} from './special-stock-documents.js';
 import {previewStockingBackorderConversion,convertStockingToBackorder} from './stocking-backorder-conversion.js';
 
 /** @param {import('express').Application} app
  * @param {{salesGuards:import('express').RequestHandler[],scmRead:import('express').RequestHandler,scmWrite:import('express').RequestHandler,salesContext:(req:any)=>{operatorId:string,authorizedDestinationLocationIds:number[]},emit:(source:string,payload:any)=>void}} options */
 export function mountBackorderRoutes(app,{salesGuards,scmRead,scmWrite,salesContext,emit}) {
+  const poPrefix='/api/scm/stock-requests/:id/backorder/purchase-order/';
+  for (const [action,read] of Object.entries({splits:listSpecialPurchaseOrderSplits,note:readSpecialPurchaseOrderNote})) {
+    app.get(poPrefix+action,scmRead,async(req,res,next)=>{
+      try {
+        res.setHeader('Cache-Control','private, no-store');
+        res.json(await withBackorderWorkflow(()=>read(req.params.id)));
+      } catch(error) {next(error);}
+    });
+  }
+  app.put(poPrefix+'routing',scmWrite,async(req,res,next)=>{
+    try {
+      const result=await withBackorderWorkflow(()=>saveSpecialPurchaseOrderRouting(req.params.id,req.body || {},
+        {operatorId:(/** @type {import('express').Request & {operator:{id:string}}} */ (req)).operator.id}));
+      emit('backorder-po-routing',{requestId:Number(req.params.id)});
+      res.json(result);
+    } catch(error) {next(error);}
+  });
   app.get('/api/scm/stock-requests/:id/backorder-conversion',scmWrite,async(req,res,next)=>{
     try{
       res.setHeader('Cache-Control','private, no-store');

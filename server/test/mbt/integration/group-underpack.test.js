@@ -83,16 +83,19 @@ test("loading eight whole layers closes the exact rounded sales quantity for SO 
   }
 }));
 
-test("exact 0.1 rounding boundary closes loaded sales quantities for SO and TO", async () => scenario(async () => {
+test("a 0.1 SQFT discrepancy no longer forces local completion for SO and TO", async () => scenario(async () => {
   for (const transfer of [false, true]) {
-    for (const values of [{ quantity: 93.356 }, { quantity: 1.1, layers: 1, packed: 1, conversion: 1 },
-      { quantity: 0.7, layers: 1, packed: 1, conversion: 0.8 }]) {
+    for (const values of [{ quantity: 93.356 }, { quantity: 1.1, layers: 1, packed: 1, conversion: 1 }]) {
       const order = await packingOrder({ transfer, ...values });
       const result = await recordDeliveryLoad(order.id, null, { photoDataUrls: ["data:image/png;base64,dGVzdDE=", "data:image/png;base64,dGVzdDI="] });
-      assert.equal(result.remainingLines, 0);
-      assert.equal(result.localYardOrderStatus, "Loaded");
-      assert.equal(Number((await getDeliveryOrder(order.id)).lines[0].loaded_qty), values.quantity);
+      assert.equal(result.remainingLines, 1);
+      assert.equal(result.localYardOrderStatus, "Partial Loaded");
+      assert.equal(Number((await getDeliveryOrder(order.id)).lines[0].loaded_qty), values.conversion || 93.256);
     }
+    const excess = await packingOrder({ transfer, quantity: 0.7, layers: 1, packed: 1, conversion: 0.8 });
+    const result = await recordDeliveryLoad(excess.id, null, { photoDataUrls: ["data:image/png;base64,dGVzdDE=", "data:image/png;base64,dGVzdDI="] });
+    assert.equal(result.localYardOrderStatus, 'Partial Loaded');
+    assert.equal(result.remainingLines, 1);
   }
 }));
 
@@ -104,13 +107,13 @@ test("overpacking beyond the rounding tolerance remains blocked without changing
   assert.deepEqual(await packingState(order), before);
 }));
 
-test("confirmation derives eight layers at the exact conversion boundary", async () => scenario(async () => {
+test("confirmation cannot add a whole layer using the former 0.1 tolerance", async () => scenario(async () => {
   const actor = "packing-rounding-actor";
   await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,active) VALUES($1,$1,'Packing test','test','test','operator',ARRAY['operator'],true)", [actor]);
   for (const [quantity, layers, conversion] of [[93.156, 8, 11.657], [1.9, 2, 1]]) {
     const order = await packingOrder({ quantity, conversion, layers: 0, packed: 0 });
     await confirmDeliveryLine(order.id, order.lineId, { layers }, actor);
-    assert.equal(Number((await getDeliveryOrder(order.id)).lines[0].packed_layer_qty), layers);
+    assert.equal(Number((await getDeliveryOrder(order.id)).lines[0].packed_layer_qty), layers - 1);
   }
 }));
 

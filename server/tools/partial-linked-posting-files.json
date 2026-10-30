@@ -1,0 +1,10 @@
+[
+  "src/direct-po-allocation-receipt.js",
+  "src/direct-po-auto-receipt.js",
+  "src/direct-po-auto-receipt-domain.js",
+  "src/operator-netsuite-posting-domain.js",
+  "src/operator-netsuite-posting-netsuite-adapter.js",
+  "src/operator-netsuite-posting-finalizer.js",
+  "src/receiving-repository.js",
+  "migrations/314_partial_linked_po_receipts.sql"
+]

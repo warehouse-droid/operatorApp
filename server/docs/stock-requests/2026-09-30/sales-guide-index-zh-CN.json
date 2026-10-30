@@ -1,0 +1,114 @@
+[
+  {
+    "number": 1,
+    "id": "navigation",
+    "title": "打开销售库存申请页面",
+    "workflow": "开始使用",
+    "audience": "销售"
+  },
+  {
+    "number": 2,
+    "id": "delivery-create",
+    "title": "填写 SO 和选择货场",
+    "workflow": "常规送货 Delivery",
+    "audience": "销售"
+  },
+  {
+    "number": 3,
+    "id": "delivery-quantities",
+    "title": "核对自动数量和 PALLET",
+    "workflow": "常规送货 Delivery",
+    "audience": "销售"
+  },
+  {
+    "number": 4,
+    "id": "delivery-approval",
+    "title": "提交后查看审批结果",
+    "workflow": "常规送货 Delivery",
+    "audience": "销售"
+  },
+  {
+    "number": 5,
+    "id": "delivery-progress",
+    "title": "查看 TO、打印状态与重试",
+    "workflow": "常规送货 Delivery",
+    "audience": "销售"
+  },
+  {
+    "number": 6,
+    "id": "special-header",
+    "title": "新建特殊商品询价",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 7,
+    "id": "special-items",
+    "title": "填写商品、售价并提交询价",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 8,
+    "id": "special-quote",
+    "title": "预览报价和包装数量",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 9,
+    "id": "special-decision",
+    "title": "查看供应商回复并记录客户决定",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 10,
+    "id": "special-so-account",
+    "title": "选择 SO 客户账户和交付资料",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 11,
+    "id": "special-so-create",
+    "title": "保存草稿，再创建或关联 SO",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 12,
+    "id": "special-follow",
+    "title": "跟进订单、ETA 和调度",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 13,
+    "id": "special-fulfillment",
+    "title": "更新交付资料或记录供应商自取",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 14,
+    "id": "special-adjustment",
+    "title": "申请订单调整",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 15,
+    "id": "special-close",
+    "title": "申请关闭、到期与查看文件",
+    "workflow": "特殊订单 Special",
+    "audience": "销售"
+  },
+  {
+    "number": 16,
+    "id": "troubleshooting",
+    "title": "销售常见问题与提交前核对",
+    "workflow": "日常参考",
+    "audience": "销售"
+  }
+]

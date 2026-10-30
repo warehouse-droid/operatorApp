@@ -80,7 +80,7 @@ test('SOR-6 delivered and billed equipment keeps its outstanding return, without
  await query("UPDATE sales_orders SET status_text='Billed' WHERE netsuite_id=98800901");
  await runSorReturnQueue({loadOrders:async()=>[],limit:1});
  assert.equal((await query('SELECT status FROM dispatch_custom_orders WHERE ref_number=$1',[draft.refNumber])).rows[0].status,'open');
- assert.equal((await sorSourceDrafts(order.id,[order])).drafts.length,0);
+ assert.deepEqual((await sorSourceDrafts(order.id,[order])).drafts.map(value=>value.refNumber),[draft.refNumber]);
  await query("DELETE FROM driver_job_records WHERE job_id='sor-delivered'");
  await query("INSERT INTO sor_return_reconcile_queue(source_ref) VALUES('SOR98800901') ON CONFLICT(source_ref) DO UPDATE SET version=sor_return_reconcile_queue.version+1");
  await runSorReturnQueue({loadOrders:async()=>[],limit:1});

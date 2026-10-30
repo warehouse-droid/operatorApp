@@ -1,0 +1,7 @@
+{
+  "public/dispatch.js": "457444562290164327322093fe0167e4bc6cae2bb9c66d785099b0a9a63f5527",
+  "public/dispatch.html": "0ce4f0d01769ab6c789cc93c11b1bf29e29e22e06b5f359ce19570820507865f",
+  "src/server.js": "e878e143d35541ecb24f0b62af882827f1501d32bedc18c90d8680d0cb2e423c",
+  "src/dispatch-planner-v2-repository.js": "45e3f7fdbffbb5660b723515e567854d3bb0849766b69233346cd9d34d2c2004",
+  "src/dispatch-delivery-group-repository.js": "f757a5e6c5c0e0b2926f2f6245394ce67d94fcc7b97ac37fa80dd518f6905893"
+}

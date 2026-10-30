@@ -243,7 +243,7 @@ test("MBT assets HTTP: named opening options are authenticated, role-limited, an
   assert.equal(netSuiteTransportCalls, 0);
 });
 
-test("P3-F11 HTTP: registration is Admin-only, gated, idempotent, and binds the server actor", async () => {
+test("P3-F11 HTTP: registration is Admin/Dispatcher, gated, idempotent, and binds the server actor", async () => {
   const body = {
     actor: { operatorId: "browser-forgery", roles: ["admin"] },
     asset: {
@@ -267,7 +267,7 @@ test("P3-F11 HTTP: registration is Admin-only, gated, idempotent, and binds the 
     reason: "Register synthetic HTTP asset"
   };
   const dispatcher = await request("/api/mbt/assets", {
-    actor: "dispatcher",
+    actor: "operator",
     method: "POST",
     body,
     idempotencyKey: "p3-http-dispatcher-forbidden"

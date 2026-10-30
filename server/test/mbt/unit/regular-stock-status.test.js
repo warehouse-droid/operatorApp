@@ -53,7 +53,7 @@ test('Waitlist allocation, partial conversion, release, success and rejection st
 test('Backorder review, Sales confirmation, shortages and Already Ordered use shared statuses',()=>{
   assert.equal(summary(backorder([{salesDecision:'pending',supplyStatus:null}])).status,'pending_scm');
   assert.equal(summary(backorder([{salesDecision:'pending',supplyStatus:'production'}])).status,'pending_sales');
-  assert.equal(summary(backorder([{salesDecision:'accepted',supplyStatus:'production'}],{salesOrderId:2,purchaseOrderId:3})).status,'waiting_stock');
+  assert.equal(summary(backorder([{salesDecision:'accepted',supplyStatus:'production'}],{salesOrderId:2,purchaseOrderId:3})).status,'in_progress');
   assert.equal(summary(backorder([{salesDecision:'accepted',supplyStatus:'in_stock'}],{salesOrderId:2,purchaseOrderId:3})).status,'in_progress');
   assert.equal(summary(backorder([{salesDecision:'pending',supplyStatus:'already_ordered'}],{stage:'completed'})).status,'completed');
 });

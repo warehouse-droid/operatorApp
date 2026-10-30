@@ -40,8 +40,9 @@
 .special-planning-order [data-special-po-sent-form] button:hover { border-color: #9a3412; background: #9a3412; }
 
 .special-sales-order-summary { grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); }
-.special-sales-order-reference { display: flex; align-items: center; gap: 10px; }
-.special-sales-order-reference button { flex-shrink: 0; padding: 6px 10px; }
+.special-sales-order-reference { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.special-sales-order-reference strong { min-width: 0; overflow-wrap: anywhere; }
+.special-sales-order-reference button { flex-shrink: 0; white-space: nowrap; padding: 6px 10px; }
 .special-stock-page .special-sales-pricing-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); grid-column: 1 / -1; gap: 12px; margin-top: 8px; align-items: start; min-width: 0; }
 .special-sales-pricing-row > label { grid-template-rows: 36px auto; align-content: start; }
 .special-sales-pricing-row > label > span { align-self: end; }

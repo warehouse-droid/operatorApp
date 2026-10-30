@@ -1,11 +1,9 @@
 // @ts-check
 import crypto from "node:crypto";
-import { ensureOutboundLocationDirectory } from "./outbound-location-runtime.js";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
 import { DISPATCH_FLEET_PLANNING_LOCK } from "./dispatch-fleet-status.js";
 import { lockConsolidatedLoadOrders } from "./consolidation-load-locks.js";
-import { listClosedNetSuiteOrders } from "./netsuite-closed-order-repository.js";
 import { outboundYardLocationId, OUTBOUND_YARD_IDS } from "./outbound-location-domain.js";
 import { operatorProgressStatus, readOperatorProgressActor } from "./operator-order-progress-repository.js";
 
@@ -83,7 +81,10 @@ async function memberState(identity, lock) {
   const header = (await query(`SELECT * FROM ${target.header} WHERE ${target.id}=$1 ${lock ? "FOR UPDATE" : ""}`, [identity.id])).rows[0];
   if (!header) { throw fail(`${identity.ref} changed. Preview it again.`, "OPERATOR_REOPEN_STALE"); }
   const lines = (await query(`SELECT * FROM ${target.lines} WHERE ${target.parent}=$1 ORDER BY id ${lock ? "FOR UPDATE" : ""}`, [identity.id])).rows;
-  return { ...identity, header, lines };
+  const fulfillments = ["sales_order", "transfer_order"].includes(identity.kind)
+    ? (await query(`SELECT id,item_fulfillment_id FROM delivery_fulfillment_records WHERE order_id=$1 ORDER BY id ${lock ? "FOR UPDATE" : ""}`, [identity.id])).rows
+    : [];
+  return { ...identity, header, lines, fulfillments };
 }
 
 /** @param {any[]} orders @param {number[]} allowed */
@@ -123,18 +124,10 @@ async function reopenBlockers(orders, ref) {
   const blockers = [];
   const add = (/** @type {string} */ code, /** @type {string} */ message) => blockers.push({ code, message });
   const refs = [...new Set([ref, ...orders.map((/** @type {any} */ order) => order.ref)])];
-  const closed = await listClosedNetSuiteOrders(refs);
-  for (const row of closed) { add("OPERATOR_REOPEN_CLOSED", `${orders.find((/** @type {any} */ order) => order.ref.toUpperCase() === String(row.canonicalRef || row.requestedRef).toUpperCase())?.ref || row.requestedRef} is closed in NetSuite.`); }
   for (const order of orders) {
     const h = order.header;
-    if (h.netsuite_active === false || /^(cancelled|canceled|closed|hold|completed|received)$/iu.test(text(h.status))) {
+    if (order.kind === "co_order" && /^(cancelled|canceled|closed|hold|completed|received)$/iu.test(text(h.status))) {
       add("OPERATOR_REOPEN_INACTIVE", `${order.ref} is inactive, cancelled, completed or on hold.`);
-    }
-    // Billing alone can be incorrect; retain every recorded fulfillment guard.
-    if ((order.kind === "sales_order" && (/^F$/u.test(text(h.status)) || /^(?:Sales Order\s*:\s*)?Pending Billing$/iu.test(text(h.status_text))))
-      || h.last_item_fulfillment_id || h.fulfilled_at || /^(fulfilled|partial_fulfilled|shipped)$/iu.test(text(h.fulfillment_status))
-      || order.lines.some((/** @type {any} */ line) => ["fulfilled_pallet_qty", "fulfilled_layer_qty", "fulfilled_piece_qty", "fulfilled_section_qty"].some((/** @type {any} */ key) => Number(line[key] || 0) > 0))) {
-      add("OPERATOR_REOPEN_NETSUITE_EVIDENCE", `${order.ref} has recorded NetSuite fulfillment. Use the reattempt workflow.`);
     }
     if (h.last_item_receipt_id || h.received_at || /^(received|completed)$/iu.test(text(h.receiving_status))
       || order.lines.some((/** @type {any} */ line) => ["received_pallet_qty", "received_layer_qty", "received_piece_qty", "received_section_qty", "netsuite_received_qty"]
@@ -149,19 +142,14 @@ async function reopenBlockers(orders, ref) {
   const keys = orders.flatMap((/** @type {any} */ order) => ["delivery_prep", "customer_pickup", "receiving"].map((/** @type {any} */ fn) => `${fn}:${order.kind}:${order.order_id}`));
   const posting = (await query(`SELECT c.id,c.status FROM operator_netsuite_posting_commands c
     JOIN operator_netsuite_posting_order_claims claim ON claim.command_id=c.id
-    WHERE claim.local_order_key=ANY($1::text[]) AND (claim.active OR EXISTS (
-      SELECT 1 FROM operator_netsuite_posting_steps s WHERE s.command_id=c.id
-        AND (s.netsuite_transaction_id IS NOT NULL OR s.status='posted' OR s.response->'observedTransaction'->>'id' IS NOT NULL)))`, [keys])).rows;
-  if (posting.length) { add("OPERATOR_REOPEN_POSTING", `${ref} has active or posted NetSuite work. Resolve the posting before reopening.`); }
+    WHERE claim.local_order_key=ANY($1::text[]) AND claim.active`, [keys])).rows;
+  if (posting.length) { add("OPERATOR_REOPEN_POSTING", `${ref} has an active posting request. Resolve the posting before reopening.`); }
   const consolidation = await query("SELECT order_id FROM operator_consolidated_load_claims WHERE active AND order_id=ANY($1::text[])",
     [orders.map((/** @type {any} */ order) => order.order_id)]);
   if (consolidation.rowCount) { add("OPERATOR_REOPEN_CONSOLIDATION", `${ref} belongs to a pending Consolidation Load. Resolve that load first.`); }
   const driver = await query(`SELECT job_id FROM driver_job_records WHERE order_refs ?| $1::text[]
     AND (started_at IS NOT NULL OR completed_at IS NOT NULL OR status IN ('in_progress','complete','completed'))`, [refs]);
   if (driver.rowCount) { add("OPERATOR_REOPEN_DRIVER_STARTED", `${ref} has started Driver work. Reopen the Driver stop first.`); }
-  const fulfillment = await query("SELECT id FROM delivery_fulfillment_records WHERE order_id=ANY($1::bigint[]) AND item_fulfillment_id IS NOT NULL",
-    [orders.filter((/** @type {any} */ order) => ["sales_order", "transfer_order"].includes(order.kind)).map((/** @type {any} */ order) => order.id)]);
-  if (fulfillment.rowCount) { add("OPERATOR_REOPEN_NETSUITE_EVIDENCE", `${ref} has recorded NetSuite fulfillment. Use the reattempt workflow.`); }
   return blockers;
 }
 
@@ -191,7 +179,6 @@ async function context(orderRef, actor, lock = false) {
 /** @param {{orderRef: string, actor: any}} input */
 export async function previewOperatorOrderReopen({ orderRef, actor }) {
   controlYards(actor);
-  await ensureOutboundLocationDirectory();
   return withTransaction(async () => {
     const c = await context(orderRef, actor);
     const orders = [];
@@ -216,7 +203,6 @@ export async function searchOperatorReopenOrders({ search, actor }) {
     const preview = await previewOperatorOrderReopen({ orderRef: term, actor });
     return [{ orderRef: preview.orderRef, orderType: "group_order", status: "group" }];
   }
-  await ensureOutboundLocationDirectory();
   const pattern = term.replace(/[\\%_]/gu, (/** @type {any} */ value) => "\\" + value);
   return (await query(`SELECT * FROM (${CATALOG}) catalog WHERE ref ILIKE '%'||$1||'%' ORDER BY ref LIMIT 100`, [pattern])).rows
     .filter((/** @type {any} */ row) => allowed.includes(identityYard(row)))
@@ -232,11 +218,17 @@ async function resetMember(order) {
   fields.push("confirmed_at=NULL");
   if (!local) { fields.push("confirmed=false", "loaded_qty=0", "loaded_uom=NULL"); }
   else { fields.push("confirmed_by=NULL"); }
-  if (!local && !vrma) { fields.push("sync_exception=NULL", "sync_exception_at=NULL"); }
+  if (!local && !vrma) {
+    fields.push("sync_exception=NULL", "sync_exception_at=NULL",
+      "fulfilled_pallet_qty=0", "fulfilled_layer_qty=0", "fulfilled_piece_qty=0", "fulfilled_section_qty=0");
+  }
   await query(`UPDATE ${t.lines} SET ${fields.join(",")} WHERE ${t.parent}=$1 ${order.kind === "transfer_order" ? "AND line_stage='outbound'" : ""}`, [order.id]);
   const headerFields = [`${t.status}='${local ? "pending_load" : "open"}'`, "preparing_operator_id=NULL", "preparing_started_at=NULL"];
   if (!local) { headerFields.push("local_yard_order_status='Open'", "status_updated_at=clock_timestamp()"); }
-  if (!local && !vrma) { headerFields.push("fulfillment_status='not_fulfilled'"); }
+  if (!local && !vrma) {
+    headerFields.push("fulfillment_status='not_fulfilled'", "last_item_fulfillment_id=NULL",
+      "last_item_fulfillment_tranid=NULL", "fulfilled_at=NULL");
+  }
   if (local || vrma) { headerFields.push("loaded_at=NULL", "updated_at=clock_timestamp()"); }
   if (local) { headerFields.push("details=details-'sourceLoaded'-'sourceLoadedAt'-'sourceDeliveryOrderId'"); }
   await query(`UPDATE ${t.header} SET ${headerFields.join(",")} WHERE ${t.id}=$1`, [order.id]);
@@ -249,7 +241,6 @@ export async function reopenOperatorOrder(input) {
   if (!reason || reason.length > 500 || !UUID.test(requestId) || !/^[a-f0-9]{64}$/u.test(expected)) {
     throw fail("A reason, valid request ID and current preview are required.", "OPERATOR_REOPEN_INPUT", 400);
   }
-  await ensureOutboundLocationDirectory();
   const inputHash = digest({ actor: input.actor.id, orderRef: text(input.orderRef), reason, expected });
   return withTransaction(async () => {
     await query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`operator-order-reopen:${requestId}`]);

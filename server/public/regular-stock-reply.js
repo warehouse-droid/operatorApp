@@ -2,12 +2,13 @@
   const t=(en,zh)=>window.RegularStockUI.t(en,zh),esc=value=>window.RegularStockUI.esc(value);
   const stocking=request=>request?.requestType==='regular'&&request.workflowVersion===2&&request.regular?.deliveryMethod==='stocking';
   const status=request=>request.displayStatus||request.bucket||request.status;
-  const label=value=>({pending_update:t('Pending update','待销售更新'),pending_scm:t('Pending SCM review','待 SCM 审核'),
+  const label=value=>({yard_stock:t('Stock available at destination yard','目的地货场库存充足'),pending_update:t('Pending update','待销售更新'),pending_scm:t('Pending SCM review','待 SCM 审核'),
     proposed:t('Added to PO/TO proposal','已加入采购 / 调货建议'),partially_proposed:t('Partially added to PO/TO proposal','部分已加入采购 / 调货建议'),resolved:t('Resolved','已解决'),waitlisted:t('Moved to waitlist','已转入候补清单')})[value];
   /** @param {{lines?:import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine[]}|null|undefined} request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine|null} [line] */
   const target=(request,line)=>line||(request?.lines?.length===1?request.lines[0]:null);
   /** @param {unknown} _request @param {import('../tools/regular-stock-resolution-globals.js').RegularResolutionLine & {replyStatus?:string|null}} line */
   function lineStatus(_request,line) {
+    if(line.status==='closed'&&line.yardStock)return 'yard_stock';
     if(line.resolution)return 'resolved';
     if(['closed','rejected','cancelled','received','fulfilled'].includes(line.status))return line.status;
     return line.replyStatus||(line.status==='approved'&&line.purchase?.demandId?'proposed':line.status);

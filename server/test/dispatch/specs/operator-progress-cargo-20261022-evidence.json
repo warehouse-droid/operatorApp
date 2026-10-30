@@ -1,0 +1,120 @@
+{
+  "passed": true,
+  "newFailures": 0,
+  "at": "2026-10-22T19:54:36.549Z",
+  "node": "v20.20.2",
+  "sourceHashes": {
+    "src/operator-order-progress-repository.js": "1509d8db65885e933b71886b632ee56febb37f9d753e9407a510aa072043b7d1"
+  },
+  "tests": {
+    "tests": 85,
+    "pass": 82,
+    "fail": 3,
+    "skipped": 0
+  },
+  "baselineFailures": [
+    "a loaded source CO identifies its own ref and operator instead of the source SO packer",
+    "legacy loaded quantities with no load audit identify the order without inventing an operator",
+    "stale Open header with loaded lines becomes linkable after reopening"
+  ],
+  "properties": {
+    "seed": 20261022,
+    "runs": 250
+  },
+  "types": "passed",
+  "lint": "passed",
+  "coverage": {
+    "progressStatementsCovered": 28,
+    "progressStatementsTotal": 28,
+    "progressBranchesCovered": 32
+  },
+  "mutations": {
+    "killed": 6,
+    "total": 6,
+    "names": [
+      "accounting-load",
+      "accounting-pack",
+      "lost-cargo-load",
+      "lost-cargo-pack",
+      "lost-header-load",
+      "named-service"
+    ]
+  },
+  "reorderedSuite": "passed",
+  "limits": [
+    "Scoped regression suite; repository-wide unrelated suites were not run.",
+    "No browser code changed; existing split-preview HTTP checks cover the server boundary.",
+    "No dependency, database schema, write path, or capability changes; supply-chain audit and migration rehearsal not applicable."
+  ],
+  "specApproval": "not obtained (autonomous run)",
+  "reproduce": "bash server/tools/operator-progress-cargo-checks.sh",
+  "baselineCommit": "edc61458f0e0cb74f47d06221cd6f45e2e1a2c82",
+  "baselineModuleSha256": "ea4c4f2ff37e0788773427b973890d4dd40d3d1624cdcad8d5e0edaa253b5d3e",
+  "red": {
+    "tests": 14,
+    "passed": 2,
+    "failed": 12,
+    "observedBeforeImplementation": true,
+    "failure": "Accounting rows incorrectly produce loaded instead of open; real packing is masked by those accounting loaded values."
+  },
+  "specMapping": {
+    "accountingLinesIgnored": "test/dispatch/unit/operator-progress-cargo.test.js: accounting type/name cases and the 250-run property",
+    "realAndUnknownCargoProtected": "test/dispatch/unit/operator-progress-cargo.test.js: real cargo, unknown metadata and inactive historical cargo",
+    "headersAndConsolidationProtected": "unit header evidence test and split-dialog-fast.test.js: loaded CO evidence",
+    "quantitiesAndHistoryPreserved": "test/dispatch/integration/operator-progress-cargo.test.js: complete before/after snapshots",
+    "apiAndAllocations": "split-dialog-fast.test.js, sales-split-allocation-unsplit.test.js, resplit-sibling-group-allocations.test.js",
+    "reopenSafety": "control-order-reopen.test.js, control-order-reopen-local.test.js, operator-attribution-ownership.test.js; three unchanged baseline failures recorded"
+  },
+  "baselineFailureDetails": [
+    {
+      "test": "legacy loaded quantities with no load audit identify the order without inventing an operator",
+      "error": "TypeError: Cannot read properties of undefined (reading 'message')"
+    },
+    {
+      "test": "a loaded source CO identifies its own ref and operator instead of the source SO packer",
+      "error": "TypeError: Cannot read properties of undefined (reading 'message')"
+    },
+    {
+      "test": "stale Open header with loaded lines becomes linkable after reopening",
+      "error": "AssertionError: assert.ok(activity)"
+    }
+  ],
+  "harnessCorrections": [
+    "Fixed four missing-brace lint errors in the new validation helpers.",
+    "Isolated baseline/candidate runs in fresh disposable databases after retained fixture leases caused two HTTP failures.",
+    "Replaced DROP SCHEMA with guarded disposable-database recreation after PostgreSQL reported out of shared memory / max_locks_per_transaction.",
+    "Scoped coverage to 100% of the progress-classification region rather than inheriting MBT-wide coverage settings for unrelated code."
+  ],
+  "toolVersions": {
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2"
+  },
+  "sourceReview": "Only src/operator-order-progress-repository.js changes at runtime; no imports, queries, dependencies, migrations, network/filesystem capabilities, or production data writes were added.",
+  "deployment": {
+    "at": "2026-10-22T20:42:45.725415+00:00",
+    "image": "mbbs-operator-app:scm-cargo-pickup-20261022",
+    "imageId": "sha256:7ad669670a4ea5a55d739b903b69bee22482a26a0df4b92c6954f29476ee405b",
+    "healthy": true,
+    "order": {
+      "orderRef": "SOA10414",
+      "operatorStatus": "open",
+      "yardStatus": "Open",
+      "itemCount": 6,
+      "canonical": {
+        "operator_status": "open",
+        "local_yard_order_status": "Open",
+        "line_digest": "6c82fdf678ea92db15c6f861345f2ed0"
+      }
+    },
+    "orderDataUnchanged": true,
+    "combinedTests": {
+      "tests": 125,
+      "pass": 125,
+      "fail": 0,
+      "skipped": 0,
+      "cancelled": 0
+    }
+  }
+}

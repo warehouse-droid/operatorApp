@@ -126,7 +126,7 @@ function refs(payload) {
   return payload.map((row) => row.orderRef).filter((ref) => ref.startsWith(prefix)).sort();
 }
 function expected() {
-  return fixtures.filter((fixture) => fixture.status !== "Hold" && !fixture.heldByReconciliation)
+  return fixtures.filter((fixture) => fixture.status !== "Hold" && !fixture.heldByReconciliation && !fixture.cancelledSplit)
     .map((fixture) => fixture.ref).sort();
 }
 function expectedEko70s() {

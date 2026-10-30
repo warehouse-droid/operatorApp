@@ -1,0 +1,5 @@
+[
+  "src/mbt/local-master-data-service.js",
+  "public/mbt-shell.js",
+  "public/mbt-config.html"
+]

@@ -3,7 +3,9 @@
 
   const API_TIMEOUT_MS = 60000;
   const SAVE_TIMEOUT_MS = 120000;
-  const ASSET_VERSION = "20261016-driver-reconnect-v1";
+  const UPLOAD_IDLE_TIMEOUT_MS = 30000;
+  const UPLOAD_CONFIRM_TIMEOUT_MS = 15000;
+  const ASSET_VERSION = "20261023-driver-upload-wait-v1";
   const QUEUE_KEY = "mbbs.driver.uploadFailures.v1";
   const QUEUE_LIMIT = 100;
 
@@ -120,10 +122,85 @@
     };
   }
 
-  function transfer(ticket, photo, {signal, filename, update}) {
+  function keepUploadScreenAwake(signal) {
+    let active = !signal?.aborted;
+    let pending = false;
+    let lock;
+    const release = sentinel => {
+      if (sentinel) void Promise.resolve().then(() => sentinel.release()).catch(() => {});
+    };
+    const request = () => {
+      if (!active || pending || (lock && !lock.released) || global.document?.visibilityState === "hidden"
+          || !global.navigator?.wakeLock?.request) return;
+      pending = true;
+      void Promise.resolve().then(() => global.navigator.wakeLock.request("screen")).then(sentinel => {
+        if (active && global.document?.visibilityState !== "hidden") lock = sentinel;
+        else release(sentinel);
+      }).catch(() => {}).finally(() => {pending = false;});
+    };
+    const visibility = () => {
+      if (global.document?.visibilityState === "hidden") {release(lock); lock = null;}
+      else request();
+    };
+    const stop = () => {
+      active = false;
+      global.document?.removeEventListener("visibilitychange", visibility);
+      signal?.removeEventListener("abort", stop);
+      release(lock);
+      lock = null;
+    };
+    global.document?.addEventListener("visibilitychange", visibility);
+    signal?.addEventListener("abort", stop, {once: true});
+    request();
+    return stop;
+  }
+
+  function watchTransfer(xhr, totalBudget, fail) {
+    const startedAt = Date.now();
+    let timer;
+    let expiresAt;
+    let timeoutMs;
+    let message;
+    let loaded = 0;
+    let confirming = false;
+    const expire = () => fail(Object.assign(uploadError("driver_upload_timeout", message),
+      {timeoutMs, timerDelayMs: Math.max(0, Date.now() - expiresAt)}));
+    const resume = () => {if (Date.now() >= expiresAt) expire();};
+    const arm = (limit, description) => {
+      if (timer !== undefined) global.clearTimeout(timer);
+      timeoutMs = Math.min(limit, Math.max(1, totalBudget - (Date.now() - startedAt)));
+      expiresAt = Date.now() + timeoutMs;
+      message = description;
+      // XHR timeout is measured from send(), including when changed mid-request.
+      xhr.timeout = Math.max(1, Math.min(totalBudget, expiresAt - startedAt));
+      timer = global.setTimeout(expire, timeoutMs);
+    };
+    const progress = bytes => {
+      if (confirming) return false;
+      if (bytes > loaded) {loaded = bytes; arm(UPLOAD_IDLE_TIMEOUT_MS, "Photo upload progress stopped. Reconnecting...");}
+      return true;
+    };
+    const confirm = () => {
+      if (confirming) return;
+      confirming = true;
+      arm(UPLOAD_CONFIRM_TIMEOUT_MS, "Storage did not confirm the photo in time. Reconnecting...");
+    };
+    const stop = () => {
+      global.clearTimeout(timer);
+      global.removeEventListener?.("pageshow", resume);
+      global.document?.removeEventListener("visibilitychange", resume);
+    };
+    arm(UPLOAD_IDLE_TIMEOUT_MS, "Photo upload progress stopped. Reconnecting...");
+    global.addEventListener?.("pageshow", resume);
+    global.document?.addEventListener("visibilitychange", resume);
+    return {progress, confirm, expire, stop};
+  }
+
+  function transfer(ticket, photo, {signal, filename, update, timeoutMs}) {
     return new Promise((resolve, reject) => {
       const xhr = new global.XMLHttpRequest();
       let settled = false;
+      let watchdog;
       const abort = () => {
         finish(reject, uploadError("driver_upload_cancelled", "Upload was cancelled."));
         xhr.abort();
@@ -131,17 +208,19 @@
       function finish(callback, value) {
         if (settled) return;
         settled = true;
+        watchdog?.stop();
         signal.removeEventListener("abort", abort);
         xhr.onload = xhr.onerror = xhr.ontimeout = xhr.onabort = null;
         xhr.upload.onprogress = xhr.upload.onload = null;
         callback(value);
       }
       xhr.upload.onprogress = event => {
+        if (!watchdog.progress(event.loaded)) return;
         const fraction = event.lengthComputable && event.total > 0 ? Math.min(1, event.loaded / event.total) : null;
         update("uploading", fraction === null ? null : Math.floor(fraction * 100),
           fraction === null ? 0 : Math.floor(photo.blob.size * fraction));
       };
-      xhr.upload.onload = () => update("confirming", 100, photo.blob.size);
+      xhr.upload.onload = () => {watchdog.confirm(); update("confirming", 100, photo.blob.size);};
       xhr.onload = () => {
         let payload;
         try { payload = JSON.parse(xhr.responseText || "{}"); } catch { payload = {}; }
@@ -154,7 +233,7 @@
         }
       };
       xhr.onerror = () => finish(reject, uploadError("driver_photo_upload_network_error", "The upload connection failed. The browser did not provide a more specific network reason."));
-      xhr.ontimeout = () => finish(reject, uploadError("driver_upload_timeout", "The photo upload timed out."));
+      xhr.ontimeout = () => watchdog.expire();
       xhr.onabort = () => finish(reject, uploadError("driver_upload_cancelled", "Upload was cancelled."));
       signal.addEventListener("abort", abort, {once: true});
       if (signal.aborted) { abort(); return; }
@@ -163,6 +242,7 @@
         xhr.setRequestHeader("Authorization", `Bearer ${ticket.token}`);
         const body = new global.FormData();
         body.append("file", photo.blob, filename || "driver-photo.jpg");
+        watchdog = watchTransfer(xhr, timeoutMs, error => {finish(reject, error); xhr.abort();});
         xhr.send(body);
       } catch (error) { finish(reject, error); }
     });
@@ -180,6 +260,7 @@
 
   async function upload(photo, {ticket, signal, timeoutMs, filename, onProgress = () => {}, onFailure = () => {}, context = {}}) {
     const startedAt = Date.now();
+    const releaseScreen = keepUploadScreenAwake(signal);
     const attempt = Math.max(0, Number(photo.uploadAttemptCount || 0)) + 1;
     photo.uploadAttemptCount = attempt;
     let progress = {phase: "authorizing", percentage: 0, transferredBytes: 0};
@@ -194,8 +275,9 @@
         throw uploadError("driver_photo_upload_invalid_response", "Upload authorization is incomplete.");
       }
       progress = {...progress, phase: "uploading"};
-      const reference = await deadline(innerSignal => transfer(authorization, photo, {signal: innerSignal, filename, update}),
-        {signal, timeoutMs: timeoutMs || photoTimeoutMs(photo)});
+      const transferBudget = timeoutMs || photoTimeoutMs(photo);
+      const reference = await deadline(innerSignal => transfer(authorization, photo, {signal: innerSignal, filename, update, timeoutMs: transferBudget}),
+        {signal, timeoutMs: transferBudget});
       update("uploaded", 100, photo.blob.size);
       return reference;
     } catch (error) {
@@ -203,7 +285,7 @@
       const diagnostic = failureDiagnostic(photo, context, progress, error, attempt, startedAt);
       try { onFailure(diagnostic); } catch { /* Diagnostic storage must not obscure the upload failure. */ }
       throw error;
-    }
+    } finally {releaseScreen();}
   }
 
   function boundedDiagnostic(raw) {

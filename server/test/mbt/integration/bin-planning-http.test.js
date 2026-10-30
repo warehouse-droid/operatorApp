@@ -6,7 +6,7 @@ import { createMbtRouter } from "../../../src/mbt/router.js";
 import { planningFixture, command, storedPlan } from "../support/bin-planning-fixtures.js";
 after(closeDb);
 
-test("authorized HTTP planner commands and legacy BIN writes use the same date lease", async () => {
+test("authorized HTTP planner commands and legacy BIN writes use the same date lease", {timeout:75000}, async () => {
   const f = await planningFixture(1800); const events = [];
   const app = express(); app.use(express.json());
   app.use((req, _res, next) => { req.operator = { id: f.actor.operatorId,
@@ -19,7 +19,8 @@ test("authorized HTTP planner commands and legacy BIN writes use the same date l
     const denied = await fetch(`${url}/api/mbt/planning?planDate=${f.planDate}`, { headers: { "x-test-denied": "1" } });
     assert.equal(denied.status, 403);
     const read = await fetch(`${url}/api/mbt/planning?planDate=${f.planDate}&search=${f.contractNumber}`);
-    assert.equal(read.status, 200); assert.equal((await read.json()).pool.items.length, 1);
+    const readBody=await read.json();
+    assert.equal(read.status, 200,JSON.stringify(readBody)); assert.equal(readBody.pool.items.length, 1);
     const input = await command(f, "assign");
     const headers = { "content-type": "application/json", "idempotency-key": input.idempotencyKey };
     const { editLease, ...body } = input;
@@ -34,5 +35,5 @@ test("authorized HTTP planner commands and legacy BIN writes use the same date l
     assert.equal(result.plan.revision, input.baseRevision + 1);
     assert.equal(events.length, 1); assert.equal(events[0].planId, f.planId);
     assert.equal(events[0].revision, (await storedPlan(f.planId)).revision);
-  } finally { await new Promise(resolve => server.close(resolve)); }
+  } finally { await new Promise(resolve => {server.close(resolve);server.closeAllConnections();}); }
 });

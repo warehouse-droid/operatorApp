@@ -5,7 +5,7 @@ const mode=process.argv[2] || "all";
 const files=[];
 for (const directory of ["unit","integration","concurrency","property","adversarial"]) {
   for (const file of readdirSync(`test/mbt/${directory}`).sort()) {
-    const workflow=file.startsWith("bin-order-workflow");
+    const workflow=file.startsWith("bin-order-workflow") || file.startsWith("bin-selection");
     const baseline=/^(bin-dispatch|bin-contract|bin-leg|dispatch-bin|driver-bin|frontdesk-bin|frontdesk-multibin)/u.test(file);
     const planning=file.startsWith("bin-planning-");
     const billing=/^(shadow-billing|billing-read-model|multibin-billing-isolation)/u.test(file);

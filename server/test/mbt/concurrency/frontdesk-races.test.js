@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
+import {addLegacyCollection} from '../support/legacy-bin-collection-fixture.js';
 
 import { closeDb, query } from "../../../src/db.js";
 import { MbtError } from "../../../src/mbt/errors.js";
@@ -89,7 +90,7 @@ after(async () => {
   await closeDb();
 });
 
-test("P3-F13: 25 independent two-client conversion races yield one contract, two visits, and one local case", {
+test("P3-F13: 25 independent two-client conversion races yield one contract, one delivery, and one local case", {
   timeout: 180_000
 }, async () => {
   const convertFrontdeskQuote = requiredOperation("convertFrontdeskQuote");
@@ -130,10 +131,10 @@ test("P3-F13: 25 independent two-client conversion races yield one contract, two
       status: "converted",
       quote_revision: 4,
       contracts: 1,
-      visits: 2,
+      visits: 1,
       billing_cases: 1,
       ready_visits: 1,
-      tentative_visits: 1
+      tentative_visits: 0
     });
   }
 
@@ -168,6 +169,7 @@ test("P3-F14: 25 independent extension races yield one append-only amendment and
       ACTOR,
       { quoteId, expectedRevision: 3 }
     ));
+    await addLegacyCollection(converted, ACTOR);
     const contractId = converted.body.contract.contractId;
     const [delivery, returnVisit] = converted.body.visits;
     const inputs = ["left", "right"].map((side, index) => frontdeskCommand(

@@ -1,0 +1,7 @@
+[
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "public/mbt-planning.html",
+  "src/dispatch-repository.js",
+  "src/dispatch-order-pool-sql.js"
+]

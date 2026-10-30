@@ -1,0 +1,54 @@
+{
+  "passed": true,
+  "at": "2026-10-22T19:24:13.599Z",
+  "sourceHashes": {
+    "public/dispatch.js": "491156bb4bbc8bd3ba344b7f3f4736f875734469b23524e7049ffbb4633c2971",
+    "public/dispatch.html": "75730a21b938725f655dc38ff3d18c35ad583589ae4e82362212a82d5db73de7",
+    "src/dispatch-forecast-service.js": "d53c7988c906e8572f67037cb8f21d320f29e6d87d736c540b57cd9f40adab92"
+  },
+  "newFailures": 0,
+  "regression": {
+    "tests": 62,
+    "pass": 62,
+    "fail": 0
+  },
+  "focusedTests": 14,
+  "harnesses": [
+    "src/dispatch-forecast-harness.js"
+  ],
+  "baselineFailures": [
+    {
+      "file": "src/dispatch-route-duration-harness.js",
+      "error": "Expected dispatch route helper source was not found.",
+      "line": 192
+    }
+  ],
+  "files": [
+    "test/dispatch/frontend/dispatch-delivery-start-travel.test.js",
+    "test/dispatch/frontend/dispatch-travel-pairs.test.js",
+    "test/dispatch/frontend/dispatch-start-travel-boundary.test.js",
+    "test/dispatch/frontend/dispatch-required-pickups.test.js",
+    "test/dispatch/frontend/dispatch-actual-arrival-repair.test.js"
+  ],
+  "syntax": "passed",
+  "lint": "passed",
+  "red": {
+    "tests": 12,
+    "pass": 2,
+    "fail": 10
+  },
+  "node": "v20.20.2",
+  "invariants": [
+    "No pickup added for fee-only deliveries",
+    "No new Driver tasks or record writes",
+    "Completed travel derives actual times from stop evidence",
+    "Unresolved arrivals remain unknown",
+    "Opening travel is counted once",
+    "Same-location journeys stay omitted",
+    "Bin job identity retained"
+  ],
+  "limits": [
+    "No full browser layout suite",
+    "Legacy pickup-first routing in mixed pickup/drop loads is unchanged"
+  ]
+}

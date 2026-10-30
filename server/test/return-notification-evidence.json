@@ -1,0 +1,222 @@
+{
+  "feature": "Operator stock and pallet return customer notifications",
+  "tier": 3,
+  "specApproval": "not obtained (autonomous run)",
+  "spec": "test/return-notification-spec.json",
+  "reproduce": "sudo env DISPATCH_SOURCE_RUNTIME=\"$PWD/server/deployments/return-notifications-20261026/candidate\" bash docker/run-return-notification-checks.sh",
+  "reproduceWorkspace": "sudo bash docker/run-return-notification-checks.sh",
+  "runtimeSourceHashes": {
+    "src/return-notification-domain.js": "37822c25efc112f9f193bc774d692c44c61a12f19ad93510b54854ab37ec5074",
+    "src/return-notification-router.js": "cd40335f7e6d3e44e5a2292023639e2aad69f40f190100c05841e5b92dee55fb",
+    "src/return-notification-service.js": "ab80400ce5cfad318c639c78e2161da388fa15acb767c797f1a2c0ad77956c07",
+    "src/return-notification-settings.js": "add9906167fe04ff19fb1d7973a6872093688718a360145e99e72485e4d4ad9a",
+    "src/return-notification-transport.js": "66a9ba0396a7bf6998e352a2777993994a5b31ae0f9bd0407440537a59368d3b",
+    "src/server.js": "62a8f91a187fbe72c4a8f801957973776e8c73a06fcf5f48b24b8fd5da80ff87",
+    "public/operator.js": "e85c43b6e9ca44f0beb21ba0a48aa1d46d8cdd2269cb3eda31136d75bdcecfce",
+    "public/operator.html": "fb92a09eb26de5fcfb24a321ece1432d1310d7e7a3be8cf4d8fef97ba2410a64",
+    "public/operator.css": "285e03300139876d8989c41bc46f47842378a8d8d6eb015efe97d73379bc7e16",
+    "public/control.js": "c801f5da599cb34fbbee92ac34527f5c32b60de952699dee1487dc7e762bb007",
+    "public/admin.html": "09b1281f2f60112facee5a7306ec391e4ab51dc71bc95960d5b0ad14c34b14da",
+    "public/return-notifications.js": "8f2950726576801912bdcc52060955aa9aadce3edbcd89f9544a0e2d48719d9a",
+    "migrations/311_return_customer_notifications.sql": "4d45633ea0ffde7fb3472b705d38dfa8892110ddd08ce3070aa841353cf39dae"
+  },
+  "tooling": {
+    "node": "v20.20.2",
+    "nodemailer": "10.0.13",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0",
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "@playwright/test": "1.62.1",
+    "pg": "8.21.0"
+  },
+  "results": {
+    "acceptance": {
+      "passed": 21,
+      "files": 3,
+      "repeat": "Each acceptance file also passed in a separate process in reverse file order."
+    },
+    "returnRegressions": {
+      "passed": 186,
+      "files": 17
+    },
+    "browser": {
+      "passed": 7,
+      "engine": "Chromium",
+      "cases": "Stock, pallet and combined return screens at 390px and 1024px; admin masked key save/remove."
+    },
+    "coverage": {
+      "scope": "Five new backend return-notification modules only. Browser/VM UI and shared-file additions are not included in these percentages.",
+      "lines": {
+        "total": 328,
+        "covered": 328,
+        "skipped": 0,
+        "pct": 100
+      },
+      "statements": {
+        "total": 328,
+        "covered": 328,
+        "skipped": 0,
+        "pct": 100
+      },
+      "functions": {
+        "total": 34,
+        "covered": 34,
+        "skipped": 0,
+        "pct": 100
+      },
+      "branches": {
+        "total": 189,
+        "covered": 174,
+        "skipped": 0,
+        "pct": 92.06
+      },
+      "branchesTrue": {
+        "total": 0,
+        "covered": 0,
+        "skipped": 0,
+        "pct": "Unknown"
+      }
+    },
+    "mutations": {
+      "killed": 7,
+      "total": 7,
+      "cases": [
+        "unposted allowed",
+        "wrong reference",
+        "credential response leak",
+        "duplicate send",
+        "uncertain resend",
+        "audit key leak",
+        "missing recipient input"
+      ],
+      "attribution": "Acceptance suite; not a property-only mutation score."
+    },
+    "property": {
+      "cases": 100,
+      "behavior": "North American phone formatting normalizes stably"
+    },
+    "lint": "Passed: existing rules and complexity maximum 12 for new modules, widget, tests and validation runner.",
+    "types": "Passed: JavaScript checkJs for domain/settings/transport with strict=false and Node types; syntax checks for modified shared server/operator/admin code.",
+    "secretScan": "Passed for new modules, widget and tests; API keys are redacted by shared request auditing.",
+    "http": "Real Express app with isolated PostgreSQL: authentication, authorization, settings secrecy, notification submission and audit redaction passed.",
+    "adversarial": "Malformed/multiple recipients, header injection, wrong owner/yard, missing references, concurrent sends, unknown provider outcomes, damaged credential storage and daily rate limit covered."
+  },
+  "scenarioMapping": {
+    "N1": "unit/return-notification.test.js N1; unit/return-notification-ui.test.js N1; browser cases",
+    "N2": "unit/return-notification.test.js N2; integration/return-notification.test.js N4/N2",
+    "N3": "unit/return-notification.test.js N3; integration/return-notification.test.js N3/N7 and N4/N5/N8 forged-text check",
+    "N4": "integration/return-notification.test.js N4/N2 and real HTTP N4/N5/N8",
+    "N5": "unit/return-notification.test.js N5; unit/return-notification-ui.test.js audit; integration N4/N5/N8; admin browser",
+    "N6": "unit/return-notification.test.js N6 provider contracts and real nodemailer connection refusal",
+    "N7": "integration/return-notification.test.js concurrency/replay/uncertain/retry; unit transport and UI double-click",
+    "N8": "unit UI service acceptance and escaped failures; notification HTTP and existing return regression suite",
+    "N9": "unit hostile input; integration daily rate limit",
+    "N10": "186 existing return regression checks; isolated synthetic provider boundaries; release patch limits changes to notifications"
+  },
+  "knownLimits": [
+    "Full unrelated repository suite was not run; all existing return unit/integration test files were run.",
+    "Legacy src/operator-return-ui-harness.js fails its pre-existing return-selected-editor .return-balance-grid repeat(2, minmax(0, 1fr)) CSS assertion. Identical baseline/candidate failure confirmed; assertion unchanged.",
+    "Original automated validation sent no live customer messages. The authorized follow-up verified real SMS delivery and Google SMTP authentication; see return-notification-followup-evidence.json.",
+    "Changed-line coverage for shared files and browser scripts was not measured. Those additions have HTTP, syntax, VM and browser behavior checks.",
+    "No checkpoint commits in the pre-existing dirty workspace; immutable deployed source hashes identify the validated runtime."
+  ],
+  "resolvedFindings": [
+    "Actual nodemailer connection refusal uses ESOCKET with command CONN; classify this definitive pre-send failure as retryable.",
+    "Admin success handler used an unavailable toast helper; browser execution caught it and it now uses the existing alert path.",
+    "Source UI regression harness lacks window; optional render integration uses globalThis.",
+    "Refactored SMTP failure classification to meet the unchanged complexity budget.",
+    "Rebased onto concurrent live releases; made only copied source directories readable by the disposable test user."
+  ],
+  "deployment": {
+    "deployedAt": "2026-10-26T20:56:10Z",
+    "image": "mbbs-operator-app:return-notifications-20261026",
+    "imageId": "sha256:538629487b6c45cd32612c6f81928beab227be90b422e74fb057ae81dbaee450",
+    "healthy": true,
+    "configurationPreserved": true,
+    "otherServicesPreserved": true,
+    "migration": {
+      "filename": "311_return_customer_notifications.sql",
+      "applied": true,
+      "sha256": "4d45633ea0ffde7fb3472b705d38dfa8892110ddd08ce3070aa841353cf39dae"
+    }
+  },
+  "liveVerification": {
+    "sourceHashesVerified": true,
+    "http": [
+      {
+        "path": "/health",
+        "status": 200
+      },
+      {
+        "path": "/operator",
+        "status": 200
+      },
+      {
+        "path": "/admin/return-automation",
+        "status": 200
+      },
+      {
+        "path": "/return-notifications.js?v=20261026-v1",
+        "status": 200
+      },
+      {
+        "path": "/api/admin/return-notifications",
+        "status": 401
+      }
+    ]
+  },
+  "cleanup": "The disposable runner removed its containers, database storage, networks, logs and temporary artifacts. Final host inventory recorded separately in the release operational audit.",
+  "cleanupVerification": {
+    "verifiedAt": "2026-10-26T20:57:33.196073+00:00",
+    "runningContainers": [
+      {
+        "name": "mbbs-operator-app-app-1",
+        "status": "Up About a minute (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-webhook-worker-1",
+        "status": "Up 7 days"
+      },
+      {
+        "name": "mbbs-operator-app-ollama-1",
+        "status": "Up 8 weeks (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-db-1",
+        "status": "Up 2 months (healthy)"
+      }
+    ],
+    "allContainers": [
+      {
+        "name": "mbbs-operator-app-app-1",
+        "status": "Up About a minute (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-webhook-worker-1",
+        "status": "Up 7 days"
+      },
+      {
+        "name": "mbbs-operator-app-ollama-1",
+        "status": "Up 8 weeks (healthy)"
+      },
+      {
+        "name": "mbbs-operator-app-db-1",
+        "status": "Up 2 months (healthy)"
+      }
+    ],
+    "nonProductionContainers": [],
+    "disposableVolumes": [],
+    "disposableNetworks": [],
+    "remainingTestRuns": [],
+    "health": {
+      "status": 200,
+      "ok": true
+    }
+  },
+  "operationalFollowup": {
+    "smtp": "Earlier probe omitted config.js dotenv loading. Google credentials were already saved and loaded by the app; authenticated verification against smtp.gmail.com:587 succeeded on 2026-10-26 without sending email.",
+    "sms": "User-requested SMS accepted and reported delivered by Telnyx on 2026-10-26; user confirmed receipt. Earlier incomplete keys were rejected with 10009; encryption/read-back checks passed.",
+    "audit": "server/operational-audits retains sanitized receipts; credentials excluded."
+  }
+}

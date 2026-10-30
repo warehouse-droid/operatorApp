@@ -60,7 +60,7 @@ try {
   for (const harness of harnesses) {
     console.log(`\n[legacy baseline] ${harness.name}`);
     const exitCode = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [harness.file], {
+      const child = spawn(process.execPath, harness.args || [harness.file], {
         env: environment,
         stdio: "inherit"
       });

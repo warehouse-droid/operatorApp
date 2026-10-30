@@ -83,7 +83,7 @@ export function specialDispatchPlanning(detail, plans) {
   for (const plan of plans) {
     if (plan.status === 'cancelled') continue;
     const refs = plan.plannedOrderReferences || plannedReferences(plan);
-    for (const [target, id, name] of [[salesOrder,detail.salesOrderId,detail.salesOrderRef],[purchaseOrder,detail.purchaseOrderId,detail.purchaseOrderRef],[purchaseOrder,detail.purchaseOrderId,detail.purchaseOrderReference]]) {
+    for (const [target, id, name] of [[salesOrder,detail.salesOrderId,detail.salesOrderRef],[purchaseOrder,detail.purchaseOrderId,detail.purchaseOrderTargetRef || detail.purchaseOrderRef],[purchaseOrder,detail.purchaseOrderId,detail.purchaseOrderReference]]) {
       const assignment = id && refs.get(ref(name));
       if (assignment) { target.planned = true; target.plans.push(assignment); }
     }

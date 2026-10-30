@@ -34,7 +34,8 @@ export const OPERATOR_NETSUITE_RETURN_FUNCTIONS = Object.freeze([
 
 /** @type {Map<string, Record<string, any>>} */
 const FUNCTIONS_BY_KEY = new Map(
-  [...Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS), ...OPERATOR_NETSUITE_RETURN_FUNCTIONS]
+  [...Object.values(OPERATOR_NETSUITE_POSTING_FUNCTIONS), ...OPERATOR_NETSUITE_RETURN_FUNCTIONS,
+    { functionKey: "stock_exchange", transactionType: "IT", gateSegment: "stock_exchange_it" }]
     .map((details) => [details.functionKey, details])
 );
 /** @type {Map<number, Record<string, any>>} */
@@ -91,6 +92,19 @@ export const OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS = Object.free
 );
 const CREDIT_MEMO_GATES_BY_IDENTITY = new Map(OPERATOR_NETSUITE_RETURN_CREDIT_MEMO_GATE_DEFINITIONS
   .map(definition => [`${definition.operatorFunction}:${definition.locationId}`, definition]));
+
+export const OPERATOR_NETSUITE_EXCHANGE_GATE_DEFINITIONS = Object.freeze(
+  OPERATOR_NETSUITE_YARDS.filter(yard => [1,28,26].includes(yard.locationId)).map(yard => Object.freeze({
+    flagKey: `operator_netsuite_stock_exchange_it_${yard.yardCode}`,
+    label: `${yard.yardCode} Stock exchange Inventory Transfer`,
+    description: `Post quality stock exchanges to the monthly Inventory Transfer at ${yard.yardCode}.`,
+    operatorFunction: "stock_exchange", transactionType: "IT", locationId: yard.locationId, yardCode: yard.yardCode,
+    configuredDefault: false, requiresNetSuiteDirectAccess: true, independent: true, locked: false, lockReason: null
+  }))
+);
+for (const definition of OPERATOR_NETSUITE_EXCHANGE_GATE_DEFINITIONS) {
+  GATES_BY_IDENTITY.set(`stock_exchange:${definition.locationId}`, definition);
+}
 
 /** @param {unknown} value */
 export function normalizeOperatorNetSuiteLocationId(value) {

@@ -1,0 +1,11 @@
+[
+  "src/dispatch-load-assignment.js",
+  "src/driver-repository.js",
+  "public/dispatch.js",
+  "public/dispatch.html",
+  "public/mbt-planning.html",
+  "src/operator-linked-quantity-domain.js",
+  "src/delivery-repository.js",
+  "public/operator.js",
+  "public/operator.html"
+]

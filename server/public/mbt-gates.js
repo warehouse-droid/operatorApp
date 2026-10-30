@@ -199,10 +199,9 @@ function renderOperatorNetSuiteGateMatrix() {
     { key: "customer_pickup", label: "Customer Pickup", type: "IF" },
     { key: "receiving", label: "Receiving", type: "IR" },
     { key: "delivery_prep", label: "Delivery Prep", type: "IF" },
-    { key: "stock_return", label: "Stock Return", type: "RA" },
-    { key: "pallet_return", label: "Pallet Return", type: "RA" },
     { key: "stock_return", label: "Stock Return", type: "CM" },
-    { key: "pallet_return", label: "Pallet Return", type: "CM" }
+    { key: "pallet_return", label: "Pallet Return", type: "CM" },
+    { key: "stock_exchange", label: "Stock exchange", type: "IT", yards: ["3445", "2967", "150"] }
   ];
   const yards = [...new Set(gates.map((gate) => String(gate.yardCode || "")))];
   const table = document.createElement("table");
@@ -228,6 +227,13 @@ function renderOperatorNetSuiteGateMatrix() {
     label.textContent = yardCode;
     row.append(label);
     for (const definition of functions) {
+      if (definition.yards && !definition.yards.includes(yardCode)) {
+        const cell = document.createElement("td");
+        cell.className = "mbt-operator-gate-cell";
+        cell.textContent = "Not available";
+        row.append(cell);
+        continue;
+      }
       row.append(operatorGateCell(gates.find((gate) => (
         gate.yardCode === yardCode && gate.operatorFunction === definition.key && gate.transactionType === definition.type
       ))));
@@ -237,7 +243,7 @@ function renderOperatorNetSuiteGateMatrix() {
   table.append(head, body);
   const returnHelp = document.createElement("p");
   returnHelp.className = "muted";
-  returnHelp.textContent = "CM creates a Credit Memo directly and takes priority over RA for new returns. Enable both Stock Return → CM and Pallet Return → CM at a yard for combined returns. Existing submissions retain their original transaction type.";
+  returnHelp.textContent = "Enable Stock Return → CM or Pallet Return → CM to create Credit Memos. Enable both at a yard for combined returns. Enable Stock exchange → IT for monthly exchange Inventory Transfers. Enable posting before confirming new exchanges. Existing submissions retain their original transaction type.";
   operatorNetSuiteGateMatrix.append(ceiling, returnHelp, table);
 }
 

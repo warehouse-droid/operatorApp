@@ -1,0 +1,33 @@
+[Unit]
+Description=Retain five deployment copies and remove completed test artifacts
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/operatorapp-retention/host_retention.py --apply
+Environment=PYTHONDONTWRITEBYTECODE=1
+User=root
+Group=root
+UMask=0077
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=100%
+MemoryMax=768M
+TasksMax=128
+TimeoutStartSec=30min
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/apps/operatorApp/server/deployments
+ReadWritePaths=/home/ubuntu/operatorapp-deploy-backups
+ReadWritePaths=/home/ubuntu/apps/operatorApp/server/test-artifacts
+ReadWritePaths=/home/ubuntu/storage-cleanup/retention-audit
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+LockPersonality=true
+

@@ -1,38 +1,32 @@
 // @ts-check
 import crypto from "node:crypto";
+import {binAvailability,availableBinSource,connectedBinVisits,assertBinAvailabilityDependencies,assertBinSourceMatches} from "./bin-availability.js";
+import { assertBinCargoReady } from "./bin-cargo-repository.js";
 import { query } from "../db.js";
 import { binWorkflowAsset, binWorkflowError } from "./bin-order-workflow-repository.js";
 import { binLocalDate } from "./bin-order-workflow-domain.js";
 
-/** @param {string} visitId @param {string} assetId */
-async function connectedAssetVisits(visitId, assetId) {
-  const {rows} = await query(`WITH RECURSIVE edges(a,b) AS (
-    SELECT d.dependent_visit_id,d.prerequisite_visit_id FROM mbt_bin_workflow_dependencies d
-    JOIN mbt_bin_order_parts p ON p.visit_id=d.dependent_visit_id
-    JOIN mbt_bin_order_parts q ON q.visit_id=d.prerequisite_visit_id WHERE p.asset_id=$2 AND q.asset_id=$2
-  ), ancestors(id) AS (SELECT $1::uuid UNION SELECT b FROM edges JOIN ancestors ON a=id),
-     descendants(id) AS (SELECT $1::uuid UNION SELECT a FROM edges JOIN descendants ON b=id)
-    SELECT id FROM ancestors UNION SELECT id FROM descendants`,[visitId,assetId]);
-  return new Set(rows.map((/** @type {any} */ r)=>String(r.id)));
+/** @param {any} visit */
+function assertWorkflowConfigured(visit) {
+  if (visit.service_snapshot.binWorkflow.needsBinSelection) {
+    throw binWorkflowError(409,"Configure this delivery and choose its physical bin after removing the Collection link.");
+  }
 }
-
+/** @param {any} visit */
+function awaitingPlannedSource(visit) {
+  const source=visit.service_snapshot.binWorkflow.source;
+  return !visit.actual_started_at && Boolean(source?.availabilityPredecessorId || source?.transportTripId);
+}
 /** @param {any} visit @param {any} asset @param {string} truckId */
 async function assertWorkflowCustody(visit, asset, truckId) {
+  assertWorkflowConfigured(visit);
+  if (awaitingPlannedSource(visit)) {return;}
   const prior = await query(`SELECT s.status FROM mbt_bin_workflow_dependencies d
     JOIN mbt_bin_order_parts p ON p.visit_id=d.prerequisite_visit_id
     JOIN mbt_visit_steps s ON s.service_visit_id=p.visit_id AND s.action_code=d.prerequisite_action_code
     WHERE d.dependent_visit_id=$1 AND p.asset_id=$2`,[visit.service_visit_id,asset.asset_id]);
   if (prior.rows.some((/** @type {any} */ r)=>r.status !== "completed")) {return;}
-  if (asset.location_kind === "truck") {
-    if (String(asset.truck_id) !== String(truckId)) {
-      throw binWorkflowError(409,"This bin is on another truck. Record its physical handoff before assigning this truck.");
-    }
-    if (!visit.actual_started_at && visit.service_snapshot.binWorkflow.role === "delivery"
-        && !/dump|empty/u.test(String(asset.movement_type))) {
-      throw binWorkflowError(409,"The bin aboard this truck has no confirmed empty-bin movement or completed dump.");
-    }
-    return;
-  }
+  if (asset.location_kind === "truck") {assertTruckCustody(visit,asset,truckId);return;}
   if (visit.actual_started_at) {return;} // Each remaining driver action rechecks exact custody.
   const workflow=visit.service_snapshot.binWorkflow;
   const source=workflow.role === "collection"
@@ -45,16 +39,46 @@ async function assertWorkflowCustody(visit, asset, truckId) {
   }
 }
 
+/** @param {any} visit @param {any} asset @param {string} truckId */
+function assertTruckCustody(visit,asset,truckId) {
+    if (String(asset.truck_id) !== String(truckId)) {
+      throw binWorkflowError(409,"This bin is on another truck. Record its physical handoff before assigning this truck.");
+    }
+    if (!visit.actual_started_at && visit.service_snapshot.binWorkflow.role === "delivery"
+        && !/dump|empty/u.test(String(asset.movement_type))) {
+      throw binWorkflowError(409,"The bin aboard this truck has no confirmed empty-bin movement or completed dump.");
+    }
+
+ }
+
+/** @param {any} visit @param {any} source @param {any} projected */
+async function rememberProjectedSource(visit,source,projected) {
+    if (projected.availabilityPredecessorId && !source?.availabilityPredecessorId) {
+      visit.service_snapshot.binWorkflow.source=projected;
+      await query('UPDATE mbt_service_visits SET service_snapshot=$2::jsonb WHERE service_visit_id=$1',
+        [visit.service_visit_id,JSON.stringify(visit.service_snapshot)]);
+    }
+}
+
 /** @param {any} visit @param {any} assignment @param {string} truckId @param {any} input */
 export async function reserveBinWorkflowAsset(visit, assignment, truckId, input) {
+  await assertBinCargoReady(visit);
   const asset=await binWorkflowAsset(assignment.assetId,true);
   if (String(asset.bin_type_id) !== String(visit.bin_type_id)) {throw binWorkflowError(409,"The physical bin type changed.");}
-  const legacy=await query("SELECT 1 FROM mbt_bin_asset_reservations WHERE asset_id=$1 AND released_at IS NULL",[asset.asset_id]);
-  if (legacy.rowCount) {throw binWorkflowError(409,"The bin is reserved by another issued or legacy visit.");}
-  const connected=await connectedAssetVisits(String(visit.service_visit_id),String(asset.asset_id));
-  const claims=await query("SELECT * FROM mbt_bin_workflow_claims WHERE asset_id=$1 AND released_at IS NULL FOR UPDATE",[asset.asset_id]);
-  if (claims.rows.some((/** @type {any} */ r)=>!connected.has(String(r.visit_id)))) {
-    throw binWorkflowError(409,"The bin is reserved by an unrelated order.");
+  const connected=await connectedBinVisits(String(visit.service_visit_id),String(asset.asset_id));
+  const source=visit.service_snapshot.binWorkflow.source;
+  if (visit.service_snapshot.binWorkflow.role==="delivery" && (!source?.planned || source.availabilityPredecessorId)) {
+    const available=await binAvailability(asset,{at:input.reservationStartAt || visit.scheduled_start_at,
+      until:input.reservationEndAt || visit.scheduled_end_at,truckId,exclude:connected});
+    const projected=availableBinSource(available);
+    await assertBinSourceMatches(source,projected);
+    await rememberProjectedSource(visit,source,projected);
+  } else {
+    const busy=await query(`SELECT visit_id FROM mbt_bin_asset_reservations WHERE asset_id=$1 AND released_at IS NULL
+      UNION SELECT visit_id FROM mbt_bin_workflow_claims WHERE asset_id=$1 AND released_at IS NULL`,[asset.asset_id]);
+    if (busy.rows.some((/** @type {any} */ r)=>!connected.includes(String(r.visit_id)))) {
+      throw binWorkflowError(409,"The bin is reserved by another order without a compatible planned return.");
+    }
   }
   await assertWorkflowCustody(visit,asset,truckId);
   const reservationId=crypto.randomUUID();
@@ -66,6 +90,7 @@ export async function reserveBinWorkflowAsset(visit, assignment, truckId, input)
 
 /** @param {any} visit @param {any} assignment */
 export async function validateBinWorkflowClaims(visit, assignment) {
+  await assertBinCargoReady(visit);
   const {rows}=await query(`SELECT c.*,a.tare_weight_kg,b.maximum_payload_kg FROM mbt_bin_workflow_claims c
     JOIN mbt_bin_assets a ON a.asset_id=c.asset_id JOIN mbt_bin_types b ON b.bin_type_id=a.bin_type_id
     WHERE c.visit_id=$1 AND c.released_at IS NULL FOR UPDATE OF c`,[visit.service_visit_id]);
@@ -75,9 +100,11 @@ export async function validateBinWorkflowClaims(visit, assignment) {
     throw binWorkflowError(409,"The BIN route reservation changed. Refresh before confirming.");
   }
   const asset=await binWorkflowAsset(String(rows[0].asset_id),true);
+  await assertBinAvailabilityDependencies([String(asset.asset_id)]);
   await assertWorkflowCustody(visit,asset,String(visit.planned_truck_id));
   return {requiredWeightLbs:(Number(rows[0].tare_weight_kg)+
-    (visit.service_snapshot.binWorkflow.role === "collection" ? Number(rows[0].maximum_payload_kg) : 0))*2.2046226218};
+    (visit.service_snapshot.binWorkflow.role === "collection" ? Number(rows[0].maximum_payload_kg) : 0))*2.2046226218
+    +(visit.service_snapshot.binWorkflow.role === "collection" ? 0 : Number(visit.service_snapshot.cargoPlan?.totalWeightLbs || 0))};
 }
 
 /** A load edit must move the logical claim with its visit without moving the bin.
@@ -108,13 +135,23 @@ async function plannedAction(visit, action, finish) {
   if (minute === null || minute === undefined) {throw binWorkflowError(409,"Set load times for the linked BIN steps.");}
   const at=(await query(`SELECT (($1::date+$2::int*interval '1 minute') AT TIME ZONE 'America/Toronto') AS at`,
     [plan.plan_date,minute])).rows[0].at;
-  return {at,planId:String(visit.dispatch_plan_id),truckId:String(visit.planned_truck_id),loadId:String(load.id),index};
+  return {at,timed:Boolean(stop.timing),planId:String(visit.dispatch_plan_id),truckId:String(visit.planned_truck_id),loadId:String(load.id),index};
 }
 
 /** @param {any} stop @param {any} load @param {boolean} finish */
 function actionMinute(stop,load,finish) {
   return (finish ? stop.timing?.depart : stop.timing?.arrival)
     ?? (finish ? load.plannedFinishMinute : load.plannedStartMinute);
+}
+
+/** The reused bin must be empty before loading cargo, even when its delivery is later.
+ * @param {any} visit @param {string} action */
+function dependentStartAction(visit,action) {
+  const snapshot=visit.service_snapshot;
+  if (action==="deliver_bin" && snapshot.binWorkflow?.source?.planned) {
+    return snapshot.mandatoryStops?.[0]?.actionCode || action;
+  }
+  return action;
 }
 
 /** @param {string} visitId @param {boolean} [requireReady] */
@@ -138,7 +175,7 @@ async function validateDependencyEdge(edge,visitId,requireReady) {
     const dependent=rows.find((/** @type {any} */ v)=>v.service_visit_id===edge.dependent_visit_id);
     const prerequisite=rows.find((/** @type {any} */ v)=>v.service_visit_id===edge.prerequisite_visit_id);
     if (dependent.status === "completed") {return;}
-    const to=await plannedAction(dependent,edge.dependent_action_code,false);
+    const to=await plannedAction(dependent,dependentStartAction(dependent,edge.dependent_action_code),false);
     const from=edge.status === "completed" ? {at:edge.completed_at}
       : await plannedAction(prerequisite,edge.prerequisite_action_code,true);
     const onward=prerequisite.service_snapshot.binWorkflow?.destination?.kind === "delivery";
@@ -154,15 +191,21 @@ async function validateDependencyEdge(edge,visitId,requireReady) {
 
 /** @param {any} edge @param {any} prerequisite @param {any} from @param {any} to */
 async function validateDependencyOrder(edge,prerequisite,from,to) {
-    const sameLoad=from.planId===to.planId && from.truckId===to.truckId && from.loadId===to.loadId;
-    if (sameLoad ? from.index >= to.index : new Date(from.at)>new Date(to.at)) {
-      throw binWorkflowError(409,`${edge.dependent_reference} must follow ${edge.prerequisite_reference}.`);
+    if (dependencyOutOfOrder(from,to)) {
+      throw binWorkflowError(409,`${edge.dependent_reference} must follow ${edge.prerequisite_reference}, after its prerequisite finishes.`);
     }
     if (edge.same_day) {await validateSameDayPlan(prerequisite,from,to);}
     if (edge.prerequisite_action_code!=="deliver_bin"
         && edge.dependent_asset===edge.prerequisite_asset && from.truckId && from.truckId!==to.truckId) {
       throw binWorkflowError(409,"Keep this connected bin on the same truck until a physical handoff is recorded.");
     }
+}
+
+/** @param {any} from @param {any} to */
+function dependencyOutOfOrder(from,to) {
+  const sameLoad=from.planId===to.planId && from.truckId===to.truckId && from.loadId===to.loadId;
+  if (sameLoad && from.index>=to.index) {return true;}
+  return (!sameLoad || (from.timed && to.timed)) && new Date(from.at)>new Date(to.at);
 }
 
 /** @param {any} prerequisite @param {any} from @param {any} to */

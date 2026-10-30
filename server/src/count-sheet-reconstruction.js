@@ -28,7 +28,7 @@ export async function reconstructCountSheetComparison({sheetId,expectedTitle,exp
     for(const count of items) {
       const balance=balances.find(row=>Number(row.item_id)===Number(count.item_id));
       await query(`UPDATE inventory_count_sheet_counts SET system_on_hand=$4,system_available=$5,
-        packed_qty=$6,actual_on_hand=$4::numeric-$6::numeric,variance=quantity-($4::numeric-$6::numeric),
+        packed_qty=$6,actual_on_hand=$4::numeric-$6::numeric,variance=quantity-($4::numeric-$6::numeric)+adjusting,
         inventory_synced_at=$7,packed_snapshot_at=clock_timestamp(),comparison_basis='reconstructed_current'
         WHERE sheet_id=$1 AND attempt=$2 AND item_id=$3`,
       [sheet.id,sheet.attempt,count.item_id,balance.quantity_on_hand,balance.quantity_available,packed.get(Number(count.item_id)).quantity,observedAt]);
@@ -37,7 +37,7 @@ export async function reconstructCountSheetComparison({sheetId,expectedTitle,exp
     await query(`INSERT INTO inventory_count_sheet_events(sheet_id,actor_id,action,attempt,details)
       VALUES($1,NULL,'comparison_reconstructed',$2,$3)`,[sheet.id,sheet.attempt,JSON.stringify({
       basis:'current_stock',observedAt,previousFingerprint:state.fingerprint,before:items,after:after.items,
-      packedSources:Object.fromEntries(packed),reason:'Requested reconstruction: actual on hand = on hand - packed; variance = counted - actual on hand.'
+      packedSources:Object.fromEntries(packed),reason:'Requested reconstruction: actual on hand = on hand - packed; variance = counted - actual on hand + adjusting.'
     })]);
     await query('UPDATE inventory_count_sheets SET revision=revision+1,updated_at=clock_timestamp() WHERE id=$1',[sheet.id]);
     return {...after,rollback};

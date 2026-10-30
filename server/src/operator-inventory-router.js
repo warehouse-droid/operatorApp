@@ -35,7 +35,7 @@ export function createCountSheetRouter({management=false,fetchCountSheetBalances
     if(!management && req.params.action==='refresh-inventory') {
       return res.json(await refreshCountSheetInventory(req.operator,req.params.id,{fetchBalances:fetchCountSheetBalances}));
     }
-    const actions=management?['edit','reset','cancel']:['take','line','submit'];
+    const actions=management?['edit','reset','reopen','adjust','cancel']:['take','line','submit'];
     if(!actions.includes(req.params.action)) {throw inventoryError('Invalid count-sheet action.');}
     res.json(await changeCountSheet(req.operator,req.params.id,req.params.action,req.body || {},{management}));
   }));

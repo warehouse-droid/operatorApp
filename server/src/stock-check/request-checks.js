@@ -1,22 +1,24 @@
 import {query,withTransaction} from '../db.js';
 import {config} from '../config.js';
-import {StockCheckError} from './domain.js';
+import {StockCheckError,validateQuantity} from './domain.js';
 import {isUnilock,lineFingerprint,matchLineProducts} from './line-matching.js';
 import {createOllamaMatcher} from './ollama-matching.js';
 import {stockCheckMaterial} from './line-description.js';
+import {requestCheckQuantity} from './request-quantity.js';
 
 const productChoice=product=>product?Object.fromEntries(['id','revision','sku','name','colour','size','pickupLocation','pickupNeedsReview'].map(key=>[key,product[key]])):null;
 
 async function requestLines(id,lock=false) {
   const request=await query('SELECT id FROM sales_stock_requests WHERE id=$1'+(lock?' FOR SHARE':''),[id]);
   if(!request.rows.length) {throw new StockCheckError('Stock request not found.',404);}
-  const {rows}=await query(`SELECT l.*,s.vendor_name AS case_vendor,s.workflow_kind,i.item_description AS inventory_description FROM sales_special_stock_lines l
+  const {rows}=await query(`SELECT l.*,s.vendor_name AS case_vendor,s.workflow_kind,i.item_description AS inventory_description,
+    i.stock_unit AS inventory_unit,i.to_plt AS inventory_to_plt FROM sales_special_stock_lines l
     JOIN sales_special_stock_cases s ON s.request_id=l.request_id
-    LEFT JOIN inventory_items i ON s.workflow_kind='backorder' AND i.item_id=l.regular_item_id WHERE l.request_id=$1 AND l.removed_at IS NULL
+    LEFT JOIN inventory_items i ON i.item_id=COALESCE(l.regular_item_id,l.resolved_item_id) WHERE l.request_id=$1 AND l.removed_at IS NULL
     AND s.workflow_kind IN ('special','backorder') ORDER BY l.line_number,l.id`+(lock?' FOR SHARE OF l,s':''),[id]);
   return rows.map(row=>({lineId:Number(row.id),vendorName:row.response_vendor_name||row.brand||row.case_vendor,
     ...stockCheckMaterial(row),color:row.color,size:row.size,
-    vendorReference:row.vendor_reference,quantity:Number(row.requested_quantity),uom:row.requested_uom}))
+    vendorReference:row.vendor_reference,...requestCheckQuantity(row)}))
     .filter(line=>isUnilock(line.vendorName)).map(line=>({...line,fingerprint:lineFingerprint(line)}));
 }
 function validateSelections(input,lines) {
@@ -27,7 +29,7 @@ function validateSelections(input,lines) {
     if(!line || seen.has(line.lineId) || !Number.isSafeInteger(selection.productId) || selection.productId<1) {throw new StockCheckError('Select an exact catalogue variant for each Unilock line.');}
     seen.add(line.lineId);
     if(selection.fingerprint!==line.fingerprint) {throw new StockCheckError('The request material changed. Refresh before checking stock.',409,'STOCK_CHECK_LINE_CHANGED');}
-    return {line,productId:selection.productId};
+    return {line,productId:selection.productId,quantity:validateQuantity(line.checkQuantity ?? selection.quantity)};
   });
 }
 export function createRequestStockChecks(repo,{matcher=createOllamaMatcher({settings:()=>config.ollama})}={}) {
@@ -81,16 +83,17 @@ export function createRequestStockChecks(repo,{matcher=createOllamaMatcher({sett
       const lines=await requestLines(id,true),selections=validateSelections(input,lines),vendor=await vendorId();
       await query('SELECT pg_advisory_xact_lock(19671123,$1)',[vendor]);
       const jobs=await latestJobs(id);
-      for(const {line,productId} of selections) {
+      for(const {line,productId,quantity} of selections) {
         const existing=jobs.find(job=>job.payload.requestLine.lineId===line.lineId &&
           job.payload.requestLine.fingerprint===line.fingerprint && ['queued','running'].includes(job.status));
         if(existing) {
-          if(existing.productId!==productId) {throw new StockCheckError('This line already has a check in progress for another variant. Wait for it to finish.',409);}
+          if(existing.productId!==productId || existing.payload.quantity!==quantity) {throw new StockCheckError('This line already has a check in progress for another variant or quantity. Wait for it to finish.',409);}
           continue;
         }
-        await repo.createJob(vendor,{kind:'stock_test',productId,quantity:1},actor,
+        await repo.createJob(vendor,{kind:'stock_test',productId,quantity},actor,
           {queueLimit:100,requestLine:{requestId:id,lineId:line.lineId,fingerprint:line.fingerprint,
-            description:[line.productName,line.color,line.size].filter(Boolean).join(' · '),quantity:line.quantity,uom:line.uom}});
+            description:[line.productName,line.color,line.size].filter(Boolean).join(' · '),quantity:line.quantity,uom:line.uom,
+            checkQuantity:quantity,checkUom:'PLT',quantitySource:line.checkQuantity===null?'manual':'request'}});
       }
     });
     return get(id);

@@ -109,18 +109,13 @@ try {
       baseRevision: plan.revision,
       sessionId: "fleet-status-harness"
     };
-    const savedPlan = await saveDispatchPlanSnapshot(plan.id, planPayload);
+    let savedPlan = await saveDispatchPlanSnapshot(plan.id, planPayload);
     await setDispatchDriverActive(targetDriver.id, false);
-    let disabledPlanError = null;
-    try {
-      await saveDispatchPlanSnapshot(plan.id, { ...planPayload, baseRevision: savedPlan.revision });
-    } catch (error) {
-      disabledPlanError = error;
-    }
-    assert(disabledPlanError?.code === "DISPATCH_DRIVER_DISABLED", "Plan repository accepted a disabled driver assignment.");
+    savedPlan = await saveDispatchPlanSnapshot(plan.id, { ...planPayload, baseRevision: savedPlan.revision });
+    assert(savedPlan.trucks[0].loads[0].driverLogin === targetDriver.login, "Inactive driver planning assignment was lost.");
     await setDispatchDriverActive(targetDriver.id, true);
     await setDispatchTruckActive(targetTruck.id, false);
-    disabledPlanError = null;
+    let disabledPlanError = null;
     try {
       await saveDispatchPlanSnapshot(plan.id, { ...planPayload, baseRevision: savedPlan.revision });
     } catch (error) {

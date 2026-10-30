@@ -1,5 +1,6 @@
 // @ts-check
 import {specialPurchaseOrderDispatchReady} from './special-stock-workflow.js';
+import {hasBackorderScmReply} from './backorder-review-policy.js';
 
 /** @typedef {Record<string,any>} RecordData */
 /** @type {Readonly<Record<string,string[]>>} */
@@ -10,6 +11,7 @@ export const REGULAR_STATUSES = Object.freeze({
 });
 /** @type {Readonly<Record<string,string[]>>} */
 export const REGULAR_OUTCOMES = Object.freeze({
+  yard_stock:['Stock available at destination yard','目的地货场库存充足'],
   rejected:['Rejected','已拒绝'], cancelled:['Cancelled','已取消'], closed_manually:['Closed manually','手动关闭'],
   received:['Stock received','已收货'], so_updated:['SO location updated','SO 地点已更新'],
   resolved_po:['Resolved with PO','已通过采购订单解决'], so_created:['SO created','SO 已建立'],
@@ -32,6 +34,7 @@ export const REGULAR_STATUS_DETAILS = Object.freeze({
   approval_expired:['Approval expired · Re-raise or close','批准已过期 · 请重新提交或关闭'],
   processing_failed:['Processing needs attention','处理需要关注'], print_failed:['Print needs attention','打印需要处理'],
   request_complete:['Request work completed','申请处理完成'], mixed:['Mixed outcomes','多种处理结果'],
+  so_fulfilled:['SO fulfilled','销售订单已履行'], so_loaded:['SO fully loaded','销售订单已全部装载'],
   ...REGULAR_OUTCOMES
 });
 const terminalStatuses = new Set(['closed','rejected','cancelled','received','fulfilled']);
@@ -40,9 +43,12 @@ const priority = ['pending_scm','pending_sales','in_progress','waiting_stock'];
 const state = (status,detail,outcome='') => ({status,detail,outcome});
 /** @param {RecordData} request */
 const isBackorder = request => request.workflowKind === 'backorder' || request.regular?.deliveryMethod === 'backorder';
+/** @param {RecordData} request */
+const hasBackorderSalesOrder = request => Boolean(request.salesOrderId || request.salesOrderRef || request.alreadyOrderedSalesOrderRef);
 
 /** @param {RecordData} request @param {RecordData} line */
 function lineTerminal(request,line) {
+  if ((line.status === 'closed' || line.salesDecision === 'closed') && line.yardStock) return state('completed','yard_stock','yard_stock');
   if (line.resolution || line.status === 'closed' && request.regular?.resolution) return state('completed','resolved_po','resolved_po');
   if (line.supplyStatus === 'already_ordered') return state('completed','already_ordered','already_ordered');
   if (line.status === 'received') return state('completed','received','received');
@@ -69,6 +75,7 @@ export function regularSupplyDispatchReady(request) {
 function backorderLineState(request,line) {
   if (request.informationRequest?.status === 'pending') return state('pending_sales','sales_reply');
   if (!line.supplyStatus || line.salesDecision === 'request_update') return state('pending_scm','review');
+  if (hasBackorderSalesOrder(request) && hasBackorderScmReply(line)) return state('in_progress','processing');
   if (line.salesDecision !== 'accepted') return state('pending_sales','sales_confirmation');
   if (!request.salesOrderId && !request.purchaseOrderId) return state('pending_sales','awaiting_so');
   if (!request.purchaseOrderId) return state('pending_scm','awaiting_po');
@@ -116,6 +123,21 @@ function requestState(request,states) {
     const outcome = states.length && states.every(s => s.outcome === 'rejected') ? 'rejected' : 'closed_manually';
     return state('closed',outcome,outcome);
   }
+  if (request.regular?.deliveryMethod === 'pickup' && request.regular.salesOrderProgress?.completed) return state('completed','so_fulfilled');
+  if (isBackorder(request) && request.linkedSalesOrderProgress?.completed) {
+    return state('completed',request.linkedSalesOrderProgress.source || 'request_complete');
+  }
+  if (isBackorder(request) && request.alreadyOrderedArrival?.status === 'arrived'
+    && states.some(s => s.outcome === 'already_ordered')
+    && states.every(s => ['completed','closed'].includes(s.status))) {
+    return state('completed','already_ordered','already_ordered');
+  }
+  if (isBackorder(request) && hasBackorderSalesOrder(request) && !request.operationallyComplete && states.some(s => s.status !== 'closed')) {
+    // An attached SO starts order processing even when the old case stage says
+    // Completed because its materials were marked Already Ordered.
+    const pending = states.find(s => s.status === 'pending_scm') || states.find(s => s.status === 'pending_sales');
+    return pending || state('in_progress','processing');
+  }
   if (isBackorder(request) && (request.operationallyComplete || request.stage === 'completed')) {
     const outcome = states.length && states.every(s => s.outcome === 'already_ordered') ? 'already_ordered' : '';
     return state('completed',outcome || 'request_complete',outcome);
@@ -127,7 +149,7 @@ function requestState(request,states) {
   if (states.length) {
     const completed = states.some(s => s.status === 'completed');
     const outcomes = [...new Set(states.map(s => s.outcome).filter(Boolean))];
-    return state(completed ? 'completed' : 'closed',outcomes.length === 1 ? outcomes[0] : 'mixed');
+    return state(completed ? 'completed' : 'closed',outcomes.length === 1 ? outcomes[0] || 'mixed' : 'mixed');
   }
   return request.status === 'completed' ? state('completed','request_complete') : state('pending_scm','review');
 }
@@ -159,7 +181,8 @@ export function regularStockStatusSummary(request,now=Date.now()) {
   });
   /** @type {ReturnType<typeof state>[]} */
   const states = request.regular?.deliveryMethod === 'waitlist' ? [waitlistState(request)]
-    : lines.map((/** @type {RecordData} */ line) => lineTerminal(request,line) || activeLineState(request,line));
+    : lines.map((/** @type {RecordData} */ line) => lineTerminal(request,line)
+      || (isBackorder(request) && request.linkedSalesOrderProgress?.completed ? state('completed','request_complete') : activeLineState(request,line)));
   const selected = requestState(request,states);
   const terminal = ['completed','closed'].includes(selected.status);
   const attention = terminal ? [] : attentionReasons(request);
@@ -169,10 +192,10 @@ export function regularStockStatusSummary(request,now=Date.now()) {
   const waitingReasons = terminal || regularSupplyDispatchReady(request) ? [] : Object.keys(REGULAR_WAITING_REASONS)
     .filter(reason => lines.some((/** @type {RecordData} */ line) => line.supplyStatus === reason && !terminalStatuses.has(line.status)
       && !['declined','closed'].includes(line.salesDecision) && !line.resolution));
-  if (selected.status !== 'closed' && ['arrival','arrived'].includes(request.alreadyOrderedArrival?.status)) waitingReasons.push(request.alreadyOrderedArrival.status);
+  if (selected.status !== 'closed' && !request.linkedSalesOrderProgress?.completed && ['arrival','arrived'].includes(request.alreadyOrderedArrival?.status)) waitingReasons.push(request.alreadyOrderedArrival.status);
   const counts = Object.fromEntries(Object.keys(REGULAR_STATUSES).map(status => [status,0]));
   if (request.regular?.deliveryMethod === 'waitlist') counts[selected.status] = 1;
-  else for (const row of states) counts[row.status]++;
+  else for (const row of states) counts[row.status] = (counts[row.status] || 0) + 1;
   const outcomes = [...new Set([selected.outcome,...states.map(s => s.outcome)].filter(Boolean))];
   return {status:selected.status,detail:selected.detail,outcome:selected.outcome || (outcomes.length === 1 ? outcomes[0] : null),
     outcomes,waitingReasons,needsAttention:attention.length > 0,attentionReasons:attention,counts};

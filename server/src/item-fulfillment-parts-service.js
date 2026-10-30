@@ -40,8 +40,8 @@ export function createLocationAwareIFAdapter({ adapter, repository }) {
     try {
       const result = await adapter.transform(target);
       remoteMayExist = true;
-      const record = result?.id ? await adapter.fetchById(target, Number(result.id))
-        : await adapter.findByExternalId(target, true);
+      const record = result?.record ?? (result?.id ? await adapter.fetchById(target, Number(result.id))
+        : await adapter.findByExternalId(target, true));
       if (!record) {throw uncertain('NetSuite returned no verifiable IF part.');}
       adapter.verify(target, record);
       await repository.complete(claimed, record);
@@ -127,7 +127,7 @@ export function createLocationAwareIFAdapter({ adapter, repository }) {
       try {
         const record = await resolvePlan(step, plan, true);
         if (!record) { throw uncertain('The IF parts could not be verified.'); }
-        return { id: record.id };
+        return { id: record.id, record };
       } catch (error) {
         // Keep the logical source claim until all parts are verified, even if
         // the current part was definitively rejected after another succeeded.

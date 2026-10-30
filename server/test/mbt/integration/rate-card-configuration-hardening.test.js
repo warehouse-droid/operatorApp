@@ -250,7 +250,7 @@ test("P3-F12 hardening: command authorization and optimistic inputs fail before 
   await inRollback(async () => {
     await assert.rejects(
       () => applyLocalRateCardDraft(command({
-        actor: { operatorId: "not-admin", roles: ["dispatcher"] },
+        actor: { operatorId: "not-admin", roles: ["operator"] },
         sourceKind: "manual",
         graph: graph()
       })),

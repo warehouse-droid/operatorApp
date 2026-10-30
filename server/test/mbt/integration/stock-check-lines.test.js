@@ -22,7 +22,7 @@ test.before(async()=>{
 test.after(()=>closeDb());
 async function fixture(count=2,vendorName='Unilock Ltd',kind='special') {
   if(kind==='backorder') {
-    return submitBackorderRequest({destinationLocationId:1,inquiryDate:'2099-01-01',vendorId:331,vendorName,fulfillmentMethod:'yard_pickup',
+    return submitBackorderRequest({customerName:'TEST Backorder Customer',destinationLocationId:1,inquiryDate:'2099-01-01',vendorId:331,vendorName,fulfillmentMethod:'yard_pickup',
       lines:Array.from({length:count},()=>({itemId:88997701,salesQty:25.5,quantityMode:'direct',rate:10,requiredDate:'2099-02-01',detailSpec:sample.sku}))},
     {operatorId:actor,authorizedDestinationLocationIds:[1]});
   }
@@ -30,7 +30,7 @@ async function fixture(count=2,vendorName='Unilock Ltd',kind='special') {
     lines:Array.from({length:count},()=>({productName:sample.name,color:sample.colour,size:sample.size,quantity:25.5,uom:'SQFT',rate:10,requiredDate:'2099-02-01'}))},
   {operatorId:actor,authorizedStoreLocationIds:[1]});
 }
-const selection=data=>({lines:data.lines.map(line=>({lineId:line.lineId,productId:product.id,fingerprint:line.fingerprint}))});
+const selection=data=>({lines:data.lines.map(line=>({lineId:line.lineId,productId:product.id,quantity:1,fingerprint:line.fingerprint}))});
 test('special and regular backorder lines match a unique complete variant and retain per-line jobs without editing requests',async()=>{
   for(const kind of ['special','backorder']) {
     const d=await fixture(2,'Unilock Ltd',kind);
@@ -85,7 +85,7 @@ test('regular Beacon Hill uses the saved description throughout matching, prompt
   const code='UNI-BH80S-RDM-FOS',description='Beacon Hill 80mm S Rdm Fossil 81.6sqft/plt, 11.66sqft/lyr, 7lyrs/plt';
   await query("INSERT INTO inventory_items(item_id,item_name,display_name,item_description,stock_unit,vendor,vendor_id) VALUES(88997703,$1,$1,$2,'SQFT','Unilock Ltd',331)",[code,description]);
   const material=await repo.upsertScrapedProduct(1,{sku:'0237M01818807-1',name:'Beacon Hill Smooth 8cm Fossil NS',colour:'FOSSIL',size:'Random',pickupLocation:'Ayr',url:'https://ontario.order.unilock.com/products/products/beacon-hill-smooth?child=0237M01818807-1'});
-  const d=await submitBackorderRequest({destinationLocationId:1,vendorId:331,vendorName:'Unilock Ltd',fulfillmentMethod:'yard_pickup',lines:[{itemId:88997703,salesQty:10,quantityMode:'direct'}]},
+  const d=await submitBackorderRequest({customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName:'Unilock Ltd',fulfillmentMethod:'yard_pickup',lines:[{itemId:88997703,salesQty:10,quantityMode:'direct'}]},
     {operatorId:actor,authorizedDestinationLocationIds:[1]});
   const before=(await query('SELECT * FROM sales_special_stock_lines WHERE request_id=$1',[d.id])).rows;
   const row=before[0],oldFingerprint=lineFingerprint({vendorName:row.brand,productName:row.product_name,color:row.color,size:row.size,
@@ -99,7 +99,7 @@ test('regular Beacon Hill uses the saved description throughout matching, prompt
   assert.equal(data.lines[0].stale,true);assert.equal(data.lines[0].job.id,old.id);assert.equal(data.lines[0].product,null);
   const matched=await service.match(d.id);assert.equal(matched.lines[0].product.id,material.id);assert.equal(prompts.length,1);assert.ok(prompts[0].includes(description));assert.equal(prompts[0].includes(code),false);
   assert.deepEqual((await query('SELECT * FROM sales_special_stock_lines WHERE request_id=$1',[d.id])).rows,before);
-  const saved=await service.start(d.id,{lines:[{lineId:data.lines[0].lineId,productId:material.id,fingerprint:data.lines[0].fingerprint}]},actor);
+  const saved=await service.start(d.id,{lines:[{lineId:data.lines[0].lineId,productId:material.id,quantity:1,fingerprint:data.lines[0].fingerprint}]},actor);
   assert.equal(saved.lines[0].job.payload.requestLine.description,description);
   await query("UPDATE scm_stock_check_jobs SET status='cancelled' WHERE id=$1",[saved.lines[0].job.id]);
   await query("UPDATE sales_special_stock_lines SET detail_spec=$2 WHERE request_id=$1",[d.id,description.replace('80mm','60mm')]);
@@ -109,7 +109,7 @@ test('regular Beacon Hill uses the saved description throughout matching, prompt
 test('regular lines with missing saved descriptions read the inventory description; missing descriptions never reach Ollama',async()=>{
   const code='UNI-FALLBACK-ONLY',description='Beacon Hill 80mm S Rdm Fossil';
   await query("INSERT INTO inventory_items(item_id,item_name,display_name,item_description,stock_unit,vendor,vendor_id) VALUES(88997704,$1,$1,$2,'SQFT','Unilock Ltd',331)",[code,description]);
-  const d=await submitBackorderRequest({destinationLocationId:1,vendorId:331,vendorName:'Unilock Ltd',fulfillmentMethod:'yard_pickup',lines:[{itemId:88997704,salesQty:1,quantityMode:'direct',detailSpec:''}]},
+  const d=await submitBackorderRequest({customerName:'TEST Backorder Customer',destinationLocationId:1,vendorId:331,vendorName:'Unilock Ltd',fulfillmentMethod:'yard_pickup',lines:[{itemId:88997704,salesQty:1,quantityMode:'direct',detailSpec:''}]},
     {operatorId:actor,authorizedDestinationLocationIds:[1]});
   const service=createRequestStockChecks(repo,{matcher:{match:async()=>{assert.fail('Missing descriptions must not be guessed from internal codes.');}}});
   const first=(await service.get(d.id)).lines[0];assert.equal(first.productName,description);

@@ -222,7 +222,10 @@ test('P1 split reasons survive direct CM posting without duplicate transform key
   assert.equal(result.stockReturn.netSuiteStage, 'credit_memo');
   assert.deepEqual(payload.item.items.map(line => line.custcol_atlas_rc_so.id), ['6', '7', '8', '10']);
   assert.ok(payload.item.items.every(line => line.orderLine === undefined));
-  assert.equal(new Set(payload.item.items.slice(0, 3).map(line => line.description)).size, 3);
+  assert.ok(payload.item.items.every(line => !Object.hasOwn(line, 'description')));
+  const admitted = (await query('SELECT intent_snapshot FROM return_batch_authorizations WHERE batch_id=$1', [result.stockReturn.batchId])).rows[0].intent_snapshot;
+  assert.deepEqual(admitted.lines.slice(0, 3).map(line => [line.sourceSalesOrderLineId, line.reasonId]),
+    [[99091703, 6], [99091703, 7], [99091703, 8]]);
 });
 
 test('Q1 direct CM pallet quantities reserve only until the CM is observed; stock source quota stays conserved', async t => {

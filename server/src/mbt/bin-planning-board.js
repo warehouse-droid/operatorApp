@@ -1,5 +1,6 @@
 // @ts-check
 import { binVisitGroups } from "./bin-planning-domain.js";
+import { linkedBinRoutes, expandLinkedBinLoads } from "./bin-linked-delivery-planning.js";
 import { planningError, readPlanningPlan, lockPlanningVisit, persistPlanningPlan, samePlanningValue } from "./bin-planning-repository.js";
 import { binBoardTravelFields, validateBinBoardStopTimings, validateBinBoardLaneOrder, saveBinBoardLaneOrder } from "./bin-planning-metadata.js";
 
@@ -149,6 +150,9 @@ export async function saveBinPlanningBoard(input, boundary, commands) {
   const before = await readPlanningPlan(input.planId);
   validateBinBoardLaneOrder(input.driverLaneOrder);
   const existing = validateBinBoard(before, input.loads);
+  const links=await linkedBinRoutes(input.loads.flatMap((/** @type {any} */ load)=>load.visits.map((/** @type {any} */ v)=>v.visitId)));
+  input={...input,loads:expandLinkedBinLoads(input.loads,links)};
+  validateBinBoard(before,input.loads);
   /** @type {Map<string, any>} */
   const desired = new Map(input.loads.map((/** @type {any} */ l) => [l.id, l]));
   const desiredVisits = input.loads.flatMap((/** @type {any} */ l) => l.visits)

@@ -13,7 +13,7 @@ before(async()=>{
  assert.equal(process.env.MBT_TEST_ISOLATED,'1');
  await query("INSERT INTO operators(id,username,display_name,password_hash,password_salt,role,roles,active) VALUES($1,$1,$1,'test','test','sales',ARRAY['sales'],true)",[actor]);
  await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,to_pcs,to_plt) VALUES($1,'DELIVERY-SIMPLE-MATERIAL','EA',1,100) ON CONFLICT DO NOTHING",[itemId]);
- for(const id of [1,28,15,26])await query("INSERT INTO inventory_balances(item_id,location_id,location,quantity_available,quantity_on_hand,synced_at) VALUES($1,$2,$3,100000000,100000000,now()) ON CONFLICT(item_id,location_id) DO UPDATE SET quantity_available=100000000,quantity_on_hand=100000000",[itemId,id,String(id)]);
+ for(const id of [1,28,15,26]){await query("INSERT INTO inventory_balances(item_id,location_id,location,quantity_available,quantity_on_hand,synced_at) VALUES($1,$2,$3,100000000,100000000,now()) ON CONFLICT(item_id,location_id) DO UPDATE SET quantity_available=100000000,quantity_on_hand=100000000",[itemId,id,String(id)]);}
 });
 after(closeDb);
 function fixture(from=1,to=28){
@@ -37,21 +37,21 @@ test('both automatic routes submit only three fields, issue a TO from SO quantit
  }
 });
 test('all routes involving 150 or 12441 require whole-request manual approval before transfer creation',async()=>{
- for(const from of [1,28,15,26])for(const to of [1,28,15,26]){
-  if(from===to||([1,28].includes(from)&&[1,28].includes(to)))continue;
+ for(const from of [1,28,15,26]){for(const to of [1,28,15,26]){
+  if(from===to||([1,28].includes(from)&&[1,28].includes(to))){continue;}
   const f=fixture(from,to),request=await submitDeliveryStockRequest(f.input,context,f.dependencies);
   assert.equal(request.regular.approval.automatic,false);assert.equal(request.lines[0].status,'submitted');assert.equal(request.transfers.length,0);assert.equal(f.calls.confirm,0);
   await assert.rejects(()=>retryDeliveryStockRequest(request.id,context,f.dependencies),{code:'REGULAR_APPROVAL_REQUIRED'});
   await assert.rejects(()=>linkRegularStockSalesOrder(request.id,{salesOrderRef:f.input.salesOrderRef},context,f.dependencies),{code:'REGULAR_APPROVAL_REQUIRED'});
   const approved=await decideDeliveryStockRequest(request.id,{decision:'stock',expectedRevision:request.revision,lineIds:request.lines.map(line=>line.id)},context,f.dependencies);
   assert.equal(approved.regular.handoffStatus,'complete');assert.equal(approved.manualDecisionEventId>0,true);assert.equal(f.calls.confirm,1);
- }
+ }}
 });
 test('access, same-yard, blank SO, wrong SO location and client quantities fail before writes',async()=>{
  const f=fixture();
  await assert.rejects(()=>submitDeliveryStockRequest({...f.input,destinationLocationId:26},{...context,authorizedDestinationLocationIds:[15]},f.dependencies),{status:403});
  assert.equal(f.calls.reads,0);
- for(const change of [{sourceLocationId:28},{salesOrderRef:''},{lines:[{itemId,salesQty:999}]}])await assert.rejects(()=>submitDeliveryStockRequest({...f.input,...change},context,f.dependencies));
+ for(const change of [{sourceLocationId:28},{salesOrderRef:''},{lines:[{itemId,salesQty:999}]}]){await assert.rejects(()=>submitDeliveryStockRequest({...f.input,...change},context,f.dependencies));}
  f.order.lines[0].locationId=1;await assert.rejects(()=>submitDeliveryStockRequest(f.input,context,f.dependencies),{code:'REGULAR_SO_MISMATCH'});assert.equal(f.calls.confirm,0);
 });
 test('rejection creates neither TO nor print, and cannot be bypassed by retry',async()=>{
@@ -120,7 +120,7 @@ test('SCM rejects stale revisions, partial or malformed selections and missing r
  const f=fixture(15),request=await submitDeliveryStockRequest(f.input,context,f.dependencies);
  const body={decision:'stock',expectedRevision:request.revision};
  await assert.rejects(()=>decideDeliveryStockRequest(request.id,{...body,expectedRevision:request.revision+1},context,f.dependencies),{code:'STOCK_REQUEST_REVISION_CONFLICT'});
- for(const lineIds of [[],[request.lines[0].id+1],'invalid'])await assert.rejects(()=>decideDeliveryStockRequest(request.id,{...body,lineIds},context,f.dependencies),{code:'REGULAR_DECISION_INVALID'});
+ for(const lineIds of [[],[request.lines[0].id+1],'invalid']){await assert.rejects(()=>decideDeliveryStockRequest(request.id,{...body,lineIds},context,f.dependencies),{code:'REGULAR_DECISION_INVALID'});}
  await assert.rejects(()=>decideDeliveryStockRequest(request.id,{...body,decision:'reject',reason:' '},context,f.dependencies),{code:'REGULAR_REASON_REQUIRED'});
  assert.equal((await getScmStockRequest(request.id)).regular.deliveryApproval,'pending');assert.equal(f.calls.confirm,0);
 });
@@ -147,12 +147,21 @@ test('whole backordered lines determine units and calculated PALLET, including r
  const plan=(await query('SELECT plan FROM regular_stock_handoffs WHERE request_id=$1',[request.id])).rows[0].plan;
  assert.deepEqual(plan.mappings.map(line=>[line.remoteLineId,line.quantity]),[[1,110],[3,40]]);
 });
-test('missing pallet conversion blocks instead of inventing a PALLET count',async()=>{
+test('missing pallet conversion uses Sales UOM and still requires SCM approval for manual routes',async()=>{
  const f=fixture(15);
  await query('UPDATE inventory_items SET to_plt=NULL WHERE item_id=$1',[itemId]);
- try{await assert.rejects(()=>submitDeliveryStockRequest(f.input,context,f.dependencies),{code:'REGULAR_DELIVERY_PALLET_CONVERSION'});}
+ try{
+  const pending=await submitDeliveryStockRequest(f.input,context,f.dependencies);
+  assert.equal(pending.regular.deliveryApproval,'pending');
+  assert.equal(pending.lines[0].salesQty,200);assert.equal(pending.lines[0].salesUom,'EA');
+  assert.equal(pending.regular.palletQuantity,0);assert.equal(f.calls.confirm,0);
+  const approved=await decideDeliveryStockRequest(pending.id,{decision:'stock',expectedRevision:pending.revision},context,f.dependencies);
+  assert.equal(approved.regular.handoffStatus,'complete',approved.regular.handoffError);
+  assert.equal(approved.transfers[0].palletQuantity,0);
+  assert.equal(approved.transfers[0].palletQuantityRequiresManual,false);
+  assert.equal(f.calls.confirm,1);
+ }
  finally{await query('UPDATE inventory_items SET to_plt=100 WHERE item_id=$1',[itemId]);}
- assert.equal(f.calls.confirm,0);
 });
 test('Target Yard must cover at least all backorders including repeated items',async()=>{
  const f=fixture();f.order.lines.push({...f.order.lines[0],remoteLineId:3,quantity:100,backorderedQuantity:1});

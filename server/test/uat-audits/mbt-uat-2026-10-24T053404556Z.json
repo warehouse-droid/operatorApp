@@ -1,0 +1,3049 @@
+{
+  "startedAt": "2026-10-24T05:34:04.556Z",
+  "finishedAt": "2026-10-24T05:45:02.576Z",
+  "exitCode": 1,
+  "sourceHashes": {
+    "src": "6269e726f2b1f5a2047f2ef1f2809b2e7a8d20d3c3b21b8796fa19e2e13f8234",
+    "public": "892442a12cf27207ba3465cb8e6bba761b8332a8d794d5ada77a346180a49b2f",
+    "migrations": "799bd4e6d99b9bfa64a82add14284a31d8a962dbf07213b019a079946f1291ff"
+  },
+  "sourceDrift": [],
+  "isolation": "Disposable Compose; fresh database per file; external integrations disabled",
+  "toolchain": {
+    "node": "v20.20.2",
+    "playwright": "1.62.1"
+  },
+  "tests": 846,
+  "pass": 843,
+  "fail": 3,
+  "cancelled": 0,
+  "skipped": 0,
+  "todo": 0,
+  "fileCount": 198,
+  "files": [
+    {
+      "file": "test/mbt/unit/asset-csv-import-hardening.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV hardening: missing values and incompatible opening states fail with row evidence",
+        "P3-F11 CSV hardening: byte forms, stream rejection, and source filenames remain exact"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/asset-csv-import.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV: template and exact rows normalize into safe typed asset evidence",
+        "asset CSV v2 contains only item identity and current address",
+        "P3-F11 CSV: hostile CSV and exact structural bounds fail closed",
+        "P3-F11 CSV: invalid booleans, decimals, timestamps, status, and locations fail closed",
+        "P3-F11 CSV: duplicate asset, QR, and barcode identities are rejected before staging"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-availability.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "projected bin: draft return makes a customer bin available at its planned yard and time",
+        "projected bin: an overlapping or too-early pickup remains unavailable",
+        "projected bin: exact return boundary is available, but a later reservation must not overlap",
+        "projected bin: unplanned/unknown release blocks and incompatible projected truck blocks",
+        "projected bin: unrelated future customer placement blocks until a later planned collection returns",
+        "projected bin: inputs are immutable and permutation does not change chronology",
+        "projected bin: selection may use a later return within the planning window, exact assignment still rejects early pickup",
+        "projected bin: unusable physical asset and overlapping saved work stay unavailable after projected return"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-cargo-domain.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cargo: purchased Gravel uses order identity/weight and the selected yard",
+        "cargo: multiple different Front Desk materials remain together in one bin",
+        "cargo: materials require pickup and purchased materials cannot be removed or mixed",
+        "cargo: manual materials may use different pickups and separate drops",
+        "cargo: exactly one custom order, existing or one-off, excludes materials",
+        "cargo: hostile and unbounded inputs fail closed",
+        "cargo: return pickups follow dumping and keep the physical bin actions"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-dispatch-confirm-wiring.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.11 HTTP wiring authorizes the live Dispatcher pilot before the dedicated BIN confirmation service"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-dispatch-multiline-isolation.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "multi-bin Dispatch evaluates the current leg independently for each physical service line",
+        "multi-bin cards and durable assignment snapshots retain service-line identity",
+        "contract timeline derives current/future relation per service line rather than across sibling bins"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-order-workflow-domain.test.js",
+      "tests": 9,
+      "pass": 9,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "BIN references use the approved rental, exchange and physical-action suffixes",
+        "same-bin collection-first uses a completed dump dependency and one shared destination delivery",
+        "different-bin collection-first unlocks delivery after pickup while retaining disposal and return",
+        "delivery-first allows collection days later and preserves the old asset",
+        "collection supplies the receiving rental's Delivery reference without a duplicate return",
+        "workflow rejects an incompatible reuse destination, missing dump, undefined source and same-bin delivery-first",
+        "collection-first compares local calendar dates and rejects overnight replacement plans",
+        "execution dependency rejects missing evidence and reports rather than loses a late real completion",
+        "a different-size exchange requires a different bin and delivery before collection"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-order-workflow-offline-shell.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "BIN driver upgrade installs the current driver bundle into a fresh offline shell"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-planning-domain.test.js",
+      "tests": 11,
+      "pass": 11,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "ordinary Dispatch edits remain available with an unchanged BIN assignment",
+        "malformed or split routes cannot bypass whole-visit sequencing or physical capacity",
+        "derived Dispatch stop timing is discarded while the authoritative BIN snapshot stays exact",
+        "BIN deletion, insertion, stop edits, driver/truck/time changes are protected",
+        "derived summary changes and unrelated truck ordering do not block Dispatch",
+        "hydrating a driver's display name does not change the BIN assignment",
+        "drag sequencing places a whole visit before another visit",
+        "sequencing moves one complete visit without reversing or splitting stops",
+        "one slot carries sequential complete visits without summing the day's bins",
+        "peak occupancy remains enforced while excess truck weight produces an advisory",
+        "dumping reduces payload weight while the empty bin still occupies a slot"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-planning-empty-drafts.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "confirmation skips unassigned BIN drafts but still protects timed reservations and return loads"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-planning-metadata.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "route metadata retains valid estimates and rejects malformed durations and geometry",
+        "approach, lane order, starting yards and stop sequences are bounded"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-planning-readonly-ui.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "read-only ownership follows load kind for both planners, including returns and canonical BIN stops",
+        "read-only truck-switch timing stays on the saved schedule while another planner has a draft",
+        "BIN planning uses saved Dispatch finishes instead of creating an Aurther Load 2/3 overlap",
+        "BIN planning still detects an editable BIN load overlapping the next saved Dispatch load",
+        "legacy read-only loads without a saved finish retain calculated timing",
+        "shared mutation entry points refuse read-only loads even outside their disabled card controls"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-planning-validation.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "date, role and whole-day validation reject missing or malformed planning data"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-selection-labels.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "driver stop identifies only the bin involved in its physical action",
+        "Dispatch renders a historical stop's read-only labels without exposing its opaque order ID"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-transport-domain.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "MBR/Agg sources: SOR sales, rentals and returns share BIN/flatbed; loose aggregate and Front Desk aggregate are BIN-only",
+        "transport quantities: exact fractional allocation retains original line identities and remaining quantities",
+        "transport quantities: duplicate, negative, malformed, unknown, excessive and over-allocated quantities reject",
+        "transport weight: prorated normalized line weights, missing-weight prompt and payload capacity",
+        "transport weight: missing machine weight still requires the known material weight to fit"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/bin-transport-source-lines.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport source quantities contain physical sales and rental cargo, excluding delivery fees and financial lines"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/customer-charge-admin-configuration-ui.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "item settings and rate cards replace the duplicate hard-coded customer-charge sheet",
+        "the normal rate-card editor owns per-yard aggregate and per-bin dump prices"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/customer-charge-calculator-boundaries.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "customer-charge calculator rejects every malformed money, bin, and payment boundary",
+        "customer-charge calculator rejects malformed aggregate and distance-band evidence",
+        "customer-charge calculator covers zero-line defaults and every safe-cent overflow seam"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/customer-charge-frontdesk-ui-contract.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Front Desk customer-charge form exposes the supported request inputs and no per-tonne estimate",
+        "Front Desk reads status before configuration and displays the server gate reason",
+        "Front Desk explains payment-specific HST and previews all three customer totals",
+        "priced add-bin and exchange actions replace direct charged exchange submission",
+        "each active Front Desk rate-card version is independently selectable"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/customer-charge-request-service-boundaries.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "customer-charge service validates actors, command identities, and revision envelopes before database work",
+        "customer-charge configuration rejects partial, duplicate, unsafe, and non-contiguous price sheets",
+        "customer-charge preview rejects malformed subjects and required customer-facing text before pricing"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-bin-accessible-assignment.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "MBT Dispatch keeps drag assignment and adds an accessible exact-load assignment path",
+        "accessible assignment presents the plan-date truck and load identity and reuses atomic assignment",
+        "target choices retain and enforce both projected and canonical BIN truck capabilities",
+        "accessible assignment is disabled until both an exact asset and target load are selected"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-bin-capability-discovery.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3 compatibility: Dispatch capability discovery applies the specific environment and caller pilot gates"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-bin-disabled-ui.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3 compatibility: closed BIN gates preserve the established Dispatch order pool and make no BIN feed request",
+        "Dispatch renders independently without requesting MBT capability or pool data"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-bin-safety.test.js",
+      "tests": 10,
+      "pass": 10,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "F14: BIN identity is explicit and cannot be hidden by changing only its type",
+        "F14: the reserved BIN snapshot round-trips without losing stable stop or evidence identity",
+        "F01/F14: disabled BIN save, restore, and confirmation fail with one stable error",
+        "F14/F15: a BIN order is never eligible for Driver materialization in Phase 1",
+        "F14/F15: an empty multi-driver projection cannot bypass the Driver BIN guard",
+        "F14/F15: a nested truck stop cannot hide BIN identity from save or Driver guards",
+        "F14 hardening: nested, duplicate, cyclic, and malformed order shapes cannot hide BIN identity",
+        "F14 hardening: snapshot and capability boundaries fail closed without blocking ordinary plans",
+        "F14 non-regression: deeply nested ordinary plans are scanned without call-stack failure",
+        "F14 non-regression: a representative large ordinary plan scan stays bounded"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-bin-settings-contract.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F10 Dispatch Trucks UI explicitly edits Flatbed/Bin capabilities on the shared fleet",
+        "P3-F10 typed capability command is a new guarded Dispatch setup seam"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dispatch-management-permissions.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Dispatch management: Admin and Dispatcher share asset and rate lifecycle routes; other roles cannot forge access"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/driver-bin-authorization.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18: every projected BIN job requires exact active driver/date/truck/contract/visit pilot scope",
+        "P3-F18: ordinary jobs need no BIN pilot scope and cannot make an unrelated BIN scope sufficient"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/driver-bin-offline-application.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19: ordinary offline events remain outside the dedicated BIN application boundary",
+        "P3-F19: issued-manifest starts and completions call only their dedicated operation and replay result",
+        "P3-F19: unsupported BIN schema or event types fail closed before generic Driver side effects"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/driver-bin-offline-contract.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18: BIN Driver projection is explicit opt-in and keeps complete mandatory stops",
+        "P3-F18/P3-F19: manifest sanitization retains the complete frozen BIN snapshot",
+        "P3-F18/P3-F21: offline completion sanitization retains strict scan, photo, note, signature, and receipt evidence",
+        "P3-F18/P3-F21: unknown BIN evidence fields fail closed at the offline boundary",
+        "P3-F19: operational asset-state progress keeps later frozen BIN job identities stable",
+        "P3-F19: a client-version deployment cannot weaken or silently rewrite a frozen fingerprint",
+        "BIN readable references survive offline sanitization without changing issued execution fingerprints"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/driver-bin-pwa-contract.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18: the browser recognizes only the versioned frozen BIN job contract",
+        "P3-F18/P3-F19: requirement slots remain code-mapped and exchange roles never collapse",
+        "P3-F18/P3-F22: completion builds exact scan, photo, note, and signature details",
+        "P3-F21: a dump completion retains frozen IDs, precise quantities, integer cents, and receipt photo",
+        "P3-F19/P3-F20: draft keys isolate driver, manifest, and job while normalization ignores unknown data",
+        "P3-F18/P3-F22 static seam: Driver loads BIN UI offline and starts BIN jobs only through the local event ledger"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dump-site-code.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "dump-site codes: numeric yard codes and hyphenated identities are accepted",
+        "dump-site codes: rejected identities explain the code requirement",
+        "dump-site hours: backwards intervals explain the opening-hours problem",
+        "dump-site code property: accepted identities normalize and round-trip without losing characters"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/dump-site-hours-and-bin-estimate.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "dump-site input retains multiple dump items and canonical weekly opening hours",
+        "dump-site input rejects duplicate acceptances, duplicate weekdays, and backwards hours",
+        "Front Desk expands one shared contract site into individual bins with one dump item each",
+        "Front Desk rejects quantity expansion, missing dump evidence, and multiple sites",
+        "Front Desk accepts explicit manual surcharge cents and rejects duplicate surcharge items",
+        "estimated dump charge uses integer kilograms, nearest-cent rounding, and the configured minimum",
+        "Front Desk pricing origin defaults to standard and accepts only the two quoted tables",
+        "schema retains legacy dump evidence while the customer-charge browser uses fixed prices"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/frontdesk-multibin-contract.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "MBT Front Desk multi-bin: each requested row is one independently addressable physical bin",
+        "MBT Front Desk BIN order: one inline contract site is retained by every physical bin",
+        "MBT Front Desk persistence seams and the fixed-price accessible contract shell are declared"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/frontdesk-pricing-adapter.test.js",
+      "tests": 4,
+      "pass": 3,
+      "fail": 1,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "server pricing resolves and hashes a toll-free Google route without retaining the API key",
+        "server pricing also accepts explicit origin and destination addresses for local MBBS calculation",
+        "server pricing fails closed without route authority and exposes the Ontario HST policy",
+        "the production MBT router is wired to the server-owned pricing adapter",
+        "failing tests:",
+        "the production MBT router is wired to the server-owned pricing adapter"
+      ],
+      "failure": "\u2716 failing tests:\n\ntest at test/mbt/unit/frontdesk-pricing-adapter.test.js:93:1\n\u2716 the production MBT router is wired to the server-owned pricing adapter (9.593781ms)\n  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /createMbtRouter\\(\\{\\s*frontdeskPricing:\\s*createFrontdeskPricingAdapter\\(\\{\\s*routeEstimator:/u. Input:\n  \n  'import {filterOrdinaryTransportOrders,assertTransportOrderOwnership} from \"./mbt/bin-transport-ownership.js\";\\n' +\n    'import { createSharedJsonRead } from \"./shared-json-read.js\";\\n' +\n    \"import { aggregateReconciliationNightlyTick } from './aggregate-reconciliation-service.js';\\n\" +\n    'import {traceDriverCompletion} from \"./driver-completion-trace.js\";\\n' +\n    \"import {mountStockRequestConversationRoutes} from './stock-request-conversation-router.js';\\n\" +\n    'import { previewOperatorOrderReopen, reopenOperatorOrder, searchOperatorReopenOrders } from \"./operator-order-reopen-repository.js\";\\n' +\n    \"import { createCustomerWebhookRouter } from './netsuite-customer-webhook-router.js';\\n\" +\n    \"import { createPasswordResetRouter } from './password-reset-router.js';\\n\" +\n    \"import { listTransferPostingJobs } from './transfer-order-posting-repository.js';\\n\" +\n    \"import { retryTransferPostingJob } from './transfer-order-posting-service.js';\\n\" +\n    \"import { dispatchDependencyOrderRefs } from './yard-dependency-structure.js';\\n\" +\n    \"import { createBossRepository } from './boss-approval-repository.js';\\n\" +\n    \"import { createBossApprovalService } from './boss-approval-service.js';\\n\" +\n    \"import { createBossApprovalRuntime } from './boss-approval-runtime.js';\\n\" +\n    \"import { createBossApprovalRouter,createBossApprovalAdminRouter } from './boss-approval-router.js';\\n\" +\n    \"import { createBossMailer } from './boss-approval-mail.js';\\n\" +\n    \"import { createBossApprovalNetSuite } from './netsuite.js';\\n\" +\n    'import { saveSmartScmProposalLineOrder } from \"./smart-scm-line-order-repository.js\";\\n' +\n    \"import {enqueueDeliveryOperation,getDeliveryOperation,activeDeliveryOperation,createDeliveryOperationRuntime} from './regular-stock-delivery-operations.js';\\n\" +\n    \"import {submitRegularStockRequest,editRegularStockRequest,decideRegularStockRequest,refreshRegularStockEvidence,regularStockAlerts,acknowledgeRegularStockDecisions,reraiseRegularStockRequest} from './regular-stock-request-service.js';\\n\" +\n    \"import {closeExpiredRegularStockRequest} from './regular-stock-expiry.js';\\n\" +\n    \"import {mountBackorderRoutes} from './backorder-request-routes.js';\\n\" +\n    \"import {resolveRegularStockRequest} from './regular-stock-resolution.js';\\n\" +\n    \"import {replyRegularStockRequest} from './regular-stock-replies.js';\\n\" +\n    \"import {assertRegularStockingDestinationAccess} from './regular-stock-stocking-access.js';\\n\" +\n    \"import {submitDeliveryStockRequest,retryDeliveryStockRequest,previewDeliveryStockRequest} from './regular-stock-delivery.js';\\n\" +\n    \"import {previewPickupStockTransfers,convertPickupStockTransfers} from './regular-stock-pickup.js';\\n\" +\n    \"import {linkRegularStockSalesOrder,previewRegularStockSalesOrder} from './regular-stock-handoff.js';\\n\" +\n    \"import {releaseRegularReplenishment} from './regular-stock-replenishment.js';\\n\" +\n    \"import {addPurchaseStockProposals,releasePurchaseStockDemand} from './regular-stock-purchase-service.js';\\n\" +\n    \"import { createSpecialExpiryRuntime } from './special-stock-expiry.js';\\n\" +\n    \"import { createDeliveryRequestService, prioritizeDeliveryOrders } from './delivery-request-repository.js';\\n\" +\n    \"import { createDeliveryRequestRouter } from './delivery-request-router.js';\\n\" +\n    \"import { createDeliveryRequestExpiryRuntime } from './delivery-request-expiry.js';\\n\" +\n    \"import { createMenuOrderRouter } from './menu-order-router.js';\\n\" +\n    \"import {mountWaitlistRoutes} from './regular-waitlist-router.js';\\n\" +\n    \"import {createWaitlistRuntime} from './regular-waitlist-service.js';\\n\" +\n    \"import { specialSalesReps } from './special-stock-sales-reps.js';\\n\" +\n    \"import { operatorNetSuitePriority } from './operator-netsuite-priority-middleware.js';\\n\" +\n    \"import { createSpecialQuoteService, createSpecialOrderDocumentService } from './special-stock-documents.js';\\n\" +\n    \"import { getSpecialStockAlertCounts, getSpecialSalesAlertCounts } from './special-stock-alerts.js';\\n\" +\n    \"import { listSpecialPoReferenceAlerts, acknowledgeSpecialPoReferenceAlert } from './special-po-reference-alerts.js';\\n\" +\n    \"import { listSpecialDeliveryMethodAlerts, acknowledgeSpecialDeliveryMethodAlert } from './special-delivery-method-alerts.js';\\n\" +\n    \"import { filterSorPlanningOrders } from './sor-feature-gate.js';\\n\" +\n    'import { createCountSheetRouter, createInventoryDamageRouter } from \"./operator-inventory-router.js\";\\n' +\n    'import { damagePostingTick } from \"./inventory-damage-service.js\";\\n' +\n    'import { createControlDamageRouter } from \"./control-damage-router.js\";\\n' +\n    'import { damageAdjustmentTick } from \"./control-damage-service.js\";\\n' +\n    'import { assertDamagePhotoAccess } from \"./inventory-damage-repository.js\";\\n' +\n    'import { createAggregateRequestAccessRouter } from \"./aggregate-request-access-router.js\";\\n' +\n    'import { outboundYardLocationId } from \"./outbound-location-domain.js\";\\n' +\n    \"import { scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';\\n\" +\n    'import { createOperatorPreferencesRouter } from \"./operator-preferences-router.js\";\\n' +\n    'import { createOperatorPhonePolicyRouter } from \"./operator-phone-policy-router.js\";\\n' +\n    'import { createAggregateRequestRouter } from \"./aggregate-request-router.js\";\\n' +\n    'import { hasUnappliedDispatchPlanMaintenance, pendingDispatchPlanMaintenance } from \"./dispatch-plan-maintenance-queue.js\";\\n' +\n    'import { configureDispatchMaintenanceEvents, drainDispatchPlanMaintenance } from \"./dispatch-plan-maintenance.js\";\\n' +\n    'import { listFulfilledTransferStates, fulfilledTransferPlanningRefs } from \"./dispatch-fulfilled-to-repository.js\";\\n' +\n    'import { annotateFulfilledTransferOrders } from \"./dispatch-fulfilled-to-policy.js\";\\n' +\n    'import { listFulfilledSalesDeliveryStates, overlayFulfilledSalesDeliveryPlanning, assertSalesDeliveryPlanningAllowed, fulfilledSalesDeliveryPlanningRefs } from \"./dispatch-fulfilled-so-repository.js\";\\n' +\n    'import { fulfilledSalesOrderState } from \"./dispatch-fulfilled-so-policy.js\";\\n' +\n    'import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadYard, assertOperatorOrderPhotoYard } from \"./operator-yard-authorization.js\";\\n' +\n    'import { configureConsolidationLoadEvents, listConsolidationLoadOrders, createConsolidationLoadPreview, getConsolidatedLoad, listPendingConsolidatedLoads } from \"./consolidation-load-repository.js\";\\n' +\n    'import { submitConsolidatedLoad, resumeConsolidatedLoad } from \"./consolidation-load-service.js\";\\n' +\n    'import { assertOperatorYard, operatorYardLocationIds } from \"./operator-yard-access.js\";\\n' +\n    'import express from \"express\";\\n' +\n    'import { createFieldSalesRuntime } from \"./field-sales/runtime.js\";\\n' +\n    'import { createMbrRuntime } from \"./mbr/runtime.js\";\\n' +\n    'import { createStockCheckRuntime } from \"./stock-check/runtime.js\";\\n' +\n    'import { isMbrOnly, staffPathAllowed } from \"../public/mbr/domain.js\";\\n' +\n    'import { decorateSorOrders } from \"./sor-rental-repository.js\";\\n' +\n    'import { resolveSorSignature, assertSorSignaturePhotoAccess } from \"./sor-signature-evidence.js\";\\n' +\n    'import { sorAdminRouter } from \"./sor-rental-routes.js\";\\n' +\n    'import { runSorReturnQueue } from \"./sor-rental-service.js\";\\n' +\n    'import { SALES_ORDER_SYNC_LOCATIONS, withVoyageDispatchYard } from \"./dispatch-sales-order-locations.js\";\\n' +\n    'import { completeScmVendorOrder } from \"./scm-vendor-completion.js\";\\n' +\n    'import crypto from \"node:crypto\";\\n' +\n    'import fs from \"node:fs/promises\";\\n' +\n    'import path from \"node:path\";\\n' +\n    'import { isIP } from \"node:net\";\\n' +\n    'import { Readable } from \"node:stream\";\\n' +\n    'import { pipeline } from \"node:stream/promises\";\\n' +\n    'import { fileURLToPath, pathToFileURL } from \"node:url\";\\n' +\n    'import { config, isNetSuiteSandboxEnvironment, listEnvFiles, selectEnvFile } from \"./config.js\";\\n' +\n    'import {\\n' +\n    '  authorizeGoogleBrowserMap,\\n' +\n    '  googleMapsGateway,\\n' +\n    '  googleMapsUsageRepository\\n' +\n    '} from \"./google-maps-service.js\";\\n' +\n    'import { readNetSuiteOrderLine } from \"./netsuite-order-line.js\";\\n' +\n    'import { netSuiteOrderWebhookLineFinancials } from \"./netsuite-order-webhook-financials.js\";\\n' +\n    'import { binStopLabels } from \"./mbt/bin-stop-labels.js\";\\n' +\n    'import { createMbtRouter } from \"./mbt/router.js\";\\n' +\n    'import { createFrontdeskPricingAdapter } from \"./mbt/frontdesk-pricing-adapter.js\";\\n' +\n    'import { confirmMbtBinDispatchPlan } from \"./mbt/bin-dispatch-service.js\";\\n' +\n    'import { pendingPlanningReturns, publishPlanningAssignments } from \"./mbt/bin-planning-assignments.js\";\\n' +\n    'import { binDispatchOrders } from \"./mbt/dispatch-bin-safety.js\";\\n' +\n    'import { authorizeMbtPhase3Capability } from \"./mbt/phase3-authorization.js\";\\n' +\n    'import { afterTransactionCommit, beginRollbackContext, pool, query, withTransaction } from \"./db.js\";\\n' +\n    'import { fetchSalesOrderReferenceFromNetSuite, fetchTransactionReferenceByTranidFromNetSuite } from \"./netsuite.js\";\\n' +\n    'import { fetchTransactionStatusesFromNetSuite } from \"./netsuite.js\";\\n' +\n    'import {\\n' +\n    '  activateNetSuiteM2m,\\n' +\n    '  getNetSuiteM2mPublicCertificate,\\n' +\n    '  getNetSuiteM2mStatus,\\n' +\n    '  reactivateNetSuiteM2m,\\n' +\n    '  stageNetSuiteM2mCertificate,\\n' +\n    '  useNetSuiteAuthorizationCodeFallback\\n' +\n    '} from \"./netsuite-m2m-runtime.js\";\\n' +\n    'import { reconcilePendingApp"
+    },
+    {
+      "file": "test/mbt/unit/item-charge-basis-contract.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "aggregate is a real local item with a fixed per-yard basis and dispatch density",
+        "dump items can be created and edited as either per-tonne or fixed per-bin",
+        "invalid item/basis/density combinations fail closed"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/mbt-bin-cancellation.test.js",
+      "tests": 6,
+      "pass": 5,
+      "fail": 1,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "approved -110000-cent adjustment changes the active customer total to 55000",
+        "approved 0-cent adjustment changes the active customer total to 165000",
+        "approved 10000-cent adjustment changes the active customer total to 175000",
+        "an adjustment cannot make the active total negative",
+        "signed adjustments conserve the active total or reject a negative result across 200 generated amounts",
+        "active physical-bin cards omit cancelled bins and retain the other bins",
+        "failing tests:",
+        "active physical-bin cards omit cancelled bins and retain the other bins"
+      ],
+      "failure": "\u2716 failing tests:\n\ntest at test/mbt/unit/mbt-bin-cancellation.test.js:64:1\n\u2716 active physical-bin cards omit cancelled bins and retain the other bins (25.532871ms)\n  ReferenceError [Error]: deliveryCanChange is not defined\n      at Object.renderContract (evalmachine.<anonymous>:35:7)\n      at TestContext.<anonymous> (file:///app/test/mbt/unit/mbt-bin-cancellation.test.js:75:7)\n      at Test.runInAsyncScope (node:async_hooks:206:9)\n      at Test.run (node:internal/test_runner/test:796:25)\n      at Test.processPendingSubtests (node:internal/test_runner/test:526:18)\n      at Test.postRun (node:internal/test_runner/test:889:19)\n      at Test.run (node:internal/test_runner/test:835:12)\n      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7)\n\n"
+    },
+    {
+      "file": "test/mbt/unit/multibin-billing-isolation.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "multi-bin billing resolves bin size, pricing, and rental dates from the bound service line"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/pure-contracts.test.js",
+      "tests": 16,
+      "pass": 16,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "F04 canonical JSON recursively sorts object keys, preserves array order, and does not mutate input",
+        "F04 canonical SHA-256 is lowercase, fixed-width, and based on canonical bytes",
+        "F04 canonical JSON rejects values that cannot arrive in a JSON request",
+        "F01 capability evaluation fails closed at the global, database, and NetSuite-write gates",
+        "F01 capability denial precedence is deterministic and exposes no configuration value",
+        "F03/F04 typed MBT errors produce the exact public error envelope",
+        "F05 unexpected failures are redacted by the public error envelope",
+        "F04 idempotency hashes canonical payloads and recognizes exact retries",
+        "F04 reusing an idempotency key for a different payload raises the exact conflict",
+        "F09 valid rate bands begin at zero, are contiguous, and end with one open band",
+        "F09 rate validation reports stable issue codes and messages",
+        "F09 exact raw-metre boundaries select [minimum, maximum) bands",
+        "2026 tariff boundaries keep the exact upper kilometre in the quoted band",
+        "F09 rate selection rejects rounded, negative, or otherwise invalid distances",
+        "F09 hardening: malformed boundaries report every applicable structural issue",
+        "F09 hardening: invalid band sets fail selection with their structured evidence"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-csv-import-hardening.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV hardening: binary inputs and independently defaulted downward limits stay canonical",
+        "P3-F12 CSV hardening: malformed envelopes and unsafe limit overrides fail before parsing",
+        "P3-F12 CSV hardening: blank, minimum, lexical, and finite scalar branches fail exactly"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-csv-import.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV: all five exact files aggregate into the canonical typed graph",
+        "P3-F12 CSV: missing, extra, misnamed, malformed, or unbounded bundles fail closed",
+        "P3-F12 CSV: row counts and exact scalar types fail before a preview can persist"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-csv-page-contract.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV browser: five-file preview has optional context/apply controls and starts locked",
+        "P3-F12 CSV browser: preview reads all file content and renders server-normalized evidence",
+        "P3-F12 CSV browser: apply sends only preview identities, refreshes lifecycle, and can recover"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-csv-page-hardening.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV UI hardening: each preview unlocks only its own apply control"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-item-ownership.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "a new item-owned rate graph retains its single item identity",
+        "one named rate card can contain pricing rows for multiple local items",
+        "distance rows accept explicit yard scope, quoted boundary rule, and per-km pricing"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-page-contract.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 browser contract: Rate Cards is an accessible local draft lifecycle surface",
+        "P3-F12/P4 browser contract: manual setup uses business units while retaining advanced CSV",
+        "P3-F12 browser contract: the client is no-store, local-only, and preserves active editor focus",
+        "P3-F12 browser contract: version activation performs an explicit cutover and names shared card state"
+      ]
+    },
+    {
+      "file": "test/mbt/unit/rate-card-version-cutover-contract.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "used rate versions permit only the audited active-to-retired transition",
+        "activation uses one transaction timestamp and exact replacement identity"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/aggregate-routing-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Aggregate Routing browser: Admin searches stable catalog ID, previews orders and changes routing; Dispatcher sees rate cards only"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/aggregate-routing.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Aggregate Routing: seeded loose material IDs, searchable imported catalog and Admin-only optimistic changes"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/asset-csv-import-hardening.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV service hardening: malformed actors, command identities, and empty files fail before staging",
+        "P3-F11 CSV service hardening: every supported opening location resolves through active shared references",
+        "P3-F11 CSV service hardening: invalid customer/truck references and tampered preview evidence fail closed"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/asset-csv-import-http.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV HTTP: template is authenticated Admin/asset-gated, no-store, and downloadable",
+        "P3-F11 CSV HTTP: preview authorizes before raw parsing and binds exact bytes to the server actor",
+        "P3-F11 CSV HTTP: apply requires Admin, gate, idempotency, preview identities, and no-store replay evidence"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/asset-csv-import.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV preview: only actor-owned staged evidence changes and uses the manual validator",
+        "P3-F11 CSV apply: all rows atomically gain opening ledger/state evidence and exact retry is quiet",
+        "P3-F11 CSV apply: failure injection rolls back assets, rows, receipts, audits, and batch state",
+        "P3-F11 CSV boundaries: role, closed gate, hash, ownership, expiry, and changed retry fail closed",
+        "P3-F11 CSV conflicts: inactive/unknown references, stale snapshots, and duplicate targets are explicit"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/asset-registry-hardening.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 hardening: supported initial locations and registration defaults stay atomic",
+        "P3-F11 hardening: malformed asset identities and states fail before partial evidence",
+        "P3-F11 hardening: registry pagination and timeline errors are bounded and explicit",
+        "P3-F11 hardening: partial attribute updates enforce identity, revision, and uniqueness",
+        "P3-F23 hardening: malformed and missing manual movements cannot create comparison evidence",
+        "P3-F23 hardening: resolution rejects invalid, missing, matched, and already-resolved rows",
+        "P3-F23 hardening: simultaneous resolution commands append one decision"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/asset-registry-http.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 HTTP: live Admin and Dispatcher may read private registry/timeline evidence",
+        "MBT assets HTTP: named opening options are authenticated, role-limited, and never cached",
+        "P3-F11 HTTP: registration is Admin/Dispatcher, gated, idempotent, and binds the server actor",
+        "P3-F11 HTTP: closing the asset gate blocks new commands but preserves authorized recovery reads"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/billing-read-model.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "billing queue exposes only completed/shipped operational work",
+        "P3-F25 read model exposes the atomically bound visit and immutable visit-distance identity",
+        "P3-F27 read model is role-bound and rejects unbounded or unknown queue filters"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-availability.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "planned availability: draft collection return supplies next-day delivery without Driver evidence",
+        "planned availability: an unrelated delivery with no return cannot be selected or configured again"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: Plan Delivery requires purchased mixed materials and saves manual or custom cargo"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-contract.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cargo API: authenticated Details and commands enforce role, idempotency and revision contracts",
+        "cargo contracts: purchased materials added by Front Desk appear and must all be routed",
+        "cargo contracts: closed, managed, missing and independently planned Custom Orders are rejected",
+        "cargo contracts: competing ordinary Dispatch and BIN claims have one winner",
+        "cargo contracts: rollback-safe migration, cancelled claims release, and unknown payload does not invent a zero limit"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-driver-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "driver browser: cargo pickup and destination show material quantity, action and physical BIN"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-driver.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cargo driver: Gravel pickup follows empty-bin pickup, keeps truck custody and blocks early delivery",
+        "cargo driver: existing Custom Order completes only at its separate drop and rolls back with driver evidence"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-plan.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Plan Delivery: configuration lookup propagates storage failure instead of enabling route-only editing",
+        "Plan Delivery: ordered materials require a pickup route before any workflow can be saved",
+        "Plan Delivery: one transaction saves bin and purchased cargo, with exact replay and fixed order data",
+        "Plan Delivery: downstream workflow failure rolls back a new cargo plan before a safe retry",
+        "Plan Delivery: concurrent combined saves have one winner and plain deliveries may omit cargo"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-cargo-routing.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cargo routing: existing Gravel is required before assignment and saves without changing price or window",
+        "cargo routing: unconfigured order saves manual cargo and reconfiguration retains it",
+        "cargo routing: released route changes require lease, republish atomically, and reject stale or started work",
+        "cargo routing: custom claims exclude ordinary dispatch, edits and other bins until removed",
+        "cargo routing: oversized bin payload is rejected while excess truck weight is advisory"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-collection-request-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: one D, time change, material charge and credit, overdue reminder and explicit C"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-collection-request-migration.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "price migration: failed DDL rolls back every constraint and preserves accepted rows"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-collection-request.test.js",
+      "tests": 14,
+      "pass": 14,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "collection request: single bin creation has delivery only",
+        "collection request: multiple bin creation has delivery only",
+        "collection request: extending the expected return date creates no collection",
+        "collection request: explicit command creates C once, replay and stale competitor cannot duplicate it",
+        "collection request: overdue reminder is read-only, extension clears it, and completed pickup clears it",
+        "delivery window: Front Desk reschedules before planning without creating a collection",
+        "delivery window: a delivery at or after its due date is rejected atomically",
+        "collection request: legacy accepted quotes convert to delivery only and failed conversion rolls back",
+        "price change: garbage to soil adds fixed charge, reverse creates credit (cash)",
+        "price change: garbage to soil adds fixed charge, reverse creates credit (card)",
+        "price change: soil, concrete and asphalt stay equal; size changes reprice only the difference",
+        "automatic C repair: guarded, reversible, replayable and retains due date and audit history",
+        "price change: resizing clears a prepared incompatible bin, retaining the D identity",
+        "price change: competing confirmations cannot charge twice or overwrite the winner"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-contract-front-leg.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F15: only one ready current front leg enters the selected-date BIN pool",
+        "P3-F15: search finds the current card through contract/customer/site/action/asset/visit only",
+        "P3-F15: planned work leaves the unassigned pool but remains in its read-only contract timeline",
+        "P3-F15 invariant: a later visit cannot enter ready while its predecessor is nonterminal"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dispatch-confirmation-http.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.11 HTTP Confirm: UI-only MBT loadId/timing is a no-op and reaches locked dedicated confirmation",
+        "P3.11 HTTP Confirm: changed BIN action enters generic fail-closed save with zero writes",
+        "P3.11 HTTP Confirm: changed BIN asset enters generic fail-closed save with zero writes",
+        "P3.11 HTTP Confirm: changed BIN marker enters generic fail-closed save with zero writes",
+        "P3.11 HTTP Confirm: changed BIN moved group enters generic fail-closed save with zero writes",
+        "HTTP Confirm: ordinary order changes save alongside an unchanged BIN group"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dispatch-confirmation.test.js",
+      "tests": 18,
+      "pass": 18,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.11 confirmation: a complete dedicated assignment confirms once and projects only its BIN Driver jobs",
+        "P3.11 confirmation: direct/default repository confirmation remains fail-closed after a dedicated assignment",
+        "P3.11 confirmation: missing exact Driver pilot scope aborts atomically",
+        "P3.11 confirmation: wrong truck exact Driver pilot scope aborts atomically",
+        "P3.11 confirmation: expired exact Driver pilot scope aborts atomically",
+        "P3.11 confirmation: a visit moved off the locked plan date aborts atomically",
+        "P3.11 confirmation: a changed predecessor/front-leg relationship aborts atomically",
+        "P3.11 confirmation: a changed visit template identity aborts atomically",
+        "P3.11 confirmation: aggregate BIN groups cannot exceed the current truck slot capacity",
+        "P3.11 confirmation: a stale moved asset state aborts atomically",
+        "P3.11 confirmation: rejected current dump-site material acceptance aborts atomically",
+        "P3.11 confirmation: missing mandatory stop aborts without a status transition",
+        "P3.11 confirmation: split mandatory group aborts without a status transition",
+        "P3.11 confirmation: extra mandatory stop aborts without a status transition",
+        "P3.11 confirmation: tampered action aborts without a status transition",
+        "P3.11 confirmation: a released required reservation aborts atomically",
+        "P3.11 confirmation: a changed current truck/bin capability aborts atomically",
+        "P3.11 confirmation: an injected failure after the status write rolls back status and Driver projection"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dispatch-enabled.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F16: assignment atomically plans one complete front leg, exact asset, truck, and shared-yard snapshot",
+        "P3-F16: exact retry replays one result while changed payload and stale revisions fail closed",
+        "P3-F16: a Flatbed, unsupported type, wrong asset, or incomplete pilot boundary leaves the leg untouched",
+        "P3-F16: failure after reservation rolls back reservation, visit, plan snapshot, receipt, and audit",
+        "P3-F17: moving an unstarted leg transfers the complete stop group and reservation atomically",
+        "P3-F17: a partial-stop move, mandatory-stop deletion, and ordinary generic save cannot split a BIN leg",
+        "P3-F16 control: a future BIN plan reference prevents changing its truck to Flatbed",
+        "P3-F16 control: an active whole-leg reservation prevents removing its required truck type and BIN-size support"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dispatch-hardening.test.js",
+      "tests": 12,
+      "pass": 12,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F15/F16 hardening: malformed identity, authorization, revision, and empty timeline inputs fail closed",
+        "P3-F15 hardening: a fully terminal contract remains a completed, locked timeline",
+        "P3-F15 hardening: a leg with neither exact nor eligible asset evidence cannot produce a draggable card",
+        "P3-F15 hardening: valid sparse snapshots use safe customer, address, yard, and outgoing-asset fallbacks",
+        "P3-F15 hardening: fallback customer and shared-yard roles remain explicit",
+        "P3-F16 hardening: missing visit, plan, load, wrong date, and missing exact asset fail before effects",
+        "P3-F16 hardening: a plan-only truck identity cannot bypass the canonical fleet lock",
+        "P3-F16 hardening: an unavailable shared yard fails before reservation and is recoverable",
+        "P3-F16 hardening: pre-existing visit identity in a load rolls an otherwise valid reservation back",
+        "P3-F16 hardening: load-owned truck identity, truck-owned driver, and action labels have bounded fallbacks",
+        "P3-F17 hardening: recovery eligibility, assignment identity, and destination load remain fail closed",
+        "P3-F17 hardening: stale advancement fails and a refreshed command uses its scheduled-time fallback"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-dump-charge.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "dump charge: DUMPGARBAGE/cash waits for completed collection and replay stays single",
+        "dump charge: GARBAGE/card waits for completed collection and replay stays single",
+        "dump charge: SOIL/cash waits for completed collection and replay stays single",
+        "dump charge: DUMP_GARBAGE/cash waits for completed collection and replay stays single"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-final-collection-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "final collection browser: visible red hold prevents dragging, preserves editing, and clears after all work completes"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-final-collection.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "final collection: unfinished rental work keeps unconfigured collection visible with an explicit hold",
+        "final collection: direct and board planning reject pending work atomically while route edits stay available",
+        "final collection: completing only replacement delivery is insufficient; every exchange part must finish",
+        "final collection: unconfigured exchanges block, cancelled work and unfinished other rentals do not"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-fixed-dump-rates.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "rate correction versions Soil, adds Asphalt, retains Concrete and Garbage, replays once",
+        "rate correction rolls back Soil if Asphalt cannot be created and refuses changed input"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-garbage-deposit.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "garbage 14YD uses the incoming item deposit, preserving signed revenue and no fixed dumping",
+        "garbage 20YD uses the incoming item deposit, preserving signed revenue and no fixed dumping",
+        "ambiguous incoming deposit rules are rejected instead of silently selecting or falling back",
+        "rate card graph preserves configured deposit rules",
+        "garbage deposit setup item-bound cards versions both sizes, retains rental prices, replays and rolls back",
+        "garbage deposit setup legacy component links versions both sizes, retains rental prices, replays and rolls back"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-linked-delivery-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: dragging collection includes linked cargo delivery and distinguishes bin source from material pickup"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-linked-delivery.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "linked route: collection-only board intent adds cargo and delivery atomically with stable replay",
+        "linked route: delivery cannot be planned alone; assigning collection adds both and move/cancel keeps the pair",
+        "linked route: filtered feed includes the receiving card and identifies its post-dump source",
+        "linked route: split loads, reversed steps and stale receiving revisions roll back",
+        "linked route: failed receiving cargo validation leaves neither leg nor claim assigned",
+        "linked route: concurrent distinct saves cannot partially assign or duplicate a shared-bin route",
+        "linked route: a completed collection permits its remaining delivery without replanning completed work"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-order-window.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "time window: malformed dates return a client error without a database exception",
+        "time window: Dispatch cannot change a unplanned delivery",
+        "time window: Dispatch cannot change a draft delivery",
+        "time window: Dispatch cannot change a released delivery",
+        "time window: concurrent unauthorized requests leave the released plan and assignment unchanged"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-order-workflow-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: dispatcher configures a readable BIN delivery, assigns it and retains actual pickup details"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-order-workflow-material.test.js",
+      "tests": 11,
+      "pass": 11,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "order material: options expose the fixed material and only accepting dump sites",
+        "order material: a stale or hostile client cannot replace the ordered material",
+        "order material: fixed-price order contents resolve without a planner-supplied material",
+        "order material: missing or ambiguous order definitions cannot be filled by Dispatch",
+        "order material: an exchange collects the previous order's contents, not the replacement's",
+        "order material: a changed-size exchange delivers first and only reuses the old size for onward orders",
+        "order material: charged outgoing contents override replacement material evidence",
+        "order material: final collection uses current charged contents instead of the original delivery charge",
+        "order material: inactive material blocks planning and a matching stale-client material remains compatible",
+        "order material: retargeting a draft final collection validates and updates its replacement contents atomically",
+        "order material: the replacement order supersedes a legacy final collection's original material ID"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-order-workflow.test.js",
+      "tests": 33,
+      "pass": 33,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "BIN workflow cargo: a separate replacement bin may load materials before collection while delivery still waits",
+        "BIN workflow cargo: reused-bin pickup must be planned after dumping, not merely its final delivery",
+        "BIN workflow: root references are stable and different rentals receive different numbers",
+        "BIN workflow: configuration creates one execution delivery with confirmed source and preserves billing owner",
+        "BIN workflow: stale configuration rolls back without duplicate parts",
+        "BIN workflow: driver receives the readable action reference, bin number and resolved pickup address",
+        "time window: a collection-first exchange retains its same-day replacement rule atomically",
+        "BIN workflow: a same-bin exchange can reserve both connected parts without moving the physical bin",
+        "BIN workflow: same-bin pickup, dump and redelivery retain truck custody and one billable exchange",
+        "BIN workflow: final collection dumps and returns to the selected approved yard",
+        "BIN workflow: final collection feeds the next rental's delivery once with its own BIN number",
+        "BIN workflow: multiple open exchanges retain all old bins and final closure waits for recovery",
+        "BIN workflow: draft routes can be edited while order windows and issued instructions stay frozen",
+        "BIN workflow: planning pool exposes configured delivery and a visible final collection waiting for it",
+        "BIN workflow: simultaneous configuration commits once and unrelated rental reservations lose the race",
+        "BIN workflow: the real planner confirms a same-bin route with one slot and rejects reversed dependencies",
+        "BIN workflow: custody changes only through a confirmed, idempotent physical handoff",
+        "BIN workflow: a draft final collection follows a newly planned replacement while the exchange retains the old bin",
+        "BIN workflow: completed driver delivery updates the parent and current bin exactly once",
+        "BIN workflow: different-bin collection-first allows replacement before the old bin is dumped",
+        "BIN workflow: a late actual replacement is accepted and creates a durable same-day exception",
+        "BIN workflow: failure after parent completion rolls back custody, claims and workflow evidence before a safe retry",
+        "BIN workflow: parent extensions update draft final collection but cannot rewrite assigned work",
+        "BIN workflow: invalid role, time, dump acceptance and immutable references fail without partial orders",
+        "BIN workflow: an empty bin aboard the truck skips pickup, and a legacy dumped bin uses its actual dump address",
+        "BIN workflow: an existing advanced collection still waits for its delivery plan to be released",
+        "BIN workflow: an existing overnight route retains the dumped bin aboard the same truck for tomorrow's delivery",
+        "BIN workflow: stale locations, loaded delivery bins, and revoked reservations cannot be released",
+        "BIN workflow: invalid collection identities and targets do not rewrite an existing rental",
+        "BIN workflow: a legacy delivery finishing after upgrade records the current bin without rewriting its frozen instructions",
+        "BIN workflow: linking a different source cannot silently retarget an assigned final collection",
+        "BIN workflow: a new exchange cannot redirect the bin promised to an assigned onward delivery",
+        "BIN workflow: linked plan validation rejects reverse timing, forecast truck transfers and missed local-day promises"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-adversarial.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "hostile inputs and disabled capabilities cannot change the shared day",
+        "load lifecycle validates time, fleet and ordinary boundaries; editing a released load requires confirmation",
+        "stale assignment evidence, asset status and reservations prevent publication atomically"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-board.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "board saves empty drafts, computed times and overrides atomically, preserving ordinary Dispatch",
+        "board rejects duplicates, ordinary load IDs, stale visits and overlap without partial writes",
+        "shared route timing, handoff metadata and driver lane order survive save and confirmation",
+        "invalid required steps, out-of-load timing and expired leases roll back all board changes",
+        "concurrent board saves serialize and never duplicate a visit generation",
+        "empty BIN drafts reject starts outside the plan day without changing the schedule",
+        "legacy Dispatch truck aliases resolve to the BIN fleet without duplicate trucks",
+        "resolving a legacy truck cannot relocate ordinary work on that truck"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: the complete shared Dispatch planner supports BIN timing and preserves ordinary Dispatch"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-capacity.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "loaded pickup, dump, and return occupancy fit one slot; unknown movement actions are rejected",
+        "an untouched yard bin cannot be presented as recorded resumed custody"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-commands.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "shared editor boundary requires the date lease and revision/digest before changing any BIN state",
+        "confirmation automatically releases the assigned driver; cancellation returns only that visit to pool",
+        "cancel then replan on another date keeps requested dates and uses only each date's own lease",
+        "an injected failure rolls back plan, reservations, assignment generation, audit and command receipt",
+        "confirmation rechecks current yard and visit-step evidence requirements before releasing work"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-corrections.test.js",
+      "tests": 9,
+      "pass": 9,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Front Desk delivery reason is optional: undefined",
+        "Front Desk delivery reason is optional: ",
+        "Front Desk delivery reason is optional: Customer requested",
+        "Dispatch time-window API denies mutation even with valid revisions and leases",
+        "Dispatch route setup uses order windows and ignores client window overrides",
+        "BIN search finds planned work on another plan with one readable result",
+        "BIN search finds completed work on another plan with one readable result",
+        "BIN search never uses a withdrawn assignment as a current plan",
+        "BIN search does not offer navigation to a load missing from the current plan"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-dispatch.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Dispatch legacy save succeeds with BIN present and preserves the whole BIN route",
+        "Dispatch V2 saves ordinary changes but cannot remove BIN work"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-driver.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "staged BIN work is absent from driver routes until whole-day confirmation authorizes its exact driver",
+        "race: completed delivery wins over cancellation without losing evidence or publishing the successor",
+        "race: cancellation wins over late completion, preserving the already collected bin",
+        "delivery completion releases its successor only to the pool and preserves its requested window",
+        "started cancellation preserves physical custody and completed evidence; replan resumes only remaining steps",
+        "a started visit with no completed steps can be cancelled and restarted from the yard"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-events.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "leaving a planner while event-stream authentication is pending cannot open an orphaned stream"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-frontdesk.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "a ready unassigned return can be extended or exchanged without changing commercial pricing"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-http.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "authorized HTTP planner commands and legacy BIN writes use the same date lease"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-pool.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "pool searches before pagination, includes more than 100 visits and isolates blocked cards",
+        "BIN timing edits reject shared driver and truck conflicts and leave ordinary work untouched",
+        "sequential whole visits share one slot and can be sequenced without losing groups"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-readonly-browser.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "read-only Dispatch loads in BIN reuse exact card, hover and preview information without writes",
+        "BIN planning preserves Dispatch stop times and load intervals when service estimates change",
+        "Dispatch can inspect BIN stops and saved timing through the shared preview with MBT disabled",
+        "BIN planning shows a driver's assigned flatbed followed by the shared flatbed-to-BIN truck switch"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-returns.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "BIN returns publish only at confirmation and changes require confirmation again (visit=false)",
+        "BIN returns publish only at confirmation and changes require confirmation again (visit=true)"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-planning-search-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: search planned and completed BIN orders and open the matching date and load"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-selection-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: change the bin on a released stop and show its readable reference and physical bin"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-selection-upgrade.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "BIN upgrade backfills five-digit references and confirms old frozen stops without changing legacy records"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-selection.test.js",
+      "tests": 16,
+      "pass": 16,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "bin selection: an unassigned delivery can select again without creating orders or billing parts",
+        "bin selection: draft stays draft with a fresh generation",
+        "bin selection: released work republishes with a fresh generation",
+        "bin selection: start, stale source, missing lease and unauthorized callers make no writes",
+        "bin selection: historical dependent work on another date requires both leases and changes atomically",
+        "bin selection: concurrent selections have one winner and old driver jobs cannot start",
+        "bin selection: a real driver start locks the order before its parent records a start",
+        "bin selection: a changed pickup source needs a verified route that fits the existing load",
+        "bin selection: unrelated drafts in the released plan remain unpublished",
+        "bin selection: a linked onward delivery keeps its collection bin",
+        "bin selection: legacy released delivery keeps visit and step IDs while selecting another bin",
+        "bin selection: simultaneous driver start and re-selection have exactly one committed winner",
+        "bin selection: legacy Dispatch labels use the saved generation without changing the plan",
+        "bin selection: a lost-response retry can reacquire its date lease without another generation",
+        "bin selection: an order with no initial bin must be planned before re-selection",
+        "bin selection: aboard and yard sources remove and restore pickup evidence while retaining delivery identity"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport browser: four tabs, toolbar route editor, quantity progress, saved draggable trip and no per-card buttons"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-dependencies.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport dependencies: a future trip keeps the earlier planned empty return intact across plan dates",
+        "Transport dependencies: changed source quantities cannot be confirmed from an old saved route"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-driver.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport Driver: source/bin/quantities, ordered evidence, partial cargo completion before empty return and immutable started route",
+        "Transport Driver: all source quantities complete at cargo drop, completion rollback and conflicting replay remain atomic",
+        "Transport Driver: optional SOR signature carries frozen terms and persists separately from required BIN photos",
+        "Transport Driver: a BIN deactivated after release cannot start a physical trip"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-errors-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport errors browser: 17,350 lb mixed aggregate shows missing capacity and preserves route for recovery"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-errors.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport errors: real HTTP validation retains specific messages and failed saves roll back"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-fresh-source.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport canonical source: confirmation reads current operational source even before catalog refresh"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-frontdesk.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport Front Desk: mixed aggregate lines share one original order, exact quantities, no duplicated billing and no ordinary/custom cargo pool entry"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-http.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport HTTP: Dispatcher can read and save trips; server owns actor; Aggregate Routing remains Admin only"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-linked-delivery.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport linked delivery: one bin continues to an existing rental with mandatory cargo, auto-planned and unplanned together"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-migration.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport migration: additive schema applies transactionally and rollback restores preexisting routing data"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-offline.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport offline: issued manifest retains trip/cargo identity and durable scan/photo events apply and replay once"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-ownership.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport ownership: aggregate is absent from ordinary browse/search and new assignments; existing route history remains",
+        "Transport ownership: SOR is shared until BIN trip claim, and forged card items cannot bypass canonical source ownership",
+        "Transport ownership: independent grouped orders and an existing ordinary assignment cannot acquire a BIN claim"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-planning.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport planning: assign, confirm, unplan retain source quantity, physical custody and assignment history",
+        "Transport planning: changing a draft board preserves typed transport work and validates source revisions"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-read.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport pool: original order becomes numbered trips, remaining quantity stays visible, search finds its saved load"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-source-routes.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Transport SOR return: original customer pickup, resolved yard 3445 drop, and source sync preserves started quantities",
+        "Transport same-day reuse: per-trip times permit 10:30 after a 10:00 return, reject overlap and breaking the predecessor"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-transport-trips.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "MBR/Agg trips: fractional allocation, original reference, mandatory cargo route, remaining quantity and exact replay",
+        "MBR/Agg trips: concurrent allocation has one winner, cancellation releases quantity and stale source fails"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-weight-warning-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Truck weight browser: overweight BIN transport saves, confirms and keeps advisory warnings after reload"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-weight-warning.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Truck weight warning: overweight transport assigns, saves, confirms and reloads with a specific warning",
+        "Truck weight warning: unknown loaded collection uses an explicitly labelled estimate and valid movement checks remain"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-workflow-edit-browser.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser edit locks: both unplanned linked parts unlock all route controls",
+        "browser edit locks: planned delivery leaves collection route editable",
+        "browser edit locks: planned collection retains its receiving order while replacement changes"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/bin-workflow-edit-locks.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "edit locks: both unplanned exchange legs allow sequence and dump changes while retaining linked cargo",
+        "edit locks: planned delivery freezes sequence but permits dump and after-dump edits without touching its plan or instructions",
+        "edit locks: planning collection locks its route and sequence, while its unplanned replacement stays editable",
+        "edit locks: confirmed then withdrawn parts become editable without rewriting assignment history",
+        "edit locks: changing destination removes the old link and requires its receiving delivery to choose a bin again",
+        "edit locks: simultaneous collection planning and editing cannot partially rewrite an assigned route",
+        "edit locks: a started onward delivery cannot be detached, and a rejected change leaves all routes intact"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/customer-charge-migration.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "migration 142 installs the immutable customer-charge ledger and seeded MBT catalog",
+        "database constraints reject contradictory cash tax/export evidence",
+        "database constraints conserve due-now and line-level tax evidence",
+        "a valid non-cash request stores pre-tax lines and never creates a NetSuite outbox row"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/customer-charge-request-workflow.test.js",
+      "tests": 18,
+      "pass": 18,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "configured local Gravel uses standard weight and requires an active material price",
+        "admin atomically configures the complete real-rate customer-charge sheet with optimistic locking",
+        "standalone aggregate preview uses persisted per-yard rates and exact upper-inclusive distance bands",
+        "garbage pricing fails closed when its deposit rule is missing or not CAD",
+        "confirming a standalone aggregate request creates one linked Dispatch order and no NetSuite outbox work",
+        "active contract add-bin preview reports current, request, resulting, deposit, and attached aggregate due now",
+        "incoming bin resolves rental and delivery from their independently active item rate cards",
+        "workflow configuration and pricing discover aggregate and fixed dump rates in separate active cards",
+        "cash initial then card add rolls both confirmed amounts into the next customer total",
+        "aggregate add-bin pricing persists independently of the 150 origin choice",
+        "confirmed soil-to-garbage exchange collects the garbage deposit and carries aggregate on one exchange visit",
+        "initial soil contract uses a fixed dump charge, one card HST calculation, and no estimated tonnes",
+        "rate-card and customer guards fail closed before a charge request is stored",
+        "aggregate request validation rejects malformed, duplicate, and unpriced material evidence",
+        "bin pricing rejects invalid schedules and each missing active rate selection",
+        "percentage garbage deposits are recalculated once and an initial-only confirmation stays local",
+        "contract and confirmation guards reject missing, mismatched, and stale subjects",
+        "corrupt aggregate pricing evidence cannot materialize Dispatch work"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/dispatch-bin-disabled.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "F14: a disabled BIN save is rejected before revision, snapshot, or history writes",
+        "F14: restoring a BIN snapshot is rejected before archiving or replacing the current plan",
+        "F14: confirming a persisted BIN snapshot is rejected without status or revision changes",
+        "F14: a nested stop-level BIN identity is rejected at the save repository seam",
+        "F14: a nested stop-level BIN identity is rejected at the restore repository seam",
+        "F14: an ordinary historical snapshot cannot restore over a current BIN assignment",
+        "F14: a nested stop-level BIN identity is rejected at the confirm repository seam"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/dispatch-bin-status-capability.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3 Dispatch BIN discovery composes environment, database, and caller pilot gates without changing the legacy status contract"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/dispatch-management-permissions.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "Dispatch management: real rate CSV, validation, activation and immutable-used-rate guard"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-disabled.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "F14/F15: the shared Driver projection rejects a BIN plan before creating PWA jobs",
+        "F14/F15: the Driver projection rejects stop-level MBT identity without a top-level BIN order",
+        "F15: the Driver projection remains available for existing non-BIN work",
+        "P3-F18 non-regression: another driver's BIN assignment never blocks an ordinary Driver projection"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-execution.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18: an assigned BIN physical-stop group materializes a frozen versioned Driver job without ordinary order identity",
+        "P3-F18/P3-F19: offline occurrence time applies one exact delivery movement/evidence set and exact retry is quiet",
+        "P3-F18: wrong asset and missing durable requirement evidence block every operational boundary",
+        "P3-F20: an unsafe frozen visit/template/asset change is a review boundary and retains the source event identity",
+        "P3-F19: failure after operational writes rolls back evidence, movement, job, visit, and acknowledgement together"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-loaded-exchange.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F21: loaded pickup, durable dump receipt, and yard return apply once from offline evidence",
+        "P3-F22: exchange reserves, scans, evidences, and moves outgoing/incoming BIN identities independently",
+        "P3-F22: an exchange cannot skip its prior physical stop or collapse both asset roles onto one BIN"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-manifest-integrity.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19 manifest integrity: a BIN target cannot skip an incomplete job from another manifest visit",
+        "P3-F19 manifest integrity: completion requires its durable start and exact completion retries still replay",
+        "P3-F19 manifest integrity: a pre-manifest BIN event is rejected without writes",
+        "P3-F19 manifest integrity: an event older than locked asset state cannot regress its timeline",
+        "P3-F21 manifest integrity: a frozen dump pair must remain actively accepted"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-offline-queue.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19: the established manifest/event queue applies a BIN start and completion once with device occurrence time"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-pilot-scope.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18: every released BIN job requires an exact active driver/date/truck/contract/visit pilot row",
+        "P3-F18: expired or revoked pilot rows never authorize new BIN materialization",
+        "P3-F18: next-job first paint materializes only the actionable BIN stop"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-reservation-hardening.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F21 hardening: a customer-located BIN can only be reserved for its server-owned visit site"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-signature-photo.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18 hardening: a required signature photo contributes to the offline photo budget"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-template-state-guard.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19 integrity: a locked template pre-state mismatch rolls back every completion side effect",
+        "P3-F19 integrity: an action-derived after-state cannot contradict the frozen template",
+        "P3-F22 integrity: exchange incoming identity must still be at the exact frozen customer site"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/driver-bin-time-evidence.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19 hardening: bounded device clock lead preserves all three evidence clocks",
+        "P3-F19 hardening: more than five minutes of forward device skew fails before a ledger write"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/dump-site-create-browser.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "browser: create dump site 3445, retain hours/items on edit, and explain invalid input"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/frontdesk-adversarial.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F13 adversarial: actor and command input validation fail closed",
+        "P3-F13 adversarial: pilot scoping, limiting, and active configuration remain narrow",
+        "P3-F13 adversarial: incomplete and inactive canonical configuration cannot quote",
+        "P3-F13 adversarial: untrusted distance, rate, tax, and deposit evidence fails closed",
+        "P3-F13 adversarial: quote lifecycle rejects missing, stale, expired, and wrong-state commands",
+        "P3-F13 adversarial: successful conversion hooks execute inside the local transaction",
+        "P3-F13/F14 variants: nullable canonical fields and optional timeline evidence project safely",
+        "P3-F14 adversarial: contract timeline and extension reject invalid contract chains"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/frontdesk-bin-dispatch-seam.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "initial delivery binds its bin without generating a dependent collection",
+        "multi-bin Front Desk contract exposes one independent ready Dispatch card per physical bin",
+        "P3-F13/F15 seam: legacy conversion retains the shared-yard route, configured steps/evidence, visit distance, and delivery billing owner",
+        "P3-F15/F16 seam: feed offers only eligible origin-yard assets and selected assignment binds both visits atomically",
+        "P3-F16 seam: stale, wrong-yard, and changed dependent-return revisions fail before any binding or plan write"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/frontdesk-http.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F13 HTTP: private reads are role-bound, no-store, and capability-gated",
+        "Front Desk status reports the effective gate and its exact blocking reason",
+        "P3-F13 HTTP: quote commands bind server actor, pricing adapters, and idempotency",
+        "MBT Front Desk HTTP: customer-charge preview and confirmation are private server-owned commands",
+        "MBT Front Desk HTTP: customer contracts and independent service-line actions are explicit",
+        "MBT Dispatch HTTP: schedule or size edits create an audited customer-confirmation request",
+        "P3-F13/F14 HTTP: lifecycle and timeline routes preserve command identity"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/frontdesk-multibin-workflow.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "MBT Front Desk customer search: an active imported customer needs no pre-existing subsidiary, address, or site",
+        "MBT Front Desk multi-bin: one accepted quote materializes independent ready front legs and only local records",
+        "MBT Front Desk multi-bin: every bin size retains its own rental, transport, deposit, and delivery distance evidence",
+        "MBT Front Desk estimate adds base rental, estimated dump weight, one-way delivery, and manual surcharge",
+        "MBT Front Desk BIN order: all physical bins must share the one contract site",
+        "MBT Front Desk BIN order: an inline local address is created atomically and becomes the line site",
+        "MBT Front Desk multi-bin: amendment, exchange, customer confirmation, and collection stay line-scoped"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/frontdesk-workflow.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F13: canonical customer search exposes only active service-ready pilot records",
+        "P3-F13: server-owned metres, rates, and tax produce an exact-cent draft through accepted quote",
+        "P3-F13: the explicit 150 price table reaches distance pricing and remains in quote evidence",
+        "P3-F13: accepted conversion is atomic, exactly replayable, explicitly ordered, and local-only",
+        "P3-F13: failures after contract or visit persistence roll back every conversion boundary",
+        "P3-F14: later canonical and configuration edits cannot rewrite contract or visit snapshots",
+        "P3-F14: an extension appends one approved amendment and changes only an unstarted tentative return"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/item-charge-basis-and-aggregate.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "migration exposes constrained charge basis and aggregate density",
+        "legacy local-item inserts receive the safe basis for their declared item type",
+        "activated per-tonne evidence survives a Dump switch; new cards accept BIN and Aggregate YARD"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/item-owned-dump-site.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "a dump item owns dump-site acceptance while legacy material rows stay synchronized",
+        "one dump site atomically owns multiple accepted items and its weekly opening schedule",
+        "distance, rental, and dump pricing rows retain their owning local item"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/mbt-bin-cancellation.test.js",
+      "tests": 10,
+      "pass": 9,
+      "fail": 1,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cancel Bin 1, remove its 110000 cents, preserve Bin 2 and confirmed evidence, and replay once",
+        "cancellation refuses driver-started without changing any bin or price",
+        "cancellation refuses step-started without changing any bin or price",
+        "cancellation refuses assigned-load without changing any bin or price",
+        "cancellation refuses wrong-line-charge without changing any bin or price",
+        "cancellation refuses wrong-revision without changing any bin or price",
+        "cancellation refuses wrong-amount without changing any bin or price",
+        "a late audit failure rolls back the cancellation, pricing adjustment, draft and driver steps",
+        "simultaneous cancellation commands deduct the charge once",
+        "invalid and duplicate adjustment inputs cannot change the contract",
+        "failing tests:",
+        "cancel Bin 1, remove its 110000 cents, preserve Bin 2 and confirmed evidence, and replay once"
+      ],
+      "failure": "\u2716 failing tests:\n\ntest at test/mbt/integration/mbt-bin-cancellation.test.js:64:1\n\u2716 cancel Bin 1, remove its 110000 cents, preserve Bin 2 and confirmed evidence, and replay once (547.25379ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  \n  2 !== 1\n  \n      at TestContext.<anonymous> (file:///app/test/mbt/integration/mbt-bin-cancellation.test.js:82:10)\n      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n      at async Test.run (node:internal/test_runner/test:797:9)\n      at async Test.processPendingSubtests (node:internal/test_runner/test:526:7) {\n    generatedMessage: true,\n    code: 'ERR_ASSERTION',\n    actual: 2,\n    expected: 1,\n    operator: 'strictEqual'\n  }\n\n"
+    },
+    {
+      "file": "test/mbt/integration/rate-card-configuration-hardening.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 hardening: every rate graph shape uses the same strict allowlist",
+        "P3-F12 hardening: a fixed component and fixed deposit are accepted without percentage fields",
+        "P3-F12 hardening: command authorization and optimistic inputs fail before mutation",
+        "P3-F12 hardening: lifecycle state, missing version, and stale revisions are explicit",
+        "P3-F12 hardening: service-template references resolve and the list API paginates locally"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-configuration-http.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 HTTP: private rate-card reads are Admin/Dispatcher, no-store, and local-only",
+        "customer-charge pricing configuration is Admin/Dispatcher, optimistic, audited, and local-only",
+        "P3-F12 HTTP: create, validate, and activate bind the server actor and require idempotency",
+        "rate-card editor reads named detail and updates an unused draft with optimistic revision",
+        "P3-F12 HTTP: a closed master-data gate preserves recovery reads and blocks all commands"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-configuration.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12: manual and multi-CSV rate graphs share one canonical validator",
+        "P3-F12: one draft command creates the complete graph atomically and exact retry replays",
+        "P3-F12: gaps, overlap, unsafe cents/metres, invalid dates/currency/units, and extra pricing fields fail before mutation",
+        "P3-F12: unknown local references roll back every draft row",
+        "P3-F12: validation and activation are audited, revision-bound, idempotent, and locally quiet",
+        "P3-F12: editing a used version clones a complete new draft and preserves the original checksum"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-csv-import-hardening.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV service hardening: malformed actors and command identities fail closed",
+        "P3-F12 CSV service hardening: stored status, target, staged row, and staged hash remain authoritative",
+        "P3-F12 CSV service hardening: changed targets and draft failures cannot bypass preview identity",
+        "P3-F12 CSV service hardening: database target conflicts translate without partial evidence"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-csv-import-http.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV HTTP: preview is live-session Admin/master-data only before service access",
+        "P3-F12 CSV HTTP: preview sends the exact five raw texts to a server-owned actor and is no-store",
+        "P3-F12 CSV HTTP: apply requires idempotency and forwards only preview identities plus audit reason"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-csv-import.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV preview: only private staged evidence changes before apply",
+        "P3-F12 CSV apply: one transaction creates the graph and exact retry is side-effect free",
+        "P3-F12 CSV apply: a failure after nested draft creation rolls back every boundary",
+        "P3-F12 CSV boundaries: Admin, gate, hash, ownership, and expiry fail closed"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/rate-card-version-cutover.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "a validated v2 atomically retires the explicitly expected used v1",
+        "a stale replacement identity cannot retire the current version or enable the card",
+        "a failed successor activation rolls back the retirement and parent enablement"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/shadow-billing-coverage-hardening.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3 billing coverage: public commands reject malformed and unauthorized envelopes before durable work",
+        "P3 billing coverage: selection, currency, quantity, and custom-price failures preserve the case",
+        "P3 billing coverage: a late version hook rolls back and the exact retry produces a complete queryable draft",
+        "P3 billing coverage: approval rejects missing, non-ready, and non-current evidence without mutation",
+        "P3 billing coverage: approved cases require valid current amendment lineage",
+        "P3 billing coverage: generation validates rate and customer authority and rolls back late failure",
+        "P3 billing coverage: snapshot generation rejects caller authority, invalid sets, and currency drift",
+        "P3 billing coverage: recovery reads enforce filters and expose deterministic pagination"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/shadow-billing.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F25/P3-F27 calculation atomically writes one complete local-only draft and approval creates zero external work",
+        "P3-F27 injected failure after a draft line rolls back version, every line, case, receipt, and audit",
+        "P3-F28 correction appends an amendment and new version while the approved original remains queryable",
+        "P3-F26 representative MBBS physical loads generate exact deduped draft cases and conserved allocations",
+        "P3-F27 unresolved blocking billing variance prevents local approval"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/asset-csv-import-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV race: 25 simultaneous exact retries create two assets once and replay 24",
+        "P3-F11 CSV race: 25 independent preview/apply competitors have one complete winner"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/bin-dispatch-confirmation-races.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.11 confirmation race: twenty-five authorized retries produce one confirmed revision and one Driver projection"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/bin-dispatch-enabled-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F16: fifty independent assignment commands racing for one front leg and asset yield one complete winner",
+        "P3-F16: twenty-five simultaneous exact retries return one durable result and twenty-four replays"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/bin-leg-advancement-races.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F17: twenty-five advancement commands promote the next front leg exactly once and never expose both legs",
+        "P3-F17: simultaneous exact advancement retries replay one refresh and one successor transition",
+        "P3-F17: concurrent unstarted moves have one revision winner and never split mandatory stops",
+        "P3-F17: started work rejects ordinary transfer; audited recovery preserves its prior assignment snapshot"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/bin-planning-race.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "two commands from the same base serialize to one assignment and one conflict",
+        "another session cannot acquire the Dispatch date being edited in MBT",
+        "a lease that expires before commit rolls back the assignment and emits no refresh"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/customer-charge-confirmation-races.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "customer-charge confirmation race creates exactly one Dispatch Aggregate Order"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/driver-bin-sync-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F19: 25 simultaneous exact offline completion retries create one movement/evidence/acknowledgement",
+        "P3-F19: competing event IDs for one physical job yield one winner and one review-safe conflict"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/frontdesk-bin-dispatch-seam-race.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F16 seam: twenty-five independent unbound visits racing for one asset yield one atomic binding"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/frontdesk-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F13: 25 independent two-client conversion races yield one contract, one delivery, and one local case",
+        "P3-F14: 25 independent extension races yield one append-only amendment and one stale loser"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/rate-card-configuration-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12: 25 two-version activation races produce one active winner and one explicit conflict",
+        "P3-F12: 25 simultaneous exact activation retries retain one revision, audit, and receipt"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/rate-card-csv-import-races.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV race: 25 simultaneous exact retries create one draft and replay 24",
+        "P3-F12 CSV race: independent apply keys have one winner and one explicit batch conflict"
+      ]
+    },
+    {
+      "file": "test/mbt/concurrency/shadow-billing-races.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F27 25 simultaneous exact calculation retries return one complete draft version",
+        "P3-F27 25 independent calculation competitors have one atomic winner and no partial loser",
+        "P3-F27 25 simultaneous exact approvals replay one immutable local decision",
+        "P3-F26 25 concurrent independent MBBS generations return the same deduped cases and allocations"
+      ]
+    },
+    {
+      "file": "test/mbt/property/asset-csv-import.property.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F11 CSV property: 1,000 safe tare values and quoted notes convert exactly",
+        "P3-F11 CSV property: 1,000 repeated parses retain one canonical identity"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-cargo.property.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "cargo property: every material is picked once before its drop, without losing weight or physical actions"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-collection-request.property.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "properties: price differences and deposit credits reverse exactly and preserve unrelated contract charges",
+        "properties: overdue requires a delivered open bin strictly past its expected date",
+        "properties: actual garbage tonnes use exact half-up cents and payment tax conservation"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-final-collection.property.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "collection property: exactly the unfinished noncancelled rental jobs hold the final collection",
+        "collection property: delivery and exchange routes are never treated as final collections"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-linked-delivery.property.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "linked property: expanding arbitrary surrounding visits preserves them and includes the receiving leg exactly once",
+        "linked property: every receiving-first or split-load route is rejected",
+        "linked route invariants reject a changed bin, unavailable receiving order or isolated delivery"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-order-workflow.property.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "property: rental and exchange references remain unique across action classes and ordinals",
+        "property: different-bin collection-first releases only delivery and retains the old bin's dump/return",
+        "property: a completion can never precede its prerequisite, while a later real completion is retained",
+        "property: size changes allow only a distinct delivery-first replacement"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-planning-board-properties.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "board input rejects malformed IDs, null overrides, invalid timing and oversized collections before SQL",
+        "board validation preserves arbitrary valid whole-visit order and rejects every duplicate",
+        "bounded step timings preserve both endpoints and ordinary loads always remain protected"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-planning-properties.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "property: moving any visit preserves every group and its internal sequence",
+        "property: capacity depends on peak physical occupancy, not the number of visits",
+        "property: ordinary edits preserve BIN work while any stop mutation is rejected"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-selection.property.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "property: repeated bin selections preserve delivery identity and exactly the required pickup",
+        "property: route timing fits exactly when the scheduled load has enough time"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-transport.property.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "transport property: six-place quantities round-trip exactly, including zero and maximum",
+        "transport property: every legal fractional allocation conserves quantity and every excess is rejected",
+        "transport property: known cargo is a lower bound, bin payload is an upper bound, and missing weight cannot be silently zero",
+        "transport property: saved return permits exactly later pickups and never mutates physical custody",
+        "transport property: future collisions and wrong-truck custody reject while touching intervals remain legal",
+        "transport property: catalog identity controls loose material routing, independent of display names"
+      ]
+    },
+    {
+      "file": "test/mbt/property/bin-workflow-edit.property.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "edit property: each leg controls its own route and either busy leg locks sequence",
+        "edit property: withdrawn history never locks a free leg, but each current work signal does",
+        "edit property: closed roots lock everything and single-role orders expose only their route"
+      ]
+    },
+    {
+      "file": "test/mbt/property/customer-charge-calculator.property.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "customer-charge property: cash extracts HST while non-cash adds HST exactly once (1,000 cases)",
+        "customer-charge property: resulting totals and payment timing conserve every cent (1,000 cases)"
+      ]
+    },
+    {
+      "file": "test/mbt/property/driver-bin-event.property.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F18/P3-F22 property: 1,000 scan permutations canonicalize without crossing outgoing/incoming identities",
+        "P3-F21 property: 1,000 complete dump receipts retain exact integer cents and quantity evidence",
+        "P3-F18/P3-F21: malformed, duplicate, permissively coerced, or unbalanced evidence fails closed"
+      ]
+    },
+    {
+      "file": "test/mbt/property/pure-contracts.property.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "F04 property: canonical JSON and hash ignore every object-key insertion order",
+        "F04 property: canonical JSON is stable after a JSON round trip",
+        "F04 property: changing a JSON scalar type changes its idempotency hash",
+        "F09 property: generated contiguous bands validate for at least 1,000 cases",
+        "F09 property: every exact finite boundary obeys [minimum, maximum)"
+      ]
+    },
+    {
+      "file": "test/mbt/property/rate-card-csv-import.property.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3-F12 CSV property: 1,000 generated safe cents/metres survive exact server conversion",
+        "P3-F12 CSV property: 1,000 file/child permutations retain one normalized graph identity"
+      ]
+    },
+    {
+      "file": "test/mbt/adversarial/shadow-billing-adversarial.test.js",
+      "tests": 13,
+      "pass": 13,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.10 adversarial: every shadow-billing mutation rejects a non-billing actor before durable work",
+        "P3.10 adversarial: a billing case cannot consume another visit from the same contract",
+        "P3.10 adversarial: pre-completion billing is rejected without durable work",
+        "P3.10 adversarial: every configured rate component must match the billing currency",
+        "P3.10 adversarial: an audited distance override is the frozen billed metres and amount",
+        "P3.10 adversarial: dump billing freezes the durable receipt-photo identity and content hash",
+        "P3.10 adversarial: cross-charge generation requires a band from its selected rate version",
+        "P3.10 adversarial schema: a completed-load source is frozen by immutable durable identity",
+        "P3.10 adversarial: a durable cross-charge dedupe key rejects changed source evidence",
+        "P3.10 adversarial: unknown component quantity keys fail closed instead of disappearing",
+        "P3.10 adversarial: approval compares line identities with the frozen calculation, not only sums",
+        "P3.10 adversarial schema: activated rate graphs can represent a discount component",
+        "P3.10 adversarial schema: a signed discount tax can persist when subtotal and total stay nonnegative"
+      ]
+    },
+    {
+      "file": "test/mbt/adversarial/shadow-billing-snapshot-boundary-adversarial.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "P3.10 adversarial: snapshot generation rejects caller-authored loads and retains the completed-load snapshot identity"
+      ]
+    },
+    {
+      "file": "test/mbt/contracts/customer-charge-regression.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "customer charge scenario catalog records every currently supported request family",
+        "cash CAD 100 is tax-included while card CAD 100 adds HST exactly once",
+        "cash first request and card exchange with aggregate keep independent locked tax treatments",
+        "every incoming garbage exchange collects its configured deposit while non-garbage exchange revenue is fully due",
+        "standalone aggregate enforces the CAD 150 through-30km standard and increasing later bands",
+        "seed 20260809 calculates 100 real-rate contract histories and covers the entire scenario catalog",
+        "the generated mixed-payment history is cash first then card exchange with aggregate",
+        "non-garbage bins reject every size except 14YD and aggregate origin is independently selectable"
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-sor-return-date-conflict.test.js",
+      "tests": 10,
+      "pass": 10,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "custom marker 0: a return is independent of its earlier delivery",
+        "custom marker 0: a return projection reserves only the return",
+        "custom marker 1: a return is independent of its earlier delivery",
+        "custom marker 1: a return projection reserves only the return",
+        "custom marker 2: a return is independent of its earlier delivery",
+        "custom marker 2: a return projection reserves only the return",
+        "grouped returns remain independent and keep their exact duplicate protection",
+        "genuine explicit and inferred splits retain parent aliases and whole-parent conflicts",
+        "unassigned returns and return-only loads reserve no work",
+        "property: linked custom returns stay independent while duplicate and genuine split guards remain"
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-weight-save.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "weight-only weight changes never lock executed work and do not mutate either plan",
+        "weight-only dropWeight changes never lock executed work and do not mutate either plan",
+        "unrelated executed-work errors omit group, child and stop weight differences",
+        "weight-only order changes already pass when physical stops are unchanged",
+        "weight exceptions preserve quantity, pallets, identity, destination, timing and sequence locks",
+        "Li's 0,1,3 to 0,1,2 renumbering preserves actual load order for started and completed work",
+        "unstarted later loads and stops may move, but cannot move before the in-progress stop",
+        "closing sequence gaps in earlier completed loads never changes the protected route"
+      ]
+    },
+    {
+      "file": "test/dispatch/unit/sor-rental-policy.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR-1 named hierarchy, day/month and inventory precedence",
+        "SOR-1 overrides control returns independently of physical rental cargo",
+        "SOR-3 rental pickup and SOR-4 exact rental-only return content",
+        "SOR-5 property: split quantities and suffixes survive projection",
+        "SOR-8 customer signature scope includes sales and group members, excludes returns/pickups",
+        "SOR-1/4 property: classification, explicit overrides and mixed-order content agree with the item policy",
+        "SOR-3/5 grouped rental leaves use the physical pickup yard without changing other cargo"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-sor-return-date-conflict.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "classic: save a rental return on a later date without changing the delivery route",
+        "classic: a return can be planned before its unfinished delivery",
+        "v2: save a rental return on a later date without changing the delivery route",
+        "v2: a return can be planned before its unfinished delivery",
+        "a duplicate return is rejected with a retained draft and unchanged active route",
+        "a scheduled return does not reserve its linked delivery reference"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-weight-save.test.js",
+      "tests": 2,
+      "pass": 2,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "unchanged source, group and child totals remain identical through repeated real plan reads",
+        "authenticated save accepts a stop weight update and preserves source and driver evidence"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-weight-source-review.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "all weight-only changes are silent across execution stages, including SN1400072 rounding",
+        "legacy pending weight-only notice is hidden with its evidence retained",
+        "legacy acknowledged weight-only notice is hidden with its evidence retained",
+        "weight changes preserve a genuine pending notice until cargo changes again",
+        "weight changes preserve a genuine acknowledged notice until cargo changes again",
+        "legacy mixed weight and cargo acknowledgement survives a later weight update",
+        "weight updates process without review and continue to pass the executed-prefix save check"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/resplit-sibling-group-allocations.test.js",
+      "tests": 4,
+      "pass": 4,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "completed sibling group PO allocation using the root SO does not block resplitting the selected child",
+        "selected child allocation stays blocked and cannot be bypassed by sibling group links",
+        "property: sibling group links never block a valid child, and moving the link to that child always blocks numbering",
+        "HTTP resplits an unallocated child with a completed sibling group PO link, preserves history, and retries safely"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sales-split-allocation-unsplit.test.js",
+      "tests": 14,
+      "pass": 14,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "PO allocation blocks split preview and seed with unlink instructions",
+        "PO allocation blocks initial split persistence without partial definitions",
+        "TO allocation blocks split preview and seed with unlink instructions",
+        "TO allocation blocks initial split persistence without partial definitions",
+        "cancelled PO and TO links allow splitting; established linked children can be saved unchanged",
+        "non-cancelled TO states and legacy PO targets cannot bypass the blocker",
+        "editing established split quantities with a PO link is blocked while a harmless refresh is allowed",
+        "HTTP rejects a PO-linked split preview and a direct stale plan save",
+        "a link committed while split persistence waits on the fleet lock wins without partial writes",
+        "unsplit restores the original descriptive pieces omitted by a legacy sales-only split",
+        "property: legacy sales-only unsplit conserves original sales and descriptive pieces over arbitrary partitions",
+        "converted packing quantities and actual sales shortages still block unsplit atomically",
+        "unknown child line cannot be discarded by unsplit even when known source quantities balance",
+        "unsplit immediately returns authoritative local-open flags for an audited Billed parent"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-admin-http.test.js",
+      "tests": 3,
+      "pass": 3,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR gate can be audited and toggled independently by Admin only",
+        "SOR-2 real Admin API rejects anonymous and non-admin edits, validates terms, prevents stale writes",
+        "SOR-2 item overrides persist through actual Admin endpoint and stale edits cannot win"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-feature-gate.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR gate is an independent, default-off Admin gate",
+        "SOR missing gate stops queued automation even with legacy rollout enabled",
+        "SOR off gate stops queued automation even with legacy rollout enabled",
+        "SOR off removes new prompts from assigned work; enabling restores prompts without changing jobs",
+        "SOR off prevents rental-yard NetSuite requests",
+        "SOR off hides stale rental delivery, return and group cards, preserving ordinary orders"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-rental-concurrency.test.js",
+      "tests": 1,
+      "pass": 1,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR-6 concurrent reconciliation creates one return; racing Admin edits have one winner"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-rental-repository.test.js",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR-2 Admin revisions, stable override and T&C history",
+        "SOR-3 real Dispatch projects rental service cargo and SOR-4 return keeps equipment detail",
+        "SOR-4/6 repeated reconciliation preserves one exact return and completed history",
+        "SOR-6 source changes reconcile unassigned returns and suppress empty returns",
+        "SOR-7 a missing return address blocks assignment, while an unassigned pool card does not block saving",
+        "SOR-2 metadata changes preserve Admin overrides and enqueue affected returns once",
+        "SOR-4/6 return appears in the actual SO feed and optimized pool; cancellation hides even a stale card"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-return-definition.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR collection mislabelled as a split cannot remove its delivery source",
+        "SOR plan projection persists the collection as derived and preserves true delivery splits",
+        "SOR definition repair only changes legacy rental collections and is repeatable",
+        "SOR collection keeps its own source when the delivery source refreshes",
+        "SOR canonical collection is not overwritten by an obsolete global delivery projection"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-return-driver-readiness.test.js",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR992225: return can start without a planned or completed delivery",
+        "SOR992225-S1: return can start without a planned or completed delivery",
+        "return completion without an earlier start or delivery still records required photos",
+        "cancelled return remains blocked",
+        "Dispatch review remains blocked",
+        "missing address remains blocked"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-return-lifecycle.test.js",
+      "tests": 8,
+      "pass": 8,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR-6 collision fails without modifying unrelated custom work",
+        "SOR-7 collection does not depend on delivery completion and still blocks for review",
+        "SOR-6 started return freezes quantities and raises review",
+        "SOR-5 active splits retain exact quantities and inactive split does not reappear",
+        "SOR-6 durable queue retries failed catalog refresh and records exhausted errors",
+        "SOR-6 delivered and billed equipment keeps its outstanding return, without backfilling historical sales",
+        "SOR-2 metadata sync reads hierarchy and item type from SuiteQL and keeps explicit overrides",
+        "SOR-6 unassigning untouched work clears review even when source data has reverted"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-return-lock.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR refresh sees committed return and can acquire fleet lock on an independent connection",
+        "SOR queued behind a catalog refresh needing fleet lock completes without a lock cycle",
+        "SOR catalog failure retains durable return and queue; retry cannot duplicate it",
+        "SOR refresh cannot erase a newer queued source version",
+        "SOR worker requested inside an outer transaction defers until commit and ignores rollback"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-return-source-refresh.test.js",
+      "tests": 14,
+      "pass": 14,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "assigned untouched return refreshes equipment, quantity, plan, derived catalog and driver cargo without unassigning",
+        "assigned untouched source address refreshes its pickup and invalidates old route timing",
+        "unassigned return refreshes an existing derived catalog definition",
+        "JSON key ordering and null/empty unit round trips cannot mark assigned unchanged work for review",
+        "obsolete review clears for unchanged assigned work",
+        "source edits refresh an existing return after delivery, without backfilling a historical order",
+        "projection failure rolls the source refresh back atomically",
+        "started pickup retains recorded equipment and receives a specific review reason",
+        "completed collection and an assigned collection removed from source retain their safeguards",
+        "completed travel preserves its destination while refreshing uncollected equipment",
+        "completed travel preserves its destination while holding a changed address for review",
+        "a driver start holding the fleet lock commits before a concurrent refresh can change cargo",
+        "retired source lines cannot reappear in the return of a fulfilled order",
+        "a source that explicitly removes all equipment cannot resurrect the saved delivered-equipment snapshot"
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/sor-signature-evidence.test.js",
+      "tests": 5,
+      "pass": 5,
+      "fail": 0,
+      "cancelled": 0,
+      "skipped": 0,
+      "todo": 0,
+      "names": [
+        "SOR-9 optional signature preserves validated metadata through offline sanitization",
+        "SOR-9/10 signature freezes historical Admin T&C and cannot use unrelated evidence",
+        "SOR-9 property: invalid revision never becomes a valid signing contract",
+        "SOR-9/10 signed completion retains exact evidence separately from mandatory photos and enforces ownership",
+        "SOR-8/10 a confirmed Driver route carries rental cargo, signature wording, and Dispatch history evidence"
+      ]
+    }
+  ],
+  "passed": false,
+  "runtime": "/home/ubuntu/apps/operatorApp/server/deployments/bin-weight-warning-20261024/candidate"
+}

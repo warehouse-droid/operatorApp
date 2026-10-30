@@ -76,7 +76,7 @@ export function ifirFixture(options = {}) {
         if (Number(input.id) === state.source.id && input.type === state.source.type) { return recordModel(state.source); }
         if (input.type === 'otherchargeitem') {
           return recordModel({ id: input.id, type: input.type, items: [],
-            header: { subtype: 'Purchase', generateaccruals: false } });
+            header: { subtype: state.chargeSubtype ?? 'Purchase', generateaccruals: false } });
         }
         if (state.failRead) { throw Error('READ_UNAVAILABLE'); }
         const saved = state.stored.get(Number(input.id));

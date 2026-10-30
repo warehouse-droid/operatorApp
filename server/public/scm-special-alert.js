@@ -8,6 +8,7 @@
   let session = '', checkedSession = '', allowed = false, count = null;
   let timer = null, retry = null, events = null, observer = null, request = null, authority = null, refreshAgain = false;
   let link = null, status = null;
+
   let newRequests = 0, confirmedOrders = 0;
 
   function paint() {
@@ -18,7 +19,7 @@
     if (!link) {
       link = document.createElement('a');
       link.className = 'scm-special-alert';
-      link.href = '/scm/stock-requests?tab=special&stages=new_enquiry,confirmed';
+      link.href = '/scm/stock-requests?tab=special&alerts=1';
       link.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg><span data-special-alert-label></span><strong data-special-alert-count></strong>';
     }
     if (link.parentElement !== host) { host.prepend(link); }

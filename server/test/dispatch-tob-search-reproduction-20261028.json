@@ -1,0 +1,199 @@
+{
+  "at": "2026-10-28T15:52:24.288Z",
+  "node": "v20.20.2",
+  "browser": "151.0.7922.34",
+  "image": "sha256:1019d55e092e0dc3289207dcacbe2a93bb5c8e81950d700ad9fd1bbc77992873",
+  "sourceSha256": "f5c8ecacaa19c2439acd226e6aed471d131c4395436dbf19dec65e81332bf455",
+  "scenarios": [
+    {
+      "scenario": "quiet",
+      "waiting": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": true
+      },
+      "result": {
+        "refs": [
+          "TOB01260",
+          "TOB01261",
+          "TOB01262",
+          "TOB01263",
+          "TOB01264",
+          "TOB01265",
+          "TOB01266",
+          "TOB01267",
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": false,
+        "error": "",
+        "subtitle": "Search results across all valid SO, PO, TO, Custom, and CO orders.",
+        "renderedRefs": [
+          "TOB01268",
+          "TOB01269",
+          "TOB01260",
+          "TOB01261",
+          "TOB01262",
+          "TOB01263",
+          "TOB01264",
+          "TOB01265",
+          "TOB01266",
+          "TOB01267"
+        ],
+        "allPlanned": false,
+        "epoch": 0,
+        "generation": 0,
+        "cacheSize": 1,
+        "routeNotice": ""
+      },
+      "requests": [
+        "/dispatch.html",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200"
+      ]
+    },
+    {
+      "scenario": "background-update-during-search",
+      "waiting": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": true
+      },
+      "result": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": false,
+        "error": "",
+        "subtitle": "Search results across all valid SO, PO, TO, Custom, and CO orders.",
+        "renderedRefs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "allPlanned": true,
+        "epoch": 1,
+        "generation": 0,
+        "cacheSize": 0,
+        "routeNotice": ""
+      },
+      "requests": [
+        "/dispatch.html",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200",
+        "/api/dispatch/plans/371/executed-order-reviews?baseRevision=38&baseDigest=",
+        "/api/dispatch/v2/order-pool?type=SO&limit=200",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200"
+      ],
+      "retryRefs": [
+        "TOB01260",
+        "TOB01261",
+        "TOB01262",
+        "TOB01263",
+        "TOB01264",
+        "TOB01265",
+        "TOB01266",
+        "TOB01267",
+        "TOB01268",
+        "TOB01269"
+      ]
+    },
+    {
+      "scenario": "local-edit-during-search",
+      "waiting": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": true
+      },
+      "result": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": false,
+        "error": "",
+        "subtitle": "Search results across all valid SO, PO, TO, Custom, and CO orders.",
+        "renderedRefs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "allPlanned": true,
+        "epoch": 0,
+        "generation": 1,
+        "cacheSize": 0,
+        "routeNotice": ""
+      },
+      "requests": [
+        "/dispatch.html",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200"
+      ],
+      "retryRefs": [
+        "TOB01260",
+        "TOB01261",
+        "TOB01262",
+        "TOB01263",
+        "TOB01264",
+        "TOB01265",
+        "TOB01266",
+        "TOB01267",
+        "TOB01268",
+        "TOB01269"
+      ]
+    },
+    {
+      "scenario": "background-update-before-search",
+      "waiting": {
+        "refs": [
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": true
+      },
+      "result": {
+        "refs": [
+          "TOB01260",
+          "TOB01261",
+          "TOB01262",
+          "TOB01263",
+          "TOB01264",
+          "TOB01265",
+          "TOB01266",
+          "TOB01267",
+          "TOB01268",
+          "TOB01269"
+        ],
+        "loading": false,
+        "error": "",
+        "subtitle": "Search results across all valid SO, PO, TO, Custom, and CO orders.",
+        "renderedRefs": [
+          "TOB01268",
+          "TOB01269",
+          "TOB01260",
+          "TOB01261",
+          "TOB01262",
+          "TOB01263",
+          "TOB01264",
+          "TOB01265",
+          "TOB01266",
+          "TOB01267"
+        ],
+        "allPlanned": false,
+        "epoch": 1,
+        "generation": 0,
+        "cacheSize": 1,
+        "routeNotice": ""
+      },
+      "requests": [
+        "/dispatch.html",
+        "/api/dispatch/plans/371/executed-order-reviews?baseRevision=38&baseDigest=",
+        "/api/dispatch/v2/order-pool?type=SO&limit=200",
+        "/api/dispatch/v2/order-pool?search=TOB0126&limit=200"
+      ]
+    }
+  ]
+}

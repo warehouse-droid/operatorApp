@@ -1,0 +1,98 @@
+{
+  "passed": true,
+  "at": "2026-10-22T18:19:25.093Z",
+  "specApproval": "not obtained (autonomous run)",
+  "sourceHashes": {
+    "public/dispatch.js": "f9fa48b09c7a460a4e5803e4bfbfb74aae8375d84de1aebb6f0f4a942fb6b51f",
+    "public/dispatch.html": "81000d97ee54114db47043800a662ddb0ade979862dcef18332c385985eddd26"
+  },
+  "newFailures": 0,
+  "regression": {
+    "tests": 96,
+    "pass": 94,
+    "fail": 2,
+    "failures": [
+      "RP-05 active travel protects its destination while allowing work after it",
+      "RP-08 sequence, timing, capacity, labels, and tooltips use visit-scoped orders"
+    ]
+  },
+  "reordered": true,
+  "shuffledFileOrder": [
+    "test/dispatch/unit/dispatch-executed-order-review.test.js",
+    "test/dispatch/property/dispatch-executed-order-review.test.js",
+    "test/dispatch/frontend/dispatch-start-travel-boundary.test.js",
+    "test/dispatch/frontend/dispatch-repeat-pickup-visits.red.test.js",
+    "test/dispatch/property/dispatch-repeat-pickup-visits.property.test.js",
+    "test/dispatch/adversarial/dispatch-repeat-pickup-visits.adversarial.test.js",
+    "test/dispatch/unit/dispatch-activity-allocation-scope.test.js",
+    "test/dispatch/unit/executed-prefix-historical-reflexivity.test.js",
+    "test/dispatch/frontend/dispatch-required-pickups.test.js",
+    "test/dispatch/unit/dispatch-weight-save.test.js",
+    "test/dispatch/unit/dispatch-executed-order-incidents.test.js",
+    "test/dispatch/unit/dispatch-repeat-pickup-visits.red.test.js"
+  ],
+  "focused": {
+    "tests": 14,
+    "pass": 14,
+    "fail": 0,
+    "failures": []
+  },
+  "coverage": {
+    "statements": 44,
+    "covered": 44,
+    "scope": "actual extracted production details parser and route boundary functions"
+  },
+  "syntax": "passed",
+  "lint": "passed",
+  "types": "passed",
+  "mutations": {
+    "total": 6,
+    "killed": 6,
+    "propertyKilled": 5,
+    "results": [
+      {
+        "name": "blanket-lock",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "unlock-destination",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "wrong-load",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "inter-stop-leg",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "wrong-yard",
+        "killed": true,
+        "propertyKilled": true
+      },
+      {
+        "name": "ignore-physical",
+        "killed": true,
+        "propertyKilled": false
+      }
+    ]
+  },
+  "versions": {
+    "typescript": "7.0.2",
+    "eslint": "10.8.0",
+    "fast-check": "4.9.0",
+    "c8": "12.0.0"
+  },
+  "node": "v20.20.2",
+  "limits": [
+    "Full application and browser layout suites omitted: only the existing planning guard and asset version change.",
+    "Types apply to extracted route fields; existing legacy parsing boundaries retain any.",
+    "Physical activity mutation is covered by scenario tests; suffix/encoding properties alone do not cover physical evidence.",
+    "No live dispatch plan or driver record is rewritten by this fix."
+  ]
+}

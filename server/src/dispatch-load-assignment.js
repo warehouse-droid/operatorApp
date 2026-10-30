@@ -412,6 +412,11 @@ function dispatchOwnYardLocationKeys(plan = {}) {
 
 function dispatchItemForPickupLocation(plan = {}, order = {}, item = {}, location = "") {
   if (text(order.type).toUpperCase() === "CUSTOM") return item;
+  const totalSales = Number(item.quantity ?? item.salesQty);
+  const knownSales = (item.quantity != null || item.salesQty != null) && Number.isFinite(totalSales);
+  // Packing describes this sales quantity; it is not a second cargo balance.
+  const packing = (field, legacy, sales) => !knownSales ? legacy : totalSales <= 0 ? 0
+    : Math.max(dispatchNumber(item[field]), 0) * Math.min(Math.max(sales, 0), totalSales) / totalSales;
   const ownYard = dispatchOwnYardLocationKeys(plan).has(normalizedYardLocationText(location));
   if (ownYard) {
     const source = text(order.sourceYard || order.outboundLocation);
@@ -419,24 +424,26 @@ function dispatchItemForPickupLocation(plan = {}, order = {}, item = {}, locatio
       ? dispatchDirectPickupAllocatedForItem(order, item)
       : { pallets: 0, layers: 0, sections: 0, pieces: 0, quantity: 0 };
     const balance = (value, allocated) => Math.max(dispatchNumber(value) - dispatchNumber(allocated), 0);
+    const sales = balance(item.quantity ?? item.salesQty, dispatchNumber(item.poAllocatedSalesQty) + direct.quantity);
     return {
       ...item,
-      pallets: balance(item.pallets, dispatchNumber(item.poAllocatedPallets) + direct.pallets),
-      layers: balance(item.layers, dispatchNumber(item.poAllocatedLayers) + direct.layers),
-      sections: balance(item.sections, dispatchNumber(item.poAllocatedSections) + direct.sections),
-      pieces: balance(item.pieces, dispatchNumber(item.poAllocatedPieces) + direct.pieces),
-      quantity: balance(item.quantity ?? item.salesQty, dispatchNumber(item.poAllocatedSalesQty) + direct.quantity),
-      salesQty: balance(item.salesQty ?? item.quantity, dispatchNumber(item.poAllocatedSalesQty) + direct.quantity)
+      pallets: packing('pallets', balance(item.pallets, dispatchNumber(item.poAllocatedPallets) + direct.pallets), sales),
+      layers: packing('layers', balance(item.layers, dispatchNumber(item.poAllocatedLayers) + direct.layers), sales),
+      sections: packing('sections', balance(item.sections, dispatchNumber(item.poAllocatedSections) + direct.sections), sales),
+      pieces: packing('pieces', balance(item.pieces, dispatchNumber(item.poAllocatedPieces) + direct.pieces), sales),
+      quantity: sales,
+      salesQty: sales
     };
   }
+  const sales = Math.max(0, knownSales ? Math.min(totalSales, dispatchNumber(item.poAllocatedSalesQty)) : dispatchNumber(item.poAllocatedSalesQty));
   return {
     ...item,
-    pallets: dispatchNumber(item.poAllocatedPallets),
-    layers: dispatchNumber(item.poAllocatedLayers),
-    sections: dispatchNumber(item.poAllocatedSections),
-    pieces: dispatchNumber(item.poAllocatedPieces),
-    quantity: dispatchNumber(item.poAllocatedSalesQty),
-    salesQty: dispatchNumber(item.poAllocatedSalesQty)
+    pallets: packing('pallets', dispatchNumber(item.poAllocatedPallets), sales),
+    layers: packing('layers', dispatchNumber(item.poAllocatedLayers), sales),
+    sections: packing('sections', dispatchNumber(item.poAllocatedSections), sales),
+    pieces: packing('pieces', dispatchNumber(item.poAllocatedPieces), sales),
+    quantity: sales,
+    salesQty: sales
   };
 }
 

@@ -1,0 +1,220 @@
+{
+  "date": "2026-10-21",
+  "release": "v3: all-customer discovery correction, automatic event refresh, historical full cash-credit correction and truthful rebuild summary",
+  "scope": "Eight SuiteScript files. Reporting ledger and custom refresh queue only; no financial record writes or refund submissions.",
+  "specApproval": "not obtained (autonomous run); automatic updates, cash grouping and refund deduction explicitly requested in conversation",
+  "sourceTreeSha256": "eafbaaac9987a61afd535ea82aad4069ca1c6c8aadb4ea5fbc4b313175ce232a",
+  "sourceHashMethod": "SHA256 of each sorted ppa_*.js filename followed immediately by its UTF-8 file bytes",
+  "commandFromRepositoryRoot": "PPA_TEST_TOOLING=1 bash server/tools/pallet-payment-tests.sh node test/tooling.cjs",
+  "runtime": {
+    "node": "v20.20.2",
+    "image": "mbbs-operator-app:dispatch-editor-control-browser-test-20261015"
+  },
+  "tools": {
+    "typescript": "5.9.3",
+    "eslint": "9.39.1",
+    "c8": "10.1.3",
+    "fast-check": "4.3.0"
+  },
+  "finalFreshRun": {
+    "acceptanceTests": {
+      "passed": 81,
+      "failed": 0,
+      "skipped": 0
+    },
+    "generatedCases": {
+      "passed": 4800,
+      "seeds": [
+        20261021,
+        20261022,
+        20261023,
+        20261024,
+        20261025
+      ]
+    },
+    "manualMutations": {
+      "detected": 23,
+      "attempted": 23
+    },
+    "propertyOnlyMutations": {
+      "detected": 9,
+      "attempted": 9,
+      "scope": "six calculation mutations and three queue interleaving/retry mutations"
+    },
+    "changedSourceCoverage": {
+      "lines": "910/910 (100%)",
+      "functions": "91/91 (100%)",
+      "branches": "473/548 (86.31%)"
+    },
+    "javascriptTypeCheck": "pass; allowJs/checkJs with generic native SuiteScript boundary types",
+    "lint": "pass; zero errors/warnings, complexity <=12 and nesting <=4",
+    "syntax": "all eight upload files pass node --check",
+    "uploadHeaders": "all eight pass line-delimited 2.1 JSDoc contracts; entry point script types checked",
+    "suiteHealth": "All 81 acceptance cases pass again with test-file order reversed",
+    "standaloneExecution": {
+      "cashPallets": 5,
+      "cashRate": 40,
+      "visaPallets": 1,
+      "visaRate": 45.2,
+      "verified": true
+    },
+    "historicalCashAcceptance": {
+      "creditQuantity": 10,
+      "creditNet": 400,
+      "creditTax": 52,
+      "cashRefundApplied": 452,
+      "deductedCashPallets": 10,
+      "cashRate": 40,
+      "recordedPalletPrincipal": 400,
+      "rerunDuplicates": 0
+    },
+    "disposableDevToolAudit": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0,
+      "total": 0
+    },
+    "directDevToolLicenses": {
+      "typescript": "Apache-2.0",
+      "eslint": "MIT",
+      "c8": "ISC",
+      "fast-check": "MIT"
+    },
+    "capabilityAndSecretScan": "Inspected record mutation sites: allocation/refund allowlist unchanged; queue can create/update/delete only its configured custom record. New N/task submission targets only the designated writer. No private-key blocks, AWS key patterns, long sk- tokens, runtime network/subprocess/filesystem capabilities or credentials in upload files."
+  },
+  "specEvidenceMap": {
+    "originalFinancialRules": {
+      "wholePalletsCashFirstTaxAndAppliedAmount": [
+        "test/core.test.cjs: cash is floored at net cost; other methods include tax",
+        "test/adapter.test.cjs: live-shape invoice/applications",
+        "test/properties.cjs: arithmetic property"
+      ],
+      "memoNormalizationAndAmbiguity": [
+        "test/core.test.cjs: observed historical card formats",
+        "test/core.test.cjs: ambiguous numbers",
+        "test/properties.cjs: suffix property",
+        "../docs/pallet-payment-memo-audit-20261021-verified.json (repository server/docs)"
+      ],
+      "sourceLineScopeAndFundingDate": [
+        "test/adapter.test.cjs: consolidated invoice",
+        "test/core.test.cjs: source scope",
+        "test/core.test.cjs: later receipt"
+      ],
+      "depositProvenance": [
+        "test/adapter.test.cjs: deposit application follows deposit once",
+        "test/adapter.test.cjs: native Deposit Application"
+      ],
+      "refundPendingCompletionReversal": [
+        "test/core.test.cjs: pure pallet refund",
+        "test/core.test.cjs: pending becomes completed",
+        "test/adapter.test.cjs: manual reservation",
+        "test/adapter.test.cjs: upsert linked refund history",
+        "test/properties.cjs: refund property"
+      ],
+      "mixedCreditsAndOnAccount": [
+        "test/core.test.cjs: mixed credit",
+        "test/core.test.cjs: reviewed on-account credits",
+        "test/adapter.test.cjs: real mixed credit"
+      ],
+      "reviewAndPhysicalReconciliation": [
+        "test/core.test.cjs: review blocks unknown card",
+        "test/service.test.cjs: review results"
+      ],
+      "retryPartialWriteSourceChange": [
+        "test/service.test.cjs: retry upserts",
+        "test/service.test.cjs: stale snapshot",
+        "test/service.test.cjs: changed consumed funding"
+      ],
+      "customRecordOnlyAndDryRun": [
+        "test/service.test.cjs: dry run",
+        "test/adapter.test.cjs: persistence writes only agreed custom-record fields",
+        "test/entrypoint.test.cjs: preview default"
+      ],
+      "limitsAndUnsupportedData": [
+        "test/adapter.test.cjs: missing tax and resource limits",
+        "test/adapter.test.cjs: changed record contents"
+      ],
+      "applicationIsolation": "No application runtime, database schema, deployment or existing return code changed. Only new bundle, harness and audit/documentation files."
+    },
+    "durableCapturedEvents": "test/refresh.test.cjs: later events and other customers survive acknowledgement; retry is idempotent; test/automation-properties.cjs: 400 generated interleavings",
+    "singleWriterAndRecovery": "test/refresh.test.cjs: busy/denied submissions retain rows, 15-minute defer, bounded batches, wrong-writer guard, self-resubmission without task ID, dispatcher retry",
+    "transactionCoverage": "test/refresh.test.cjs: seven transaction types, approvals/cancellation, previous/current customer, xedit missing fields and deletion",
+    "manualAndRecursion": "test/refresh.test.cjs: old/new allocation customer, generated PRA1 exclusion, externalid-only xedit, missing linked customer errors",
+    "queuePreviewAndSummary": "test/refresh.test.cjs: queue-only routing, REVIEW persisted before acknowledgement, preview has no queue writes, failure deferral and truthful completion counts",
+    "historicalFullCashCredit": "test/core.test.cjs: 10- and 100-pallet full-gross cash refunds; pure/posting/single-leg/capacity boundaries; test/automation-properties.cjs: 400 quantity/idempotence/partial-settlement cases",
+    "nativeSchemaAndReportConfiguration": "User supplied field source Transaction and confirmed change to Payment Method; live read-only query confirmed 60 saved rows for customer 5240. Cash summary settings are documented in UPGRADE-v3.txt; no saved search was modified remotely.",
+    "runtimeLimits": "New native UE/MR/dispatcher deployments not executed locally; UI installation and account role/context validation remain required.",
+    "uploadHeaders": "test/upload.test.cjs: all eight line-delimited API version headers and three correct entry point types",
+    "allCustomerDiscovery": "test/adapter.test.cjs: unsupported UNION failure boundary, two separately paged summary searches, numeric unique IDs, all pages, empty history, no writes and targeted-customer bypass. Three additional mutations detect dropping ledger-only customers, later pages or deduplication."
+  },
+  "issuesFoundAndFixed": [
+    "Initial 21 automation acceptance cases all failed against behavior-throwing stubs/old MR before implementation, then passed with the existing suite.",
+    "User confirmed custrecord_ppa_method incorrectly referenced Transaction. After the UI correction, a read-only query returned 60 allocation rows, 207 allocated, zero refunded, all unverified for customer 5240.",
+    "Two new cash-refund tests reproduced the exact gross-cash rejection before implementation. A full pure-pallet posted cash credit now uses the credited quantity while retaining net cash principal and explicit historical-tax return reference.",
+    "Adversarial tests found that native xedit omissions can be empty strings and that a manual externalid-only xedit can omit its allocation link. Both were observed failing before getFields-based loading and link lookup corrections.",
+    "An adversarial test found a missing customer on a referenced allocation was silent; it now logs a capture failure.",
+    "The first gauntlet passed types/lint/79 acceptance tests/coverage/properties but stopped on a stale mutation anchor after a variable rename. The anchor was corrected and the entire gauntlet rerun; all 20 mutations were detected.",
+    "Additional checks of already implemented bounds, writer guards and generated-record exclusion are backed by corresponding detected mutations; original business assertions were not weakened.",
+    "User reported PALLET INPUT FAILED at 5:13 PM after clearing 5240. Two new cases reproduced SSS_SEARCH_ERROR_OCCURRED at the old customers() paged fetch before implementation. Replaced the UNION query with separate native N/search customer groups; all 81 acceptance cases, 4800 generated cases and 23 mutations passed in the final fresh run."
+  ],
+  "nativeEvidence": {
+    "v2Preview": {
+      "customer": "5240",
+      "issued": 207,
+      "credited": 203,
+      "physical": 4,
+      "allocationRows": 60,
+      "refundRows": 0,
+      "verified": false
+    },
+    "fieldCorrection": "User changed custrecord_ppa_method List/Record from Transaction to Payment Method; no assistant schema mutation.",
+    "readOnlyAfterCorrection": {
+      "customers": 1,
+      "customer": "5240",
+      "rows": 60,
+      "allocated": 207,
+      "refunded": 0,
+      "verified": false
+    },
+    "v3": "Prepared and locally validated only. No native deployment, source-transaction edit, credit, refund or saved-search write performed.",
+    "allCustomerInputFailure": {
+      "reportedTime": "2026-10-21 17:13 account log time",
+      "source": "User-supplied native log",
+      "error": "SSS_SEARCH_ERROR_OCCURRED: Invalid or unsupported search",
+      "oldLocation": "ppa_netsuite.js:45 customers() paged UNION fetch",
+      "correction": "Prepared separate paged N/search summary queries; not yet uploaded or executed natively"
+    }
+  },
+  "limitsAndSkippedLayers": [
+    "Native NetSuite N/record, N/search and N/task are tested through boundary fixtures. Successful upload and role/context behavior of new deployments still require account validation.",
+    "A lost event before queue persistence (e.g. missing permissions), disabled triggers, or a transaction written by another User Event requires source integration to call the queue helper or a backfill. The dispatcher recovers durable queued work; it cannot reconstruct uncaptured events.",
+    "Balances update after background processing; no synchronous freshness guarantee or concurrent refund authorization lock is provided.",
+    "Missing card last4, partial/mixed settlements, on-account provenance and insufficient original method capacity remain REVIEW. Customer 5240 is not claimed fully reconciled.",
+    "Branch coverage is 86.31%, not exhaustive proof. Historical cash change is deliberately limited to one fully posted refund of a pure pallet credit without manual/on-account allocation.",
+    "Original large-customer/governance and unsupported-tax checks remain; no truncation of history to force verification.",
+    "Repository-wide application tests skipped because these scripts are not imported by the live application and no application code changed.",
+    "Random individual-test order is not supported by this runner; reversed file order passed. No commit/checkpoint cadence requested; source identified by SHA256.",
+    "Pinned disposable development tools emitted ESLint 9 and transitive glob deprecation warnings; audit including dev dependencies returned zero vulnerabilities. No tool dependencies are shipped or installed in the application."
+  ],
+  "previousRelease": {
+    "release": "v2: upload-header formatting correction",
+    "sourceTreeSha256": "307753bf464733ad0af24846b18566781233d0399059db40e06cc0bb1bb853df",
+    "acceptanceTests": {
+      "passed": 48,
+      "failed": 0,
+      "skipped": 0
+    },
+    "archive": "/home/ubuntu/Pallet-Payment-Scripts-v2.zip"
+  },
+  "teardown": {
+    "runner": "repository retention wrapper and bounded one-off docker run --rm",
+    "limits": "mbbs-tests.slice; 1 GiB RAM/matching swap; 1 CPU; 256 PIDs; init; 128 MiB tmpfs; disposable-test label",
+    "containers": "Final docker ps and docker ps -a each show only the four production containers",
+    "databaseVolumesCreated": 0,
+    "customNetworksCreated": 0,
+    "testArtifacts": "Raw logs, coverage, mutants, temporary dependencies and unique test artifact directory removed by runner",
+    "productionHealth": "Application health endpoint passed; app, database and Ollama Docker health statuses healthy"
+  }
+}

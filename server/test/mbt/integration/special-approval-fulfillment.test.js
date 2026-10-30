@@ -63,9 +63,12 @@ test('Sales can claim delivery edits after both orders exist, with revision and 
  const claimed=await deliveryClaim(d.id,change,context);assert.equal(claimed.fulfillmentChange.status,'applying');assert.equal(claimed.fulfillmentChange.target.fulfillmentMethod,'mbt_delivery');
  assert.equal(claimed.fulfillmentMethod,'yard_pickup');assert.equal(claimed.attention,true);
 }));
-test('planned SO blocks a delivery edit before journal or remote work',()=>fixture(async()=>{
+test('planned SO allows a delivery edit with a recoverable journal',()=>fixture(async()=>{
  const d=await linked();await query('UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=8899911');
- await assert.rejects(()=>deliveryClaim(d.id,{expectedRevision:d.revision,fulfillmentMethod:'vendor_pickup'},context),{code:'SPECIAL_FULFILLMENT_PLANNED'});
+ const claimed=await deliveryClaim(d.id,{expectedRevision:d.revision,fulfillmentMethod:'vendor_pickup'},context);
+ assert.equal(claimed.fulfillmentChange.status,'applying');
+ assert.equal(claimed.fulfillmentChange.target.fulfillmentMethod,'vendor_pickup');
+ assert.equal(claimed.fulfillmentMethod,'yard_pickup');
 }));
 
 test('delivery service preserves its saved target after remote failure, permits planning, and updates both audiences on retry',()=>fixture(async()=>{
@@ -73,6 +76,7 @@ test('delivery service preserves its saved target after remote failure, permits 
  const {prepareSpecialFulfillmentPlan,applySpecialFulfillmentPlan}=await import('../../../src/special-stock-fulfillment-adapter.js');
  const {assertSpecialStockHandoffPlanning}=await import('../../../src/dispatch-plan-repository.js');
  let d=await linked({status:'B',statusText:'Pending Receipt'});
+ await query('UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=8899911');
  const record={id:'8899911',entity:{id:'8899100'},location:{id:'1'},custbody3:{id:'1'},item:{items:[{line:1,item:{id:'2055'},quantity:2,units:'1',rate:10,description:'TEST product',location:{id:'1'}}]}};
  let patches=0,fail=true;
  const boundary={config:{pickupMethodId:1,deliveryMethodId:2},queryAll:async()=>[{uniquekey:101,rest_line_id:1,item:2055,status:'B',execution_quantity:0,billed_quantity:0,line_closed:'F'}],
@@ -186,13 +190,13 @@ test('a legacy pickup journal with a saved remote plan must still be verified',(
  d=await update(d.id,{expectedRevision:d.revision,changeId},context);assert.equal(verified,1);assert.equal(d.fulfillmentMethod,'vendor_pickup');
 }));
 
-test('pickup completion rechecks planning after claim and respects scope and revisions',()=>fixture(async()=>{
+test('pickup completion rechecks execution after claim and respects scope and revisions',()=>fixture(async()=>{
  let d=await linked();const input={expectedRevision:d.revision,fulfillmentMethod:'vendor_pickup'};
  await assert.rejects(()=>deliveryClaim(d.id,input,{...context,authorizedStoreLocationIds:[28]}),{code:'SPECIAL_CASE_STORE_FORBIDDEN'});
  await assert.rejects(()=>deliveryClaim(d.id,{...input,expectedRevision:d.revision+1},context),{code:'SPECIAL_REVISION_CONFLICT'});
  d=await deliveryClaim(d.id,input,context);
- await query('UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=8899911');
- await assert.rejects(()=>repository.finishSpecialFulfillmentChange(d.id,d.fulfillmentChange.id,{},context),{code:'SPECIAL_FULFILLMENT_PLANNED'});
+ await query("INSERT INTO sales_special_stock_handoffs(request_id,status,sales_order_netsuite_id,purchase_order_netsuite_id,pickup_address,destination_address,operational_yard_location_id) VALUES($1,'in_progress',8899911,8899912,'TEST vendor','TEST yard',1)",[d.id]);
+ await assert.rejects(()=>repository.finishSpecialFulfillmentChange(d.id,d.fulfillmentChange.id,{},context),{code:'SPECIAL_FULFILLMENT_STARTED'});
  assert.equal((await repository.getSpecialStockCase(d.id)).fulfillmentMethod,'yard_pickup');
 }));
 test('delivery preparation failure releases editing and Sales can replace the failed target',()=>fixture(async()=>{

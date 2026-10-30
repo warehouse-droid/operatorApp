@@ -1,0 +1,39 @@
+{
+  "observedDate": "2026-10-21",
+  "supersedesAccessFindingOnly": "pallet-payment-memo-audit-20261021.json",
+  "account": "6518947",
+  "role": 1067,
+  "readOnly": true,
+  "financialRecordsChanged": 0,
+  "customRecordsChanged": 0,
+  "verifiedPermissions": ["Customer Deposit: View", "Customer Payment: View", "Customer Refund: View", "Deposit Application: View", "Invoice: View"],
+  "verifiedCustomRecordTypes": ["customrecord_pallet_payment_alloc", "customrecord_pallet_refund_alloc"],
+  "savedSearch": {"id": "customsearch_pallet_payment_balance", "internalId": "1196", "title": "Pallet Balance by Payment Method", "catalogReadStatus": 200},
+  "sample": {
+    "selection": "Latest up to 1000 card-method transactions per type and year, sorted by internal ID descending. Methods 4,5,6,8,11. This is a stratified historical sample, not a full-account audit.",
+    "payment2021": 1000,
+    "payment2024": 1000,
+    "payment2026": 1000,
+    "refund2021": 929,
+    "refund2024": 1000,
+    "refund2026": 936,
+    "totalCardTransactionMemosInspected": 5865,
+    "customerDepositsVisible": 1,
+    "customerDepositMethod": "Cash",
+    "depositApplicationsVisibleInAggregate": 0
+  },
+  "observedMemoShapes": ["SOB<digits>(dddd)", "SOB<digits> / dddd", "SOB<digits> + dddd", "SOB<digits> 、 dddd", "sob<digits>（dddd）", "CMB<digits> #dddd", "CMB<digits>(dddd)", "Deposit / dddd"],
+  "findings": [
+    "Many older card payments/refunds have no recorded last-four digits; a transaction reference alone is insufficient to recover them.",
+    "Verified payment method IDs: Cash 1, Check 2, Master Card 4, VISA 5, American Express 6, EFT 7, Debit Card 8, EMT 9, Direct Deposit 10, UnionPay 11, Wechat/Alipay 13.",
+    "Invoice-to-payment NextTransactionLineLink Payment rows carry applied amounts. Credit applications are separate CustCred rows and must not manufacture new cash/card funding.",
+    "Customer Refund apply sublists identify the actual credit memo/payment and amount applied; the tested invoice-to-payment link query did not expose refund links.",
+    "Credit memo transaction lines include COGS mirror lines. Item sublist / iscogs=F avoids counting these as extra pallets.",
+    "Observed six-pallet credit subtotal 240, tax 31.20, total 271.20; user confirmed cash excludes tax and all other methods include tax.",
+    "Some pallet credits were applied against later invoices instead of refunded; those require explicit reviewed settlement allocations.",
+    "Exact customer-history query succeeded for customer 5240: 209 records, including 59 pallet invoices, 26 pallet credits, 102 payments and 22 refunds at that read time."
+  ],
+  "rawMemosRetained": false,
+  "deploymentPerformed": false,
+  "note": "Original permission-failure audit remains intact. This follow-up records newly granted access and the actual historical observations used to design the parser."
+}

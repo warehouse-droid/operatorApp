@@ -60,12 +60,21 @@ const state = {
   customers: [],
   selectedCustomer: null,
   customerContracts: [],
+  customerRequest: null,
+  customerContractsLoading: false,
+  customerContractsError: null,
+  contractRequest: null,
+  contractLoading: false,
+  selectedContractId: null,
   quote: null,
+  quoteInput: null,
+  editingQuote: null,
   contract: null,
   serviceLines: [],
   visits: [],
   amendments: [],
   chargeRequests: [],
+  dumpCharges: [],
   chargeRequest: null,
   chargeKind: null,
   chargeLine: null,
@@ -85,7 +94,7 @@ function commandIdentity(prefix) {
   return `${prefix}-${suffix}`;
 }
 
-async function api(path, { method = "GET", body, idempotencyKey = "" } = {}) {
+async function api(path, { method = "GET", body, idempotencyKey = "", signal } = {}) {
   const response = await fetch(path, {
     method,
     headers: {
@@ -94,7 +103,8 @@ async function api(path, { method = "GET", body, idempotencyKey = "" } = {}) {
       ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {})
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    cache: "no-store"
+    cache: "no-store",
+    signal
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -249,7 +259,7 @@ function syncOrderKindFields() {
   byId("orderKindHelp").textContent = delivery
     ? "This local order goes directly to Dispatch."
     : kind === "bin"
-      ? "Continue to fixed per-bin pricing. Garbage has no dump fee; soil, asphalt, and concrete use one fixed charge."
+      ? "Continue to bin pricing. Garbage dumping is charged per tonne after collection; soil, asphalt, and concrete have a fixed upfront dump charge."
       : kind === "aggregate"
         ? "Aggregate material is priced per yard with the configured distance band."
         : "Select Delivery, BIN, or Aggregate Order.";
@@ -278,12 +288,27 @@ async function selectCustomer(customer) {
   state.searchSequence += 1;
   state.selectedCustomer = customer;
   state.customers = [customer];
+  state.contractRequest?.controller.abort();
+  state.contractRequest = null;
+  state.contractLoading = false;
+  state.selectedContractId = null;
   state.contract = null;
   state.quote = null;
+  state.serviceLines = [];
+  state.chargeRequests = [];
+  state.visits = [];
+  state.customerContracts = [];
   customerSearch.value = customer.displayName || customer.phone || "";
   renderCustomers();
-  await loadCustomerContracts();
-  setMessage(`${customer.displayName || "Customer"} selected. Existing contracts are ready.`);
+  renderQuote();
+  renderContract();
+  setMessage(`Loading contracts for ${customer.displayName || "customer"}…`);
+  const ready = await loadCustomerContracts();
+  if (ready && state.selectedCustomer === customer) {
+    setMessage(`${customer.displayName || "Customer"} selected. Existing contracts are ready.`);
+    return true;
+  }
+  return false;
 }
 
 function renderCustomers() {
@@ -318,6 +343,17 @@ function renderCustomers() {
 
 function renderContractMaster() {
   contractMaster.replaceChildren();
+  contractMaster.setAttribute("aria-busy", String(state.customerContractsLoading));
+  if (state.customerContractsLoading) {
+    contractMaster.append(element("p", "Loading contracts…", "mbt-frontdesk-muted"));
+    return;
+  }
+  if (state.customerContractsError) {
+    contractMaster.append(element("p", state.customerContractsError), button("Retry contracts", async () => {
+      if (await loadCustomerContracts()) setMessage("Customer contracts loaded.");
+    }));
+    return;
+  }
   if (!state.selectedCustomer) {
     contractMaster.append(element("p", "Select a customer to view their current contracts.", "mbt-frontdesk-muted"));
     return;
@@ -331,7 +367,7 @@ function renderContractMaster() {
       `${contract.contractNumber} · ${String(contract.status || "unknown").replaceAll("_", " ")}`,
       () => loadContractTimeline(contract.contractId)
     );
-    choice.setAttribute("aria-pressed", String(state.contract?.contractId === contract.contractId));
+    choice.setAttribute("aria-pressed", String((state.selectedContractId || state.contract?.contractId) === contract.contractId));
     choice.append(element("span", `${contract.openServiceLineCount ?? 0} open bin(s)`, "mbt-choice-detail"));
     contractMaster.append(choice);
   }
@@ -339,36 +375,78 @@ function renderContractMaster() {
 
 async function loadCustomerContracts() {
   if (!state.selectedCustomer) return;
+  state.customerRequest?.controller.abort();
+  const customerId = state.selectedCustomer.customerNetsuiteId;
+  const request = { controller: new globalThis.AbortController() };
+  state.customerRequest = request;
+  state.customerContractsLoading = true;
+  state.customerContractsError = null;
+  renderContractMaster();
   try {
     const result = await api(
-      `/api/mbt/frontdesk/customers/${encodeURIComponent(state.selectedCustomer.customerNetsuiteId)}/contracts?limit=50`
+      `/api/mbt/frontdesk/customers/${encodeURIComponent(customerId)}/contracts?limit=50&summary=true`,
+      { signal: request.controller.signal }
     );
+    if (state.customerRequest !== request || state.selectedCustomer?.customerNetsuiteId !== customerId) return false;
     state.customerContracts = result.items || [];
+    return true;
   } catch (error) {
+    if (state.customerRequest !== request || error.name === "AbortError") return false;
     state.customerContracts = [];
+    state.customerContractsError = error.message;
     setMessage(error.message, "attention");
+    return false;
+  } finally {
+    if (state.customerRequest === request) {
+      state.customerRequest = null;
+      state.customerContractsLoading = false;
+      renderContractMaster();
+    }
   }
-  renderContractMaster();
 }
 
 async function loadContractTimeline(contractId) {
-  try {
-    const [timeline, charges] = await Promise.all([
-      api(`/api/mbt/frontdesk/contracts/${encodeURIComponent(contractId)}`),
-      api(`/api/mbt/frontdesk/contracts/${encodeURIComponent(contractId)}/charge-requests`)
-        .catch(() => ({ items: [] }))
-    ]);
-    state.contract = timeline.contract;
-    state.serviceLines = timeline.serviceLines || [];
-    state.visits = timeline.visits || [];
-    state.amendments = timeline.amendments || [];
-    state.chargeRequests = charges.items || [];
-    state.quote = null;
-    renderContractMaster();
-    renderContract();
-  } catch (error) {
-    setMessage(error.message, "attention");
-  }
+  if (state.contractRequest?.id === contractId) return state.contractRequest.promise;
+  state.contractRequest?.controller.abort();
+  const request = { id: contractId, customerId: state.selectedCustomer?.customerNetsuiteId,
+    controller: new globalThis.AbortController(), promise: null };
+  state.contractRequest = request;
+  state.selectedContractId = contractId;
+  state.contractLoading = true;
+  state.contract = null;
+  state.quote = null;
+  renderQuote();
+  renderContractMaster();
+  renderContract();
+  setMessage("Loading contract…");
+  request.promise = (async () => {
+    try {
+      const timeline = await api(`/api/mbt/frontdesk/contracts/${encodeURIComponent(contractId)}`, { signal: request.controller.signal });
+      if (state.contractRequest !== request || state.selectedCustomer?.customerNetsuiteId !== request.customerId) return false;
+      state.contract = timeline.contract;
+      state.serviceLines = timeline.serviceLines || [];
+      state.visits = timeline.visits || [];
+      state.amendments = timeline.amendments || [];
+      state.chargeRequests = timeline.chargeRequests || [];
+      state.dumpCharges = timeline.dumpCharges || [];
+      state.quote = null;
+      setMessage(`${timeline.contract.contractNumber} loaded.`);
+      void refreshOverdueBins();
+      return true;
+    } catch (error) {
+      if (state.contractRequest !== request || error.name === "AbortError") return false;
+      setMessage(error.message, "attention");
+      return false;
+    } finally {
+      if (state.contractRequest === request) {
+        state.contractRequest = null;
+        state.contractLoading = false;
+        renderContractMaster();
+        renderContract();
+      }
+    }
+  })();
+  return request.promise;
 }
 
 function pricingLines(pricing) {
@@ -422,7 +500,7 @@ function renderQuote() {
     pricingLines(quote.pricing)
   );
   const actions = element("div", "", "mbt-quote-actions");
-  if (quote.status === "draft") actions.append(button("Issue quote", issueQuote));
+  if (quote.status === "draft") actions.append(button("Edit quote", editQuote), button("Issue quote", issueQuote));
   if (quote.status === "issued") actions.append(button("Accept quote", acceptQuote));
   if (quote.status === "accepted") actions.append(button("Convert to contract", convertQuote));
   summary.append(actions);
@@ -433,13 +511,17 @@ function requestTotals(request) {
   const list = element("dl", "", "mbt-price-grid");
   const entries = [
     ["Current contract total", money(request.currentContractTotalMinor, request.currency)],
-    ["New request charge", money(request.newRequestChargeableMinor, request.currency)],
+    [request.kind === "change_bin" ? "Price change / credit" : "New request charge", money(request.newRequestChargeableMinor, request.currency)],
     ["Resulting contract total", money(request.resultingContractTotalMinor, request.currency)],
     ["Deposit", money(request.requiredDepositMinor, request.currency)],
     ["Due now", money(request.dueNowMinor, request.currency)],
     [request.taxMode === "included" ? "Included HST" : "Added HST",
       money(request.taxMode === "included" ? request.includedHstMinor : request.addedHstMinor, request.currency)]
   ];
+  if (request.kind === "change_bin") entries.push(
+    ["Previous bin price", money(request.previousBinTotalMinor, request.currency)],
+    ["Revised bin price", money(request.revisedBinTotalMinor, request.currency)],
+    ["Deposit credit", money(request.depositCreditMinor, request.currency)]);
   for (const [label, value] of entries) {
     const group = element("div");
     group.append(element("dt", label), element("dd", value));
@@ -473,9 +555,21 @@ function binAvailableForService(line) {
   return latest?.status === "completed";
 }
 
+function deliveryCanChange(line) {
+  const root = state.visits.find(v => v.serviceLineId === line.serviceLineId && v.serviceAction === "delivery" && !v.parentOrderId);
+  if (!root) return false;
+  return state.visits.filter(v => v.visitId === root.visitId || v.parentOrderId === root.visitId)
+    .every(v => !v.planningAssigned && !v.actualStartedAt && ["ready", "tentative"].includes(v.status));
+}
+
 function renderContract() {
   contractCard.replaceChildren();
-  contractCard.hidden = !state.contract;
+  contractCard.hidden = !state.contract && !state.contractLoading;
+  contractCard.setAttribute("aria-busy", String(state.contractLoading));
+  if (state.contractLoading) {
+    contractCard.append(element("p", "Loading contract…", "mbt-frontdesk-muted"));
+    return;
+  }
   if (!state.contract) return;
   workspaceEmpty.hidden = true;
   quoteCard.hidden = true;
@@ -497,8 +591,9 @@ function renderContract() {
       element("p", `Status: ${String(line.status || "unknown").replaceAll("_", " ")}`),
       element("p", `Contents: ${contractLineContent(line)}`),
       element("p", `Site: ${fullAddress(line.site) || "Service site snapshot unavailable"}`),
-      element("p", `Delivery: ${displayDate(line.plannedDeliveryAt)} · Return: ${displayDate(line.plannedReturnAt)}`)
+      element("p", `Delivery: ${displayDate(line.plannedDeliveryAt)} · Expected return: ${displayDate(line.plannedReturnAt)}`)
     );
+    if (line.overdue) card.append(element("p", "Bin overdue · review the expected return date or request collection.", "mbt-message"));
     if (line.currentBin) card.append(element("p",`Current physical bin: ${line.currentBin.assetCode}`));
     if (line.recoveryPending) card.append(element("p","Recovery pending · remaining collections or onward deliveries must finish."));
     for (const pending of line.pendingCollections || []) {
@@ -506,6 +601,10 @@ function renderContract() {
     }
     if (!["closed", "cancelled"].includes(line.status)) {
       const actions = element("div", "", "mbt-quote-actions");
+      if (deliveryCanChange(line)) {
+        actions.append(button("Change delivery time", () => openServiceLineAction(line, "delivery"), "mbt-button-secondary"),
+          button("Change bin size or material", () => openCustomerChargeDialog(line, "change_bin"), "mbt-button-secondary"));
+      }
       const exchange = button("Exchange bin", () => openCustomerChargeDialog(line, "exchange_bin"), "mbt-button-secondary");
       const collect = button("Collect bin", () => openServiceLineAction(line, "collection"), "mbt-button-secondary");
       exchange.disabled = collect.disabled = !binAvailableForService(line);
@@ -521,6 +620,15 @@ function renderContract() {
     lines.append(card);
   }
   summary.append(lines);
+  if (state.dumpCharges.length) {
+    const charges = element("section", "", "mbt-service-line-list");
+    charges.append(element("h3", "Dump charges after collection"));
+    for (const charge of state.dumpCharges) charges.append(element("p", charge.status === "priced"
+      ? `${charge.weightTonnes} tonnes × ${money(charge.ratePerTonneMinor, charge.currency)}/tonne · ${money(charge.customerAmountMinor, charge.currency)}`
+      : charge.status === "prepaid" ? "Fixed dump charge included in the upfront order price."
+      : `Billing review required: ${charge.reason}`));
+    summary.append(charges);
+  }
   if (state.chargeRequests.length) {
     const history = element("section", "", "mbt-service-line-list");
     history.append(element("h3", "Priced request history"));
@@ -541,7 +649,7 @@ function renderContract() {
     summary.append(amendmentHistory);
   }
   const timeline = element("ol", "", "mbt-timeline");
-  for (const visit of state.visits) {
+  for (const visit of state.visits.filter(item => !item.parentOrderId)) {
     const item = element("li", "", "mbt-visit-card");
     item.append(
       element("h3", `${visit.displayReference || visit.visitReference || ""} · ${visit.displayName || visit.serviceAction}`),
@@ -554,8 +662,13 @@ function renderContract() {
   contractCard.append(summary);
 }
 
-async function loadChargeConfiguration(rateCardVersionId) {
+async function loadChargeConfiguration(rateCardVersionId, contractId = null) {
   if (!rateCardVersionId) throw new Error("Select an active MBT workflow before pricing this request.");
+  if (contractId) {
+    const result = await api(`/api/mbt/frontdesk/customer-charge/configuration?rateCardVersionId=${encodeURIComponent(rateCardVersionId)}&contractId=${encodeURIComponent(contractId)}`);
+    state.chargeConfigurationByRate.set(result.rateCardVersionId, result);
+    return result;
+  }
   if (!state.chargeConfigurationByRate.has(rateCardVersionId)) {
     const result = await api(
       `/api/mbt/frontdesk/customer-charge/configuration?rateCardVersionId=${encodeURIComponent(rateCardVersionId)}`
@@ -675,6 +788,7 @@ function initialSiteSelection(addressText) {
 }
 
 async function openCustomerChargeDialog(line, kind) {
+  state.editingQuote = null;
   if (kind === "exchange_bin" && !binAvailableForService(line)) {
     setMessage("Wait for Dispatch and the driver to complete this bin's delivery before requesting an exchange.", "attention");
     return;
@@ -684,19 +798,23 @@ async function openCustomerChargeDialog(line, kind) {
     return;
   }
   const workflowIsSelectable = ["initial_bin", "aggregate_order"].includes(kind);
-  const service = workflowIsSelectable
-    ? selectableServices(kind)[0] || null
-    : (state.configuration.services || []).find(
-      (item) => item.rateCardVersionId === contractRateCardVersionId()
-    ) || null;
-  if (workflowIsSelectable && !service) {
-    setMessage("Activate an MBT rate card with a Front Desk workflow before pricing this request.", "attention");
-    return;
-  }
-  const rateCardVersionId = workflowIsSelectable
-    ? service?.rateCardVersionId
-    : contractRateCardVersionId();
   try {
+    if (workflowIsSelectable) {
+      state.configuration = await api("/api/mbt/frontdesk/configuration");
+      state.chargeConfigurationByRate.clear();
+    }
+    const service = workflowIsSelectable
+      ? selectableServices(kind)[0] || null
+      : (state.configuration.services || []).find(
+        (item) => item.rateCardVersionId === contractRateCardVersionId()
+      ) || null;
+    if (workflowIsSelectable && !service) {
+      setMessage("Activate an MBT rate card with a Front Desk workflow before pricing this request.", "attention");
+      return;
+    }
+    const rateCardVersionId = workflowIsSelectable
+      ? service?.rateCardVersionId
+      : contractRateCardVersionId();
     state.chargeKind = kind;
     state.chargeLine = line;
     state.chargeRateCardVersionId = rateCardVersionId;
@@ -706,12 +824,15 @@ async function openCustomerChargeDialog(line, kind) {
       populateChargeServiceOptions(kind);
       chargeServiceCode.value = service?.rateCardVersionId || "";
     }
-    const configuration = await loadChargeConfiguration(rateCardVersionId);
+    const configuration = await loadChargeConfiguration(rateCardVersionId, workflowIsSelectable ? null : state.contract.contractId);
+    state.chargeRateCardVersionId = configuration.rateCardVersionId;
     aggregateLineEditor.replaceChildren();
     customerChargeSummary.replaceChildren();
     customerChargeSummary.hidden = true;
     confirmCustomerCharge.hidden = true;
-    paymentMethod.value = "cash";
+    const acceptedCharge = state.chargeRequests.find(r => r.chargeRequestId === line?.pricing?.chargeRequestId);
+    paymentMethod.value = kind === "change_bin" ? acceptedCharge?.paymentMethod || state.contract?.pricing?.paymentMethod || "cash" : "cash";
+    paymentMethod.disabled = kind === "change_bin";
     contractTelephone.value = state.selectedCustomer.phone || "";
     const site = line?.site || state.serviceLines[0]?.site || state.selectedCustomer.sites?.[0] || {};
     serviceAddressText.value = fullAddress(site);
@@ -725,7 +846,7 @@ async function openCustomerChargeDialog(line, kind) {
     const outgoingContent = line ? contractLineContent(line) : "garbage";
     populateContentAndBins(configuration, outgoingContent, line?.binItemCode || "");
     chargeDeliveryAt.value = localDateTimeValue(
-      kind === "exchange_bin" ? Date.now() + 86_400_000 : Date.now() + 86_400_000
+      kind === "change_bin" ? line.plannedDeliveryAt : Date.now() + 86_400_000
     );
     chargeReturnAt.value = localDateTimeValue(line?.plannedReturnAt || Date.now() + (15 * 86_400_000));
     customerChargeReason.value = kind === "initial_bin"
@@ -734,15 +855,22 @@ async function openCustomerChargeDialog(line, kind) {
         ? "Create a standalone aggregate order"
         : kind === "add_bin"
           ? "Customer requested an additional bin"
-          : "Customer requested a bin exchange";
+          : kind === "change_bin" ? "Customer requested a bin size or material change" : "Customer requested a bin exchange";
     const aggregateOnly = kind === "aggregate_order";
     chargeBinFields.hidden = aggregateOnly;
     chargeBinFields.querySelectorAll("input, select, textarea").forEach((control) => {
       control.disabled = aggregateOnly;
     });
     chargeWorkflowFields.hidden = !["initial_bin", "aggregate_order"].includes(kind);
-    chargeOrderFrom150.checked = false;
-    chargeOrderFrom150.disabled = false;
+    chargeOrderFrom150.checked = kind === "change_bin" && (acceptedCharge?.orderFrom150 || line?.pricing?.pricingOriginYardCode === "150");
+    chargeOrderFrom150.disabled = kind === "change_bin";
+    chargeDeliveryAt.disabled = chargeReturnAt.disabled = kind === "change_bin";
+    addAggregateLine.hidden = kind === "change_bin";
+    if (kind === "change_bin") {
+      chargeDeliveryItemCode.disabled = true;
+      binDiscountCad.value = String(Number(line.pricing.lines?.find(l => l.lineType === "bin_discount")?.configuredAmountMinor || 0) / -100);
+      binDiscountReason.value = acceptedCharge?.pricing?.bin?.calculator?.discountReason || "Retain the accepted order discount";
+    }
     if (aggregateOnly) addAggregateRow();
     customerChargeTitle.textContent = kind === "initial_bin"
       ? "New BIN contract price"
@@ -750,16 +878,46 @@ async function openCustomerChargeDialog(line, kind) {
         ? "Aggregate Order price"
         : kind === "add_bin"
           ? `Add bin · ${state.contract.contractNumber}`
-          : `Exchange bin · Line ${line.lineNumber}`;
+          : kind === "change_bin" ? `Change bin size or material · ${line.rentalReference}` : `Exchange bin · Line ${line.lineNumber}`;
     chargeDeliveryLabel.textContent = kind === "exchange_bin" ? "Exchange date and time" : "Delivery date and time";
     customerChargeHelp.textContent = aggregateOnly
       ? "Material is charged per yard. Delivery starts at $150 through 30 km, then follows the configured distance bands."
+      : kind === "change_bin" ? "Review the revised bin price and the difference from the accepted order. A negative amount is a credit. Garbage dumping is charged per tonne after collection; soil, asphalt, and concrete dump charges are fixed upfront."
       : "The server calculates fixed bin charges, payment-specific HST, deposit, optional aggregate, and the exact customer amount.";
     newContractDialog.close();
     customerChargeDialog.showModal();
   } catch (error) {
     setMessage(error.message, "attention");
   }
+}
+
+async function editQuote() {
+  if (state.quote?.status !== "draft" || !state.quoteInput) return;
+  const quote = state.quote, input = structuredClone(state.quoteInput);
+  await openCustomerChargeDialog(null, "initial_bin");
+  if (!customerChargeDialog.open) return;
+  try {
+    chargeServiceCode.value = input.rateCardVersionId;
+    await syncChargeWorkflowConfiguration();
+    binContentCode.value = input.contentCode;
+    binContentCode.onchange();
+    chargeBinType.value = input.binItemCode;
+    chargeDeliveryItemCode.value = input.deliveryItemCode;
+    paymentMethod.value = input.paymentMethod;
+    billingAddressText.value = input.billingAddressText;
+    serviceAddressText.value = input.serviceAddressText;
+    contractTelephone.value = input.contractTelephone;
+    chargeOrderFrom150.checked = input.orderFrom150;
+    chargeDeliveryAt.value = input.deliveryLocal;
+    chargeReturnAt.value = input.returnLocal;
+    binDiscountCad.value = String(input.discountMinor / 100);
+    binDiscountReason.value = input.discountReason || "";
+    aggregateLineEditor.replaceChildren();
+    input.aggregateLines.forEach(addAggregateRow);
+    customerChargeReason.value = "Edit the draft Front Desk BIN quote";
+    customerChargeTitle.textContent = `Edit quote · ${quote.quoteNumber}`;
+    state.editingQuote = { quoteId: quote.quoteId, revision: quote.revision };
+  } catch (error) { setMessage(error.message, "attention"); }
 }
 
 function chargeCommonBody() {
@@ -817,9 +975,7 @@ async function previewCustomerChargeRequest(event) {
       const bin = chargeBinBody();
       if (!service || !chargeDeliveryItemCode.value) throw new Error("Select the BIN workflow and delivery item.");
       setMessage("Calculating the fixed-price BIN quote…");
-      const result = await api("/api/mbt/frontdesk/quotes", {
-        method: "POST",
-        body: {
+      const quoteInput = {
           customerNetsuiteId: state.selectedCustomer.customerNetsuiteId,
           ...initialSiteSelection(common.serviceAddressText),
           serviceTemplateVersionId: service.templateVersionId,
@@ -844,14 +1000,20 @@ async function previewCustomerChargeRequest(event) {
             ...initialSiteSelection(common.serviceAddressText)
           }],
           ...common
-        },
+      };
+      const editing = state.editingQuote;
+      const result = await api(`/api/mbt/frontdesk/quotes${editing ? `/${editing.quoteId}` : ""}`, {
+        method: "POST",
+        body: { ...quoteInput, ...(editing ? { expectedRevision: editing.revision } : {}) },
         idempotencyKey: commandIdentity("mbt-frontdesk-fixed-bin")
       });
       state.quote = result.quote;
+      state.quoteInput = { ...quoteInput, deliveryLocal: chargeDeliveryAt.value, returnLocal: chargeReturnAt.value };
+      state.editingQuote = null;
       state.contract = null;
       customerChargeDialog.close();
       renderQuote();
-      setMessage("Fixed-price BIN quote created. Review the exact customer total before issuing it.");
+      setMessage(`Fixed-price BIN quote ${editing ? "updated" : "created"}. Review the exact customer total before issuing it.`);
       return;
     }
     const body = {
@@ -889,24 +1051,27 @@ async function previewCustomerChargeRequest(event) {
 
 async function confirmCustomerChargeRequest() {
   const request = state.chargeRequest;
-  if (!request) return;
+  if (!request || confirmCustomerCharge.disabled) return;
+  confirmCustomerCharge.disabled = true;
   try {
     const result = await api(`/api/mbt/frontdesk/charge-requests/${request.chargeRequestId}/confirm`, {
       method: "POST",
       body: { expectedRevision: request.revision, reason: customerChargeReason.value.trim() },
       idempotencyKey: commandIdentity("mbt-frontdesk-charge-confirm")
     });
-    customerChargeDialog.close();
     state.chargeRequest = null;
     if (state.contract) {
       const contractId = state.contract.contractId;
       await Promise.all([loadCustomerContracts(), loadContractTimeline(contractId)]);
     }
+    customerChargeDialog.close();
     setMessage(result.dispatchOrder
       ? `${result.dispatchOrder.refNumber || "Aggregate order"} is ready in Dispatch.`
       : "Customer request confirmed; the operational bin work and charge evidence are linked.");
   } catch (error) {
     setMessage(error.message, "attention");
+  } finally {
+    confirmCustomerCharge.disabled = false;
   }
 }
 
@@ -1078,15 +1243,15 @@ function openServiceLineAction(line, action) {
   state.serviceAction = action;
   state.serviceActionLineId = line.serviceLineId;
   serviceLineActionFields.replaceChildren();
-  if (action === "collection") {
-    serviceLineActionTitle.textContent = `Collect bin · Line ${line.lineNumber}`;
-    serviceLineActionHelp.textContent = "Request collection for this bin only.";
-    const controls = windowFields(serviceLineActionFields, line.plannedReturnAt);
+  if (action === "collection" || action === "delivery") {
+    serviceLineActionTitle.textContent = `${action === "delivery" ? "Change delivery time" : "Collect bin"} · ${line.rentalReference || `Line ${line.lineNumber}`}`;
+    serviceLineActionHelp.textContent = action === "delivery" ? "Change delivery time before Dispatch assigns this order to a load." : "Create a collection order for this bin.";
+    const controls = windowFields(serviceLineActionFields, action === "delivery" ? line.plannedDeliveryAt : line.plannedReturnAt);
     const reason = document.createElement("textarea");
-    reason.required = true;
-    field("Audit reason", reason);
+    reason.required = action !== "delivery";
+    field(action === "delivery" ? "Reason (optional)" : "Audit reason", reason);
     state.serviceActionControls = { ...controls, reason };
-    serviceLineActionSubmit.textContent = "Request collection";
+    serviceLineActionSubmit.textContent = action === "delivery" ? "Save delivery time" : "Request collection";
   } else {
     serviceLineActionTitle.textContent = `Customer confirmation · Line ${line.lineNumber}`;
     serviceLineActionHelp.textContent = "Record the customer's decision for an operational size change.";
@@ -1105,13 +1270,14 @@ function openServiceLineAction(line, action) {
 async function saveServiceLineAction(event) {
   event.preventDefault();
   const line = state.serviceLines.find((item) => item.serviceLineId === state.serviceActionLineId);
-  if (!line) return;
+  if (!line || serviceLineActionSubmit.disabled) return;
   const controls = state.serviceActionControls;
   const collection = state.serviceAction === "collection";
-  const path = `/api/mbt/frontdesk/contracts/${state.contract.contractId}/service-lines/${line.serviceLineId}/${collection ? "collections" : "customer-confirmations"}`;
-  const body = collection ? {
+  const delivery = state.serviceAction === "delivery";
+  const path = `/api/mbt/frontdesk/contracts/${state.contract.contractId}/service-lines/${line.serviceLineId}/${delivery ? "delivery-window" : collection ? "collections" : "customer-confirmations"}`;
+  const body = collection || delivery ? {
     expectedRevision: line.revision,
-    collectionWindow: {
+    [delivery ? "deliveryWindow" : "collectionWindow"]: {
       startAt: new Date(controls.start.value).toISOString(),
       endAt: new Date(controls.end.value).toISOString()
     },
@@ -1121,16 +1287,19 @@ async function saveServiceLineAction(event) {
     decision: controls.decision.value,
     reason: controls.reason.value.trim()
   };
+  serviceLineActionSubmit.disabled = true;
   try {
     await api(path, {
       method: "POST", body,
       idempotencyKey: commandIdentity(`mbt-frontdesk-${state.serviceAction}`)
     });
-    serviceLineActionDialog.close();
     await loadContractTimeline(state.contract.contractId);
+    serviceLineActionDialog.close();
     setMessage("Physical-bin service action saved.");
   } catch (error) {
     setMessage(error.message, "attention");
+  } finally {
+    serviceLineActionSubmit.disabled = false;
   }
 }
 
@@ -1156,6 +1325,30 @@ function disableCommandSurfaces() {
   }
 }
 
+async function refreshOverdueBins() {
+  if (!state.enabled) return;
+  const panel = byId("overdueBins"), list = byId("overdueBinList");
+  try {
+    const result = await api("/api/mbt/frontdesk/overdue-bins");
+    list.replaceChildren(); panel.hidden = !result.items.length;
+    for (const item of result.items) {
+      const row = element("div", "", "mbt-service-line-card");
+      row.append(element("p", `${item.rentalReference} · ${item.customerName} · ${item.assetCode || item.binTypeCode}`),
+        element("p", `Expected return: ${displayDate(item.plannedReturnAt)} · ${item.collectionRequested ? "Collection requested" : "Collection not requested"}`));
+      row.append(button("Review bin", async () => {
+        const ready = await selectCustomer({customerNetsuiteId:item.customerNetsuiteId, displayName:item.customerName});
+        if (!ready) return;
+        await loadContractTimeline(item.contractId);
+        contractCard.scrollIntoView({behavior:"smooth", block:"start"});
+      }));
+      list.append(row);
+    }
+  } catch {
+    panel.hidden = false; list.replaceChildren(element("p", "Overdue reminders could not be refreshed."),
+      button("Retry reminders", refreshOverdueBins));
+  }
+}
+
 async function initialize() {
   try {
     const status = await api("/api/mbt/frontdesk/status");
@@ -1172,6 +1365,8 @@ async function initialize() {
     const configuration = await api("/api/mbt/frontdesk/configuration");
     state.configuration = configuration;
     populateConfiguration();
+    await refreshOverdueBins();
+    globalThis.setInterval(refreshOverdueBins, 60000);
     renderContractMaster();
     setMessage("Front Desk is ready. Cash stays local; non-cash HST is calculated once. NetSuite posting is not enabled.");
   } catch (error) {

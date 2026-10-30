@@ -213,8 +213,14 @@ function normalizedSelectedLine(line) {
       itemId: positiveInteger(line.itemId, 'Confirmed non-inventory item ID'),
       salesUom: requiredText(line.salesUom, 'Confirmed sales UOM').toUpperCase() } : {}),
     ...(line.directCompletionEventId ? { directCompletionEventId: positiveInteger(line.directCompletionEventId, 'Direct completion event') } : {}),
+    ...(line.directReceiptJobId ? { directReceiptJobId: requiredText(line.directReceiptJobId, 'Direct receipt job') } : {}),
     ...(line.kit ? { kit: canonicalValue(line.kit) } : {})
   };
+}
+
+/** @param {any[]} lines */
+function deferredQuantityEvidence(...lines) {
+  return lines.some(line => line?.quantityCheckDeferred === true) ? { quantityCheckDeferred: true } : {};
 }
 
 /** @param {Record<string, unknown>} line */
@@ -230,6 +236,7 @@ function normalizedAvailableLine(line) {
     completedQuantity: optionalNonNegativeQuantity(line.completedQuantity, "Completed NetSuite quantity"),
     remainingQuantity: optionalNonNegativeQuantity(line.remainingQuantity, "Remaining NetSuite quantity"),
     linkedTransactions: normalizedLinkedTransactions(line.linkedTransactions),
+    ...deferredQuantityEvidence(line),
     ...(optionalText(line.salesUom ?? line.unit) ? { salesUom: String(line.salesUom ?? line.unit).trim().toUpperCase() } : {})
   };
 }
@@ -353,7 +360,8 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         || !Array.isArray(evidence.pickupJobIds) || !evidence.pickupJobIds.length) {
       throw inputError('A system direct receipt requires verified pickup and delivery evidence.');
     }
-    directDeliveryEvidence={completionEventId:positiveInteger(evidence.completionEventId,'Direct completion event'),
+    const allocationEvidence=evidence.receiptJobId ? normalizedAllocationReceiptEvidence(evidence,requestId) : null;
+    directDeliveryEvidence={...(allocationEvidence || {completionEventId:positiveInteger(evidence.completionEventId,'Direct completion event')}),
       sourcePoId:positiveInteger(evidence.sourcePoId,'Direct receipt source PO'),
       pickupJobIds:[...new Set(evidence.pickupJobIds.map((/** @type {unknown} */ value)=>requiredText(value,'Pickup job')))].sort(),
       deliveryJobId:requiredText(evidence.deliveryJobId,'Delivery job')};
@@ -423,6 +431,7 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         location: current ? mergeLocation(current.location, line.location) : line.location,
         sourceLineKey: current?.sourceLineKey || line.sourceLineKey,
         sourceLineAliases: normalizedAliases([current?.sourceLineAliases || [], line.sourceLineAliases]),
+        ...deferredQuantityEvidence(current, line),
         ...((current?.salesUom || line.salesUom) ? { salesUom: current?.salesUom || line.salesUom } : {}),
         orderedQuantity: current
           ? mergeOptionalQuantity(current.orderedQuantity, line.orderedQuantity, "ordered quantities")
@@ -462,7 +471,7 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
         sourceLineKey: current?.sourceLineKey || line.sourceLineKey || available.sourceLineKey,
         ...((line.salesUom || available.salesUom) ? { salesUom: line.salesUom || available.salesUom } : {})
       });
-      group.lineSnapshot.push(line);
+      group.lineSnapshot.push({ ...line, ...deferredQuantityEvidence(available) });
     }
     for (const rawLine of rawTarget.confirmedNonInventoryLines || []) {
       if (sourceOrderKind !== 'SO' || transactionType !== 'IF' || rawLine.autoIncludedNonInventory !== true
@@ -643,4 +652,13 @@ export function buildOperatorNetSuitePostingDraft(input = {}) {
     inputHash: hash(inputSnapshot),
     inputSnapshot
   };
+}
+
+/** @param {Record<string,any>} evidence @param {string} requestId */
+function normalizedAllocationReceiptEvidence(evidence,requestId) {
+  if(evidence.receiptJobId!==requestId || !Array.isArray(evidence.executionEventIds) || !evidence.executionEventIds.length) {
+    throw inputError('An allocation receipt requires its own job and execution evidence.');
+  }
+  return {receiptJobId:requestId,deliveryJobRecordId:positiveInteger(evidence.deliveryJobRecordId,'Delivery record'),
+    executionEventIds:[...new Set(evidence.executionEventIds.map((/** @type {unknown} */ id)=>positiveInteger(id,'Allocation execution')))].sort((a,b)=>a-b)};
 }

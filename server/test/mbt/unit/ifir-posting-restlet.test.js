@@ -315,3 +315,13 @@ test('a changed request with the same key returns original saved evidence for ve
   assert.throws(() => verifyPurchaseReceiptWithCharges(f.step(), replay.record, replay.source), /quantity/);
   assert.equal(f.state.saves.length, 1);
 });
+
+test('charge classification is reread after save instead of reusing pre-save metadata', () => {
+  const f = ifirFixture();
+  f.state.source.items.push({ line: 3, lineuniquekey: 7003, item: 503, itemtype: 'OthCharge',
+    quantity: 1, rate: 50, units: 'Each', unitstext: 'Each', location: 15 });
+  f.state.afterSave = () => { f.state.chargeSubtype = 'Sale'; };
+  const result = f.post();
+  assert.equal(result.record.item.items[1].itemSubtype, 'Sale');
+  assert.throws(() => verifyPurchaseReceiptWithCharges(f.step(), result.record, result.source), /unexpected positive line/);
+});

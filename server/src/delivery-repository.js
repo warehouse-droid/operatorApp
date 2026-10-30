@@ -1,3 +1,5 @@
+import { appliedSalesOrderBilledSql } from './applied-sales-order-billing.js';
+import { operatorRoundedSalesQuantity, operatorLoadedUnitCount, operatorPackUnitCapacity } from './operator-load-quantity.js';
 import { outboundLocationIds, outboundYardLocationId } from "./outbound-location-domain.js";
 import { scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';
 import { captureTransferPosting } from './transfer-order-posting-repository.js';
@@ -13,6 +15,7 @@ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.j
 import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
 import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
 import { assertNoCoSourcePacking } from "./co-source-packing-handoff.js";
+import { operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
 import { deliveryOrderWithinYards } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
@@ -190,6 +193,7 @@ async function decorateActiveSalesOrderReload(order) {
 
 function exactBilledSalesOrderSql(alias) {
   return `(
+    ${appliedSalesOrderBilledSql(alias)} OR
     UPPER(BTRIM(COALESCE(${alias}.status, ''))) = 'G'
     OR UPPER(REGEXP_REPLACE(
          REGEXP_REPLACE(BTRIM(COALESCE(${alias}.status_text, '')), '\\s*:\\s*', ':', 'g'),
@@ -294,14 +298,6 @@ function unitConversion(line, unit) {
   return 0;
 }
 
-function explicitUnitQuantity(line, unit) {
-  if (unit === "pallets") return positiveQuantity(line.pallet_qty);
-  if (unit === "layers") return positiveQuantity(line.layer_qty);
-  if (unit === "sections") return positiveQuantity(line.section_qty);
-  if (unit === "pieces") return positiveQuantity(line.piece_qty);
-  return 0;
-}
-
 function lineUnitsToSalesQuantity(line, quantities) {
   const pallets = positiveQuantity(quantities?.pallets);
   const layers = positiveQuantity(quantities?.layers);
@@ -315,6 +311,7 @@ function lineUnitsToSalesQuantity(line, quantities) {
 }
 
 function lineRequiredSalesQuantity(line) {
+  if (positiveQuantity(line.original_quantity) > 0) return positiveQuantity(line.quantity);
   return positiveQuantity(line.quantity) || lineUnitsToSalesQuantity(line, {
     pallets: line.pallet_qty,
     layers: line.layer_qty,
@@ -370,23 +367,13 @@ function lineLoadSalesQuantity(line) {
   const packedSalesQty = roundQuantity(linePackedSalesQuantity(line));
   if (packedSalesQty <= 0) return 0;
   const remainingSalesQty = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
-  if (remainingSalesQty > 0 && roundQuantity(Math.abs(remainingSalesQty - packedSalesQty)) <= LOAD_SALES_QTY_TOLERANCE) {
+  const unit = hasConversion(line) ? line.unit : '';
+  if (remainingSalesQty > 0
+      && operatorRoundedSalesQuantity(lineLoadedSalesQuantity(line) + packedSalesQty, unit)
+        === operatorRoundedSalesQuantity(lineRequiredSalesQuantity(line), unit)) {
     return remainingSalesQty;
   }
   return packedSalesQty;
-}
-
-function wholeUnitsFromSalesQuantity(salesQuantity, conversion) {
-  const sales = positiveQuantity(salesQuantity);
-  const unitSize = positiveQuantity(conversion);
-  if (!sales || !unitSize) return 0;
-  const rawUnits = sales / unitSize;
-  const floorUnits = Math.floor(rawUnits + 0.000001);
-  const ceilUnits = Math.ceil(rawUnits - 0.000001);
-  if (ceilUnits > floorUnits && roundQuantity(Math.abs((ceilUnits * unitSize) - sales)) <= LOAD_SALES_QTY_TOLERANCE) {
-    return ceilUnits;
-  }
-  return floorUnits;
 }
 
 function orderFamily(order) {
@@ -467,7 +454,8 @@ async function insertOperatorLoadRecord({
 }
 
 function loadedUnitConsumption(line) {
-  let remainingLoadedSales = lineLoadedSalesQuantity(line);
+  const loadedSales = lineLoadedSalesQuantity(line);
+  let consumedSales = 0;
   const units = [
     { key: "pallet", required: positiveQuantity(line.pallet_qty), conversion: positiveQuantity(line.to_plt) },
     { key: "layer", required: positiveQuantity(line.layer_qty), conversion: positiveQuantity(line.to_lyr) },
@@ -475,15 +463,33 @@ function loadedUnitConsumption(line) {
     { key: "piece", required: positiveQuantity(line.piece_qty), conversion: positiveQuantity(line.to_pcs) }
   ];
   return units.reduce((result, unit) => {
-    if (!unit.required || !unit.conversion || remainingLoadedSales <= 0) {
-      result[unit.key] = 0;
-      return result;
-    }
-    const consumed = Math.min(unit.required, Math.floor((remainingLoadedSales / unit.conversion) + 0.000001));
+    const consumed = operatorLoadedUnitCount(loadedSales, consumedSales, unit.required, unit.conversion, line.unit);
     result[unit.key] = consumed;
-    remainingLoadedSales = Math.max(0, remainingLoadedSales - (consumed * unit.conversion));
+    consumedSales += consumed * unit.conversion;
     return result;
   }, {});
+}
+
+function capConvertedPackQuantities(line, quantities) {
+  if (!hasConversion(line)) return quantities;
+  const next = { ...quantities };
+  let consumed = packingLoadedSalesQuantity(line);
+  for (const unit of ["pallets", "layers", "sections", "pieces"]) {
+    const conversion = unitConversion(line, unit);
+    next[unit] = Math.min(positiveQuantity(next[unit]),
+      operatorPackUnitCapacity(lineRequiredSalesQuantity(line), consumed, conversion, line.unit));
+    consumed += next[unit] * conversion;
+  }
+  return next;
+}
+
+function packingLoadedSalesQuantity(line) {
+  const loaded = lineLoadedSalesQuantity(line);
+  const counts = loadedUnitConsumption(line);
+  const converted = counts.pallet * positiveQuantity(line.to_plt) + counts.layer * positiveQuantity(line.to_lyr)
+    + counts.section * positiveQuantity(line.to_sec) + counts.piece * positiveQuantity(line.to_pcs);
+  return operatorRoundedSalesQuantity(converted, line.unit) === operatorRoundedSalesQuantity(loaded, line.unit)
+    ? converted : loaded;
 }
 
 function remainingPackAvailability(line) {
@@ -502,24 +508,34 @@ function remainingPackAvailability(line) {
     }
     return { pallets: 0, layers: 0, sections: 0, pieces: salesAvailable };
   }
-  const consumed = loadedUnitConsumption(line);
-  const deriveFromSales = !hasRequiredCustomQuantity(line);
-  const unitAvailable = (unit, consumedValue) => {
-    const conversion = unitConversion(line, unit);
-    if (!conversion) return 0;
-    const explicit = explicitUnitQuantity(line, unit);
-    // An exhausted explicit unit stays exhausted; the remaining sales quantity
-    // can already be represented by other units (for example, whole pallets).
-    if (explicit > 0) return Math.max(0, explicit - positiveQuantity(consumedValue));
-    return deriveFromSales ? wholeUnitsFromSalesQuantity(salesAvailable, conversion) : 0;
-  };
+  const unitAvailable = unit => operatorPackUnitCapacity(lineRequiredSalesQuantity(line),
+    packingLoadedSalesQuantity(line), unitConversion(line, unit), line.unit);
   return {
-    pallets: unitAvailable("pallets", consumed.pallet),
-    layers: unitAvailable("layers", consumed.layer),
-    pieces: unitAvailable("pieces", consumed.piece),
-    sections: unitAvailable("sections", consumed.section)
+    pallets: unitAvailable("pallets"),
+    layers: unitAvailable("layers"),
+    pieces: unitAvailable("pieces"),
+    sections: unitAvailable("sections")
   };
 }
+
+function lineHasRemainingLoadQuantity(line) {
+  // Retain review of historical lines whose physical order already exceeded its
+  // sales quantity. Normal converted lines finish when their shared balance does.
+  if (hasConversion(line) && hasRequiredCustomQuantity(line)) {
+    const physical = lineUnitsToSalesQuantity(line, { pallets: line.pallet_qty, layers: line.layer_qty,
+      sections: line.section_qty, pieces: line.piece_qty });
+    if (operatorRoundedSalesQuantity(physical, line.unit) > operatorRoundedSalesQuantity(lineRequiredSalesQuantity(line), line.unit)) {
+      const consumed = loadedUnitConsumption(line);
+      if (["pallet", "layer", "section", "piece"].some(unit => positiveQuantity(line[`${unit}_qty`]) > consumed[unit])) return true;
+    }
+  }
+  if (hasConversion(line) && hasRequiredCustomQuantity(line)
+      && Object.values(remainingPackAvailability(line)).some(value => value > 0)) return true;
+  const unit = hasConversion(line) ? line.unit : '';
+  return operatorRoundedSalesQuantity(lineRequiredSalesQuantity(line), unit)
+    > operatorRoundedSalesQuantity(lineLoadedSalesQuantity(line), unit);
+}
+
 function resolveIndependentPackedSalesQuantity(line, next, requestedSalesQty, { absolute = false, physicalChanged = false } = {}) {
   if (hasConversion(line) || !hasRequiredCustomQuantity(line)) return 0;
   const salesAvailable = Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line));
@@ -1106,11 +1122,12 @@ async function loadDispatchGroupChildOrders(groups = []) {
     linesByOrder.get(key).push(line);
   }
   const ordersByRef = new Map();
-  for (const order of orderResult.rows) {
-    const base = {
+  const routedOrders = await routeOperatorSalesOrders(orderResult.rows.map(order => ({
       ...order,
       lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
-    };
+  })));
+  for (const base of routedOrders) {
+    const order = base;
     if (isTransfer) {
       ordersByRef.set(String(order.tranid), base);
     } else {
@@ -1158,6 +1175,8 @@ function buildDispatchGroupDeliveryOrder(group, childOrders = []) {
     child_orders: childOrders,
     child_order_refs: childOrders.map((order) => order.tranid),
     child_order_ids: childOrders.map((order) => order.netsuite_id),
+    co_waiting_for_arrival: childOrders.some(order => order.co_waiting_for_arrival),
+    transit_co_ref: childOrders.find(order => order.co_waiting_for_arrival)?.transit_co_ref || base.transit_co_ref,
     reload_authorized: reloadChildren.length > 0,
     reload_child_order_refs: reloadChildren.map((order) => order.tranid),
     reload_cycles: reloadChildren.map((order) => order.reload_cycle),
@@ -1308,11 +1327,13 @@ export async function getDeliveryOrdersBatch(ids = []) {
       if (!linesByOrder.has(key)) linesByOrder.set(key, []);
       linesByOrder.get(key).push(line);
     }
-    for (const order of orderResult.rows) {
+    const routedOrders = await routeOperatorSalesOrders(orderResult.rows.map(order => ({
+      ...order, lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
+    })));
+    for (const order of routedOrders) {
       ordersByKey.set(String(order.netsuite_id), await decorateActiveSalesOrderReload({
         ...order,
-        testFixture: sandboxFixtures && order.is_test_fixture === true,
-        lines: (linesByOrder.get(String(order.netsuite_id)) || []).filter(hasDeliveryDisplayQuantity)
+        testFixture: sandboxFixtures && order.is_test_fixture === true
       }));
     }
   }
@@ -1469,10 +1490,32 @@ function mapLocalCoLineForDelivery(line = {}) {
   };
 }
 
+function groupedLocalCoLines(co, lines) {
+  const byId = new Map(lines.map(line => [String(line.id), line]));
+  return aggregateGroupLines(co.co_ref, [{ netsuite_id: co.delivery_order_id || -Number(co.id),
+    tranid: co.co_ref, order_type: 'co_order', lines }]).map(line => {
+    const sources = line.source_lines.map(source => byId.get(String(source.lineId)));
+    if (sources.length === 1) return sources[0];
+    return { ...line, id: line.id.replace('GRPLINE-', 'COGRPLINE-'), co_source_lines: sources,
+      confirmed: sources.every(source => Boolean(source.confirmed || source.confirmed_at)),
+      confirmed_at: sources.every(source => source.confirmed_at) ? sources[0].confirmed_at : null };
+  });
+}
+
+function localCoSourceLines(order) {
+  return (order.lines || []).flatMap(line => line.co_source_lines || [line]);
+}
+
+function localCoOperatorLine(order, lineId) {
+  return (order.lines || []).find(line => String(line.id) === String(lineId))
+    || localCoSourceLines(order).find(line => String(line.id) === String(lineId));
+}
+
 function mapLocalCoOrderForDelivery(co = {}, lines = []) {
   const details = co.details && typeof co.details === "object" ? co.details : {};
   const loaded = isLocalCoLoaded(co);
-  const mappedLines = lines.map(line => projectCoOperatorLinkedSupply(mapLocalCoLineForDelivery(line), { loaded }));
+  const mappedLines = groupedLocalCoLines(co,
+    lines.map(line => projectCoOperatorLinkedSupply(mapLocalCoLineForDelivery(line), { loaded })));
   const releasedPacking = co.status === "pending_load" && !co.preparing_operator_id && !co.preparing_started_at
     && mappedLines.some(line => line.confirmed_at && lineHasPackedQuantity(line));
   const status = releasedPacking ? "packed" : String(co.status || "pending_load");
@@ -1885,8 +1928,8 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
   const result = await query(
     `WITH delivery_order_source AS (
        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
-              foreign_total, order_location_id, order_location, outbound_location_id,
-              outbound_location, delivery_method_id, sales_order_type AS delivery_method,
+              foreign_total, order_location_id, order_location, ${operatorCoYardColumnsSql("sales_orders")},
+              delivery_method_id, sales_order_type AS delivery_method,
                operator_status, local_yard_order_status, preparing_operator_id,
                preparing_started_at, status_updated_at,
                CASE WHEN ${sandboxSql} AND COALESCE(is_test_fixture, false) THEN true ELSE netsuite_active END AS netsuite_active,
@@ -1897,7 +1940,7 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
               dispatch_instructions, memo, 'sales_order'::text AS order_type,
               NULL::bigint AS source_location_id, NULL::text AS source_location,
               NULL::bigint AS destination_location_id, NULL::text AS destination_location
-	       FROM sales_orders
+	       FROM sales_orders ${operatorCoRouteJoinSql("sales_orders")}
 	       WHERE sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
 	         AND NOT ${billedSalesOrderFamilySql("sales_orders")}
 	         AND NOT ${netSuiteClosedOrderFamilySql("sales_orders", "SO")}
@@ -2052,7 +2095,8 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
         AND NOT EXISTS (
           SELECT 1
             FROM local_co_orders source_co
-           WHERE source_co.source_order_ref = delivery_order_source.tranid
+           WHERE delivery_order_source.order_type <> 'sales_order'
+             AND source_co.source_order_ref = delivery_order_source.tranid
              AND source_co.status IN ('pending_load', 'preparing', 'packed', 'planned')
              AND (
                source_co.from_location_id IS NULL
@@ -2117,7 +2161,8 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
   const locationClause = locationId ? `AND outbound_location_id = ANY($${params.push(outboundLocationIds(locationId))}::bigint[])` : "";
   const result = await query(
     `WITH planned_delivery_orders AS (
-       SELECT dispatch_truck_plate, dispatch_load_name, outbound_location_id, operator_status,
+       SELECT dispatch_truck_plate, dispatch_load_name,
+              COALESCE(operator_co_route.route_location_id,sales_orders.outbound_location_id) AS outbound_location_id, operator_status,
               local_yard_order_status, 'sales_order'::text AS order_type,
               EXISTS (
                 SELECT 1
@@ -2126,7 +2171,7 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
                    AND reload_cycle.status = ANY($2::text[])
                    AND reload_cycle.workflow_kind <> 'sales_order_reattempt'
               ) AS reload_authorized
-         FROM sales_orders
+         FROM sales_orders ${operatorCoRouteJoinSql("sales_orders")}
 	         WHERE dispatch_plan_date = $1
 	           AND COALESCE(dispatch_truck_plate, '') <> ''
 	           AND sales_order_type <> '${CUSTOMER_PICKUP_DELIVERY_METHOD.replaceAll("'", "''")}'
@@ -2454,7 +2499,9 @@ function buildDeliveryPrepNotifications({ locationId = null, salesActive = [], t
 
 /** @param {any} id @param {{includeNetSuiteClosed?: boolean}} [options] */
 export async function getDeliveryOrder(id, options = {}) {
-  return attachOperatorLoadState(await getDeliveryOrderData(id, options));
+  const order = await getDeliveryOrderData(id, options);
+  const [routed] = order ? await routeOperatorSalesOrders([order]) : [];
+  return attachOperatorLoadState(routed || null);
 }
 
 async function getDeliveryOrderData(id, { includeNetSuiteClosed = false } = {}) {
@@ -3851,7 +3898,7 @@ async function recordLocalCoDeliveryLoad(order, operatorId, { photoDataUrls }) {
     photoDataUrls,
     sourceTable: "local_co_orders",
     sourceRecordId: order.local_co_id || Math.abs(Number(order.netsuite_id)),
-    lineSnapshot: operatorLoadLineSnapshot(order.lines || []),
+    lineSnapshot: operatorLoadLineSnapshot(localCoSourceLines(order)),
     response: {
       localYardOrderStatus: "Loaded",
       coStatus: "planned",
@@ -4217,7 +4264,7 @@ async function recordDeliveryLoadUnlocked(orderId, operatorId, {
   });
   const remainingLines = (loadedSnapshotOrder.lines || []).filter((line) => {
     if (!line.netsuite_active || !["InvtPart", "NonInvtPart"].includes(line.item_type || "")) return false;
-    return lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) + linePackedSalesQuantity(line) + 0.000001;
+    return lineHasRemainingLoadQuantity(line);
   });
   const nextStatus = remainingLines.length ? "partial_loaded" : "loaded";
   const loadRecord = await insertOperatorLoadRecord({
@@ -4412,7 +4459,7 @@ async function recordCustomerPickupLoadUnlocked(orderId, operatorId, { photoData
   const remainingLines = (refreshed.lines || []).filter((line) => {
     const roundedCompletion = Object.hasOwn(verifiedSalesQuantities, String(line.id))
       && isSmallNetSuiteSqftVariance(lineRequiredSalesQuantity(line), lineLoadedSalesQuantity(line), line.unit);
-    return line.item_type !== "Kit" && lineRequiredSalesQuantity(line) > lineLoadedSalesQuantity(line) && !roundedCompletion;
+    return line.item_type !== "Kit" && lineHasRemainingLoadQuantity(line) && !roundedCompletion;
   });
   const pickupStatus = remainingLines.length ? "partial_loaded" : "loaded";
 
@@ -4866,6 +4913,7 @@ async function updateVrmaLinePackedQuantity(orderId, lineId, values, operatorId,
       physicalChanged: requested.pallets + requested.layers + requested.pieces + requested.sections > 0
     });
   }
+  next = capConvertedPackQuantities(line, next);
   const storageLineId = line.line_id;
   await query(
     `UPDATE scm_vrma_order_lines
@@ -4959,6 +5007,27 @@ async function claimLocalCoPreparingOrder(order, operatorId) {
 }
 
 async function updateLocalCoLinePackedQuantity(order, lineId, next) {
+  const line = localCoOperatorLine(order, lineId);
+  if (line?.co_source_lines) {
+    const remaining = { ...next };
+    const updates = line.co_source_lines.map(source => {
+      assertOperatorLinkedLineLoadable(source);
+      const available = remainingPackAvailability(source);
+      const allocated = capConvertedPackQuantities(source, {
+        ...Object.fromEntries(['pallets', 'layers', 'sections', 'pieces'].map(unit =>
+          [unit, Math.min(positiveQuantity(remaining[unit]), available[unit])])),
+        salesQty: Math.min(positiveQuantity(remaining.salesQty), Math.max(0,
+          lineRequiredSalesQuantity(source) - lineLoadedSalesQuantity(source)))
+      });
+      for (const unit of Object.keys(remaining)) remaining[unit] = roundQuantity(remaining[unit] - allocated[unit]);
+      return { source, allocated };
+    });
+    if (Object.values(remaining).some(value => value > 0.000001)) {
+      throw new Error('Combined CO packing exceeds the source lines remaining quantity.');
+    }
+    for (const { source, allocated } of updates) await updateLocalCoLinePackedQuantity(order, source.id, allocated);
+    return;
+  }
   await query(
     `UPDATE local_co_order_lines line
         SET packed_pallet_qty = $3,
@@ -4979,7 +5048,7 @@ async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, {
   const currentOrder = await getDeliveryOrder(orderId);
   if (!currentOrder || !isLocalCoDeliveryOrder(currentOrder)) throw new Error("Local CO order not found.");
   const order = await claimLocalCoPreparingOrder(currentOrder, operatorId);
-  const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+  const line = localCoOperatorLine(order, lineId);
   if (!line) throw new Error("Local CO line not found.");
   assertOperatorLinkedLineLoadable(line);
   const available = remainingPackAvailability(line);
@@ -4991,7 +5060,7 @@ async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, {
     salesQty: normalizeQuantity(values?.salesQty) || 0
   };
   const salesOnly = isSalesQuantityOnlyLine(line);
-  const next = salesOnly
+  const next = capConvertedPackQuantities(line, salesOnly
     ? {
       pallets: 0,
       layers: 0,
@@ -5016,7 +5085,7 @@ async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, {
       pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + valuesToApply.pieces),
       sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + valuesToApply.sections),
       salesQty: 0
-    };
+    });
   if (!salesOnly && !absolute) {
     next.salesQty = resolveIndependentPackedSalesQuantity(line, next, valuesToApply.salesQty, {
       physicalChanged: valuesToApply.pallets + valuesToApply.layers + valuesToApply.pieces + valuesToApply.sections > 0
@@ -5027,8 +5096,10 @@ async function confirmLocalCoDeliveryLine(orderId, lineId, values, operatorId, {
     actorOperatorId: operatorId,
     action: absolute ? "delivery.local_co.line.update_packed_quantity" : "delivery.local_co.line.confirm",
     orderId: order.netsuite_id,
-    lineId,
-    details: { coRef: order.tranid, pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections, salesQty: next.salesQty }
+    lineId: line.co_source_lines ? null : lineId,
+    details: { coRef: order.tranid, operatorLineId: lineId,
+      sourceLineIds: (line.co_source_lines || [line]).map(source => source.id),
+      pallets: next.pallets, layers: next.layers, pieces: next.pieces, sections: next.sections, salesQty: next.salesQty }
   });
 }
 
@@ -5419,7 +5490,12 @@ async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values,
     let remaining = positiveQuantity(requested[unit]);
     for (const source of working) {
       if (remaining <= 0) break;
-      const canAdd = Math.max(0, source.capacity[unit] - source.next[unit]);
+      const convertedCapacity = hasConversion(source.line)
+        ? operatorPackUnitCapacity(lineRequiredSalesQuantity(source.line),
+          packingLoadedSalesQuantity(source.line) + lineUnitsToSalesQuantity(source.line, source.next),
+          unitConversion(source.line, unit), source.line.unit)
+        : Infinity;
+      const canAdd = Math.min(convertedCapacity, Math.max(0, source.capacity[unit] - source.next[unit]));
       const add = Math.min(canAdd, remaining);
       source.next[unit] = roundQuantity(source.next[unit] + add);
       remaining = roundQuantity(remaining - add);
@@ -5914,14 +5990,14 @@ async function confirmDeliveryLineUnlocked(orderId, lineId, values, operatorId) 
   const lineTarget = canonicalLineTarget(order);
   const salesOnly = isSalesQuantityOnlyLine(line);
   const available = remainingPackAvailability(line);
-  const next = salesOnly
+  const next = capConvertedPackQuantities(line, salesOnly
     ? { pallets: 0, layers: 0, pieces: 0, sections: 0 }
     : {
       pallets: Math.min(available.pallets, positiveQuantity(line.packed_pallet_qty) + pallets),
       layers: Math.min(available.layers, positiveQuantity(line.packed_layer_qty) + layers),
       pieces: Math.min(available.pieces, positiveQuantity(line.packed_piece_qty) + pieces),
       sections: Math.min(available.sections, positiveQuantity(line.packed_section_qty) + sections)
-    };
+    });
   const packedSalesQty = salesOnly
     ? resolveSalesOnlyPackedQuantity(line, values)
     : resolveIndependentPackedSalesQuantity(line, next, requestedSalesQty, {
@@ -6025,14 +6101,14 @@ async function confirmCustomerPickupLineUnlocked(orderId, lineId, values, operat
   const requestedSalesQty = normalizeQuantity(values?.salesQty) || 0;
   const salesOnly = isSalesQuantityOnlyLine(line);
   const available = remainingPackAvailability(line);
-  const next = salesOnly
+  const next = capConvertedPackQuantities(line, salesOnly
     ? { pallets: 0, layers: 0, pieces: 0, sections: 0 }
     : {
       pallets: Math.min(available.pallets, (absolute ? 0 : positiveQuantity(line.packed_pallet_qty)) + pallets),
       layers: Math.min(available.layers, (absolute ? 0 : positiveQuantity(line.packed_layer_qty)) + layers),
       pieces: Math.min(available.pieces, (absolute ? 0 : positiveQuantity(line.packed_piece_qty)) + pieces),
       sections: Math.min(available.sections, (absolute ? 0 : positiveQuantity(line.packed_section_qty)) + sections)
-    };
+    });
   const packedSalesQty = salesOnly
     ? resolveSalesOnlyPackedQuantity(line, values, { absolute })
     : resolveIndependentPackedSalesQuantity(line, next, requestedSalesQty, {
@@ -6182,14 +6258,14 @@ async function setDeliveryLinePackedQuantityUnlocked(orderId, lineId, values, op
   assertOperatorLinkedLineLoadable(line);
   const salesOnly = isSalesQuantityOnlyLine(line);
   const available = remainingPackAvailability(line);
-  const next = salesOnly
+  const next = capConvertedPackQuantities(line, salesOnly
     ? { pallets: 0, layers: 0, pieces: 0, sections: 0 }
     : {
       pallets: Math.min(available.pallets, pallets),
       layers: Math.min(available.layers, layers),
       pieces: Math.min(available.pieces, pieces),
       sections: Math.min(available.sections, sections)
-    };
+    });
   const packedSalesQty = salesOnly
     ? resolveSalesOnlyPackedQuantity(line, values, { absolute: true })
     : resolveIndependentPackedSalesQuantity(line, next, requestedSalesQty, {
@@ -6312,7 +6388,7 @@ async function unpackDeliveryLineUnlocked(orderId, lineId, values, operatorId) {
     return;
   }
   if (isLocalCoDeliveryOrder(order)) {
-    const line = (order.lines || []).find((item) => String(item.id) === String(lineId));
+    const line = localCoOperatorLine(order, lineId);
     if (!line) throw new Error("Local CO line not found.");
     const packed = {
       pallets: positiveQuantity(line.packed_pallet_qty),
@@ -6326,9 +6402,10 @@ async function unpackDeliveryLineUnlocked(orderId, lineId, values, operatorId) {
     await writeAudit({
       actorOperatorId: operatorId,
       action: "delivery.local_co.line.unpack",
-      orderId,
-      lineId,
-      details: { coRef: order.tranid, ...packed }
+      orderId: order.netsuite_id,
+      lineId: line.co_source_lines ? null : lineId,
+      details: { coRef: order.tranid, operatorLineId: lineId,
+        sourceLineIds: (line.co_source_lines || [line]).map(source => source.id), ...packed }
     });
     return;
   }

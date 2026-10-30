@@ -1,0 +1,82 @@
+{
+  "startedAt": "2026-10-27T15:07:42.209Z",
+  "finishedAt": "2026-10-27T15:10:25.803Z",
+  "sourceHashes": {
+    "src": "ea8cc92bc0dfa7b7df852abad44100cbbc6ed08a40e6eb2edc58fe9a44fb522a",
+    "public": "ac3ab4289e6c350e01990f672914f57f688c19f126bbcb17504113cbb82a5bd4",
+    "migrations": "7daee8cece47df9143dca482dc625987ae44fe1994bb0383d37055609c094857"
+  },
+  "tests": 31,
+  "pass": 14,
+  "fail": 17,
+  "fileCount": 6,
+  "runtime": "Captured unchanged live source and migrations before this task",
+  "files": [
+    {
+      "file": "test/mbt/unit/backorder-pending-po.test.js",
+      "tests": 6,
+      "pass": 3,
+      "fail": 3,
+      "failedNames": [
+        "every accepted supply state waits for SCM until the PO is linked",
+        "Already Ordered and other terminal outcomes do not wait for another PO",
+        "linked PO dispatch and non-Backorder handoffs retain their existing status"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/backorder-pending-po.test.js",
+      "tests": 3,
+      "pass": 0,
+      "fail": 3,
+      "failedNames": [
+        "Sales and SCM APIs filter SO-linked requests by Pending SCM and retain production waiting",
+        "Sales and SCM browsers show Pending SCM and Awaiting PO in the list, filter and detail",
+        "linking the PO clears Pending SCM and a production-only request then waits for stock"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/backorder-already-ordered-browser.test.js",
+      "tests": 4,
+      "pass": 2,
+      "fail": 2,
+      "failedNames": [
+        "All Already Ordered request shows Completed and no remaining SO/PO steps",
+        "Completing the last material after a PO was linked removes its remaining planning prompt"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/regular-stock-resolution-browser.test.js",
+      "tests": 4,
+      "pass": 3,
+      "fail": 1,
+      "failedNames": [
+        "Sales notification opens the resolved case and its PO/ETA once, and remains dismissed after refresh"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/regular-waitlist-http-browser.test.js",
+      "tests": 10,
+      "pass": 5,
+      "fail": 5,
+      "failedNames": [
+        "SCM selects PO demand, confirms partial allocation, and Sales converts only that quantity",
+        "SCM finds an existing PO, opens its item pool, releases a mature hold and acknowledges returned stock",
+        "Sales Close releases fresh allocations and the SCM notice deep-links the same PO pool",
+        "Delivery conversion persists fulfillment details and closing the remainder retains SO quantity",
+        "an invalid delivery date shows the error, preserves the draft and creates no conversion"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/stocking-line-actions-browser.test.js",
+      "tests": 4,
+      "pass": 1,
+      "fail": 3,
+      "failedNames": [
+        "SCM Purchase actions send only the clicked material even when other materials are pending",
+        "Transfer Stocking reply and Resolve controls belong to the individual material",
+        "Sales can reply only in the instructed material card and sends its line ID"
+      ]
+    }
+  ],
+  "reason": "Pre-existing pending-PO/Already Ordered expectations, notification modal interference, and obsolete line-reply selectors reproduced against unchanged live source. Exact failure names must match the candidate."
+}

@@ -1,0 +1,101 @@
+import test,{after} from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import {writeFile} from 'node:fs/promises';
+import {chromium,expect} from '@playwright/test';
+import {app} from '../../../src/server.js';
+import {config} from '../../../src/config.js';
+import {query,closeDb} from '../../../src/db.js';
+import {createOperator,loginOperator} from '../../../src/auth-repository.js';
+import {rental} from '../support/bin-collection-request-fixtures.js';
+import {planningFixture} from '../support/bin-planning-fixtures.js';
+import {configureBinOrderWorkflow} from '../../../src/mbt/bin-order-workflow-service.js';
+import {withBrowserCoverageSources} from '../support/browser-source-coverage.js';
+after(closeDb);
+test('browser: one D, time change, material charge and credit, overdue reminder and explicit C', {timeout:90000},async()=>{
+  const f=await rental(false,'garbage');
+  const planner=await planningFixture(4999);
+  await configureBinOrderWorkflow({visitId:f.visits[0].visitId,expectedRevision:1,actor:planner.actor,
+    idempotencyKey:crypto.randomUUID(),correlationId:crypto.randomUUID(),requestId:crypto.randomUUID(),
+    deliveryAssetId:planner.assetId,deliveryWindow:{startAt:f.proposedDeliveryAt,endAt:'2037-08-03T16:00:00Z'}});
+  const username=`collection-browser-${crypto.randomUUID()}`,password='synthetic-bin-browser-password';
+  const operator=await createOperator({username,displayName:'Bin Front Desk Test',password,roles:['mbt_frontdesk']});
+  const token=(await loginOperator(username,password)).token;
+  config.mbt.enabled=true;config.mbtPhase3.frontdeskOperationsEnabled=true;
+  await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key IN ('mbt_enabled','mbt_frontdesk_operations')");
+  const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});let browser,releaseTimeline;
+  try {
+    browser=await chromium.launch({headless:true,executablePath:'/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell',args:['--no-sandbox','--disable-dev-shm-usage']});
+    const context=await browser.newContext({viewport:{width:1500,height:1000},timezoneId:'UTC'});
+    await context.addInitScript(token=>localStorage.setItem('mbbs.staff.token',token),token);
+    const page=await context.newPage(),errors=[],coverage=[];page.on('pageerror',error=>errors.push(error.message));
+    let timelineGate=null;
+    const timelinePath=`/api/mbt/frontdesk/contracts/${f.contractId}`;
+    await page.route(`**${timelinePath}`,async route=>{if(timelineGate) await timelineGate;await route.continue();});
+    const holdTimeline=()=>{
+      timelineGate=new Promise(resolve=>{releaseTimeline=resolve;});
+      return page.waitForRequest(request=>new URL(request.url()).pathname===timelinePath && request.method()==='GET');
+    };
+    const resumeTimeline=()=>{releaseTimeline();timelineGate=null;};
+    page.setDefaultTimeout(12000);await page.coverage.startJSCoverage({resetOnNavigation:false});
+    const origin=`http://127.0.0.1:${server.address().port}`;
+    assert.equal((await fetch(`${origin}/api/mbt/frontdesk/overdue-bins`)).status,401);
+    await page.goto(`${origin}/mbt/frontdesk`);
+    await expect(page.locator('#openNewContractOrder')).toBeEnabled();
+    // Select the real imported customer and load the contract through authenticated APIs.
+    await page.locator('#customerSearch').fill(f.marker);
+    await page.locator('#customerResults button').first().click();
+    await expect(page.locator('#contractMaster')).toContainText(f.contract.contractNumber);
+    await page.locator('#contractMaster button').filter({hasText:f.contract.contractNumber}).click();
+    await expect(page.locator('.mbt-timeline .mbt-visit-card')).toHaveCount(1);
+    await page.getByRole('button',{name:'Change delivery time',exact:true}).click();
+    const timeDialog=page.locator('#serviceLineActionDialog');
+    await timeDialog.getByLabel('Window start').fill('2037-08-04T12:00');
+    await timeDialog.getByLabel('Window end').fill('2037-08-04T16:00');
+    await expect(timeDialog.getByLabel('Reason (optional)')).toHaveJSProperty('required',false);
+    const savedWindow=page.waitForResponse(r=>r.url().endsWith('/delivery-window') && r.request().method()==='POST');
+    const windowRefresh=holdTimeline();
+    await timeDialog.getByRole('button',{name:'Save delivery time'}).click();
+    const windowResponse=await savedWindow;
+    assert.equal(windowResponse.status(),200,await windowResponse.text());
+    await windowRefresh;
+    await expect(timeDialog).toBeVisible();
+    await expect(timeDialog.getByRole('button',{name:'Save delivery time'})).toBeDisabled();
+    resumeTimeline();
+    await expect(timeDialog).not.toBeVisible();
+    assert.equal((await query('SELECT scheduled_start_at FROM mbt_service_visits WHERE service_visit_id=$1',[f.visits[0].visitId])).rows[0].scheduled_start_at.toISOString(),'2037-08-04T12:00:00.000Z');
+    for(const [material,amount] of [['soil',30000],['garbage',-30000]]) {
+      await page.getByRole('button',{name:'Change bin size or material',exact:true}).click();
+      const dialog=page.locator('#customerChargeDialog');
+      await dialog.locator('#contractTelephone').fill('4165550123');
+      await dialog.locator('#binContentCode').selectOption(material);
+      const response=page.waitForResponse(r=>r.url().endsWith('/frontdesk/charge-requests/preview') && r.request().method()==='POST');
+      await dialog.locator('button[type="submit"]').click();
+      const preview=await (await response).json();
+      await expect(dialog.locator('#confirmCustomerCharge')).toBeVisible();
+      assert.equal(preview.request.newRequestChargeableMinor,amount);
+      const priceRefresh=holdTimeline();
+      await dialog.locator('#confirmCustomerCharge').click();
+      await priceRefresh;
+      await expect(dialog).toBeVisible();
+      await expect(dialog.locator('#confirmCustomerCharge')).toBeDisabled();
+      resumeTimeline();
+      await expect(dialog).not.toBeVisible();
+    }
+    await query("UPDATE mbt_service_visits SET status='completed',actual_completed_at=now() WHERE service_line_id=$1 AND service_action='delivery'",[f.line.serviceLineId]);
+    await query("UPDATE mbt_contract_service_lines SET planned_delivery_at=now()-interval '16 days',planned_return_at=now()-interval '2 days',revision=revision+1 WHERE service_line_id=$1",[f.line.serviceLineId]);
+    coverage.push(...await page.coverage.stopJSCoverage());
+    await page.coverage.startJSCoverage({resetOnNavigation:false});
+    await page.reload();await expect(page.locator('#overdueBins')).toBeVisible();
+    await page.locator('#overdueBins').getByRole('button',{name:'Review bin'}).click();
+    await page.getByRole('button',{name:'Collect bin',exact:true}).click();
+    await timeDialog.getByLabel('Window start').fill('2037-08-20T12:00');
+    await timeDialog.getByLabel('Window end').fill('2037-08-20T16:00');
+    await timeDialog.getByLabel('Audit reason').fill('Customer explicitly requested collection');
+    await timeDialog.locator('button[type="submit"]').click();
+    await expect(timeDialog).not.toBeVisible();await expect(page.locator('.mbt-timeline .mbt-visit-card')).toHaveCount(2);
+    await expect(page.locator('#overdueBins')).toContainText('Collection requested');
+    assert.deepEqual(errors,[]);
+    await writeFile('test-artifacts/bin-collection-browser-v8.json',JSON.stringify(await withBrowserCoverageSources(page,[...coverage,...await page.coverage.stopJSCoverage()])));
+  } finally {releaseTimeline?.();await browser?.close();await new Promise(resolve=>server.close(resolve));}
+});

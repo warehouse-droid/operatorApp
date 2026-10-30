@@ -1,0 +1,26 @@
+{
+  "captures": [
+    {
+      "name": "delivery-waiting-sales",
+      "filename": "screenshots/delivery-waiting-sales.png",
+      "caption": "Sales sees the Delivery request waiting for SCM approval"
+    },
+    {
+      "name": "special-orders-sales",
+      "filename": "screenshots/special-orders-sales.png",
+      "caption": "Sales order references, PO approval and dispatch planning status"
+    },
+    {
+      "name": "special-adjustment-sales",
+      "filename": "screenshots/special-adjustment-sales.png",
+      "caption": "Sales requests a quantity and PALLET change for SCM review"
+    },
+    {
+      "name": "special-close-sales",
+      "filename": "screenshots/special-close-sales.png",
+      "caption": "Sales requests closure and waits for SCM confirmation"
+    }
+  ],
+  "errors": [],
+  "source": "Sales UI only; fictional training data; network disabled"
+}

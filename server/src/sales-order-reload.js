@@ -447,11 +447,10 @@ export function reloadPackedQuantities(target = {}, state = {}, requested = {}, 
   ]) {
     const current = packedStateValue(state, `packed${label}Qty`);
     const desired = absolute ? requestedValue(requested, requestKey) : current + requestedValue(requested, requestKey);
-    const reloadedUnits = packedStateValue(state, `reloaded${label}Qty`);
-    const unitLimit = Math.max(0, number(target[`target${label}Qty`]) - reloadedUnits);
     const conversion = conversions[label];
+    // Converted packages share the authorized sales balance, including broken pallets.
     const bySales = conversion > 0 ? Math.floor((salesCapacity / conversion) + QUANTITY_TOLERANCE) : 0;
-    const packed = roundQuantity(Math.min(desired, unitLimit, bySales));
+    const packed = roundQuantity(Math.min(desired, bySales));
     result[`packed${label}Qty`] = packed;
     salesCapacity = roundQuantity(Math.max(0, salesCapacity - (packed * conversion)));
   }

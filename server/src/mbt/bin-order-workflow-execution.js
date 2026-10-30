@@ -1,14 +1,24 @@
 // @ts-check
 import crypto from "node:crypto";
+import {assertTransportDeliveryEvidence} from './bin-transport-delivery.js';
+import { finishBinCargo } from "./bin-cargo-repository.js";
 import { query } from "../db.js";
 import { assertBinWorkflowDependency, binLocalDate } from "./bin-order-workflow-domain.js";
 import { binWorkflowError } from "./bin-order-workflow-repository.js";
 import { releaseMbtBinSuccessorToPool } from "./bin-planning-repository.js";
 
+/** Reused bins inherit the dump prerequisite before loading; separate bins can preload.
+ * @param {any} visit @param {any} step */
+function dependencyAction(visit,step) {
+  return step.action_code.startsWith('cargo_') && visit.service_snapshot.binWorkflow.source?.planned
+    ? 'deliver_bin' : step.action_code;
+}
+
 /** A dependency is satisfied by committed evidence, including another driver's work.
  * @param {any} visit @param {any} step @param {Date} occurredAt */
 export async function assertBinWorkflowPrerequisites(visit, step, occurredAt) {
   if (!visit.service_snapshot?.binWorkflow) {return [];}
+  await assertTransportDeliveryEvidence(visit,occurredAt);
   const {rows} = await query(`SELECT d.*,s.status,s.completed_at,p.display_reference,
       pickup.completed_at AS picked_up_at
     FROM mbt_bin_workflow_dependencies d
@@ -16,7 +26,7 @@ export async function assertBinWorkflowPrerequisites(visit, step, occurredAt) {
     JOIN mbt_bin_order_parts p ON p.visit_id=d.prerequisite_visit_id
     LEFT JOIN mbt_visit_steps pickup ON pickup.service_visit_id=d.prerequisite_visit_id AND pickup.action_code='pickup_bin'
     WHERE d.dependent_visit_id=$1 AND d.dependent_action_code=$2`,
-  [visit.service_visit_id,step.action_code]);
+  [visit.service_visit_id,dependencyAction(visit,step)]);
   const late = [];
   for (const row of rows) {
     try {
@@ -79,6 +89,7 @@ export async function finishBinWorkflowStep(context, visitCompleted) {
   const assetId = String(visit.expected_asset_id);
   const at = context.normalized.occurredAt;
   const actorId = `driver:${context.normalized.driverLogin}`;
+  await finishBinCargo(context);
   if (action === "deliver_bin") {
     await query("UPDATE mbt_bin_rental_numbers SET current_asset_id=$2 WHERE service_line_id=$1",[visit.service_line_id,assetId]);
   } else if (action === "pickup_bin") {

@@ -53,7 +53,7 @@ export async function readPlanningPlan(planId) {
 /** @param {string} visitId @param {number | undefined} [revision] */
 export async function lockPlanningVisit(visitId, revision) {
   const { rows } = await query("SELECT * FROM mbt_service_visits WHERE service_visit_id=$1 FOR UPDATE", [visitId]);
-  const visit = rows[0];
+  const visit = rows[0] || await (await import("./bin-transport-planning.js")).transportPlanningVisit(visitId,true);
   if (!visit) {throw planningError(404, "MBT_BIN_VISIT_NOT_FOUND", "The BIN visit was not found.");}
   if (revision !== undefined && (!Number.isSafeInteger(revision) || Number(visit.revision) !== revision)) {
     throw planningError(409, "MBT_BIN_DISPATCH_STALE_REVISION", "The BIN visit changed. Refresh before retrying.");
@@ -121,6 +121,7 @@ export function assertPlanningSchedule(plan, confirm = false) {
 }
 /** @param {any} visit @param {any} input @param {string} action @param {any} prior @param {any} assignment @param {number} planRevision */
 export async function planningHistory(visit, input, action, prior, assignment, planRevision) {
+  if (visit.transportTripId) {return;}
   await query(`INSERT INTO mbt_bin_dispatch_assignment_history
     (assignment_history_id,service_visit_id,contract_id,dispatch_plan_id,action,prior_assignment,assignment,
       visit_revision,plan_revision,actor_operator_id,reason,idempotency_key)

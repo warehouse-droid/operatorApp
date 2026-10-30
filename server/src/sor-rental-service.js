@@ -31,6 +31,11 @@ export async function sorSourceDrafts(baseRef,orders=[]) {
     FROM sales_orders WHERE regexp_replace(tranid,'-S[0-9]+$','')=$1`,[baseRef])).rows;
   const byRef=new Map(headers.map(row=>[row.tranid,row]));
   const base=byRef.get(baseRef);
+  const outstanding=new Set((await query(`SELECT parent_order_ref FROM dispatch_custom_orders
+    WHERE order_kind='sor_rental_return' AND status='open'
+      AND regexp_replace(parent_order_ref,'-S[0-9]+$','')=$1`,[baseRef])).rows.map(row=>row.parent_order_ref));
+  const retiredLines=new Set((await query(`SELECT id FROM sales_order_lines
+    WHERE sales_order_id=ANY($1::bigint[]) AND netsuite_active=false`,[headers.map(row=>row.netsuite_id)])).rows.map(row=>String(row.id)));
   const definitions=(await query(`SELECT split_ref,full_order,active FROM dispatch_global_order_splits
     WHERE parent_order_ref=$1 AND definition_kind='split' AND order_type='SO'
       AND split_ref ~ '^SOR[0-9]+-S[0-9]+$'`,[baseRef])).rows;
@@ -50,14 +55,17 @@ export async function sorSourceDrafts(baseRef,orders=[]) {
     if(order.deliveryMethod==='Pick-Up'){continue;}
     const header=byRef.get(order.id) || base;
     if(!header || header.sales_order_type!=='Delivery' || !header.netsuite_active || header.operator_status==='cancelled'
-      || /(?:^|:\s*)(?:Billed|Closed|Cancelled|Pending Approval)$/iu.test(header.status_text || '')){continue;}
+      || /(?:^|:\s*)(?:Cancelled|Pending Approval)$/iu.test(header.status_text || '')
+      || (/(?:^|:\s*)(?:Billed|Closed)$/iu.test(header.status_text || '') && !outstanding.has(order.id))){continue;}
     const completed=(await query(`SELECT 1 FROM driver_job_records WHERE stop_type='dropoff'
       AND status='complete' AND order_refs @> jsonb_build_array($1::text) LIMIT 1`,[order.id])).rowCount;
-    if(completed){continue;}
-    const draft=sorReturnDraft({...order,netsuiteId:header.netsuite_id,deliveryMethod:header.sales_order_type});
+    if(completed && !outstanding.has(order.id)){continue;}
+    const draft=sorReturnDraft({...order,netsuiteId:header.netsuite_id,deliveryMethod:header.sales_order_type,
+      items:(order.items || []).filter(line=>!retiredLines.has(String(line.lineRowId)))});
     if(draft){drafts.push(draft);}
   }
-  return {drafts,preserveMissing:Boolean(base && /(?:^|:\s*)(?:Billed|Closed)$/iu.test(base.status_text || ''))};
+  return {drafts,availableSourceRefs:[...leaves.keys()],
+    preserveMissing:Boolean(base && /(?:^|:\s*)(?:Billed|Closed)$/iu.test(base.status_text || ''))};
 }
 
 /** @param {{loadOrders: (options: {type:string,exactOrderRefs:string[]}) => Promise<any[]>, refreshRefs?: (refs:string[])=>Promise<void>, limit?:number}} options */
@@ -86,6 +94,9 @@ export async function runSorReturnQueue({loadOrders,refreshRefs=async(_refs)=>{}
             AND regexp_replace(parent_order_ref,'-S[0-9]+$','')=$1 AND status='open'`,[row.source_ref])).rows;
           for(const saved of existing) {
             if(source.drafts.some(draft=>draft.refNumber===saved.ref_number)){continue;}
+            // A loaded source with no rental items is an explicit change.
+            // Saved cargo is only a fallback when that source is unavailable.
+            if(source.availableSourceRefs.includes(saved.parent_order_ref)){continue;}
             const delivered=(await query(`SELECT 1 FROM driver_job_records WHERE stop_type='dropoff' AND status='complete'
               AND order_refs @> jsonb_build_array($1::text) LIMIT 1`,[saved.parent_order_ref])).rowCount;
             if(delivered || source.preserveMissing) {

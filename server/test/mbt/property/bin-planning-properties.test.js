@@ -24,8 +24,10 @@ test("property: capacity depends on peak physical occupancy, not the number of v
   fc.assert(fc.property(fc.array(fc.integer({ min: 1, max: 1000 }), { minLength: 1, maxLength: 50 }), weights => {
     const movements = weights.flatMap((weightLbs, assetId) => [{ assetId, weightLbs, delta: 1 }, { assetId, delta: -1 }]);
     assert.equal(assertBinRouteCapacity([{ slotCapacity: 1, capacityLbs: Math.max(...weights), movements }]), true);
-    assert.throws(() => assertBinRouteCapacity([{ slotCapacity: 1, capacityLbs: Math.max(...weights) - 1, movements }]),
-      error => error.code === "MBT_BIN_CAPACITY_EXCEEDED");
+    const capacityLbs=Math.max(...weights)-1,warnings=[];
+    assert.equal(assertBinRouteCapacity([{slotCapacity:1,capacityLbs,movements}],warnings),true);
+    assert.deepEqual(warnings.map(w=>w.weightLbs),weights.filter(weight=>weight>capacityLbs));
+    assert.ok(warnings.every(w=>w.code==='MBT_BIN_WEIGHT_WARNING' && w.excessLbs===w.weightLbs-capacityLbs));
   }), { seed: 9272027, numRuns: 1000 });
 });
 test("property: ordinary edits preserve BIN work while any stop mutation is rejected", () => {

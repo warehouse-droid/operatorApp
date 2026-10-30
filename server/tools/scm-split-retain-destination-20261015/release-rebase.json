@@ -1,0 +1,17 @@
+{
+  "disjointFilesPreserved": {
+    "src/dispatch-split-preview-repository.js": "1a9559bf4aada894ce4b0c5fff1f165b5028c9de07b9e2ee107bac78dc4d1a14",
+    "src/dispatch-sales-resplit-repository.js": "bf67e953821bd97eae1fc23b4bd1391ac305fea72b355989a32be77ea3b9bf28",
+    "src/delivery-repository.js": "dfb0375f7a2c81d23d23ddbe639ead5e388a987862cf7829b2d8eecaee25bba8",
+    "src/sales-repository.js": "76b5eecb7d1edd9216b2f98efc4a60cdf2c30cd55460591346e577a2b8685ff3",
+    "src/dispatch-sales-split-allocation.js": "b64c9d922c5e9660e69dbf610ac72cfe07a27f1547a532579753413926a2ed69",
+    "src/dispatch-delivery-group-repository.js": "e2470abde70dd80d7f755abda636d4ccfa32dee4be6b7a3187fd459950d23182",
+    "public/sales-printing.html": "f9c901f90ad03634086ec3d3dee66eb8cf241489f183dd16501e8ef92b7c9964",
+    "public/sales-printing.js": "a63c724f9f437153111f513edb79e55c04cf518d194b7fa34a940516445159e8",
+    "public/sales.html": "848b64be5a84e4a65cd2ad414ed1c984e2f302c63bc48d15cf49a28af3420f4f",
+    "public/sales.js": "6e7affebb47c5e1caa502556ca3dbb68a07a6473fdd877f8395d92b7685b510f"
+  },
+  "overlappingFiles": [
+    "src/server.js"
+  ]
+}

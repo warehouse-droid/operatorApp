@@ -8,6 +8,7 @@ import { finalizeTransferPosting } from './transfer-order-posting-repository.js'
 import { completeConsolidatedLoad } from "./consolidation-load-repository.js";
 import { recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
 import { recordReceivingReceipt } from "./receiving-repository.js";
+import { enqueuePurchaseReceiptRefresh } from './purchase-receipt-refresh-repository.js';
 import {
   syncDirectDependencyOperatorProgress,
   syncOrderDependenciesForTransferOrder
@@ -188,7 +189,8 @@ export function createOperatorNetSuitePostingFinalizer({
       allowNetSuiteCompleted: true,
       verifiedSalesQuantities: verifiedLocalNetSuiteSalesQuantities(command),
       ...(operation.kind === 'direct_po_receipt'
-        ? {verifiedDirectCompletionEventId: command.inputSnapshot.directDeliveryEvidence.completionEventId} : {})
+        ? {verifiedDirectCompletionEventId: command.inputSnapshot.directDeliveryEvidence.completionEventId,
+          verifiedDirectReceiptJobId: command.inputSnapshot.directDeliveryEvidence.receiptJobId} : {})
     });
     if (operation.orderType === "transfer_order") {
       await syncTransferDependencies(operation.orderId);
@@ -209,6 +211,12 @@ export function createOperatorNetSuitePostingFinalizer({
     delivery_prep_load: deliveryPrepFinalization,
     receiving_receipt: receivingFinalization,
     direct_po_receipt: async (/** @type {Record<string,any>} */ command, /** @type {Record<string,any>} */ operation, /** @type {string[]} */ photos) => {
+      await enqueuePurchaseReceiptRefresh(operation.orderId);
+      if(command.inputSnapshot.directDeliveryEvidence.receiptJobId) {
+        // The receipt ledger advances only the selected local quantities. Do not
+        // promote a partly allocated line to its entire ordered quantity.
+        return receivingFinalization(command,operation,photos);
+      }
       // Whole local direct-PO delivery was verified before admission. Freeze its
       // received progress only inside the verified command's finalization.
       const verifiedQuantities = verifiedLocalNetSuiteSalesQuantities(command);

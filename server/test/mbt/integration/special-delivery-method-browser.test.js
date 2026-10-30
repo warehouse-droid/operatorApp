@@ -65,20 +65,31 @@ async function fixture(role = 'scm', width = 1440, salesPage = false, configure 
   await page.goto(salesPage ? 'http://localhost/sales/stock-requests?tab=special' : `http://localhost/${role === 'dispatcher' ? 'dispatch' : 'scm'}/method-test`);
   return { page, state, close: async () => { await writeFile(`${out}/coverage-${++capture}.json`, JSON.stringify(await page.coverage.stopJSCoverage())); await context.close(); } };
 }
-for (const width of [1440, 390]) test(`Sales can change linked SPREQ pickup at width ${width} and sees team notification guidance`, async () => {
-  const { page, state, close } = await fixture('sales', width, true);
+for (const planned of [false, true, 'arrived']) for (const width of [1440, 390]) test(`Sales can change linked SPREQ pickup at width ${width}, planned=${planned}, and sees team notification guidance`, async () => {
+  const { page, state, close } = await fixture('sales', width, true, value => {
+    if (planned) Object.assign(value.record, {stage:'dispatch_arrangement',dispatchPlanned:true,dispatchPlanning:{anyPlanned:true},handoff:{status:'planned'}});
+    if (planned==='arrived') Object.assign(value.record,{requestRef:'SPREQ-TEST-ARRIVED',fulfillmentMethod:'mbt_delivery',purchaseOrderReceivedAt:'2026-10-20T18:43:29Z',handoff:{status:'completed',route:'via_yard'}});
+  });
   try {
     await page.locator('.stock-request-card[data-id="1"]').click();
     const form = page.locator('[data-special-fulfillment-form]'); await expect(form).toBeVisible();
     await expect(form).toContainText('SCM and Dispatch'); await expect(form).toContainText('PO reference');
+    if(planned==='arrived')assert.deepEqual(await form.locator('[name=fulfillmentMethod] option').evaluateAll(options=>options.map(option=>option.value)),['yard_pickup','mbt_delivery']);
     await form.locator('[name=fulfillmentMethod]').selectOption('yard_pickup'); await form.getByRole('button', { name: 'Save', exact: true }).click();
     await expect.poll(() => state.posts.length).toBe(1);
     assert.equal(state.posts[0].path, '/api/sales/special-stock-requests/1/fulfillment');
     assert.equal(state.posts[0].body.expectedRevision, 19); assert.equal(state.posts[0].body.fulfillmentMethod, 'yard_pickup');
     await expect(page.getByText('Delivery method saved. SCM and Dispatch alerted.', { exact: true })).toBeVisible();
     assert.equal(state.record.purchaseOrderReference, 'SN1402193'); assert.deepEqual(state.errors, []);
-    await page.screenshot({ path: `${out}/sales-${width}.png`, fullPage: true });
+    await page.screenshot({ path: `${out}/sales-${width}-${planned}.png`, fullPage: true });
   } finally { await close(); }
+});
+for(const width of [390,1440])test(`fulfilled pickup is Completed without a delivery dropdown at width ${width}`,async()=>{
+ const {page,state,close}=await fixture('sales',width,true,value=>Object.assign(value.record,{requestRef:'SPREQ-000080',stage:'completed',operationallyComplete:true,
+  fulfillmentMethod:'yard_pickup',salesOrderStatus:'Sales Order : Pending Billing',purchaseOrderReceivedAt:'2026-10-20T18:43:29Z'}));
+ try{await page.locator('.stock-request-card[data-id="1"]').click();await expect(page.locator('select[name=fulfillmentMethod]')).toHaveCount(0);
+  await expect(page.getByText('Pickup at inquired yard',{exact:true}).last()).toBeVisible();assert.deepEqual(state.errors,[]);
+ }finally{await close();}
 });
 for (const role of ['scm', 'scm_staff', 'dispatcher']) test(`${role} sees a durable change popup with yard and order references`, async () => {
   const { page, state, close } = await fixture(role, role === 'dispatcher' ? 390 : 1440);

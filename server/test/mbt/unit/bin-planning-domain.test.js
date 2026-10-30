@@ -95,13 +95,15 @@ test("one slot carries sequential complete visits without summing the day's bins
       { assetId: "b", delta: 1, weightLbs: 800 }, { assetId: "b", delta: -1 }] };
   assert.equal(assertBinRouteCapacity([route]), true);
 });
-test("peak occupancy and weight fail even when all bins are eventually unloaded", () => {
-  for (const constraints of [{ slotCapacity: 1, capacityLbs: 2000 }, { slotCapacity: 2, capacityLbs: 1000 }]) {
-    assert.throws(() => assertBinRouteCapacity([{ truckId: "1", ...constraints,
-      movements: [{ assetId: "a", delta: 1, weightLbs: 600 }, { assetId: "b", delta: 1, weightLbs: 600 },
-        { assetId: "a", delta: -1 }, { assetId: "b", delta: -1 }] }]),
-    e => e.code === "MBT_BIN_CAPACITY_EXCEEDED");
-  }
+test("peak occupancy remains enforced while excess truck weight produces an advisory", () => {
+  const movements=[{assetId:'a',delta:1,weightLbs:600},{assetId:'b',delta:1,weightLbs:600},
+    {assetId:'a',delta:-1},{assetId:'b',delta:-1}];
+  assert.throws(()=>assertBinRouteCapacity([{truckId:'1',slotCapacity:1,capacityLbs:2000,movements}]),
+    e=>e.code==='MBT_BIN_CAPACITY_EXCEEDED');
+  const warnings=[];
+  assert.equal(assertBinRouteCapacity([{truckId:'1',slotCapacity:2,capacityLbs:1000,movements}],warnings),true);
+  assert.equal(warnings.length,1);assert.equal(warnings[0].weightLbs,1200);
+  assert.equal(warnings[0].capacityLbs,1000);assert.equal(warnings[0].excessLbs,200);
 });
 test("dumping reduces payload weight while the empty bin still occupies a slot", () => {
   const movements = [{ assetId: "a", delta: 1, weightLbs: 900 }, { assetId: "a", delta: 0, weightLbs: 100 },

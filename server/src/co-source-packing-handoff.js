@@ -121,13 +121,13 @@ export async function assertNoCoSourcePacking(order) {
   if (!sources.length) {return;}
   const result = await query(`SELECT co.co_ref FROM local_co_orders co
     JOIN sales_orders source ON (co.source_order_ref=source.tranid OR co.details->'childOrderIds' ? source.tranid)
-    WHERE source.netsuite_id=ANY($1::bigint[]) AND co.status=ANY($2::text[])
-      AND co.loaded_at IS NULL AND co.received_at IS NULL
+    WHERE source.netsuite_id=ANY($1::bigint[]) AND co.status<>'cancelled'
+      AND ${completedCoArrivalSql('co')} IS NULL
       AND (co.from_location_id=source.outbound_location_id
         OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(source.outbound_location,':',1))))
-    ORDER BY co.id LIMIT 1`, [sources.map(row => row.netsuite_id), ACTIVE_CO_STATUSES]);
+    ORDER BY co.id LIMIT 1`, [sources.map(row => row.netsuite_id)]);
   if (result.rowCount) {
-    throw handoffError(`Packing has moved to ${result.rows[0].co_ref}. Open that CO to pack or load this cargo.`, "CO_SOURCE_PACKING_HANDOFF");
+    throw handoffError(`Waiting for ${result.rows[0].co_ref} to arrive at the destination yard. Open that CO to pack or load the transfer cargo.`, "CO_SOURCE_PACKING_HANDOFF");
   }
 }
 

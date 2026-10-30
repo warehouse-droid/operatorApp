@@ -1,0 +1,819 @@
+{
+  "baseImage": "sha256:e97d2903007dcde21a11a7333860dcb7274ab838269ce358f8e5d92f1944bb73",
+  "files": {
+    "public/dispatch.js": "2734f1e497c148677700c4a7a209204ae27231fd36acd337c2d77c8653bd277d",
+    "public/dispatch.html": "13098d75d232f26f6543cc3ecd110db755b26020c84a47212ce0e65683d0e9f8",
+    "public/mbt-planning.html": "a1b8a53e592368ac754cf41d7abc18189e2c8cf868295e510b9c49c1554f3f1f",
+    "src/dispatch-repository.js": "ed5447b19e8dcdee4d90b68072310ee728c865e29993e5731240d6a5a526a99e",
+    "src/dispatch-order-pool-sql.js": "7da572084975d102193d72cc84075bbdb6c1ac82beac846ec45a77990757a41b"
+  },
+  "changedLines": {
+    "public/dispatch.js": [
+      4766,
+      4767,
+      4768,
+      4769,
+      4770,
+      4771,
+      4772,
+      4773,
+      4774,
+      4775,
+      4776,
+      4777,
+      4778,
+      4781,
+      4784,
+      4785,
+      4786,
+      4797,
+      4798,
+      4799,
+      4801,
+      4803,
+      4804,
+      4805,
+      4806,
+      4807,
+      4808,
+      4809,
+      4810,
+      4816,
+      4818,
+      4820,
+      4822,
+      4823,
+      4824,
+      4825,
+      4916,
+      4917,
+      4918,
+      4919,
+      4920,
+      4921,
+      4922
+    ],
+    "public/dispatch.html": [
+      20
+    ],
+    "public/mbt-planning.html": [
+      25
+    ],
+    "src/dispatch-repository.js": [
+      32,
+      33,
+      519,
+      520,
+      743,
+      781,
+      886,
+      923,
+      944
+    ],
+    "src/dispatch-order-pool-sql.js": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ]
+  },
+  "baselineFiles": {
+    "public/dispatch.js": "f5c8ecacaa19c2439acd226e6aed471d131c4395436dbf19dec65e81332bf455",
+    "public/dispatch.html": "4e57375569c55bbe0bb2ef36c9de9b8543d1017577547fdabf0c58de7b9f199a",
+    "public/mbt-planning.html": "13b0c6ba3b331decf2fe5f08220e1e1f7c1d059d9d1aaa825399ed79c52b3fdd",
+    "src/dispatch-repository.js": "843e749506c85961fe08d05d29c6c473f6c5dad4e2ced24f8695929b0d58ee15",
+    "src/dispatch-order-pool-sql.js": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "passed": true,
+  "node": "v20.20.2",
+  "tests": [
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "baseline-correctness",
+      "status": 1,
+      "tests": 10,
+      "passed": 3,
+      "failures": [
+        {
+          "name": "TO search: existing queued read searches the active term instead of the browse tab",
+          "error": "|-\n    Expected values to be strictly equal:",
+          "errorSha256": "1906c9d7b36748808ab37655df4cf515f391d52f1429f13d4013ece461f10754"
+        },
+        {
+          "name": "TO search: plan edits and targeted mutations preserve newer cards while discovering missing orders",
+          "error": "|-\n    Expected values to be strictly equal:\n    + actual - expected",
+          "errorSha256": "db4e3d534d36cc2d49cc601b3cd96dceceaf868dfc62b1872179de92495ba058"
+        },
+        {
+          "name": "TO search: scope, date, plan and navigation changes reject late results",
+          "error": "|-\n    Expected values to be strictly equal:",
+          "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+        },
+        {
+          "name": "TO search: superseded work waiting for group hydration never starts a request",
+          "error": "|-\n    Expected values to be strictly equal:",
+          "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+        },
+        {
+          "name": "TO search: response waits for group hydration and rechecks navigation afterwards",
+          "error": "|-\n    Expected values to be strictly equal:",
+          "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+        },
+        {
+          "name": "TO search: errors are visible, aborts are neutral, empty and legacy results complete",
+          "error": "|-\n    Expected values to be strictly equal:\n    + actual - expected",
+          "errorSha256": "efb12d19690382e0dc4d1eca9b2910c1164a3627077eb37aa196bd4e0ace988e"
+        },
+        {
+          "name": "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data",
+          "error": "|-\n    Property failed after 2 tests\n    { seed: 20261028, path: \"1:0:1:0:0\", endOnFailure: true }\n    Counterexample: [0,1,false]\n    Shrunk 4 time(s)",
+          "errorSha256": "f37f911ff53275a6c527f80f90e7eda9b6c59ae7ef9cdea90f625b9511dab7de"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-freshness-races.test.js",
+      "label": "baseline-test/dispatch/frontend/dispatch-freshness-races.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/group-hydration-concurrency.test.js",
+      "label": "baseline-test/dispatch/frontend/group-hydration-concurrency.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/sales-order-group-hydration.red.test.js",
+      "label": "baseline-test/dispatch/frontend/sales-order-group-hydration.red.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-planner-performance.contract.test.js",
+      "label": "baseline-test/dispatch/frontend/dispatch-planner-performance.contract.test.js",
+      "status": 1,
+      "tests": 32,
+      "passed": 31,
+      "failures": [
+        {
+          "name": "DP-33 frontend: active CO projection retains every current relationship pickup",
+          "error": "|-\n    The input did not match the regular expression /activeTransitPickupLocations\\(order,\\s*basePickupLocations\\)/u. Input:",
+          "errorSha256": "36635c20401b9cf144ba39354fdfa5d26a418849134755595415034fddf88d84"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-unplan-freshness.red.test.js",
+      "label": "baseline-test/dispatch/frontend/dispatch-unplan-freshness.red.test.js",
+      "status": 1,
+      "tests": 3,
+      "passed": 2,
+      "failures": [
+        {
+          "name": "Dispatch requests the unplan-freshness client generation",
+          "error": "|-\n    The input did not match the regular expression /dispatch\\.js\\?v=20260911-map-geometry-v2/. Input:",
+          "errorSha256": "35561b3fed4b8982533024bec376b5a611ca1666184520d6bc50db1db06d561f"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-po-ref-link-search.test.js",
+      "label": "baseline-test/dispatch/frontend/dispatch-po-ref-link-search.test.js",
+      "status": 1,
+      "tests": 2,
+      "passed": 1,
+      "failures": [
+        {
+          "name": "Dispatch loads the PO-ref search client generation",
+          "error": "|-\n    The input did not match the regular expression /dispatch\\.js\\?v=20260911-map-geometry-v2/u. Input:",
+          "errorSha256": "7ecda60328ed917008e6006c6dc64acc0521f30433eaee333ea54bbdca010fdc"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/property/dispatch-search-session.property.test.js",
+      "label": "baseline-test/dispatch/property/dispatch-search-session.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-order-pool-gate.contract.test.js",
+      "label": "baseline-test/dispatch/unit/dispatch-order-pool-gate.contract.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-order-pool-policy.test.js",
+      "label": "baseline-test/dispatch/unit/dispatch-order-pool-policy.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-fulfilled-so-policy.test.js",
+      "label": "baseline-test/dispatch/unit/dispatch-fulfilled-so-policy.test.js",
+      "status": 0,
+      "tests": 11,
+      "passed": 11,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-search-session.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-search-session.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-fulfilled-so-planning.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-fulfilled-so-planning.test.js",
+      "status": 0,
+      "tests": 11,
+      "passed": 11,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/scm-po-split-corrected-receipt-visibility.test.js",
+      "label": "baseline-test/dispatch/integration/scm-po-split-corrected-receipt-visibility.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/scm-po-split-status-consistency.red.test.js",
+      "label": "baseline-test/dispatch/integration/scm-po-split-status-consistency.red.test.js",
+      "status": 0,
+      "tests": 23,
+      "passed": 23,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-derived-order-pool.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-global-derived-order-pool.red.test.js",
+      "status": 1,
+      "tests": 9,
+      "passed": 7,
+      "failures": [
+        {
+          "name": "SO, PO, TO, and CO splits are global definitions while their date assignment remains independent",
+          "error": "\"Cannot read properties of null (reading 'originalOrderId')\"",
+          "errorSha256": "7af4bbe1c2ab71bbcd45b739eea24b4209f665e85cec67fbc4f9858fa54431fb"
+        },
+        {
+          "name": "grouped CO and CO-of-group are global without hiding the source-order lifecycle",
+          "error": "\"Cannot read properties of null (reading 'childOrders')\"",
+          "errorSha256": "c4a77890e50ca43c9e8da129c44d35b13aa58fb14bbe603cc1657d4405620dae"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "label": "baseline-test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "status": 0,
+      "tests": 7,
+      "passed": 7,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-v2-snapshot-performance.red.test.js",
+      "label": "baseline-test/dispatch/integration/dispatch-v2-snapshot-performance.red.test.js",
+      "status": 1,
+      "tests": 6,
+      "passed": 5,
+      "failures": [
+        {
+          "name": "DP-13 and DP-16: checkpoint list is metadata-only and compact reads/commands record bounded timings",
+          "error": "|-\n    The expression evaluated to a falsy value:",
+          "errorSha256": "dffeccbb214a2d65b5dad7a99aaa29b6f337f77b04b16554563d26941d364abb"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "baseline-test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "status": 0,
+      "tests": 22,
+      "passed": 22,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-po-ref-link-search.test.js",
+      "label": "candidate-test/dispatch/frontend/dispatch-po-ref-link-search.test.js",
+      "status": 1,
+      "tests": 2,
+      "passed": 1,
+      "failures": [
+        {
+          "name": "Dispatch loads the PO-ref search client generation",
+          "error": "|-\n    The input did not match the regular expression /dispatch\\.js\\?v=20260911-map-geometry-v2/u. Input:",
+          "errorSha256": "7ecda60328ed917008e6006c6dc64acc0521f30433eaee333ea54bbdca010fdc"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-order-catalog.red.test.js",
+      "status": 0,
+      "tests": 7,
+      "passed": 7,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-planner-performance.contract.test.js",
+      "label": "candidate-test/dispatch/frontend/dispatch-planner-performance.contract.test.js",
+      "status": 1,
+      "tests": 32,
+      "passed": 31,
+      "failures": [
+        {
+          "name": "DP-33 frontend: active CO projection retains every current relationship pickup",
+          "error": "|-\n    The input did not match the regular expression /activeTransitPickupLocations\\(order,\\s*basePickupLocations\\)/u. Input:",
+          "errorSha256": "36635c20401b9cf144ba39354fdfa5d26a418849134755595415034fddf88d84"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-search-session.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-search-session.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "candidate-test/dispatch/frontend/dispatch-tob-search.test.js",
+      "status": 0,
+      "tests": 10,
+      "passed": 10,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-po-pickup-yard.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "label": "candidate-test/dispatch/integration/linked-po-pickup-feed-20261028.test.js",
+      "status": 0,
+      "tests": 22,
+      "passed": 22,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-fulfilled-so-planning.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-fulfilled-so-planning.test.js",
+      "status": 0,
+      "tests": 11,
+      "passed": 11,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-fulfilled-so-policy.test.js",
+      "label": "candidate-test/dispatch/unit/dispatch-fulfilled-so-policy.test.js",
+      "status": 0,
+      "tests": 11,
+      "passed": 11,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "label": "candidate-test/dispatch/property/dispatch-global-order-group-pool.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-unplan-freshness.red.test.js",
+      "label": "candidate-test/dispatch/frontend/dispatch-unplan-freshness.red.test.js",
+      "status": 1,
+      "tests": 3,
+      "passed": 2,
+      "failures": [
+        {
+          "name": "Dispatch requests the unplan-freshness client generation",
+          "error": "|-\n    The input did not match the regular expression /dispatch\\.js\\?v=20260911-map-geometry-v2/. Input:",
+          "errorSha256": "35561b3fed4b8982533024bec376b5a611ca1666184520d6bc50db1db06d561f"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-order-pool-gate.contract.test.js",
+      "label": "candidate-test/dispatch/unit/dispatch-order-pool-gate.contract.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/scm-po-split-corrected-receipt-visibility.test.js",
+      "label": "candidate-test/dispatch/integration/scm-po-split-corrected-receipt-visibility.test.js",
+      "status": 0,
+      "tests": 2,
+      "passed": 2,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-freshness-races.test.js",
+      "label": "candidate-test/dispatch/frontend/dispatch-freshness-races.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/sales-order-group-hydration.red.test.js",
+      "label": "candidate-test/dispatch/frontend/sales-order-group-hydration.red.test.js",
+      "status": 0,
+      "tests": 5,
+      "passed": 5,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-v2-snapshot-performance.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-v2-snapshot-performance.red.test.js",
+      "status": 1,
+      "tests": 6,
+      "passed": 5,
+      "failures": [
+        {
+          "name": "DP-13 and DP-16: checkpoint list is metadata-only and compact reads/commands record bounded timings",
+          "error": "|-\n    The expression evaluated to a falsy value:",
+          "errorSha256": "dffeccbb214a2d65b5dad7a99aaa29b6f337f77b04b16554563d26941d364abb"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-global-order-group-pool.red.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/property/dispatch-search-session.property.test.js",
+      "label": "candidate-test/dispatch/property/dispatch-search-session.property.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/unit/dispatch-order-pool-policy.test.js",
+      "label": "candidate-test/dispatch/unit/dispatch-order-pool-policy.test.js",
+      "status": 0,
+      "tests": 6,
+      "passed": 6,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/frontend/group-hydration-concurrency.test.js",
+      "label": "candidate-test/dispatch/frontend/group-hydration-concurrency.test.js",
+      "status": 0,
+      "tests": 4,
+      "passed": 4,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/scm-po-split-status-consistency.red.test.js",
+      "label": "candidate-test/dispatch/integration/scm-po-split-status-consistency.red.test.js",
+      "status": 0,
+      "tests": 23,
+      "passed": 23,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-global-derived-order-pool.red.test.js",
+      "label": "candidate-test/dispatch/integration/dispatch-global-derived-order-pool.red.test.js",
+      "status": 1,
+      "tests": 9,
+      "passed": 7,
+      "failures": [
+        {
+          "name": "SO, PO, TO, and CO splits are global definitions while their date assignment remains independent",
+          "error": "\"Cannot read properties of null (reading 'originalOrderId')\"",
+          "errorSha256": "7af4bbe1c2ab71bbcd45b739eea24b4209f665e85cec67fbc4f9858fa54431fb"
+        },
+        {
+          "name": "grouped CO and CO-of-group are global without hiding the source-order lifecycle",
+          "error": "\"Cannot read properties of null (reading 'childOrders')\"",
+          "errorSha256": "c4a77890e50ca43c9e8da129c44d35b13aa58fb14bbe603cc1657d4405620dae"
+        }
+      ],
+      "existingFailure": true
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "mutant-drop-search-after-plan-edit",
+      "status": 1,
+      "tests": 10,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data",
+          "error": "|-\n    Property failed after 2 tests\n    { seed: 20261028, path: \"1:0:1:0:0\", endOnFailure: true }\n    Counterexample: [0,1,false]\n    Shrunk 4 time(s)",
+          "errorSha256": "f37f911ff53275a6c527f80f90e7eda9b6c59ae7ef9cdea90f625b9511dab7de"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "mutant-overwrite-newer-card",
+      "status": 1,
+      "tests": 10,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data",
+          "error": "|-\n    Property failed after 2 tests\n    { seed: 20261028, path: \"1:0:1:0:0\", endOnFailure: true }\n    Counterexample: [0,1,false]\n    Shrunk 4 time(s)",
+          "errorSha256": "f37f911ff53275a6c527f80f90e7eda9b6c59ae7ef9cdea90f625b9511dab7de"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "mutant-accept-same-date-old-navigation",
+      "status": 1,
+      "tests": 10,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data",
+          "error": "|-\n    Property failed after 1 tests\n    { seed: 20261028, path: \"0:0:0\", endOnFailure: true }\n    Counterexample: [0,0,true]\n    Shrunk 2 time(s)",
+          "errorSha256": "930152b964089118a4ae4d3357cd83d8d954fdd39286865b7b9f56008c8e8359"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "mutant-refresh-browse-instead-of-search",
+      "status": 1,
+      "tests": 10,
+      "passed": 9,
+      "failures": [
+        {
+          "name": "TO search: existing queued read searches the active term instead of the browse tab",
+          "error": "|-\n    Expected values to be strictly equal:",
+          "errorSha256": "1906c9d7b36748808ab37655df4cf515f391d52f1429f13d4013ece461f10754"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "label": "mutant-ignore-closed-split-member",
+      "status": 1,
+      "tests": 1,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "search SQL properties: materialized closure exactly preserves original SO/PO/TO family rules",
+          "error": "|-\n    Property failed after 1 tests\n    { seed: 20261028, path: \"0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:1:1:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:1\", endOnFailure: true }\n    Counterexample: [[{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{",
+          "errorSha256": "371fe0ea9e51e06449e931e1ca9c4d807fa76269e548197a7d79cf1ec38c9f1b"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "label": "mutant-omit-closed-family-children",
+      "status": 1,
+      "tests": 1,
+      "passed": 0,
+      "failures": [
+        {
+          "name": "search SQL properties: materialized closure exactly preserves original SO/PO/TO family rules",
+          "error": "|-\n    Property failed after 1 tests\n    { seed: 20261028, path: \"0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:3:9:10:8:8:8:8:8:8:8:8:8:8\", endOnFailure: true }\n    Counterexample: [[{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillment\"},{\"code\":\"B\",\"label\":\"Pending Fulfillm",
+          "errorSha256": "9715d53b1dcbc1271f79633f18575b892341e0281b3562fc3e080e4c5dbfe56b"
+        }
+      ]
+    },
+    {
+      "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+      "label": "restored-test/dispatch/frontend/dispatch-tob-search.test.js",
+      "status": 0,
+      "tests": 10,
+      "passed": 10,
+      "failures": []
+    },
+    {
+      "file": "test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "label": "restored-test/dispatch/integration/dispatch-tob-search-sql.test.js",
+      "status": 0,
+      "tests": 1,
+      "passed": 1,
+      "failures": []
+    }
+  ],
+  "specApproval": "not obtained (autonomous run)",
+  "toolchain": {
+    "eslint": "10.8.0",
+    "typescript": "7.0.2",
+    "c8": "12.0.0",
+    "fast-check": "4.9.0",
+    "pg": "8.21.0"
+  },
+  "red": {
+    "file": "test/dispatch/frontend/dispatch-tob-search.test.js",
+    "label": "baseline-correctness",
+    "status": 1,
+    "tests": 10,
+    "passed": 3,
+    "failures": [
+      {
+        "name": "TO search: existing queued read searches the active term instead of the browse tab",
+        "error": "|-\n    Expected values to be strictly equal:",
+        "errorSha256": "1906c9d7b36748808ab37655df4cf515f391d52f1429f13d4013ece461f10754"
+      },
+      {
+        "name": "TO search: plan edits and targeted mutations preserve newer cards while discovering missing orders",
+        "error": "|-\n    Expected values to be strictly equal:\n    + actual - expected",
+        "errorSha256": "db4e3d534d36cc2d49cc601b3cd96dceceaf868dfc62b1872179de92495ba058"
+      },
+      {
+        "name": "TO search: scope, date, plan and navigation changes reject late results",
+        "error": "|-\n    Expected values to be strictly equal:",
+        "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+      },
+      {
+        "name": "TO search: superseded work waiting for group hydration never starts a request",
+        "error": "|-\n    Expected values to be strictly equal:",
+        "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+      },
+      {
+        "name": "TO search: response waits for group hydration and rechecks navigation afterwards",
+        "error": "|-\n    Expected values to be strictly equal:",
+        "errorSha256": "8f9c2a4992aea16da9238aeaa21157125a2e161569264ad906bf1ec02044ffd3"
+      },
+      {
+        "name": "TO search: errors are visible, aborts are neutral, empty and legacy results complete",
+        "error": "|-\n    Expected values to be strictly equal:\n    + actual - expected",
+        "errorSha256": "efb12d19690382e0dc4d1eca9b2910c1164a3627077eb37aa196bd4e0ace988e"
+      },
+      {
+        "name": "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data",
+        "error": "|-\n    Property failed after 2 tests\n    { seed: 20261028, path: \"1:0:1:0:0\", endOnFailure: true }\n    Counterexample: [0,1,false]\n    Shrunk 4 time(s)",
+        "errorSha256": "f37f911ff53275a6c527f80f90e7eda9b6c59ae7ef9cdea90f625b9511dab7de"
+      }
+    ]
+  },
+  "types": {
+    "baseline": 3459,
+    "current": 3459,
+    "newErrors": []
+  },
+  "lint": {
+    "baseline": 78,
+    "current": 78,
+    "newErrors": []
+  },
+  "coverage": [
+    {
+      "file": "public/dispatch.js",
+      "total": 29,
+      "covered": 29,
+      "missing": []
+    },
+    {
+      "file": "src/dispatch-repository.js",
+      "total": 9,
+      "covered": 9,
+      "missing": []
+    },
+    {
+      "file": "src/dispatch-order-pool-sql.js",
+      "total": 26,
+      "covered": 26,
+      "missing": []
+    }
+  ],
+  "mutations": [
+    {
+      "name": "drop-search-after-plan-edit",
+      "killed": true,
+      "propertyAlone": true,
+      "failures": [
+        "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data"
+      ]
+    },
+    {
+      "name": "overwrite-newer-card",
+      "killed": true,
+      "propertyAlone": true,
+      "failures": [
+        "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data"
+      ]
+    },
+    {
+      "name": "accept-same-date-old-navigation",
+      "killed": true,
+      "propertyAlone": true,
+      "failures": [
+        "TO search properties: unrelated update timing never loses discoveries or overwrites newer existing data"
+      ]
+    },
+    {
+      "name": "refresh-browse-instead-of-search",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "TO search: existing queued read searches the active term instead of the browse tab"
+      ]
+    },
+    {
+      "name": "ignore-closed-split-member",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "search SQL properties: materialized closure exactly preserves original SO/PO/TO family rules"
+      ]
+    },
+    {
+      "name": "omit-closed-family-children",
+      "killed": true,
+      "propertyAlone": false,
+      "failures": [
+        "search SQL properties: materialized closure exactly preserves original SO/PO/TO family rules"
+      ]
+    }
+  ]
+}

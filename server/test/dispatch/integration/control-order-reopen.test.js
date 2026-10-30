@@ -102,15 +102,17 @@ for (const [label, patch] of [
   ["closed order", "status='H',status_text='Sales Order : Closed'"],
   ["inactive order", "netsuite_active=false"]
 ]) {
-  test(`${label} prevents a full local reset`, () => rollback(async () => {
+  test(`${label} is retained as history without preventing a local reset`, () => rollback(async () => {
     const f = await reopenFixture();
     await query(`UPDATE sales_orders SET ${patch} WHERE netsuite_id=$1`, [f.id]);
     const initial = await state(f);
     const preview = await previewOperatorOrderReopen({ orderRef: f.ref, actor: f.actor });
-    assert.equal(preview.allowed, false);
-    assert.ok(preview.blockers[0].message.includes(f.ref));
-    await assert.rejects(() => reopenOperatorOrder(resetInput(f, preview)), error => error.status === 409);
-    assert.deepEqual(await state(f), initial);
+    assert.equal(preview.allowed, true, JSON.stringify(preview.blockers));
+    const result = await reopenOperatorOrder(resetInput(f, preview));
+    assert.equal((await state(f)).header.operator_status, "open");
+    const correction = (await query("SELECT before_state FROM operator_order_reopens WHERE id=$1", [result.correctionId])).rows[0];
+    assert.equal(correction.before_state[0].header.status, initial.header.status);
+    assert.equal((await state(f)).header.netsuite_active, initial.header.netsuite_active);
   }));
 }
 

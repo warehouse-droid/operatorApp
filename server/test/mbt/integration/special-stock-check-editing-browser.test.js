@@ -146,3 +146,61 @@ test('decline revision remains unavailable for closed lines, closed cases, pendi
     } finally { await close(); }
   }
 });
+
+test('accepted SCM readiness offers the same stock statuses and submits each exact selection', async () => {
+  const { page, state, close } = await fixture(record => {
+    Object.assign(record.lines[0], { salesDecision: 'accepted', supplyStatus: 'in_stock' });
+    Object.assign(record.lines[1], { salesDecision: 'pending', supplyStatus: 'in_stock', vendorYard: 'TEST Yard' });
+  });
+  try {
+    const line = page.locator('[data-special-stock-line="1"]');
+    const statuses = ['in_stock', 'low_inventory', 'production', 'vendor_transfer', 'no_stock'];
+    assert.deepEqual(await line.locator('[name=supplyStatus] option').evaluateAll(options => options.map(option => option.value)), statuses);
+    assert.deepEqual(await page.locator('[data-special-stock-line="2"] [name=supplyStatus] option').evaluateAll(options => options.map(option => option.value)), statuses);
+    for (const supplyStatus of statuses) {
+      await line.locator('[name=supplyStatus]').selectOption(supplyStatus);
+      if (supplyStatus === 'production') {
+        await expect(line.locator('[name=eta]')).toBeVisible();
+        await expect(line.locator('[name=eta]')).toHaveAttribute('required', '');
+        await line.locator('[name=eta]').fill('2099-03-01');
+      } else {
+        await expect(line.locator('[name=eta]')).toBeDisabled();
+      }
+      if (supplyStatus === 'vendor_transfer') await expect(line.locator('[data-special-transfer-eta]')).toBeVisible();
+      else await expect(line.locator('[data-special-transfer-eta]')).toBeHidden();
+      const previous = state.posts.length;
+      await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
+      await expect.poll(() => state.posts.length).toBe(previous + 1);
+      await expect(page.locator('.stock-request-feedback')).toContainText('Saved.');
+      assert.deepEqual(state.posts.at(-1).lines[0], { lineId: 1, kind: 'readiness', supplyStatus, eta: supplyStatus === 'production' ? '2099-03-01' : null });
+      await expect(line.locator('[name=supplyStatus]')).toHaveValue(supplyStatus);
+    }
+    assert.deepEqual(state.errors, []);
+  } finally { await close(); }
+});
+
+test('readiness retains the selected status and ETA after a failed save and preserves existing transfer dates', async () => {
+  const { page, state, close } = await fixture(record => {
+    record.salesOrderId = 42;
+    Object.assign(record.lines[0], { salesDecision: 'accepted', supplyStatus: 'vendor_transfer', availabilityMode: 'dated', availableDate: '2099-03-01' });
+  });
+  try {
+    const line = page.locator('[data-special-stock-line="1"]');
+    await expect(line.locator('[name=supplyStatus]')).toHaveValue('vendor_transfer');
+    await expect(line.locator('[name=eta]')).toBeVisible();
+    await expect(line.locator('[name=eta]')).toHaveValue('2099-03-01');
+    await line.locator('[name=supplyStatus]').selectOption('production');
+    await line.locator('[name=eta]').fill('2099-03-05');
+    state.fail = true;
+    await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
+    await expect(page.locator('.stock-request-feedback')).toContainText('Case changed');
+    await expect(line.locator('[name=supplyStatus]')).toHaveValue('production');
+    await expect(line.locator('[name=eta]')).toHaveValue('2099-03-05');
+    state.fail = false;
+    await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
+    await expect(page.locator('.stock-request-feedback')).toContainText('Saved.');
+    assert.equal(state.posts.at(-1).lines[0].supplyStatus, 'production');
+    assert.equal(state.posts.at(-1).lines[0].eta, '2099-03-05');
+    assert.deepEqual(state.errors, []);
+  } finally { await close(); }
+});

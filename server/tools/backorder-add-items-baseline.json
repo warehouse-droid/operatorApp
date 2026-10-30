@@ -1,0 +1,32 @@
+{
+  "source": "Unchanged live image mbbs-operator-app:repair-office-merge-20261027",
+  "sourceHashes": {
+    "src": "55666ca1fe8ad19a097ada39b5ae4fa12f89a60dfdcee83462edeaaaf822e8e7",
+    "public": "d75ecf35fa99ccb9cac5e438eb983b51144d889829396e613e3e8e33e38ad804",
+    "migrations": "42cff455692205a6862188df9c0f4e0ac8b5f4ab7cc28442f7f20e63713adddb"
+  },
+  "files": [
+    {
+      "file": "test/mbt/integration/backorder-requests.test.js",
+      "tests": 42,
+      "pass": 37,
+      "fail": 5,
+      "failedNames": [
+        "Backorder PO linkage notifies Sales with the PO number once and quotation changes do not repeat it",
+        "Backorder persisted pending information after PO linkage gets a fresh alert without repeating the PO notice",
+        "Backorder information replies, Regular alerts and acknowledgements use the authorized request profile",
+        "Manual Backorder links keep revised material confirmations in Sales notifications",
+        "SO linking rejects unfinished material review and ignores forged confirmation and planning flags"
+      ]
+    },
+    {
+      "file": "test/mbt/integration/special-sales-items-copy-http.test.js",
+      "tests": 10,
+      "pass": 9,
+      "fail": 1,
+      "failedNames": [
+        "HTTP add items resets New enquiry, preserves every old SQL column and invalidates the unsent SO draft"
+      ]
+    }
+  ]
+}

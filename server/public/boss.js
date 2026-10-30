@@ -12,7 +12,7 @@ async function api(path,options={}){
  if(response.status===401){window.location.replace('/');throw new Error('Please sign in again.');}
  if(!response.ok){throw new Error(result.error||'Unable to load approvals.');}return result;
 }
-const date=value=>value?new Date(value).toLocaleString():'';
+const date=value=>value?new Date(value).toLocaleString(undefined,{timeZone:'America/Toronto'}):'';
 function money(value){return value===null||value===undefined?'Unavailable':Number(value).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
 function creditColor(value){return value==null?'':Number(value)<0?'credit-negative':'credit-positive';}
 function amounts(s){return `<dl class="amounts"><div><dt>Account Credit</dt><dd>${escape(money(s.creditLimit))}</dd><small>${escape(s.currency)} credit limit</small></div>

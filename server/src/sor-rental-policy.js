@@ -76,6 +76,9 @@ export function sorReturnDraft(order = {}) {
 }
 
 export function sorSignatureRefs(job = {}) {
+  if (job.mbt?.transportTripId && job.mbt.actionCode==='cargo_dropoff_1' && isSorDeliveryRef(job.mbt.sourceRef)) {
+    return [job.mbt.sourceRef];
+  }
   if (job.stopType !== 'dropoff') {return [];}
   return [...new Set([...(job.orderRefs || []),...(job.orders || []).flatMap(order =>
     [order.orderRef || order.id,...(order.childOrders || [])])].filter(isSorDeliveryRef))].sort();
