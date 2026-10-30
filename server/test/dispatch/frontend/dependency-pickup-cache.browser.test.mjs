@@ -88,6 +88,38 @@ test("applying a saved plan cannot revive a cancelled pickup from the browser ca
   assert.equal(result.trucks[0].loads[0].stops.some(stop => stop.location === "2967"), false);
 }));
 
+test("a clean bootstrap over a stored stale pickup lets the next real save drop that pickup", () => browserCase(async (page, { before, after }, saves) => {
+  // Production shape: bootstrap now projects the group without the cancelled link,
+  // while the stored route still holds the explicit 2967 visit for that group.
+  const state = await page.evaluate(async ({ stored, clean }) => {
+    applySavedPlan({ ...stored, orders: clean });
+    normalizePlanBeforeSave();
+    markLocalPlanDirty();
+    await saveCurrentPlanNow();
+    return { routeNotice, localPlanDirty };
+  }, { stored: before, clean: after.orders });
+  assert.equal(saves.length, 1);
+  assert.deepEqual(validateDispatchPickupVisits({ ...saves[0], orders: after.orders }), []);
+  assert.equal(saves[0].trucks[0].loads[0].stops.some(stop => stop.location === "2967"), false);
+  assert.equal(saves[0].trucks[0].loads[0].stops.some(stop => stop.location === "3445"), true);
+  assert.equal(state.localPlanDirty, false);
+  assert.doesNotMatch(state.routeNotice, /backed up separately/);
+}));
+
+test("the pre-fix stale bootstrap reproduces the production rejection", () => browserCase(async (page, { before, after }, saves) => {
+  const state = await page.evaluate(async stored => {
+    applySavedPlan(stored);
+    normalizePlanBeforeSave();
+    markLocalPlanDirty();
+    await saveCurrentPlanNow();
+    return { routeNotice };
+  }, before);
+  assert.equal(saves.length, 1);
+  assert.match(validateDispatchPickupVisits({ ...saves[0], orders: after.orders })[0]?.message || "",
+    /GOA-10724S1-10878S1 does not require pickup at 2967/);
+  assert.match(state.routeNotice, /backed up separately/);
+}));
+
 test("unlink acknowledgement followed by a real browser save keeps the pickup removed", () => browserCase(async (page, { after }, saves) => {
   const state = await page.evaluate(async saved => {
     applyAtomicDependencyMutationPayload({ plan: saved, orders: saved.orders }, { generation: localPlanGeneration });

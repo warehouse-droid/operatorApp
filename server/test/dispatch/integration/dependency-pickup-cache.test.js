@@ -3,6 +3,7 @@ import test, { after } from "node:test";
 import { beginRollbackContext, closeDb, query } from "../../../src/db.js";
 import { enrichDispatchOrdersWithDependencies } from "../../../src/order-dependency-repository.js";
 import { getDispatchOrderCatalogOrder, listDispatchOrderPool, upsertDispatchOrderCatalog } from "../../../src/dispatch-order-catalog-repository.js";
+import { getDispatchV2Bootstrap } from "../../../src/dispatch-planner-v2-repository.js";
 import { cacheFixture, groupRef, splitRef } from "../../support/dependency-pickup-cache-fixture.mjs";
 after(closeDb);
 
@@ -42,6 +43,23 @@ test("cancelled nested transfer projections cannot survive feed refresh; PO and 
   assert.deepEqual(fresh.items, stale.items);
   assert.deepEqual(stale, original);
   assert.deepEqual(await enrichDispatchOrdersWithDependencies([fresh]), [fresh]);
+}));
+
+test("plan bootstrap rebuilds a stored group's cancelled transfer pickup before the browser plans with it", () => isolated(async () => {
+  const { before } = cacheFixture();
+  const planId = (await query("INSERT INTO dispatch_plans(plan_date,status,revision) VALUES($1,'draft',1) RETURNING id",
+    [before.planDate])).rows[0].id;
+  await query("INSERT INTO dispatch_plan_snapshots(plan_id,orders,trucks,summary) VALUES($1,$2::jsonb,$3::jsonb,'{}')",
+    [planId, JSON.stringify(before.orders), JSON.stringify(before.trucks)]);
+  const { plan } = await getDispatchV2Bootstrap({ planId: String(planId) });
+  const group = plan.assignedOrderSnapshots.find((order) => order.id === groupRef);
+  assert.deepEqual(group.pickupLocations, ["3445"]);
+  assert.deepEqual(group.orderDependencies || [], []);
+  assert.deepEqual(group.directPickupManifest || [], []);
+  assert.deepEqual(group.childOrderDetails[0].orderDependencies || [], []);
+  assert.deepEqual(group.childOrderDetails[0].pickupLocations, ["3445"]);
+  assert.equal((await query("SELECT orders->0->'orderDependencies'->0->>'status' AS status FROM dispatch_plan_snapshots WHERE plan_id=$1",
+    [planId])).rows[0].status, "active");
 }));
 
 test("group catalogue hydration clears old split dependencies without rewriting stored structure", () => isolated(async () => {

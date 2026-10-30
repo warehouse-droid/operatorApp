@@ -256,7 +256,10 @@ export async function getDispatchV2Bootstrap({ planId = "", date = "" } = {}) {
       }
     };
   }
-  return { exists: true, plan: publicPlan(plan) };
+  // A stored snapshot keeps PO/TO relationship projections from its last save.
+  // Rebuild them as GET /plans/:id does; otherwise a cancelled link reaches the
+  // browser as a required pickup that every later save is rejected for.
+  return { exists: true, plan: publicPlan(await refreshDispatchPlanAuthoritativeOrderProjection(plan)) };
 }
 
 export async function repairDispatchV2SummaryMarkers({
