@@ -1531,13 +1531,34 @@ export async function removeDispatchGlobalGroupedMember(memberOrderRef = "") {
   });
 }
 
-export async function deactivateDispatchGlobalOrderDefinitions(orderRefs = []) {
+// Ungrouping from one date must not retire a group that another date has on a
+// truck: that plan would keep a retired group and every later save would fail.
+async function assertGroupsNotPlannedElsewhere(refs, planId) {
+  const planned = await query(
+    `SELECT DISTINCT global_group.group_ref, assignment.plan_date::text AS plan_date
+       FROM dispatch_global_order_groups global_group
+       JOIN dispatch_plan_order_assignments assignment ON lower(assignment.order_ref) = lower(global_group.group_ref)
+       JOIN dispatch_plans plan ON plan.id = assignment.plan_id AND plan.status <> 'cancelled'
+      WHERE global_group.active = true
+        AND lower(global_group.group_ref) = ANY($1::text[])
+        AND assignment.plan_id::text <> $2
+      ORDER BY global_group.group_ref, plan_date`,
+    [refs, text(planId)]
+  );
+  if (!planned.rowCount) return;
+  const relations = planned.rows.map((row) => `${row.group_ref} is on a load in the ${row.plan_date} plan`).join("; ");
+  throw Object.assign(new Error(`Cannot ungroup: ${relations}. Remove it from that load or ungroup it from that plan.`),
+    { status: 409, code: "DISPATCH_GROUP_PLANNED_ELSEWHERE" });
+}
+
+export async function deactivateDispatchGlobalOrderDefinitions(orderRefs = [], { planId = null } = {}) {
   const refs = [...new Set((Array.isArray(orderRefs) ? orderRefs : [])
     .map((ref) => text(ref).toLowerCase())
     .filter(Boolean))];
   if (!refs.length) return { groups: [], splits: [] };
   return withTransaction(async () => {
     await lockDispatchGlobalOrderDefinitionRefs(refs);
+    if (planId !== null && planId !== undefined && text(planId)) await assertGroupsNotPlannedElsewhere(refs, planId);
     const groups = await query(
       `UPDATE dispatch_global_order_groups
           SET active = false,

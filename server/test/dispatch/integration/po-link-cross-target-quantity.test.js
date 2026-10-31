@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import test, { after } from "node:test";
 import { query, withTransaction, closeDb } from "../../../src/db.js";
-import { getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation } from "../../../src/dispatch-repository.js";
+import { getSalesOrderPoAllocationOptions, createSalesOrderPoAllocation,
+  enrichDispatchOrdersWithPoTargetAllocations } from "../../../src/dispatch-repository.js";
 
 after(closeDb);
 const isolated = run => withTransaction(run, { rollback: true });
@@ -31,8 +32,9 @@ async function seed() {
   const splits = [[`${ref}-S1`, 6], [`${ref}-S2`, 4]];
   for (const [splitRef, quantity] of splits) {
     const split = { id: splitRef, type: "SO", originalOrderId: ref, items: [item(quantity)] };
+    // Inactive until a test splits the order: a parent with active splits takes no new links.
     await query(`INSERT INTO dispatch_global_order_splits(split_ref,order_type,parent_order_ref,source_plan_id,
-      source_plan_date,full_order,card) VALUES($1,'SO',$2,$3,'2095-11-02',$4::jsonb,$4::jsonb)`,
+      source_plan_date,full_order,card,active) VALUES($1,'SO',$2,$3,'2095-11-02',$4::jsonb,$4::jsonb,false)`,
     [splitRef, ref, plan.id, JSON.stringify(split)]);
   }
   const poId = id + 2;
@@ -45,8 +47,19 @@ async function seed() {
     item_description,item_type,item_type_text,quantity,unit,netsuite_active)
     VALUES($1,201,2055,'MBBS-Special Order','MBBS-Special Order','Cross slab','NonInvtPart','Non-inventory Item',50,'PC',true)
     RETURNING id`, [poId])).rows[0];
-  return { ref, groupRef, splitRefs: splits.map(([splitRef]) => splitRef), poRef, poLineId: poLine.id };
+  // Group after split: both sibling splits travel in one group.
+  const siblingGroupRef = `GO-XSPLITS-${id}`;
+  const siblings = splits.map(([splitRef, quantity]) => ({ id: splitRef, type: "SO", originalOrderId: ref, items: [item(quantity)] }));
+  await query(`INSERT INTO dispatch_global_order_groups(group_ref,order_type,source_plan_id,source_plan_date,full_order,card)
+    VALUES($1,'SO',$2,'2095-11-02',$3::jsonb,$3::jsonb)`, [siblingGroupRef, plan.id,
+    JSON.stringify({ id: siblingGroupRef, type: "SO", childOrders: siblings.map(split => split.id), childOrderDetails: siblings,
+      items: siblings.flatMap(split => split.items) })]);
+  const siblingGroup = { id: siblingGroupRef, type: "SO", childOrders: siblings.map(split => split.id), childOrderDetails: siblings,
+    items: siblings.flatMap(split => split.items) };
+  return { ref, groupRef, siblingGroupRef, siblingGroup, splitRefs: splits.map(([splitRef]) => splitRef), poRef, poLineId: poLine.id };
 }
+
+const activateSplits = f => query("UPDATE dispatch_global_order_splits SET active=true WHERE parent_order_ref=$1", [f.ref]);
 
 async function link(f, target, salesQty) {
   const options = await getSalesOrderPoAllocationOptions(target);
@@ -71,6 +84,7 @@ test("the member order cannot link again what its group already linked", () => i
 
 test("split siblings keep their own shares of one sales line", () => isolated(async () => {
   const f = await seed();
+  await activateSplits(f);
   await link(f, f.splitRefs[0], 6);
   await link(f, f.splitRefs[1], 4);
 }));
@@ -78,5 +92,23 @@ test("split siblings keep their own shares of one sales line", () => isolated(as
 test("a split cannot exceed what the shared sales line has left", () => isolated(async () => {
   const f = await seed();
   await link(f, f.ref, 8);
+  await activateSplits(f);
   await assert.rejects(link(f, f.splitRefs[0], 6), /open sales quantity is only 2/u);
+}));
+
+test("a group of sibling splits offers both splits' quantity of the shared line", () => isolated(async () => {
+  const f = await seed();
+  await activateSplits(f);
+  const options = await getSalesOrderPoAllocationOptions(f.siblingGroupRef);
+  assert.equal(options.salesLines.reduce((sum, line) => sum + Number(line.required?.salesQty ?? line.quantity ?? 0), 0), 10);
+  for (const line of options.salesLines) await link(f, f.siblingGroupRef, Number(line.required?.salesQty ?? line.quantity));
+}));
+
+test("a PO link on a group of sibling splits is shown once across the splits, not on each", () => isolated(async () => {
+  const f = await seed();
+  await activateSplits(f);
+  await link(f, f.siblingGroupRef, 7);
+  const [group] = await enrichDispatchOrdersWithPoTargetAllocations([structuredClone(f.siblingGroup)]);
+  assert.deepEqual(group.childOrderDetails.map(child => child.items[0].poAllocatedSalesQty), [6, 1]);
+  assert.equal(group.items.reduce((sum, item) => sum + item.poAllocatedSalesQty, 0), 7);
 }));

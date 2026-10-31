@@ -12667,7 +12667,10 @@ function renderSelectedOrderActions() {
   const billingOnly = selected.every((item) => item.type === "SO"
     && /^(?:Sales Order\s*:\s*)?Billed$/i.test(String(item.netsuiteStatusText || item.raw?.status_text || "").trim()));
   const reconciliationBlocked = selected.some((item) => isScmReconciliationBlocked(item));
-  const blockedUngroup = groupedCount && groupedOrderTransitCoId(order);
+  // With several orders selected the action regroups them, whichever was
+  // clicked first; Ungroup applies to a group selected on its own.
+  const offerUngroup = groupedCount && selected.length <= 1;
+  const blockedUngroup = offerUngroup && groupedOrderTransitCoId(order);
   const dispatchCompleted = order.dispatchCompletionStatus === "completed"
     && order.dispatchReconciliationPlanningEligible !== true
     && (order.dispatchPlanningRestricted === true || order.dispatchFulfilledSalesPlanningEligible !== true)
@@ -12680,7 +12683,7 @@ function renderSelectedOrderActions() {
       ${billingOnly ? `<span>Billed in NetSuite</span>` : reviewOnly ? `<span>Delivery history</span>` : ""}
       ${order.localOrderReopened === true && !reviewOnly ? `<span>Reopened locally</span>` : ""}
       ${reconciliationBlocked ? `<span class="chip warn">${escapeHtml(scmReconciliationBlockText(selected.find(isScmReconciliationBlocked)))}</span>` : ""}
-      ${reconciliationBlocked ? "" : groupedCount ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
+      ${reconciliationBlocked ? "" : offerUngroup ? `<button data-action="ungroup-order" data-order-ref="${escapeHtml(order.id)}" ${blockedUngroup ? `disabled title="Cancel ${escapeHtml(blockedUngroup)} before ungrouping"` : ""} type="button">Ungroup</button>` : selected.length > 1 && !includesCustomOrder ? `<button data-action="open-group-modal" data-order-ref="${escapeHtml(order.id)}" type="button">Group</button>` : ""}
       ${blockedUngroup ? `<span>Cancel ${escapeHtml(blockedUngroup)} before ungrouping</span>` : ""}
       ${isSalesOrderReattempt(order) ? `<span class="chip">System-managed Sales Order re-attempt for ${escapeHtml(order.parentOrderRef || "linked parent")}</span>` : order.type === "CUSTOM" ? `<button data-action="edit-custom-order" data-custom-order-id="${escapeHtml(order.customOrderId || "")}" type="button">Open Custom Order</button>` : ""}
       ${!reviewOnly && !reconciliationBlocked && !dispatchCompleted && transitCoSupported ? `<button data-action="open-transit-co" data-order-ref="${escapeHtml(order.id)}" type="button">${order.transitCo ? "Manage CO" : "Add CO"}</button>` : ""}
@@ -14906,7 +14909,7 @@ function renderModal() {
           </div>
           <div class="modal-footer">
             <button data-action="close-modal" type="button">Cancel</button>
-            <button class="primary" data-action="confirm-group" data-order="${order.id}" type="button">Add Group to Selected Load</button>
+            <button class="primary" data-action="confirm-group" data-order="${order.id}" type="button">Group Orders</button>
           </div>
         </section>
       </div>
@@ -15959,6 +15962,26 @@ function applyGroupedOrderPlanning(grouped, planning = {}) {
   routeNotice = `${grouped.id} grouped in ${planning.truck?.plate || "truck"} ${load.name}.`;
 }
 
+const GROUP_ADDRESS_ABBREVIATIONS = {
+  street: "st", road: "rd", avenue: "ave", drive: "dr", boulevard: "blvd", crescent: "cres", court: "ct",
+  place: "pl", lane: "ln", highway: "hwy", parkway: "pkwy", east: "e", west: "w", north: "n", south: "s",
+  ontario: "on"
+};
+
+function groupAddressKey(address = "") {
+  return String(address || "").toLowerCase().split(/[^a-z0-9]+/u).filter(Boolean)
+    .map((token) => GROUP_ADDRESS_ABBREVIATIONS[token] || token).join("");
+}
+
+// A group is one drop at the first selected order's address. Orders bound for
+// other addresses lose their own stop, so the dispatcher confirms that choice.
+function groupAddressWarning(groupItems = []) {
+  const withAddress = groupItems.filter((item) => groupAddressKey(item?.address));
+  if (new Set(withAddress.map((item) => groupAddressKey(item.address))).size <= 1) return "";
+  const lines = withAddress.map((item) => `- ${item.id}: ${item.address}`).join("\n");
+  return `These orders deliver to different addresses:\n${lines}\n\nThe group will deliver only to ${groupItems[0]?.address || withAddress[0].address}.\n\nGroup them anyway?`;
+}
+
 function coGroupSelectionBlockReason(groupItems = []) {
   const coFlags = groupItems.map((item) =>
     String(item?.type || "").trim().toUpperCase() === "CO"
@@ -16184,10 +16207,39 @@ function ungroupDriverActivityBlock(groupId) {
   return "";
 }
 
+// A TO carries one active link, so a group link covering several orders cannot
+// be handed to one of them; the server refuses that ungroup (see
+// assertNoActiveOrderDependenciesByRefs). Say so before changing the board.
+function ungroupSharedTransferLinkBlock(group = {}) {
+  for (const dependency of group.orderDependencies || []) {
+    if (dependency.status === "cancelled" || dependency.dispatchTargetKind !== "group") continue;
+    const sources = [...new Set((dependency.lines || [])
+      .filter((line) => (line.lineRole || "sales_allocation") === "sales_allocation")
+      .map((line) => String(line.sourceOrderRef || "").trim()).filter(Boolean))].sort();
+    if (sources.length > 1) {
+      return `Cannot ungroup ${group.id}: ${dependency.transferOrderRef} covers ${sources.join(" and ")}. A Transfer Order can be linked to only one order, so unlink it first and relink it after ungrouping.`;
+    }
+  }
+  return "";
+}
+
+// Retiring a group that another date has on a truck would leave that plan
+// holding a retired group; the server refuses it (DISPATCH_GROUP_PLANNED_ELSEWHERE).
+function ungroupPlannedElsewhereBlock(group = {}) {
+  if (!group?.id || !isOrderPlannedOnAnotherDate(group)) return "";
+  const where = [group.dispatchTruckPlate, group.dispatchLoadName].filter(Boolean).join(" ");
+  return `Cannot ungroup ${group.id}: it is on ${where || "a load"} in the ${String(group.dispatchPlanDate).slice(0, 10)} plan. Remove it from that load or ungroup it from that plan.`;
+}
+
+function ungroupBlockReason(groupId) {
+  const group = orderById(groupId);
+  return ungroupDriverActivityBlock(groupId) || ungroupPlannedElsewhereBlock(group) || ungroupSharedTransferLinkBlock(group);
+}
+
 async function ungroupOrderWithPoCheck(orderId) {
   const grouped = orderById(orderId);
   if (!grouped?.childOrders?.length) return false;
-  const activityBlock = ungroupDriverActivityBlock(orderId);
+  const activityBlock = ungroupBlockReason(orderId);
   if (activityBlock) {
     routeNotice = activityBlock;
     render({ save: false });
@@ -16226,7 +16278,7 @@ function ungroupOrder(orderId) {
     routeNotice = `Cancel ${coId} before ungrouping ${group.id}.`;
     return null;
   }
-  const activityBlock = ungroupDriverActivityBlock(group.id);
+  const activityBlock = ungroupBlockReason(group.id);
   if (activityBlock) {
     routeNotice = activityBlock;
     return null;
@@ -16238,10 +16290,23 @@ function ungroupOrder(orderId) {
   const restored = group.childOrders
     .map((id) => detailById.get(id) || fallbackById.get(id))
     .filter(Boolean)
-    .map((item) => normalizeOrder({
-      ...item,
-      localDispatchStatus: "open"
-    }));
+    .map((item) => {
+      // Members carried the group's assignment; the group has left its load.
+      const groupAssignment = !item.plannedOrderRef || String(item.plannedOrderRef) === String(group.id);
+      return normalizeOrder({
+        ...item,
+        localDispatchStatus: "open",
+        ...(groupAssignment ? {
+          dispatchPlanned: false,
+          dispatchPlanId: "",
+          dispatchPlanDate: "",
+          dispatchTruckPlate: "",
+          dispatchLoadName: "",
+          dispatchParkingSpot: "",
+          plannedOrderRef: ""
+        } : {})
+      });
+    });
   const groupIndex = orders.findIndex((item) => item.id === group.id);
   orders = orders.filter((item) => item.id !== group.id && !restored.some((child) => child.id === item.id));
   orders.splice(Math.max(groupIndex, 0), 0, ...restored);
@@ -17617,12 +17682,21 @@ app.addEventListener("click", async (event) => {
     poAllocationError = "";
     getLinkModalDraft("po", modalOrderId);
     render({ save: false });
+    // Pending edits (a new split, say) must reach the server before it can
+    // resolve the link target; only that step is about saving.
     try {
       if (localPlanDirty || saveQueued || saveInFlight) await saveCurrentPlanNow();
+    } catch (error) {
+      poAllocationLoading = false;
+      poAllocationError = `Save the plan before linking a PO: ${error.message}`;
+      renderActiveLinkModalInPlace();
+      return;
+    }
+    try {
       await loadPoAllocationOptions(actionOrderId);
     } catch (error) {
       poAllocationLoading = false;
-      poAllocationError = `Save the split before linking its PO: ${error.message}`;
+      poAllocationError = `Unable to load PO links: ${error.message}`;
       renderActiveLinkModalInPlace();
     }
     return;
@@ -17752,6 +17826,11 @@ app.addEventListener("click", async (event) => {
       .filter((order) => Array.isArray(order.childOrders) && order.childOrders.length)
       .map((order) => String(order.id || ""))
       .filter(Boolean);
+    const addressWarning = groupAddressWarning(selectedBefore);
+    if (addressWarning && !confirm(addressWarning)) {
+      render({ save: false });
+      return;
+    }
     const poCheck = await confirmGroupPoLinkRemoval(replacedGroupRefs, "Regroup");
     if (!poCheck.proceed) {
       render({ save: false });

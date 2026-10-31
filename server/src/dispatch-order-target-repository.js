@@ -283,6 +283,26 @@ function linesForEntry({ targetRef, kind, entry, canonical }) {
   return rows;
 }
 
+const MERGED_LINE_QUANTITIES = ["quantity", "shortageQuantity", "pallets", "layers", "sections", "pieces"];
+
+// Unmaterialized sibling splits in one group carry shares of the same parent
+// line, so they share its target key. The group carries their sum.
+function mergeTargetLinesByKey(lines = [], canonical) {
+  const merged = new Map();
+  for (const line of lines) {
+    const existing = merged.get(line.targetLineKey);
+    if (!existing) { merged.set(line.targetLineKey, { ...line }); continue; }
+    for (const field of MERGED_LINE_QUANTITIES) existing[field] = number(existing[field]) + number(line[field]);
+  }
+  const backordered = new Map([...canonical.lines.values()].flat()
+    .map((line) => [Number(line.id), number(line.netsuite_backordered_qty)]));
+  for (const line of merged.values()) {
+    const cap = backordered.get(Number(line.salesLineId)) || 0;
+    if (cap > EPSILON) line.shortageQuantity = Math.min(line.shortageQuantity, cap);
+  }
+  return [...merged.values()];
+}
+
 async function applyExistingAllocations(targetRef, lines) {
   if (!lines.length) return lines;
   const direct = "dependency.dependency_mode = 'direct_to_customer'";
@@ -385,7 +405,21 @@ async function applyExistingAllocations(targetRef, lines) {
   });
 }
 
-export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planDate = "" } = {}) {
+// Splitting is refused while an SO has links, but a planner that has not seen
+// the split still shows the parent. A new link there would apply to every split.
+async function assertNotSplitParent(ref) {
+  const splits = (await query(
+    `SELECT split_ref FROM dispatch_global_order_splits
+      WHERE lower(parent_order_ref) = lower($1) AND active = true AND order_type = 'SO' AND definition_kind = 'split'
+      ORDER BY split_ref`,
+    [ref]
+  )).rows.map((row) => row.split_ref);
+  if (!splits.length) return;
+  throw Object.assign(new Error(`${ref} is split into ${splits.join(", ")}. Refresh Orders and link the split instead.`),
+    { status: 409, code: "DISPATCH_TARGET_SPLIT_PARENT", splitRefs: splits });
+}
+
+export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planDate = "", forNewLink = false } = {}) {
   const ref = text(dispatchTargetRef);
   if (!ref) throw new Error("Dispatch Sales Order target is required.");
   const globalOrder = await globalSalesTarget(ref);
@@ -396,13 +430,14 @@ export async function resolveDispatchSalesTarget({ dispatchTargetRef = "", planD
   const exactCanonical = canonical.headers.get(ref) || null;
   if (!globalOrder && !snapshot && !exactCanonical) throw new Error(`${ref} was not found in the selected dispatch plan or Sales Order table.`);
   const kind = targetKind(order, exactCanonical);
+  if (forNewLink && kind === "normal") await assertNotSplitParent(ref);
   const entries = kind === "group"
     ? flattenGroupMembers(order)
     : [{ ...order, id: ref, items: kind === "normal" && exactCanonical ? [] : order.items }];
   const requiredRefs = entries.flatMap((entry) => [text(entry.id), splitParentRef(entry)]).filter(Boolean);
   canonical = await loadCanonicalOrders([...initialRefs, ...requiredRefs]);
   let lines = entries.flatMap((entry) => linesForEntry({ targetRef: ref, kind, entry, canonical }));
-  lines = [...new Map(lines.map((line) => [line.targetLineKey, line])).values()]
+  lines = mergeTargetLinesByKey(lines, canonical)
     .filter((line) => line.itemId && line.quantity > EPSILON);
   if (!lines.length) throw new Error(`${ref} has no available Sales Order item lines.`);
   lines = await applyExistingAllocations(ref, lines);

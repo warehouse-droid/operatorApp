@@ -8280,9 +8280,43 @@ function selectedDirectServicePoLineIds(allocations = []) {
   ));
 }
 
+// Sibling splits of one parent line share its target key, so one allocation
+// can match several of a group's items. Share it out in item order so each
+// item shows only the part it can carry, not the whole allocation.
+function sharedAllocationRowsByItem(order = {}, allocations = []) {
+  const leaves = [];
+  const collect = (candidate) => {
+    if ((candidate.childOrderDetails || []).length) { candidate.childOrderDetails.forEach(collect); return; }
+    const sources = [candidate.id, candidate.originalOrderId];
+    for (const item of candidate.items || []) leaves.push({ item, sources });
+  };
+  collect(order);
+  const rowsByItem = new Map();
+  for (const allocation of allocations) {
+    const matched = leaves.filter(({ item, sources }) => allocationMatchesDispatchItem(allocation, item, sources));
+    if (matched.length < 2) continue;
+    const total = positiveQuantity(allocation.allocated_sales_qty);
+    let remaining = total;
+    matched.forEach(({ item }, index) => {
+      const capacity = positiveQuantity(item.quantity ?? item.salesQty);
+      const share = index === matched.length - 1 ? remaining : Math.min(remaining, capacity);
+      remaining = Math.max(0, remaining - share);
+      const ratio = total > 0 ? share / total : 0;
+      const scaled = { ...allocation, allocated_sales_qty: share };
+      for (const field of ["allocated_pallet_qty", "allocated_layer_qty", "allocated_section_qty", "allocated_piece_qty"]) {
+        scaled[field] = Number((positiveQuantity(allocation[field]) * ratio).toFixed(6));
+      }
+      if (!rowsByItem.has(item)) rowsByItem.set(item, new Map());
+      rowsByItem.get(item).set(allocation, scaled);
+    });
+  }
+  return rowsByItem;
+}
+
 function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
   const serviceSalesLines = selectedServiceSalesLines(allocations);
   const directServicePoLineIds = selectedDirectServicePoLineIds(allocations);
+  const sharedRows = sharedAllocationRowsByItem(order, allocations);
   const matchesCandidate = (candidate, allocation) =>
     (candidate.childOrderDetails || []).some(child => matchesCandidate(child, allocation))
     || (candidate.items || []).some(item => allocationMatchesDispatchItem(
@@ -8308,7 +8342,11 @@ function applyTargetPoAllocationsToOrder(order = {}, allocations = []) {
               poAllocatedSalesQty: positiveQuantity(item.quantity ?? item.salesQty)
             };
           }
-          const matches = allocations.filter((allocation) => allocationMatchesDispatchItem(allocation, item, sources));
+          const shared = sharedRows.get(item) || new Map();
+          const matches = allocations.filter((allocation) => allocationMatchesDispatchItem(allocation, item, sources))
+            // A shared allocation already used up by earlier siblings is not this item's.
+            .filter((allocation) => !shared.has(allocation) || positiveQuantity(shared.get(allocation).allocated_sales_qty) > 0)
+            .map((allocation) => shared.get(allocation) || allocation);
           if (!matches.length) return item;
           const allocatedSalesQty = matches.reduce((sum, row) => sum + positiveQuantity(row.allocated_sales_qty), 0);
           return {
@@ -8703,7 +8741,8 @@ async function createSalesOrderPoAllocationWithExecutor(executor, {
 } = {}) {
   const resolved = await resolveDispatchSalesTarget({
     dispatchTargetRef: dispatchTargetRef || salesOrderRef,
-    planDate
+    planDate,
+    forNewLink: true
   });
   await assertNoClosedNetSuiteOrders(
     [resolved.target.ref, ...(resolved.target.memberRefs || [])],

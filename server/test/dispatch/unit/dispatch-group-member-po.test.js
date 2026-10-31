@@ -37,7 +37,7 @@ function repository(rows) {
   return destinationFunctions("../../src/dispatch-repository.js", [
     "positiveQuantity", "isMbbsSpecialLine", "allocationDetails", "dispatchItemLineIdentities",
     "allocationMatchesDispatchItem", "allocatedDispatchPhysicalQuantity", "selectedServiceSalesLines",
-    "selectedDirectServicePoLineIds", "applyTargetPoAllocationsToOrder", "enrichDispatchOrdersWithPoTargetAllocations"
+    "selectedDirectServicePoLineIds", "sharedAllocationRowsByItem", "applyTargetPoAllocationsToOrder", "enrichDispatchOrdersWithPoTargetAllocations"
   ], {
     MBBS_SPECIAL_ITEM_ID: 2055, uniqueDispatchLocations,
     poPickupSql: { location: "po.vendor", address: "po.dispatch_address", joins: "" },

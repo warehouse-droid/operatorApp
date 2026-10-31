@@ -6996,6 +6996,15 @@ function dispatchOrderStructureState(plan = {}) {
       const token = `group:${id}:${childRefs.join("|")}`;
       containers.set(id, { signature: token, refs: [id, ...childRefs] });
       for (const ref of childRefs) membership.set(ref, token);
+      // A grouped split is still part of its split family; grouping it does
+      // not change the family or its other members.
+      for (const child of order?.childOrderDetails || []) {
+        const childId = String(child?.id || "").trim();
+        const childParent = String(child?.originalOrderId || "").trim();
+        if (!childId || !childParent || childParent === childId || !structuralRefs.has(childParent)) continue;
+        if (!splitChildrenByParent.has(childParent)) splitChildrenByParent.set(childParent, []);
+        splitChildrenByParent.get(childParent).push(childId);
+      }
       continue;
     }
     if (parentRef) {
@@ -7015,13 +7024,16 @@ function dispatchOrderStructureState(plan = {}) {
   return { membership, containers };
 }
 
-function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
+export function changedDispatchOrderStructureRefs(previousPlan = {}, nextPlan = {}) {
   const before = dispatchOrderStructureState(previousPlan);
   const after = dispatchOrderStructureState(nextPlan);
   const refs = new Set();
   for (const key of before.membership.keys()) {
     if (!after.membership.has(key) || before.membership.get(key) === after.membership.get(key)) continue;
     refs.add(key);
+    // A link on the moved split's parent still applies to it.
+    const splitParent = String(before.membership.get(key) || "").match(/^split-child:(.+)$/u)?.[1];
+    if (splitParent) refs.add(splitParent);
   }
   for (const [key, membership] of after.membership) {
     if (membership !== "normal" && !before.membership.has(key)) refs.add(key);

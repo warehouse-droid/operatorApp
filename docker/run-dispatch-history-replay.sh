@@ -3,6 +3,7 @@
 # internal-only database and re-save every retained plan state with the
 # baseline ref and with the working tree, then compare them state by state.
 # Usage: bash docker/run-dispatch-history-replay.sh [baseline-ref]
+# Optional: DISPATCH_HISTORY_CANDIDATE_REF replays that commit instead of the working tree.
 # Optional: DISPATCH_HISTORY_FROM / _THROUGH (plan dates), DISPATCH_HISTORY_LIMIT.
 set -Eeuo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,9 +41,14 @@ python3 docker/verify-memory-limits.py
 mkdir -m 0700 "$art/baseline" "$art/out"
 git archive "$baseline_ref" server | tar -x -C "$art/baseline"
 # Freeze the candidate so edits made while a long replay runs cannot mix versions.
+# DISPATCH_HISTORY_CANDIDATE_REF replays a commit instead of the shared working tree.
 mkdir -p "$art/candidate/server"
-cp -a server/src server/public server/tools server/test server/contracts server/migrations server/package.json \
-  "$art/candidate/server/"
+if [[ -n "${DISPATCH_HISTORY_CANDIDATE_REF:-}" ]]; then
+  git archive "$DISPATCH_HISTORY_CANDIDATE_REF" server | tar -x -C "$art/candidate"
+else
+  cp -a server/src server/public server/tools server/test server/contracts server/migrations server/package.json \
+    "$art/candidate/server/"
+fi
 candidate="$art/candidate/server"
 cp server/tools/dispatch-history-replay-all.mjs server/tools/dispatch-history-replay-compare.mjs \
   server/tools/dispatch-all-history-fixture-classification.mjs "$art/baseline/server/tools/"

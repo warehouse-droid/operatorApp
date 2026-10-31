@@ -1142,7 +1142,7 @@ export async function applyDispatchV2Command({ planId, command = {}, actorId = n
     await deactivateDispatchGlobalOrderDefinitions(commandRetiredRefs
       .map(text)
       .filter((ref) => ref && !retainedRefs.has(ref.toLowerCase()))
-      .slice(0, 200));
+      .slice(0, 200), { planId: result.plan.id });
     const payload = {
       plan: publicPlan(result.plan),
       patch: result.patch,

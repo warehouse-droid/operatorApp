@@ -12,7 +12,7 @@ function browser({ allocations = [], accept = true, failed = false, type = "SO",
   const functions = cargoFunctions(process.env.PO_IDENTITY_BROWSER_SOURCE || "../../public/dispatch.js", ["ungroupOrderWithPoCheck", "confirmGroupPoLinkRemoval"], {
     orderById: () => group,
     groupedOrderTransitCoId: () => "",
-    ungroupDriverActivityBlock: () => "",
+    ungroupBlockReason: () => "",
     currentPlanDate: "2026-10-15",
     URLSearchParams,
     saveCurrentPlanNow: async () => { calls.push("save"); },

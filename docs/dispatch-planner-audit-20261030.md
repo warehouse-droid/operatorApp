@@ -69,7 +69,40 @@ Third round:
 | PO link and direct TO link on one line not cross-checked | PO links and direct-pickup TO links share one supply capacity per line (Operator's rule): Link PO, direct Link TO and a switch to direct pickup cannot exceed it; replenishment links stay outside it. | `test/mbt/integration/po-direct-to-link-capacity.test.js` |
 | Snapshot restore refused after any ungroup/regroup | Restore reactivates a retired group when no member is now in another active group, a retired split, or planned on another plan; otherwise it stays refused. | `test/dispatch/integration/snapshot-restore-retired-group.test.js` |
 
-No audit findings from this document remain open.
+Correction: an earlier version of this section claimed no findings remained
+open. That was wrong. Round four re-checked each open finding with a test
+that failed before its fix:
+
+| Finding | Result | Tests |
+|---|---|---|
+| Ungroup handed a multi-SO TO link to one SO | Ungroup refused (planner and server) while one TO link covers several of the group's orders; a single-order link still returns to its order. | `ungroup-multi-order-to-link.test.js`, `ungroup-shared-to-link.browser.test.mjs` |
+| Replenishment links left on retired splits | Unsplit/resplit refused while any TO link targets a split they retire. | `unsplit-retired-split-link.test.js` |
+| Direct link before a split applies to every split | Splitting is already refused while links exist; the remaining path (a stale planner linking the parent after a split) is now refused, naming the splits. | `split-parent-link-refused.test.js` |
+| Group drop used the first order's address | Grouping orders for different addresses asks for confirmation and names the address used. | `group-address-warning.browser.test.mjs` |
+| Sibling splits merged lines in Link PO | Lines sharing a key are summed (6 + 4 = 10 offered, not 4); one allocation is spread over the sibling cards instead of shown on each. | `po-link-cross-target-quantity.test.js` |
+| Ungroup of a group on another date's truck | Refused (`DISPATCH_GROUP_PLANNED_ELSEWHERE`); it would have left that plan unable to save. | `ungroup-planned-elsewhere.test.js`, `ungroup-shared-to-link.browser.test.mjs` |
+| Ungrouped members kept the group's planned fields | Cleared on ungroup; Unsplit is no longer blocked afterwards. | `ungroup-clears-planned.browser.test.mjs` |
+| Grouping a split blocked by its sibling's direct link | A grouped split still counts in its split family; a link on an unchanged sibling no longer blocks; a link on the parent still does. | `group-split-sibling-direct-link.test.js` |
+| Split Link TO window hid SO-level links | Lists links made on its SO before the split and caps its quantity by them, in the window and on save. | `split-inherited-to-link.test.js` |
+| Group/Ungroup depended on click order | Several selected orders always offer Group; Ungroup only for a group alone. | `group-button-selection-order.browser.test.mjs` |
+| "Add Group to Selected Load", "Save the split before linking its PO", Unsplit worded as split | Label is "Group Orders"; save and load failures have their own messages; Unsplit refusals say Unsplit. | `po-link-open-error.browser.test.mjs`, `unsplit-retired-split-link.test.js` |
+
+Left open on purpose:
+
+- Regrouping on another date keeps the original plan as the group's owner,
+  so that date's edits to the group while it is unassigned are not saved and a
+  reload shows it from the order pool. This is pinned as intended by
+  `dispatch-cross-plan-regroup.test.js` ("keep original definition
+  provenance"); a fix that moved ownership broke those tests and was reverted.
+
+- `packed` direct links block grouping although the link-move code accepts
+  `packed`. Which rule is right is a product decision about TOs already packed
+  in the yard.
+- Later loads keep their saved times after a server-side reroute of an earlier
+  load, until the planner's next save rewrites them. Clearing them on the
+  server would trip the executed-load review for loads with driver activity.
+- PO card hidden until the next save after a v2 ungroup: not reproduced. A
+  reload re-projects the plan and Ungroup refreshes the affected PO cards.
 
 Replay found the grouped-split deactivation already happened in production:
 `SOA10724-S1/S2` and `SOA10878-S1/S2` (plan 373) are inactive and are restored

@@ -1598,7 +1598,7 @@ export async function saveDispatchPlanSnapshot(planId, {
       : [])
       .map((ref) => String(ref || "").trim())
       .filter((ref) => ref && !retainedRefs.has(ref.toLowerCase()))
-      .slice(0, 200));
+      .slice(0, 200), { planId });
     await syncDispatchPlannerReadProjections({
       ...storedPlan,
       id: planId,

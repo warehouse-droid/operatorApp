@@ -131,8 +131,8 @@ export function buildSalesResplits(source, parts, nextSuffix) {
   assertConserved(source, children);
   return children;
 }
-/** @param {string} ref */
-async function assertUnplannedSource(ref) {
+/** @param {string} ref @param {"split"|"unsplit"} [action] */
+async function assertUnplannedSource(ref, action = "split") {
   const assignments = await query(`SELECT 1 FROM dispatch_plan_order_assignments
     WHERE lower(order_ref)=lower($1) OR lower(planned_order_ref)=lower($1) LIMIT 1`, [ref]);
   const grouped = await query(`SELECT 1 FROM dispatch_global_order_group_members m JOIN dispatch_global_order_groups g USING(group_ref)
@@ -140,29 +140,32 @@ async function assertUnplannedSource(ref) {
   const planned = await query(`SELECT 1 FROM sales_orders WHERE tranid=$1
     AND (dispatch_planned OR dispatch_plan_date IS NOT NULL OR COALESCE(dispatch_truck_plate,'')<>'' OR COALESCE(dispatch_load_name,'')<>'') LIMIT 1`, [ref]);
   if (assignments.rowCount || grouped.rowCount || planned.rowCount) {
-    throw failure("DISPATCH_SPLIT_PLANNED", `Unplan or ungroup ${ref} before splitting its unfinished quantity.`);
+    throw failure("DISPATCH_SPLIT_PLANNED", action === "unsplit"
+      ? `Unplan or ungroup ${ref} before using Unsplit.`
+      : `Unplan or ungroup ${ref} before splitting its unfinished quantity.`);
   }
 }
-/** @param {string} ref @param {any} header @param {any[]} lines */
-async function assertUnfinishedSource(ref, header, lines) {
+/** @param {string} ref @param {any} header @param {any[]} lines @param {"split"|"unsplit"} [action] */
+async function assertUnfinishedSource(ref, header, lines, action = "split") {
+  const blocked = action === "unsplit" ? "Unsplit blocked for" : "Cannot split";
   const executed = await query(`SELECT 1 FROM driver_job_records WHERE order_refs ? $1
     AND (started_at IS NOT NULL OR completed_at IS NOT NULL OR status IN ('in_progress','complete','completed')) LIMIT 1`, [ref]);
   if (executed.rowCount || header?.fulfilled_at || header?.last_item_fulfillment_id
       || /^(fulfilled|partial_fulfilled|shipped)$/iu.test(text(header?.fulfillment_status))
       || lines.some(line => ["fulfilled_pallet_qty", "fulfilled_layer_qty", "fulfilled_section_qty", "fulfilled_piece_qty"]
         .some(key => Number(line[key] || 0) > 0))) {
-    throw failure("DISPATCH_SPLIT_EXECUTED", `Cannot split ${ref}: it has started Driver work or recorded fulfillment. Completed siblings remain retained.`);
+    throw failure("DISPATCH_SPLIT_EXECUTED", `${blocked} ${ref}: it has started Driver work or recorded fulfillment. Completed siblings remain retained.`);
   }
   const progress = (await getOperatorProgressDetails([ref]))[0];
   if (progress && ["packed", "loaded"].includes(progress.status)) {
     const actor = progress.operator ? ` by ${progress.operator.displayName}` : "";
-    throw failure("DISPATCH_SPLIT_OPERATOR_ACTIVITY", `Cannot split ${ref}: it is ${progress.status}${actor}. Reopen or unpack this order first.`);
+    throw failure("DISPATCH_SPLIT_OPERATOR_ACTIVITY", `${blocked} ${ref}: it is ${progress.status}${actor}. Reopen or unpack this order first.`);
   }
   const claims = await query(`SELECT 1 FROM operator_netsuite_posting_order_claims WHERE active
     AND local_order_key=ANY($1::text[]) LIMIT 1`, [[`delivery_prep:sales_order:${header?.netsuite_id}`, `customer_pickup:sales_order:${header?.netsuite_id}`]]);
   const links = await query("SELECT 1 FROM dispatch_so_po_allocations WHERE dispatch_target_ref=$1 AND status='active' LIMIT 1", [ref]);
   if (claims.rowCount || links.rowCount) {
-    throw failure("DISPATCH_SPLIT_RESERVED", `Cannot split ${ref}: resolve its pending posting or unlink its PO allocation first.`);
+    throw failure("DISPATCH_SPLIT_RESERVED", `${blocked} ${ref}: resolve its pending posting or unlink its PO allocation first.`);
   }
 }
 
@@ -210,7 +213,7 @@ export async function resplitUnfinishedSalesOrder(input = {}) {
       throw failure("DISPATCH_SPLIT_STALE", `${row.split_ref} native quantities changed. Refresh Orders before splitting.`);
     }
     await assertSalesDeliveryPlanningAllowed([row.split_ref], "split the unfinished order");
-    await assertNoActiveOrderDependenciesByRefs([row.split_ref], "split this unfinished order");
+    await assertNoActiveOrderDependenciesByRefs([row.split_ref], "split this unfinished order", { retiringTargetRefs: [row.split_ref] });
     await assertNoActiveConsolidationClaimsByRefs([row.split_ref], "split this unfinished order");
     const seed = await getNextDispatchSplitSuffix({ originalOrderId: row.split_ref, orderType: "SO" });
     const orders = buildSalesResplits(source, input.parts ?? [], seed.nextSuffix);
@@ -270,12 +273,12 @@ async function assertUnsplitOrdersUnstarted(refs, headers, definitions = []) {
   if (completed.length) {
     throw failure("DISPATCH_UNSPLIT_ACTIVITY", `Unsplit blocked. ${completed.map(row => row.order_ref).join(", ")} was completed.`);
   }
-  await assertNoActiveOrderDependenciesByRefs(refs, "unsplit these orders");
+  await assertNoActiveOrderDependenciesByRefs(refs, "unsplit these orders", { retiringTargetRefs: refs });
   await assertNoActiveConsolidationClaimsByRefs(refs, "unsplit these orders");
   const activityKeys = ["loaded_qty", "packed_sales_qty", "packed_pallet_qty", "packed_layer_qty", "packed_section_qty",
     "packed_piece_qty", "fulfilled_pallet_qty", "fulfilled_layer_qty", "fulfilled_section_qty", "fulfilled_piece_qty"];
   for (const ref of refs) {
-    await assertUnplannedSource(ref);
+    await assertUnplannedSource(ref, "unsplit");
     const header = headers.find(row => row.tranid === ref);
     /** @type {any[]} */
     const lines = header ? (await query("SELECT * FROM sales_order_lines WHERE sales_order_id=$1 ORDER BY id FOR UPDATE", [header.netsuite_id])).rows : [];
@@ -288,7 +291,7 @@ async function assertUnsplitOrdersUnstarted(refs, headers, definitions = []) {
     if (lines.some(line => line.confirmed || activityKeys.some(key => Number(line[key] || 0) > 0))) {
       throw failure("DISPATCH_UNSPLIT_ACTIVITY", `Unsplit blocked. ${ref} has packing, loading or fulfillment activity. Reopen or clear it first.`);
     }
-    await assertUnfinishedSource(ref, header, lines);
+    await assertUnfinishedSource(ref, header, lines, "unsplit");
   }
 }
 
@@ -363,8 +366,8 @@ export async function unsplitSalesOrder(input = {}) {
     if (family.source) {
       const sourceHeader = headers.find(row => row.tranid === family.restoreRef);
       const sourceLines = sourceHeader ? (await query("SELECT * FROM sales_order_lines WHERE sales_order_id=$1 ORDER BY id FOR UPDATE", [sourceHeader.netsuite_id])).rows : [];
-      await assertUnfinishedSource(family.restoreRef, sourceHeader, sourceLines);
-      await assertUnplannedSource(family.restoreRef);
+      await assertUnfinishedSource(family.restoreRef, sourceHeader, sourceLines, "unsplit");
+      await assertUnplannedSource(family.restoreRef, "unsplit");
     } else {
       await assertUnsplitOrdersUnstarted([family.restoreRef], headers);
     }

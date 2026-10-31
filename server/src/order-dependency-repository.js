@@ -590,13 +590,48 @@ export async function assertNoActiveOrderDependenciesByRefs(orderRefs = [], acti
   // validateDispatchPlanDependencies and getSalesOrderDependencyExecutionBlock.
   // Direct pickups may move from a normal SO to its proven new group before
   // execution. Splits, ungrouping, and independent TO edits remain protected.
+  // A link on a split outside the change keeps its own target; it is reached
+  // here only through the shared parent ref and must not block its siblings.
+  const changedRefs = new Set(refs.map((ref) => ref.toLowerCase()));
   const blocked = result.rows.filter((dependency) =>
-    dependencyBlocksDispatchStructureChange(dependency, options)
+    !(dependency.dispatch_target_kind === "split" && !changedRefs.has(text(dependency.dispatch_target_ref).toLowerCase()))
+    && dependencyBlocksDispatchStructureChange(dependency, options)
     || (dependency.dependency_mode === "direct_to_customer" && refs.includes(dependency.transfer_order_ref))
   );
-  if (!blocked.length) return;
-  const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
-  const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
+  // Unsplit and resplit retire their split refs; a link of any mode that
+  // targets one would be left pointing at an order that no longer exists.
+  const retiring = new Set((options.retiringTargetRefs || []).map((ref) => text(ref).toLowerCase()).filter(Boolean));
+  blocked.push(...result.rows.filter((dependency) => !blocked.includes(dependency)
+    && retiring.has(text(dependency.dispatch_target_ref).toLowerCase())));
+  if (blocked.length) {
+    const relations = blocked.map((row) => `${row.dispatch_target_ref || row.sales_order_ref} -> ${row.transfer_order_ref}`).join(", ");
+    const error = new Error(`Cannot ${action} while an active order dependency exists: ${relations}. Unlink the dependency first.`);
+    error.status = 409;
+    error.code = "ORDER_DEPENDENCY_STRUCTURE_LOCK";
+    throw error;
+  }
+  // One TO carries one active link. A group link covering several orders cannot
+  // be handed to one of them on ungroup without leaving the others ungated.
+  const ungroupedRefs = [...new Set((options.allowEstablishedUngroupTargets || [])
+    .map((entry) => text(entry?.groupRef).toLowerCase()).filter(Boolean))];
+  if (!ungroupedRefs.length) return;
+  const shared = await query(
+    `SELECT dependency.dispatch_target_ref, dependency.transfer_order_ref,
+            array_agg(DISTINCT source_sales.tranid ORDER BY source_sales.tranid) AS source_refs
+       FROM order_dependencies dependency
+       JOIN order_dependency_lines line ON line.dependency_id = dependency.id AND line.line_role = 'sales_allocation'
+       JOIN sales_order_lines sales_line ON sales_line.id = line.sales_line_id
+       JOIN sales_orders source_sales ON source_sales.netsuite_id = sales_line.sales_order_id
+      WHERE dependency.status <> 'cancelled'
+        AND dependency.dispatch_target_kind = 'group'
+        AND lower(dependency.dispatch_target_ref) = ANY($1::text[])
+      GROUP BY dependency.id, dependency.dispatch_target_ref, dependency.transfer_order_ref
+     HAVING COUNT(DISTINCT source_sales.tranid) > 1`,
+    [ungroupedRefs]
+  );
+  if (!shared.rows.length) return;
+  const relations = shared.rows.map((row) => `${row.transfer_order_ref} covers ${row.source_refs.join(" and ")} in ${row.dispatch_target_ref}`).join("; ");
+  const error = new Error(`Cannot ${action}: ${relations}. A Transfer Order can be linked to only one order, so unlink it first and relink it after ungrouping.`);
   error.status = 409;
   error.code = "ORDER_DEPENDENCY_STRUCTURE_LOCK";
   throw error;
@@ -1256,10 +1291,53 @@ export async function syncDirectDependencyOperatorProgress(transferOrderId) {
   });
 }
 
+// A link made on an SO before it was split names the SO, yet applies to each
+// split carrying a linked item (dependencyAppliesToDispatchOrder) and shows on
+// its card. The split's Link TO window lists it so it can be seen and unlinked.
+async function inheritedSplitParentLinks(targetRef, ownLinks = []) {
+  const split = (await query(
+    `SELECT parent_order_ref, full_order FROM dispatch_global_order_splits
+      WHERE lower(split_ref) = lower($1) AND order_type = 'SO' AND definition_kind = 'split' AND active = true`,
+    [targetRef]
+  )).rows[0];
+  const parentRef = text(split?.parent_order_ref);
+  if (!parentRef) return [];
+  const own = new Set(ownLinks.map((link) => String(link.id)));
+  const order = { id: targetRef, items: Array.isArray(split.full_order?.items) ? split.full_order.items : [] };
+  return (await loadDependencies({ salesOrderRef: parentRef }))
+    .filter((link) => !own.has(String(link.id)) && text(link.dispatchTargetRef) === parentRef
+      && dependencyAppliesToDispatchOrder(link, order))
+    .map((link) => ({ ...link, inheritedFromRef: parentRef }));
+}
+
+// A split's line is shared with the SO and its other splits. It keeps its own
+// share, but cannot use quantity that links through other targets already took.
+async function splitLineTransferCapacity(targetRef, lines = []) {
+  const salesLineIds = [...new Set(lines.map((line) => Number(line.salesLineId)).filter(Number.isFinite))];
+  if (!salesLineIds.length) return new Map();
+  const result = await query(
+    `SELECT line.id,
+            CASE WHEN COALESCE(line.netsuite_backordered_qty, 0) > $3 THEN line.netsuite_backordered_qty ELSE line.quantity END AS shortage,
+            COALESCE((SELECT SUM(dependency_line.allocated_quantity)
+                        FROM order_dependency_lines dependency_line
+                        JOIN order_dependencies dependency ON dependency.id = dependency_line.dependency_id
+                       WHERE dependency.status <> 'cancelled'
+                         AND dependency_line.line_role = 'sales_allocation'
+                         AND dependency_line.sales_line_id = line.id
+                         AND lower(dependency.dispatch_target_ref) <> lower($2)), 0) AS other_allocated
+       FROM sales_order_lines line
+      WHERE line.id = ANY($1::bigint[])`,
+    [salesLineIds, text(targetRef), EPSILON]
+  );
+  return new Map(result.rows.map((row) => [Number(row.id), Math.max(0, number(row.shortage) - number(row.other_allocated))]));
+}
+
 export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesOrderRef = "", transferOrderRef = "", planDate = "" } = {}) {
   transferOrderRef = text(transferOrderRef).toUpperCase();
   const targetRef = text(dispatchTargetRef || salesOrderRef);
   const existingLinks = targetRef ? await loadDependencies({ salesOrderRef: targetRef }) : [];
+  const inheritedLinks = targetRef ? await inheritedSplitParentLinks(targetRef, existingLinks) : [];
+  existingLinks.push(...inheritedLinks);
   const transferOrders = await query(
     `SELECT t.netsuite_id, t.tranid, t.from_location, t.to_location,
             t.dispatch_planned, t.fulfillment_status, t.status, t.status_text,
@@ -1283,7 +1361,7 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
   let targetResolutionError = "";
   if (targetRef) {
     try {
-      resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
+      resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate, forNewLink: true });
     } catch (error) {
       if (!existingLinks.length) throw error;
       targetResolutionError = text(error?.message || error);
@@ -1318,10 +1396,13 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
         remainingByItem.set(key, Math.max(0, number(remainingByItem.get(key)) - number(line.allocatedQuantity)));
       }
     }
+    const lineCapacity = resolved.target.kind === "split" ? await splitLineTransferCapacity(resolved.target.ref, resolved.lines) : new Map();
     matchingLines = resolved.lines.map((line) => {
       const itemKey = transferLinkItemKey(line.itemId, line.unit);
       const transferQuantity = number(remainingByItem.get(itemKey));
-      const availableShortage = Math.max(0, number(line.shortageQuantity) - number(line.dependencyAllocatedQuantity));
+      const ownShortage = Math.max(0, number(line.shortageQuantity) - number(line.dependencyAllocatedQuantity));
+      const availableShortage = lineCapacity.has(line.salesLineId)
+        ? Math.min(ownShortage, lineCapacity.get(line.salesLineId)) : ownShortage;
       const suggestedQuantity = Math.min(availableShortage, transferQuantity);
       remainingByItem.set(itemKey, Math.max(0, transferQuantity - suggestedQuantity));
       const availableSelection = conversionSelection(availableShortage, line);
@@ -1353,7 +1434,10 @@ export async function getOrderDependencyOptions({ dispatchTargetRef = "", salesO
     }).filter((row) => row.suggestedQuantity > EPSILON);
     if (!matchingLines.length) {
       const transferItems = transferLines.rows.filter((row) => number(row.transfer_quantity) > EPSILON);
-      const targetItems = resolved.lines.filter((line) => Math.max(0, number(line.shortageQuantity) - number(line.dependencyAllocatedQuantity)) > EPSILON);
+      const targetItems = resolved.lines.filter((line) => Math.min(
+        Math.max(0, number(line.shortageQuantity) - number(line.dependencyAllocatedQuantity)),
+        lineCapacity.has(line.salesLineId) ? lineCapacity.get(line.salesLineId) : Infinity
+      ) > EPSILON);
       const targetItemIds = new Set(targetItems.map((line) => String(line.itemId)));
       const commonItem = transferItems.some((line) => targetItemIds.has(String(line.item_id)));
       if (!transferItems.length) {
@@ -4129,7 +4213,7 @@ export async function createOrderDependency({
       "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
       [`order-dependency:${targetRef.toLowerCase()}`]
     );
-    const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate });
+    const resolved = await resolveDispatchSalesTarget({ dispatchTargetRef: targetRef, planDate, forNewLink: true });
     const transfer = await query(
       "SELECT * FROM transfer_orders WHERE UPPER(tranid) = $1 FOR UPDATE",
       [transferOrderRef]
@@ -4231,6 +4315,7 @@ export async function createOrderDependency({
     }
     const normalized = [];
     const requestedByItem = new Map();
+    const splitCapacity = resolved.target.kind === "split" ? await splitLineTransferCapacity(resolved.target.ref, resolved.lines) : new Map();
     const requestedByTargetLine = new Map();
     for (const allocation of requested) {
       const requestedSalesLineId = Number(allocation.salesLineId);
@@ -4247,7 +4332,8 @@ export async function createOrderDependency({
       const availableShortage = Math.max(0, Math.min(
         number(targetLine.shortageQuantity) - number(targetLine.dependencyAllocatedQuantity),
         normalizedMode === "direct_to_customer" && Number.isFinite(targetLine.supplyLinkCapacitySalesQty)
-          ? targetLine.supplyLinkCapacitySalesQty : Infinity
+          ? targetLine.supplyLinkCapacitySalesQty : Infinity,
+        splitCapacity.has(targetLine.salesLineId) ? splitCapacity.get(targetLine.salesLineId) : Infinity
       ));
       const requestedQuantity = allocationSalesQuantity(allocation, targetLine);
       const qty = requestedQuantity.quantity;
@@ -5097,6 +5183,15 @@ async function retiredDependencyGroups(plan, dependencies) {
   ]));
 }
 
+// Every allocated line belongs to the link's own sales order, so handing the
+// link back to that order leaves no other order without its gate.
+function dependencyLinesHaveSingleSource(dependency) {
+  const canonicalRef = text(dependency.canonicalSalesOrderRef).toLowerCase();
+  const allocations = dependency.lines.filter(line => line.lineRole === "sales_allocation");
+  return allocations.length > 0
+    && allocations.every(line => line.salesLineId && text(line.sourceOrderRef).toLowerCase() === canonicalRef);
+}
+
 function retiredDependencyHasSingleSource(dependency, retiredGroups) {
   const canonicalRef = text(dependency.canonicalSalesOrderRef).toLowerCase();
   const members = retiredGroups.get(text(dependency.dispatchTargetRef).toLowerCase()) || [];
@@ -5211,7 +5306,7 @@ export async function syncOrderDependenciesFromDispatchPlan(plan = {}, {
       }
       if (
         !groupRef
-        && (establishedUngroupTargets.get(canonicalRef) === currentTargetRef
+        && ((establishedUngroupTargets.get(canonicalRef) === currentTargetRef && dependencyLinesHaveSingleSource(dependency))
           || retiredDependencyHasSingleSource(dependency, retiredGroups))
         && dependency.dispatchTargetKind === "group"
         && dependency.mode === "yard_replenishment"
