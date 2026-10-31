@@ -52,6 +52,19 @@ Each fix was reproduced by a failing test first, then fixed until green.
 | Priority 6: parent TO link gates every split | Replenishment links apply to a split (or group of splits) only when it carries a linked item; enrichment, plan validation, driver start and client splits share one rule. Direct-pickup links unchanged. | `test/dispatch/integration/split-dependency-scope.test.js`, `test/dispatch/unit/split-dependency-scope.test.js` |
 | Grouping pickups | Pickups after the grouped drop merge into an earlier same-yard visit or move ahead of it; removing/ungrouping keeps shared pickup visits. | `group-pickup-placement.browser.test.mjs` |
 
+Second round (same method):
+
+| Finding | Fix | Tests |
+|---|---|---|
+| Same SO line linked twice to POs via its group or split | Link PO limits each target to what the shared sales line still has after PO links on its other targets (split siblings keep their own shares). | `test/dispatch/integration/po-link-cross-target-quantity.test.js` |
+| TO unsplit left a grouped or other-plan sibling behind | Server requires the whole active split family, none grouped or planned on another plan; client refuses while a group holds a sibling. | `to-unsplit-family.test.js`, `to-unsplit-grouped-sibling.browser.test.mjs` |
+| Unlink TO did not refresh the TO card | Unlink response and change event include the TO (and other affected refs). | `test/mbt/integration/unlink-to-refresh-http.test.js` |
+| Link TO plan-date check | Link TO follows the plan that holds the group (saved/assigned here, else its owner date), not a stale plan id or blank date. | `link-to-plan-owner.browser.test.mjs` |
+| Split grouped before first save had no definition (suffix reuse) | Plan save records definitions for splits inside groups. | `grouped-split-definition.test.js` |
+
+Still open: snapshot restore after ungroup/regroup (needs safe group
+reactivation); PO link vs direct TO link on one line not cross-checked.
+
 Replay found the grouped-split deactivation already happened in production:
 `SOA10724-S1/S2` and `SOA10878-S1/S2` (plan 373) are inactive and are restored
 by the next confirmed save once the fix is deployed.

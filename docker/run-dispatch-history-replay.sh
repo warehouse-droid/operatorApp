@@ -84,7 +84,7 @@ replay() {
     -e GOOGLE_MAPS_MODE=disabled -e MBT_NETSUITE_WRITES_ENABLED=false -e SMART_SCM_LIVE_EXECUTION_ENABLED=false \
     -e DISPATCH_PLANNER_ORDER_POOL_MODE=on -e DISPATCH_DRIVER_ORIENTED_PLANNING=true \
     -e DISPATCH_HISTORY_LABEL="$name" -e DISPATCH_HISTORY_OUTPUT=test-artifacts/history-replay \
-    -e DISPATCH_HISTORY_FROM -e DISPATCH_HISTORY_THROUGH -e DISPATCH_HISTORY_LIMIT -e DISPATCH_HISTORY_DELIVERY_ONLY \
+    -e DISPATCH_HISTORY_FROM -e DISPATCH_HISTORY_THROUGH -e DISPATCH_HISTORY_LIMIT -e DISPATCH_HISTORY_DELIVERY_ONLY -e DISPATCH_HISTORY_GROUPED_SPLITS_ONLY \
     mbbs-mbt-p1-test-test:latest "$@"
 }
 server_result=0
@@ -97,7 +97,7 @@ if [[ "${DISPATCH_HISTORY_CLIENT_ONLY:-}" != 1 ]]; then
 fi
 
 # Browser timing replay: the same states through baseline and candidate dispatch.js.
-[[ "${DISPATCH_HISTORY_DELIVERY_ONLY:-}" != 1 ]] || exit "$server_result"
+[[ "${DISPATCH_HISTORY_DELIVERY_ONLY:-}" != 1 && "${DISPATCH_HISTORY_SKIP_CLIENT:-}" != 1 ]] || exit "$server_result"
 docker run --rm --name "$run_id-client" --network "$network" "${labels[@]}" "${limits[@]}" \
   --tmpfs /tmp:rw,size=512m --shm-size=256m --user "$(id -u):$(id -g)" -w /app \
   -v "$art/baseline/server/public:/baseline-public:ro" -v "$candidate/public:/app/public:ro" \

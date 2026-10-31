@@ -24,6 +24,8 @@ const through = process.env.DISPATCH_HISTORY_THROUGH || "2999-12-31";
 const limit = Number(process.env.DISPATCH_HISTORY_LIMIT || 0);
 // Delivery-only mode replays just the confirmed-plan Operator step on the stored state.
 const deliveryOnly = process.env.DISPATCH_HISTORY_DELIVERY_ONLY === "1";
+// Replay only states that carry split orders inside groups (the save path they exercise).
+const groupedSplitsOnly = process.env.DISPATCH_HISTORY_GROUPED_SPLITS_ONLY === "1";
 const resultsPath = `${output}/${label}.ndjson`;
 
 const hash = (value) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
@@ -126,6 +128,12 @@ try {
         const summary = receipt?.summary || source.summary || {};
         const revision = Number(receipt?.revision ?? source.revision ?? header.revision);
         const begin = performance.now();
+        if (groupedSplitsOnly && !groupedSplitRefs(orders).length) {
+          row.result = "no_grouped_split";
+          counts[row.result] = (counts[row.result] || 0) + 1;
+          await appendFile(resultsPath, `${JSON.stringify(row)}\n`);
+          continue;
+        }
         if (deliveryOnly) {
           if ((receipt?.status || header.status) === "confirmed") {
             await withTransaction(async () => {

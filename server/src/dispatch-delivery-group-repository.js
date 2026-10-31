@@ -534,13 +534,22 @@ function projectGlobalSplits(plan = {}) {
   const sourcePlanDate = dateOnly(plan.planDate || plan.plan_date);
   if (!Number.isInteger(planId) || !sourcePlanDate) return [];
   const splits = [];
-  for (const order of plan.orders || []) {
+  // A split grouped before the plan's first save still owns its definition and
+  // suffix. (A CO only carries copies of its source members.)
+  const seen = new Set();
+  const candidates = (plan.orders || []).flatMap((order) => [{ order, groupRef: "" },
+    ...(isGroupedDispatchOrder(order) && canonicalGroupedOrderType(order) !== "CO"
+      ? (order.childOrderDetails || []).map((child) => ({ order: child, groupRef: text(order.id) }))
+      : [])]);
+  for (const { order, groupRef } of candidates) {
     if (!isGlobalDerivedOrder(order)) continue;
     const splitRef = text(order.id);
+    if (seen.has(splitRef.toLowerCase())) continue;
+    seen.add(splitRef.toLowerCase());
     const definitionKind = derivedDefinitionKind(order);
     const parentOrderRef = derivedParentRef(order, plan);
     if (definitionKind === "split" && !parentOrderRef) continue;
-    const assignment = findGroupAssignment(plan, splitRef);
+    const assignment = findGroupAssignment(plan, splitRef) || (groupRef ? findGroupAssignment(plan, groupRef) : null);
     const declaredSourcePlanId = Number(
       order.globalOrderSourcePlanId
       || order.dispatchSnapshotSourcePlanId

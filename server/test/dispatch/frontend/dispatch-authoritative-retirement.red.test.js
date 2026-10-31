@@ -72,6 +72,7 @@ const extractedFunctions = [
   "resetPlanningBoard",
   "resetUndoHistory",
   "applyHistorySnapshot",
+  "stopsWithoutOrders",
   "removeStopsForOrders",
   "saveTransitCoToServer",
   "clearTransitCoFromOrderSnapshot",

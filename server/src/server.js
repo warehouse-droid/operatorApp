@@ -15878,7 +15878,7 @@ async function executeScmDependencyHttpCommand(req, command, surface) {
       orderRefs: [...new Set([command.targetRef, result.dependency?.dispatchTargetRef,
         result.dependency?.salesOrderRef, result.dependency?.transferOrderRef,
         result.cancelled?.salesOrderRef, result.cancelled?.transferOrderRef, result.cancelled?.poOrderRef,
-        command.payload?.poRef, command.payload?.transferOrderRef].filter(Boolean))],
+        command.payload?.poRef, command.payload?.transferOrderRef, ...(result.relatedOrderRefs || [])].filter(Boolean))],
       refreshOrderPool: true,
       planId: result.planId || command.planId || null
     });
@@ -16090,10 +16090,11 @@ app.delete("/api/dispatch/order-dependencies/:id", async (req, res, next) => {
     const result = await executeScmDependencyHttpCommand(req, command, "dispatch");
     if (result.pending) return res.status(202).json(result);
     const cancelled = result.cancelled;
+    // The unlinked TO becomes plannable again, so refresh its card with the SO.
     return res.json({
       ...result,
       cancelled,
-      ...await dispatchMutationOrderResponse(req, req.body?.orderRefs || [])
+      ...await dispatchMutationOrderResponse(req, [...(req.body?.orderRefs || []), ...(result.relatedOrderRefs || [])])
     });
   } catch (error) {
     if (error instanceof DispatchPlanEditLeaseError) return sendDispatchPlanEditLeaseError(res, error);
@@ -18291,7 +18292,8 @@ app.post("/api/dispatch/split-orders/unsplit", async (req, res, next) => {
     const result = await deactivateUnplannedDispatchSplitOrders({
       originalOrderId: req.body?.originalOrderId,
       orderType: req.body?.orderType,
-      splitOrderIds: req.body?.splitOrderIds
+      splitOrderIds: req.body?.splitOrderIds,
+      planId: req.body?.planId
     });
     await deactivateDispatchGlobalOrderDefinitions(result.deactivated || []);
     for (const splitRef of result.deactivated || []) {

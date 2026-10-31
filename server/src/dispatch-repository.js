@@ -8482,11 +8482,13 @@ function targetLineAsAllocationRow(line = {}) {
     to_sec: line.toSec,
     to_pcs: line.toPcs,
     netsuite_received_qty: 0,
-    allocated_pallet_qty: line.poAllocatedPallets,
-    allocated_layer_qty: line.poAllocatedLayers,
-    allocated_section_qty: line.poAllocatedSections,
-    allocated_piece_qty: allocatedDispatchPhysicalQuantity(line, "pieces", line.poAllocatedPieces, line.poAllocatedSalesQty),
-    allocated_sales_qty: line.poAllocatedSalesQty
+    // Quantity that PO links on another target of the same sales line already took is unavailable here.
+    allocated_pallet_qty: line.poAllocatedPallets + Number(line.poLinkedElsewherePallets || 0),
+    allocated_layer_qty: line.poAllocatedLayers + Number(line.poLinkedElsewhereLayers || 0),
+    allocated_section_qty: line.poAllocatedSections + Number(line.poLinkedElsewhereSections || 0),
+    allocated_piece_qty: allocatedDispatchPhysicalQuantity(line, "pieces", line.poAllocatedPieces, line.poAllocatedSalesQty)
+      + Number(line.poLinkedElsewherePieces || 0),
+    allocated_sales_qty: line.poAllocatedSalesQty + Number(line.poLinkedElsewhereSalesQty || 0)
   };
 }
 

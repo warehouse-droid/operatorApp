@@ -15676,6 +15676,16 @@ function prepareUnsplitOrder(splitOrderId) {
     routeNotice = blockReason;
     return null;
   }
+  // A sibling inside a group is not a top-level order; restoring the parent
+  // while it travels in that group would count its quantity twice.
+  const parentRef = splitParentOrderId(split);
+  const holdingGroup = orders.find((order) => order.childOrders?.length
+    && canonicalDispatchOrderType(order.type, order.id) !== "CO"
+    && flattenDispatchGroupMembers(order).childOrderDetails.some((child) => splitParentOrderId(child) === parentRef));
+  if (holdingGroup) {
+    routeNotice = `Unsplit blocked. Ungroup ${holdingGroup.id} first; it holds a split of ${parentRef}.`;
+    return null;
+  }
   const parent = orderCatalog.find((order) => order.id === split.originalOrderId);
   if (!parent) {
     routeNotice = `Cannot unsplit ${split.originalOrderId}. Refresh orders first, then try again.`;
@@ -16102,6 +16112,20 @@ function uniqueGroupedDispatchOrderId(groupItems = []) {
     if (!dispatchOrderIdExists(candidate, excludedIds)) return candidate;
   }
   return `${baseId}-V${Date.now()}`;
+}
+
+// The server lets a grouped TO link be changed only from the plan that holds the
+// group, so Link TO follows that owner: a group saved in or assigned to this
+// plan is managed here, whatever plan id it last recorded; a group owned by
+// another date is managed there.
+function transferLinkPlanBlock(order) {
+  if (!order?.childOrders?.length) return "";
+  const groupRef = String(order.id || "");
+  const savedHere = (lastAcknowledgedPlanState?.orders || []).some((saved) => String(saved?.id || "") === groupRef);
+  if (savedHere || isOrderAssignedInCurrentPlan(groupRef)) return "";
+  const ownerDate = String(order.groupPlanDate || order.globalGroupSourcePlanDate || order.dispatchPlanDate || "").slice(0, 10);
+  if (!ownerDate || ownerDate === String(currentPlanDate || "").slice(0, 10)) return "";
+  return `${groupRef} belongs to the ${ownerDate} plan. Load that plan before managing linked Transfer Orders.`;
 }
 
 function groupedOrderTransitCoId(order) {
@@ -17605,18 +17629,9 @@ app.addEventListener("click", async (event) => {
   }
   if (action === "open-to-link-modal") {
     const targetOrder = orderById(actionOrderId);
-    const groupPlanId = Number(targetOrder?.groupPlanId || 0);
-    const currentPlanId = Number(currentPlan?.id || 0);
-    const groupPlanDate = String(
-      targetOrder?.groupPlanDate
-      || (targetOrder?.childOrders?.length ? targetOrder?.dispatchPlanDate : "")
-      || ""
-    ).slice(0, 10);
-    if (
-      (groupPlanId && currentPlanId && groupPlanId !== currentPlanId)
-      || (groupPlanDate && groupPlanDate !== String(currentPlanDate || "").slice(0, 10))
-    ) {
-      routeNotice = `${targetOrder.id} belongs to the ${groupPlanDate || "other"} plan. Load that plan before managing linked Transfer Orders.`;
+    const planBlock = transferLinkPlanBlock(targetOrder);
+    if (planBlock) {
+      routeNotice = planBlock;
       render({ save: false });
       return;
     }

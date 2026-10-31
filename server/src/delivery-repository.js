@@ -3472,7 +3472,44 @@ export async function applyConfirmedDispatchPlanToDelivery(plan, { forceOrderRef
   return { planned: plannedRows.length, ...materializedSplits };
 }
 
-async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrderId = "", orderType = "", splitOrderIds = [] } = {}) {
+// Unsplit restores the parent's whole quantity, so a TO unsplit must take every
+// active split, and none may travel in a group or sit on another plan. (The SO
+// path resolves its split family before calling the deactivation below.)
+async function assertTransferUnsplitFamilyFree({ originalRef, splitPattern, requestedRefs, planId = "" }) {
+  const requested = new Set(requestedRefs.map((ref) => ref.toLowerCase()));
+  const family = await query(
+    `SELECT tranid AS ref FROM transfer_orders WHERE tranid LIKE $1 AND netsuite_active = true
+     UNION SELECT split_ref FROM dispatch_global_order_splits WHERE parent_order_ref = $2 AND active = true`,
+    [splitPattern, originalRef]
+  );
+  const missing = family.rows.map((row) => String(row.ref)).filter((ref) => !requested.has(ref.toLowerCase()));
+  if (missing.length) {
+    throw new Error(`Unsplit blocked. Every split of ${originalRef} must be unsplit together; ${missing.join(", ")} is still active.`);
+  }
+  const grouped = await query(
+    `SELECT member.member_order_ref AS ref, member.group_ref
+       FROM dispatch_global_order_group_members member
+       JOIN dispatch_global_order_groups grouped ON grouped.group_ref = member.group_ref AND grouped.active
+      WHERE lower(member.member_order_ref) = ANY($1::text[])`,
+    [[...requested]]
+  );
+  if (grouped.rows.length) {
+    throw new Error(`Unsplit blocked. Ungroup first: ${grouped.rows.map((row) => `${row.ref} is in ${row.group_ref}`).join(", ")}.`);
+  }
+  const planned = await query(
+    `SELECT DISTINCT assignment.order_ref, assignment.plan_date::text AS plan_date
+       FROM dispatch_plan_order_assignments assignment
+      WHERE (lower(assignment.order_ref) = ANY($1::text[]) OR lower(assignment.planned_order_ref) = ANY($1::text[]))
+        AND assignment.plan_id::text <> $2`,
+    [[...requested], String(planId || "")]
+  );
+  if (planned.rows.length) {
+    throw new Error(`Unsplit blocked. Unplan first: ${planned.rows.map((row) => `${row.order_ref} on ${row.plan_date}`).join(", ")}.`);
+  }
+}
+
+async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrderId = "", orderType = "", splitOrderIds = [], planId = "" } = {}) {
+  const excludedPlanId = planId;
   const originalRef = String(originalOrderId || "").trim();
   const requestedRefs = (Array.isArray(splitOrderIds) ? splitOrderIds : [])
     .map((ref) => String(ref || "").trim())
@@ -3502,6 +3539,9 @@ async function deactivateUnplannedDispatchSplitOrdersInTransaction({ originalOrd
       ORDER BY tranid`,
     [splitPattern, requestedRefs.length ? requestedRefs : null]
   );
+  if (!isSales && requestedRefs.length) {
+    await assertTransferUnsplitFamilyFree({ originalRef, splitPattern, requestedRefs, planId: excludedPlanId });
+  }
   const refs = existing.rows.map((row) => String(row.tranid || ""));
   if (!refs.length) return { deactivated: [], deletedLines: 0 };
 

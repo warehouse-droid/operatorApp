@@ -307,10 +307,33 @@ async function applyExistingAllocations(targetRef, lines) {
       GROUP BY dispatch_target_line_key`,
     [text(targetRef)]
   );
+  // A sales line can be reached through several targets: the order itself, a
+  // group holding it, or its splits. Each target keeps its own share, but none
+  // may use quantity that PO links on the other targets already took.
+  const salesLineIds = [...new Set(lines.map((line) => line.salesLineId).filter(Number.isFinite))];
+  const shared = salesLineIds.length ? await query(
+    `SELECT line.id, line.quantity, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty,
+            COALESCE(SUM(allocation.allocated_pallet_qty), 0) AS pallets,
+            COALESCE(SUM(allocation.allocated_layer_qty), 0) AS layers,
+            COALESCE(SUM(allocation.allocated_section_qty), 0) AS sections,
+            COALESCE(SUM(allocation.allocated_piece_qty), 0) AS pieces,
+            COALESCE(SUM(allocation.allocated_sales_qty), 0) AS sales_qty
+       FROM sales_order_lines line
+       LEFT JOIN dispatch_so_po_allocations allocation
+         ON allocation.sales_line_id = line.id
+        AND allocation.status = 'active'
+        AND allocation.dispatch_target_ref IS DISTINCT FROM $2
+      WHERE line.id = ANY($1::bigint[])
+      GROUP BY line.id`,
+    [salesLineIds, text(targetRef)]
+  ) : { rows: [] };
   const dependencyByKey = new Map(dependencies.rows.map((row) => [text(row.dispatch_target_line_key), number(row.allocated_quantity)]));
   const poByKey = new Map(poAllocations.rows.map((row) => [text(row.dispatch_target_line_key), row]));
+  const sharedById = new Map(shared.rows.map((row) => [Number(row.id), row]));
   return lines.map((line) => {
     const po = poByKey.get(line.targetLineKey) || {};
+    const other = sharedById.get(line.salesLineId);
+    const taken = (share, total, used) => other ? Math.max(0, number(share) - Math.max(number(total) - number(used), 0)) : 0;
     return {
       ...line,
       dependencyAllocatedQuantity: number(dependencyByKey.get(line.targetLineKey)),
@@ -318,7 +341,12 @@ async function applyExistingAllocations(targetRef, lines) {
       poAllocatedLayers: number(po.layers),
       poAllocatedSections: number(po.sections),
       poAllocatedPieces: number(po.pieces),
-      poAllocatedSalesQty: number(po.sales_qty)
+      poAllocatedSalesQty: number(po.sales_qty),
+      poLinkedElsewherePallets: taken(line.pallets, other?.pallet_qty, other?.pallets),
+      poLinkedElsewhereLayers: taken(line.layers, other?.layer_qty, other?.layers),
+      poLinkedElsewhereSections: taken(line.sections, other?.section_qty, other?.sections),
+      poLinkedElsewherePieces: taken(line.pieces, other?.piece_qty, other?.pieces),
+      poLinkedElsewhereSalesQty: taken(line.quantity, other?.quantity, other?.sales_qty)
     };
   });
 }
