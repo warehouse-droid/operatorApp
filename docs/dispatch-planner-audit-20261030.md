@@ -62,8 +62,14 @@ Second round (same method):
 | Link TO plan-date check | Link TO follows the plan that holds the group (saved/assigned here, else its owner date), not a stale plan id or blank date. | `link-to-plan-owner.browser.test.mjs` |
 | Split grouped before first save had no definition (suffix reuse) | Plan save records definitions for splits inside groups. | `grouped-split-definition.test.js` |
 
-Still open: snapshot restore after ungroup/regroup (needs safe group
-reactivation); PO link vs direct TO link on one line not cross-checked.
+Third round:
+
+| Finding | Fix | Tests |
+|---|---|---|
+| PO link and direct TO link on one line not cross-checked | PO links and direct-pickup TO links share one supply capacity per line (Operator's rule): Link PO, direct Link TO and a switch to direct pickup cannot exceed it; replenishment links stay outside it. | `test/mbt/integration/po-direct-to-link-capacity.test.js` |
+| Snapshot restore refused after any ungroup/regroup | Restore reactivates a retired group when no member is now in another active group, a retired split, or planned on another plan; otherwise it stays refused. | `test/dispatch/integration/snapshot-restore-retired-group.test.js` |
+
+No audit findings from this document remain open.
 
 Replay found the grouped-split deactivation already happened in production:
 `SOA10724-S1/S2` and `SOA10878-S1/S2` (plan 373) are inactive and are restored

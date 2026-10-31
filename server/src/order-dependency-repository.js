@@ -4242,7 +4242,13 @@ export async function createOrderDependency({
       const outbound = outboundEntry?.first;
       const receiving = receivingLines.find((line) => transferLinkItemKey(line.item_id, line.unit) === itemKey);
       if (!targetLine || !outbound) throw new Error(`Item ${itemId} with matching base UOM is not available on both ${targetRef} and ${transferOrderRef}.`);
-      const availableShortage = Math.max(0, number(targetLine.shortageQuantity) - number(targetLine.dependencyAllocatedQuantity));
+      // A direct pickup supplies the customer like a PO link, so it shares the
+      // line's remaining supply capacity (see applyExistingAllocations).
+      const availableShortage = Math.max(0, Math.min(
+        number(targetLine.shortageQuantity) - number(targetLine.dependencyAllocatedQuantity),
+        normalizedMode === "direct_to_customer" && Number.isFinite(targetLine.supplyLinkCapacitySalesQty)
+          ? targetLine.supplyLinkCapacitySalesQty : Infinity
+      ));
       const requestedQuantity = allocationSalesQuantity(allocation, targetLine);
       const qty = requestedQuantity.quantity;
       if (qty <= EPSILON) throw new Error(`Enter a valid allocation for ${targetLine.itemName || itemId}.`);
@@ -4539,6 +4545,27 @@ export async function updateOrderDependencyMode(
     );
     if (!result.rowCount) throw new Error("This dependency has already started and its mode cannot be changed.");
     if (normalizedMode === "direct_to_customer") {
+      // A direct pickup supplies the customer like a PO link; together they may
+      // not exceed the sales line (Operator refuses such a load).
+      const oversupplied = await query(
+        `SELECT line.item_name, line.quantity,
+                COALESCE((SELECT SUM(allocation.allocated_sales_qty) FROM dispatch_so_po_allocations allocation
+                           WHERE allocation.sales_line_id = line.id AND allocation.status = 'active'), 0)
+                + COALESCE((SELECT SUM(dependency_line.allocated_quantity) FROM order_dependency_lines dependency_line
+                              JOIN order_dependencies dependency ON dependency.id = dependency_line.dependency_id
+                             WHERE dependency_line.sales_line_id = line.id AND dependency_line.line_role = 'sales_allocation'
+                               AND dependency.status <> 'cancelled' AND dependency.dependency_mode = 'direct_to_customer'), 0)
+                AS linked
+           FROM sales_order_lines line
+          WHERE line.id IN (SELECT sales_line_id FROM order_dependency_lines
+                             WHERE dependency_id = $1 AND line_role = 'sales_allocation')`,
+        [Number(dependencyId)]
+      );
+      const over = oversupplied.rows.find((row) => number(row.linked) > number(row.quantity) + EPSILON);
+      if (over) {
+        throw Object.assign(new Error(`${over.item_name || "This item"} would be linked for ${number(over.linked)} of ${number(over.quantity)}: PO links already cover it. Reduce the PO links before switching to direct pickup.`),
+          { status: 409, code: "ORDER_DEPENDENCY_SUPPLY_EXCEEDED" });
+      }
       await reconcileLinkedDirectShipQuantities({ transferOrderId: Number(result.rows[0].transfer_order_id) });
     }
     return (await loadDependencies({ salesOrderRef: result.rows[0].dispatch_target_ref || result.rows[0].sales_order_ref })).find((row) => String(row.id) === String(dependencyId));

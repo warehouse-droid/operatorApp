@@ -17,6 +17,7 @@ import { canonicalizeDispatchCustomOrdersInPlan } from "./dispatch-custom-order-
 import {
   deactivateDispatchGlobalOrderDefinitions,
   reconcileDispatchPlanGlobalOrderDefinitions,
+  restorableRetiredGroupRefs,
   syncDispatchDeliveryGroupsFromPlan
 } from "./dispatch-delivery-group-repository.js";
 import {
@@ -1700,6 +1701,8 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
               || dispatchLoadAssignmentDefaults.ownYards
           })
     );
+    // Groups an Ungroup or Regroup retired after this snapshot come back when safe.
+    const reactivatedGlobalOrderRefs = await restorableRetiredGroupRefs(sanitizedPlan, current.id);
     const canonicalPlan = await refreshDispatchPlanAuthoritativeOrderProjection(
       await reconcileDispatchPlanOrderAuthorities(await canonicalizeDispatchCustomOrdersInPlan({
         ...sanitizedPlan,
@@ -1712,7 +1715,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
           trucks: current.trucks || []
         },
         lockRows: true
-      }), { rejectRetiredGlobalOrderRefs: true })
+      }), { rejectRetiredGlobalOrderRefs: true, reactivatedGlobalOrderRefs })
     );
     await assertDispatchPlanAuthoritativeProjectionValid(canonicalPlan);
     await assertCustomOrderPlanDateExclusivity(canonicalPlan, {
@@ -1829,7 +1832,7 @@ export async function restoreDispatchPlanSnapshot(snapshotId, { sessionId = "" }
       revision: Number(current.revision || 0) + 1,
       orders: cleanPlan.orders,
       trucks: cleanPlan.trucks
-    }, { rejectRetiredGlobalOrderRefs: true });
+    }, { rejectRetiredGlobalOrderRefs: true, reactivatedGlobalOrderRefs });
     await syncDispatchPlannerReadProjections({
       ...cleanPlan,
       id: source.plan_id,

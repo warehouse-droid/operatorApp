@@ -285,8 +285,14 @@ function linesForEntry({ targetRef, kind, entry, canonical }) {
 
 async function applyExistingAllocations(targetRef, lines) {
   if (!lines.length) return lines;
+  const direct = "dependency.dependency_mode = 'direct_to_customer'";
   const dependencies = await query(
-    `SELECT line.dispatch_target_line_key, SUM(line.allocated_quantity) AS allocated_quantity
+    `SELECT line.dispatch_target_line_key, SUM(line.allocated_quantity) AS allocated_quantity,
+            COALESCE(SUM(line.pallet_qty) FILTER (WHERE ${direct}), 0) AS direct_pallets,
+            COALESCE(SUM(line.layer_qty) FILTER (WHERE ${direct}), 0) AS direct_layers,
+            COALESCE(SUM(line.section_qty) FILTER (WHERE ${direct}), 0) AS direct_sections,
+            COALESCE(SUM(line.piece_qty) FILTER (WHERE ${direct}), 0) AS direct_pieces,
+            COALESCE(SUM(line.allocated_quantity) FILTER (WHERE ${direct}), 0) AS direct_sales_qty
        FROM order_dependency_lines line
        JOIN order_dependencies dependency ON dependency.id = line.dependency_id
       WHERE dependency.dispatch_target_ref = $1
@@ -307,46 +313,74 @@ async function applyExistingAllocations(targetRef, lines) {
       GROUP BY dispatch_target_line_key`,
     [text(targetRef)]
   );
-  // A sales line can be reached through several targets: the order itself, a
-  // group holding it, or its splits. Each target keeps its own share, but none
-  // may use quantity that PO links on the other targets already took.
+  // PO links and direct-pickup TO links both supply the customer, and Operator
+  // refuses a load whose links together exceed the line. A sales line can also
+  // be reached through several targets (the order, a group holding it, its
+  // splits): each target keeps its own share, but none may use quantity that
+  // links on the line, through any target, already took.
   const salesLineIds = [...new Set(lines.map((line) => line.salesLineId).filter(Number.isFinite))];
   const shared = salesLineIds.length ? await query(
     `SELECT line.id, line.quantity, line.pallet_qty, line.layer_qty, line.section_qty, line.piece_qty,
-            COALESCE(SUM(allocation.allocated_pallet_qty), 0) AS pallets,
-            COALESCE(SUM(allocation.allocated_layer_qty), 0) AS layers,
-            COALESCE(SUM(allocation.allocated_section_qty), 0) AS sections,
-            COALESCE(SUM(allocation.allocated_piece_qty), 0) AS pieces,
-            COALESCE(SUM(allocation.allocated_sales_qty), 0) AS sales_qty
+            COALESCE(po.pallets, 0) AS po_pallets, COALESCE(po.layers, 0) AS po_layers,
+            COALESCE(po.sections, 0) AS po_sections, COALESCE(po.pieces, 0) AS po_pieces,
+            COALESCE(po.sales_qty, 0) AS po_sales_qty,
+            COALESCE(direct.pallets, 0) AS direct_pallets, COALESCE(direct.layers, 0) AS direct_layers,
+            COALESCE(direct.sections, 0) AS direct_sections, COALESCE(direct.pieces, 0) AS direct_pieces,
+            COALESCE(direct.sales_qty, 0) AS direct_sales_qty
        FROM sales_order_lines line
-       LEFT JOIN dispatch_so_po_allocations allocation
-         ON allocation.sales_line_id = line.id
-        AND allocation.status = 'active'
-        AND allocation.dispatch_target_ref IS DISTINCT FROM $2
-      WHERE line.id = ANY($1::bigint[])
-      GROUP BY line.id`,
+       LEFT JOIN (
+         SELECT sales_line_id, SUM(allocated_pallet_qty) AS pallets, SUM(allocated_layer_qty) AS layers,
+                SUM(allocated_section_qty) AS sections, SUM(allocated_piece_qty) AS pieces,
+                SUM(allocated_sales_qty) AS sales_qty
+           FROM dispatch_so_po_allocations
+          WHERE status = 'active' AND dispatch_target_ref IS DISTINCT FROM $2 AND sales_line_id = ANY($1::bigint[])
+          GROUP BY sales_line_id
+       ) po ON po.sales_line_id = line.id
+       LEFT JOIN (
+         SELECT dependency_line.sales_line_id, SUM(dependency_line.pallet_qty) AS pallets,
+                SUM(dependency_line.layer_qty) AS layers, SUM(dependency_line.section_qty) AS sections,
+                SUM(dependency_line.piece_qty) AS pieces, SUM(dependency_line.allocated_quantity) AS sales_qty
+           FROM order_dependency_lines dependency_line
+           JOIN order_dependencies dependency ON dependency.id = dependency_line.dependency_id
+          WHERE dependency.status <> 'cancelled' AND ${direct}
+            AND dependency_line.line_role = 'sales_allocation' AND dependency_line.sales_line_id = ANY($1::bigint[])
+          GROUP BY dependency_line.sales_line_id
+       ) direct ON direct.sales_line_id = line.id
+      WHERE line.id = ANY($1::bigint[])`,
     [salesLineIds, text(targetRef)]
   ) : { rows: [] };
-  const dependencyByKey = new Map(dependencies.rows.map((row) => [text(row.dispatch_target_line_key), number(row.allocated_quantity)]));
+  const dependencyByKey = new Map(dependencies.rows.map((row) => [text(row.dispatch_target_line_key), row]));
   const poByKey = new Map(poAllocations.rows.map((row) => [text(row.dispatch_target_line_key), row]));
   const sharedById = new Map(shared.rows.map((row) => [Number(row.id), row]));
+  const units = [["Pallets", "pallets", "pallet_qty"], ["Layers", "layers", "layer_qty"], ["Sections", "sections", "section_qty"],
+    ["Pieces", "pieces", "piece_qty"], ["SalesQty", "quantity", "quantity"]];
+  const poKey = { Pallets: "pallets", Layers: "layers", Sections: "sections", Pieces: "pieces", SalesQty: "sales_qty" };
   return lines.map((line) => {
     const po = poByKey.get(line.targetLineKey) || {};
+    const dependency = dependencyByKey.get(line.targetLineKey) || {};
     const other = sharedById.get(line.salesLineId);
-    const taken = (share, total, used) => other ? Math.max(0, number(share) - Math.max(number(total) - number(used), 0)) : 0;
+    const fields = {};
+    for (const [suffix, shareField, totalField] of units) {
+      const key = poKey[suffix];
+      const share = number(line[shareField]);
+      const ownPo = number(po[key]);
+      const ownDirect = number(dependency[`direct_${key}`]);
+      const capacity = Math.max(0, other
+        ? Math.min(share - ownPo - ownDirect,
+          number(other[totalField]) - ownPo - number(other[`po_${key}`]) - number(other[`direct_${key}`]))
+        : share - ownPo - ownDirect);
+      fields[`poLinkedElsewhere${suffix}`] = Math.max(0, share - ownPo - capacity);
+      if (suffix === "SalesQty") fields.supplyLinkCapacitySalesQty = capacity;
+    }
     return {
       ...line,
-      dependencyAllocatedQuantity: number(dependencyByKey.get(line.targetLineKey)),
+      dependencyAllocatedQuantity: number(dependency.allocated_quantity),
       poAllocatedPallets: number(po.pallets),
       poAllocatedLayers: number(po.layers),
       poAllocatedSections: number(po.sections),
       poAllocatedPieces: number(po.pieces),
       poAllocatedSalesQty: number(po.sales_qty),
-      poLinkedElsewherePallets: taken(line.pallets, other?.pallet_qty, other?.pallets),
-      poLinkedElsewhereLayers: taken(line.layers, other?.layer_qty, other?.layers),
-      poLinkedElsewhereSections: taken(line.sections, other?.section_qty, other?.sections),
-      poLinkedElsewherePieces: taken(line.pieces, other?.piece_qty, other?.pieces),
-      poLinkedElsewhereSalesQty: taken(line.quantity, other?.quantity, other?.sales_qty)
+      ...fields
     };
   });
 }

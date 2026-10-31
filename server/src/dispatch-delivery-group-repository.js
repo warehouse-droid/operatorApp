@@ -1305,6 +1305,43 @@ function withCanonicalGlobalOrderRefs(plan = {}, canonicalByRef = new Map()) {
   };
 }
 
+// A snapshot from before an Ungroup or Regroup holds a group that was since
+// retired. Restoring it may bring the group back only when no member now
+// belongs to another active group, is a retired split, or is planned on
+// another plan. Retired splits themselves stay unrestorable.
+export async function restorableRetiredGroupRefs(plan = {}, planId = "") {
+  const groups = (Array.isArray(plan.orders) ? plan.orders : []).filter(isGroupedDispatchOrder);
+  if (!groups.length) return [];
+  const retired = await query(
+    "SELECT lower(group_ref) AS ref FROM dispatch_global_order_groups WHERE active = false AND lower(group_ref) = ANY($1::text[])",
+    [groups.map((group) => orderIdentity(group).toLowerCase())]
+  );
+  const retiredRefs = new Set(retired.rows.map((row) => row.ref));
+  const restorable = [];
+  for (const group of groups) {
+    const ref = orderIdentity(group);
+    if (!retiredRefs.has(ref.toLowerCase())) continue;
+    const members = (group.childOrders || []).map((member) => text(member).toLowerCase()).filter(Boolean);
+    if (!members.length) continue;
+    const busy = await query(
+      `SELECT 1 FROM dispatch_global_order_group_members member
+         JOIN dispatch_global_order_groups other ON other.group_ref = member.group_ref AND other.active
+        WHERE lower(member.member_order_ref) = ANY($1::text[]) AND lower(other.group_ref) <> $2
+       UNION ALL
+       SELECT 1 FROM dispatch_global_order_splits split
+        WHERE split.active = false AND lower(split.split_ref) = ANY($1::text[])
+       UNION ALL
+       SELECT 1 FROM dispatch_plan_order_assignments assignment
+        WHERE (lower(assignment.order_ref) = ANY($1::text[]) OR lower(assignment.planned_order_ref) = ANY($1::text[]))
+          AND assignment.plan_id::text <> $3
+       LIMIT 1`,
+      [members, ref.toLowerCase(), String(planId || "")]
+    );
+    if (!busy.rowCount) restorable.push(ref);
+  }
+  return restorable;
+}
+
 export async function reconcileDispatchPlanGlobalOrderDefinitions(plan, {
   reactivatedGlobalOrderRefs = [],
   rejectRetiredGlobalOrderRefs = false
