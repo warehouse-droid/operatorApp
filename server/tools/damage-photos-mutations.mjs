@@ -9,7 +9,9 @@ const mutants=[
   {name:'foreign-transfer',file:'src/inventory-damage-photo-links.js',from:'String(report.transfer_id)===String(transfer.id)',to:'true',test:'damage-photo-links'},
   {name:'ambiguous-line',file:'src/inventory-damage-photo-links.js',from:'lines.length!==1',to:'lines.length<1',test:'damage-photo-links'},
   {name:'duplicate-photo',file:'public/damage-photo-download.js',from:'!reference || references.has(reference)',to:'!reference',test:'damage-photo-download'},
-  {name:'wrong-line-name',file:'public/damage-photo-download.js',from:"String(line.line).padStart(3,'0')",to:"String(1).padStart(3,'0')",test:'damage-photo-download'}
+  {name:'wrong-month-name',file:'public/damage-photo-download.js',from:'months[Number(match[1])-1]',to:'months[Number(match[1])]',test:'damage-photo-download'},
+  {name:'wrong-brand',file:'public/damage-photo-download.js',from:'text.slice(0,hyphen)',to:'text',test:'damage-photo-download'},
+  {name:'case-only-collision',file:'public/damage-photo-download.js',from:'key=prefix.toLowerCase()',to:'key=prefix',test:'damage-photo-download'}
 ];
 for(const mutant of mutants) {
   const root=mkdtempSync(join(tmpdir(),'damage-photo-mutant-'));

@@ -21,10 +21,16 @@ Acceptance scenarios:
   into one ZIP. Each reference occurs once, including reports retained after
   removal or awaiting reconciliation. Use saved transfer data rather than edits
   in an unsaved draft.
-- Z2: attached names are `IT00571_line-001_UNI-PISAS-COP-SAFARI_photo-01.jpg`.
-  Preserve actual line keys and image formats. Unmatched/removed reports are
-  named with their report identity/status instead of inventing a current line.
-  Names cannot contain paths; duplicate names remain distinct.
+- Z2: attached names are `Brand_location_month_Damage_SKU_photo-NN`, e.g.
+  `BVS_3445_Oct_Damage_BVS-DMD-2430_photo-01.jpg` (user request 2026-11-02).
+  Brand is the SKU prefix before the first hyphen (`Other` when absent);
+  location is the yard name; NN continues per SKU across lines and reports.
+  Preserve image formats. Names cannot contain paths; duplicate names remain
+  distinct, including names that differ only by letter case.
+- Z6: the user chooses original or compressed photos (user request
+  2026-11-02). Compressed is browser-side JPEG, longest side 1600 px, quality
+  0.8, same names; a photo that cannot be decoded or would not shrink keeps its
+  original bytes. ZIP name gains `_compressed`.
 - Z3: fetch original images through the existing authenticated photo preview
   endpoint. Empty, failed, or non-image responses produce a visible error and
   no incomplete ZIP. Progress is visible; an empty review disables download.

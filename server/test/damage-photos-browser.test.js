@@ -2,12 +2,14 @@
 import test,{before,after} from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import {mkdir,writeFile} from 'node:fs/promises';
+import {mkdir,readFile,writeFile} from 'node:fs/promises';
 import {chromium,expect} from '@playwright/test';
+import sharp from 'sharp';
 import {app} from '../src/server.js';
 import {closeDb} from '../src/db.js';
 import {createOperator,loginOperator} from '../src/auth-repository.js';
 const out='test-artifacts/damage-photos-20261001';
+const originalButton='[data-cd-action="download-photos"][data-quality="original"]',compressedButton='[data-cd-action="download-photos"][data-quality="compressed"]';
 const picture=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=','base64');
 let server,base,browser,token;
 before(async()=>{
@@ -19,9 +21,19 @@ before(async()=>{
   browser=await chromium.launch({headless:true,args:['--no-sandbox']});await mkdir(out,{recursive:true});
 });
 after(async()=>{await browser?.close();await new Promise(resolve=>server.close(resolve));await closeDb();});
-async function open({empty=false,fail=false,expired=false,transient=false}={}) {
+// Stored ZIP entries: [{name,bytes}] read from local headers (no compression in our archives).
+function unzip(bytes) {
+  const files=[];
+  for(let offset=0;bytes.readUInt32LE(offset)===0x04034b50;) {
+    const size=bytes.readUInt32LE(offset+18),nameLength=bytes.readUInt16LE(offset+26),start=offset+30+nameLength;
+    files.push({name:bytes.subarray(offset+30,start).toString('utf8'),bytes:bytes.subarray(start,start+size)});offset=start+size;
+  }
+  return files;
+}
+async function open({empty=false,fail=false,expired=false,transient=false,photo=null}={}) {
   const context=await browser.newContext({viewport:{width:1280,height:900},serviceWorkers:'block',acceptDownloads:true});
-  await context.addInitScript(value=>localStorage.setItem('mbbs.staff.token',value),token);
+  // Seed the session on app pages only: an expired session redirects to /login.html, which must see the cleared token.
+  await context.addInitScript(value=>{if(location.pathname!=='/login.html') {localStorage.setItem('mbbs.staff.token',value);}},token);
   const page=await context.newPage();page.setDefaultTimeout(6000);
   await page.coverage.startJSCoverage({resetOnNavigation:false});
   const originals=[],writes=[];
@@ -32,7 +44,7 @@ async function open({empty=false,fail=false,expired=false,transient=false}={}) {
     if(original && expired) return route.fulfill({status:401,json:{error:'Login required'}});
     if(original && fail && url.searchParams.get('ref')==='r2://photo-2') return route.fulfill({status:404,json:{error:'Missing original photo'}});
     if(original && transient && url.searchParams.get('ref')==='r2://photo-2' && originals.filter(value=>value==='r2://photo-2').length===1) return route.fulfill({status:502,json:{error:'Photo storage is temporarily unreachable. Please try again.',code:'PHOTO_STORAGE_UNAVAILABLE'}});
-    await route.fulfill({contentType:'image/png',body:picture});
+    await route.fulfill(photo || {contentType:'image/png',body:picture});
   });
   await page.route('**/api/control/damage/**',async route=>{
     const url=new URL(route.request().url());
@@ -57,9 +69,11 @@ test('Z1/Z2/Z3 browser: one click downloads every original once with persisted l
   const {page,context,originals,writes}=await open();
   try {
     await page.locator('[data-cd-action="edit"]').click();await page.locator('[data-cd-quantity]').fill('99');await page.locator('[data-cd-action="apply-line"]').click();
-    const saved=page.waitForEvent('download');await page.locator('[data-cd-action="download-photos"]').click();
+    const saved=page.waitForEvent('download');await page.locator(originalButton).click();
     const download=await saved;assert.equal(download.suggestedFilename(),'Damage-stock_3445_2026-10.zip');
     await download.saveAs(`${out}/browser-photos.zip`);
+    const zipped=await readFile(`${out}/browser-photos.zip`);
+    for(const name of ['UNI_3445_Oct_Damage_UNI-PISAS-COP-SAFARI_photo-01.png','UNI_3445_Oct_Damage_UNI-PISAS-COP-SAFARI_photo-02.png','Other_3445_Oct_Damage_Saved SKU_photo-01.png']) {assert.ok(zipped.includes(Buffer.from(name)),name);}
     assert.deepEqual(originals,['r2://photo-1','r2://photo-2','r2://photo-3']);assert.deepEqual(writes,[]);
     await expect(page.locator('.control-damage-quantity')).toHaveText('99 PC');
     await page.setViewportSize({width:390,height:844});
@@ -68,37 +82,61 @@ test('Z1/Z2/Z3 browser: one click downloads every original once with persisted l
       .filter(element=>element.getBoundingClientRect().right>window.innerWidth+1)
       .map(element=>({tag:element.tagName,cls:element.className,left:element.getBoundingClientRect().left,width:element.getBoundingClientRect().width,
         minWidth:getComputedStyle(element).minWidth,text:element.textContent.slice(0,80)}))),null,2));
-    assert.ok(await page.locator('[data-cd-action="download-photos"]').isVisible());
+    assert.ok(await page.locator(originalButton).isVisible());assert.ok(await page.locator(compressedButton).isVisible());
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false);
   } finally {await close(page,context,'success');}
 });
 test('Z3 browser: a missing original shows the error and never downloads an incomplete ZIP',async()=>{
   const {page,context,writes}=await open({fail:true});let downloads=0;page.on('download',()=>downloads++);
   try {
-    await page.locator('[data-cd-action="download-photos"]').click();
+    await page.locator(originalButton).click();
     await expect(page.locator('[data-cd-error]')).toContainText('Missing original photo');
-    await expect(page.locator('[data-cd-action="download-photos"]')).toBeEnabled();
+    await expect(page.locator(originalButton)).toBeEnabled();
     assert.equal(downloads,0);assert.deepEqual(writes,[]);
   } finally {await close(page,context,'failure');}
 });
 test('Z3 browser: a transient storage failure is retried and the complete ZIP downloads',async()=>{
   const {page,context,originals,writes}=await open({transient:true});
   try {
-    const saved=page.waitForEvent('download');await page.locator('[data-cd-action="download-photos"]').click();
+    const saved=page.waitForEvent('download');await page.locator(originalButton).click();
     const download=await saved;assert.equal(download.suggestedFilename(),'Damage-stock_3445_2026-10.zip');
     assert.deepEqual(originals,['r2://photo-1','r2://photo-2','r2://photo-2','r2://photo-3']);assert.deepEqual(writes,[]);
     await expect(page.locator('[data-cd-error]')).toHaveCount(0);
   } finally {await close(page,context,'transient');}
 });
+test('Z6 browser: compressed download resizes full-size photos to JPEG with the same names',async()=>{
+  const width=2400,height=1800,noise=crypto.randomBytes(width*height*3);
+  const full=await sharp(noise,{raw:{width,height,channels:3}}).jpeg({quality:95}).toBuffer();
+  const {page,context,originals,writes}=await open({photo:{contentType:'image/jpeg',body:full}});
+  try {
+    await expect(page.locator(compressedButton)).toHaveText('Download compressed photos (ZIP)');
+    await expect(page.locator(originalButton)).toHaveText('Download original photos (ZIP)');
+    const saved=page.waitForEvent('download');await page.locator(compressedButton).click();
+    const download=await saved;assert.equal(download.suggestedFilename(),'Damage-stock_3445_2026-10_compressed.zip');
+    await download.saveAs(`${out}/browser-compressed.zip`);
+    const files=unzip(await readFile(`${out}/browser-compressed.zip`));
+    assert.deepEqual(files.map(file=>file.name),['UNI_3445_Oct_Damage_UNI-PISAS-COP-SAFARI_photo-01.jpg','UNI_3445_Oct_Damage_UNI-PISAS-COP-SAFARI_photo-02.jpg','Other_3445_Oct_Damage_Saved SKU_photo-01.jpg']);
+    for(const file of files) {
+      const meta=await sharp(file.bytes).metadata();
+      assert.equal(meta.format,'jpeg');assert.equal(Math.max(meta.width,meta.height),1600);assert.equal(meta.width/meta.height,4/3);
+      assert.ok(file.bytes.length<full.length/2,`${file.name} ${file.bytes.length} < ${full.length}`);
+    }
+    assert.deepEqual(originals,['r2://photo-1','r2://photo-2','r2://photo-3']);assert.deepEqual(writes,[]);
+    const plain=page.waitForEvent('download');await page.locator(originalButton).click();
+    const raw=await plain;assert.equal(raw.suggestedFilename(),'Damage-stock_3445_2026-10.zip');
+    await raw.saveAs(`${out}/browser-original.zip`);
+    for(const file of unzip(await readFile(`${out}/browser-original.zip`))) {assert.ok(file.bytes.equals(full),file.name);}
+  } finally {await close(page,context,'compressed');}
+});
 test('Z3 browser: an empty review disables download',async()=>{
   const {page,context}=await open({empty:true});
-  try {await expect(page.locator('[data-cd-action="download-photos"]')).toBeDisabled();}
+  try {await expect(page.locator(originalButton)).toBeDisabled();await expect(page.locator(compressedButton)).toBeDisabled();}
   finally {await close(page,context,'empty');}
 });
 test('Z3/R1 browser: an expired session stops the download and returns to login',async()=>{
   const {page,context,writes}=await open({expired:true});let downloads=0;page.on('download',()=>downloads++);
   try {
-    await page.locator('[data-cd-action="download-photos"]').click();
+    await page.locator(originalButton).click();
     await expect(page.locator('[data-form="login"]')).toBeVisible();
     assert.equal(await page.evaluate(()=>localStorage.getItem('mbbs.staff.token')),null);
     assert.equal(downloads,0);assert.deepEqual(writes,[]);
