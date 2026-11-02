@@ -8,6 +8,8 @@ import {createDeliveryStockRequestFromOrder,calculateDeliveryStockRequest,getScm
 import {refreshStockRequestItemsAvailability} from './stock-request-service.js';
 import {readRegularStockSalesOrderFromNetSuite} from './netsuite.js';
 import {linkRegularStockSalesOrder} from './regular-stock-handoff.js';
+import {loadSalesOrderLineClaims,claimSalesOrderLines} from './regular-stock-line-claims.js';
+import {assertDeliveryLinesUnclaimed,backorderedDeliveryLineIds} from './regular-stock-line-claim-domain.js';
 
 function reference(value) {
   const ref = typeof value === 'string' ? value.trim() : '';
@@ -19,32 +21,50 @@ function requireDelivery(request) {
   if (request.regular?.deliveryVersion !== 1) throw regularError('This request does not use SO-based Delivery.', 'REGULAR_DELIVERY_REQUIRED');
 }
 
-async function existingRequest(order, route, context, selectedRemoteLineIds) {
-  const existing = (await query(`SELECT h.request_id,h.plan FROM regular_stock_handoffs h
-    WHERE h.sales_order_id=$1 OR upper(btrim(h.sales_order_ref))=upper(btrim($2))`, [order.id,order.ref])).rows[0];
-  if (!existing) return null;
-  const request = await getScmStockRequest(existing.request_id);
-  if (request.regular.deliveryVersion !== 1 || request.requestedBy !== context.operatorId
-      || request.regular.sourceLocationId !== route.sourceLocationId || request.destinationLocationId !== route.destinationLocationId) {
-    throw regularError('This SO is already linked to another stock request.', 'REGULAR_SO_REUSED');
+/** Same requester, same route, SO-based Delivery: a resubmission of that request. */
+function ownClaim(route, context) {
+  return claim => claim.regular.deliveryVersion === 1 && claim.requestedBy === context.operatorId
+    && Number(claim.regular.sourceLocationId) === route.sourceLocationId && claim.destinationLocationId === route.destinationLocationId;
+}
+
+/** A resubmission returns the request whose live line claims match it exactly.
+ * Without a selection, it matches only when every backordered line is already covered. */
+async function existingRequest(order, route, context, selection, claims) {
+  const own = new Map();
+  for (const claim of claims.filter(entry => entry.live && ownClaim(route,context)(entry))) {
+    own.set(claim.requestId,[...(own.get(claim.requestId) || []),claim.remoteLineId]);
   }
-  if (selectedRemoteLineIds !== undefined && (selectedRemoteLineIds.length !== existing.plan.materialLineIds.length
-      || selectedRemoteLineIds.some(id => !existing.plan.materialLineIds.includes(id)))) {
-    throw regularError('This SO already has a saved transfer with different selected lines. Open its existing request to check progress.', 'REGULAR_DELIVERY_SELECTION_CONFLICT');
+  if (!own.size) return null;
+  if (selection !== undefined) {
+    const match = [...own].find(([,lineIds]) => lineIds.length === selection.length && selection.every(id => lineIds.includes(id)));
+    return match ? getScmStockRequest(match[0]) : null;
   }
-  return request;
+  const covered = new Set(claims.filter(claim => claim.live).map(claim => claim.remoteLineId));
+  if (backorderedDeliveryLineIds(order,route.destinationLocationId).some(id => !covered.has(id))) return null;
+  return getScmStockRequest(Math.max(...own.keys()));
+}
+
+/** Without an explicit selection, default to backordered lines no live claim covers. */
+function defaultSelection(order, destination, selection, claims) {
+  if (selection !== undefined) return selection;
+  const covered = new Set(claims.filter(claim => claim.live).map(claim => claim.remoteLineId));
+  const open = backorderedDeliveryLineIds(order,destination).filter(id => !covered.has(id));
+  return open.length ? open : undefined;
 }
 
 async function saveRequest(order, route, materials, context) {
   return withTransaction(async () => {
     await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`regular-stock-so:${order.id}`]);
-    const existing = await existingRequest(order,route,context,materials.map(line=>line.remoteLineId));
+    const lineIds = materials.map(line=>line.remoteLineId);
+    const claims = await loadSalesOrderLineClaims(order.id);
+    const existing = await existingRequest(order,route,context,lineIds,claims);
     if (existing) return existing;
+    assertDeliveryLinesUnclaimed(order,lineIds,claims,ownClaim(route,context));
     const request = await createDeliveryStockRequestFromOrder(route,materials,context);
     const approval = {automatic:route.automatic,rule:'delivery_yards',sourceName:route.sourceName,destinationName:route.destinationName};
     const details = {deliveryVersion:1,deliveryMethod:'delivery',sourceLocationId:route.sourceLocationId,sourceName:route.sourceName,
       salesOrderId:order.id,salesOrderRef:order.ref,customerId:order.customerId,approval,palletQuantity:request.deliveryCalculation.palletQuantity,
-      selectedRemoteLineIds:materials.map(line=>line.remoteLineId),
+      selectedRemoteLineIds:lineIds,
       deliveryApproval:route.automatic ? 'approved' : 'pending',approvedAt:route.automatic ? new Date().toISOString() : null};
     await query(`UPDATE sales_stock_requests SET workflow_version=2,regular_details=$2::jsonb,status=$3,
       first_scm_decision_at=CASE WHEN $4 THEN now() ELSE NULL END WHERE id=$1`,
@@ -53,13 +73,14 @@ async function saveRequest(order, route, materials, context) {
       WHERE request_id=$1`, [request.id,route.automatic?'approved':'submitted',route.automatic?'stock':null,route.automatic]);
     const plannedLines = request.lines.map(line => ({...line,decision:'stock'}));
     const plan = {delivery:true,mode:'transfer',sourceLocationId:null,groups:groupStockRequestLinesForTransfer(plannedLines),order,
-      salesOrderId:order.id,salesOrderRef:order.ref,materialLineIds:materials.map(line=>line.remoteLineId),
+      salesOrderId:order.id,salesOrderRef:order.ref,materialLineIds:lineIds,
       mappings:request.deliveryCalculation.lines.map((line,index)=>({requestLineId:request.lines[index].id,
         remoteLineId:line.remoteLineId,itemId:line.itemId,quantity:line.salesQty}))};
     await query(`INSERT INTO regular_stock_handoffs(request_id,sales_order_id,sales_order_ref,plan) VALUES($1,$2,$3,$4::jsonb)`,
       [request.id,order.id,order.ref,JSON.stringify(plan)]);
-    for (const line of materials) await query(`INSERT INTO regular_stock_so_line_owners(sales_order_id,remote_line_id,request_id) VALUES($1,$2,$3)`,
-      [order.id,line.remoteLineId,request.id]);
+    const released = await claimSalesOrderLines(order.id,request.id,materials,claims);
+    if (released.length) await recordStockRequestEvent({requestId:request.id,eventType:'regular_so_lines_reclaimed',actorId:context.operatorId,
+      details:{salesOrderRef:order.ref,lines:released}});
     await recordStockRequestEvent({requestId:request.id,eventType:route.automatic?'regular_auto_approved':'regular_manual_review',actorId:context.operatorId,details:approval});
     return getScmStockRequest(request.id);
   });
@@ -73,9 +94,12 @@ export async function submitDeliveryStockRequest(input, context, dependencies = 
   const selection = normalizeDeliveryLineSelection(input.selectedRemoteLineIds);
   await deliveryProgress('checking_so');
   const order = await (dependencies.readOrder || readRegularStockSalesOrderFromNetSuite)(ref);
-  const existing = await existingRequest(order,route,context,selection);
+  const claims = await loadSalesOrderLineClaims(order.id);
+  const existing = await existingRequest(order,route,context,selection,claims);
   if (existing) return existing.regular.deliveryApproval === 'approved' ? retryDeliveryStockRequest(existing.id,context,dependencies) : existing;
-  const materials = deliveryMaterials(order,route.destinationLocationId,selection);
+  const materials = deliveryMaterials(order,route.destinationLocationId,defaultSelection(order,route.destinationLocationId,selection,claims));
+  // Fail before the stock refresh; saveRequest repeats this under the SO lock.
+  assertDeliveryLinesUnclaimed(order,materials.map(line=>line.remoteLineId),claims,ownClaim(route,context));
   await deliveryProgress('checking_stock');
   await (dependencies.refreshAvailability || refreshStockRequestItemsAvailability)(materials.map(line=>line.itemId));
   await deliveryProgress('calculating');
@@ -89,11 +113,20 @@ export async function previewDeliveryStockRequest(input, context, dependencies =
   const base = deliveryBaseYard(order);
   assertDeliveryStockRequestDestinationAccess(input.sourceLocationId,base.locationId,context.authorizedDestinationLocationIds,{preview:true});
   const candidates = deliveryMaterials(order,base.locationId);
-  const noneSelected = Array.isArray(input.selectedRemoteLineIds) && input.selectedRemoteLineIds.length === 0;
-  const materials = noneSelected ? [] : deliveryMaterials(order,base.locationId,input.selectedRemoteLineIds);
+  const claims = (await loadSalesOrderLineClaims(order.id)).filter(claim => claim.live);
+  const covered = new Map(claims.map(claim => [claim.remoteLineId,claim]));
+  // Lines a live claim covers are shown but not selected; an empty default is a valid "none".
+  const selection = input.selectedRemoteLineIds !== undefined ? input.selectedRemoteLineIds
+    : candidates.filter(line => !covered.has(line.remoteLineId)).map(line => line.remoteLineId);
+  const noneSelected = Array.isArray(selection) && selection.length === 0;
+  const materials = noneSelected ? [] : deliveryMaterials(order,base.locationId,selection);
+  assertDeliveryLinesUnclaimed(order,materials.map(line=>line.remoteLineId),claims,()=>false);
   const result = {salesOrderRef:order.ref,baseLocationId:base.locationId,baseName:base.yardCode,
     candidates:candidates.map(line=>({remoteLineId:line.remoteLineId,itemId:line.itemId,itemName:line.itemName || String(line.itemId),
-      quantity:line.quantity,backorderedQuantity:line.backorderedQuantity,uom:line.uom})),selectedRemoteLineIds:materials.map(line=>line.remoteLineId)};
+      quantity:line.quantity,backorderedQuantity:line.backorderedQuantity,uom:line.uom,
+      ...(covered.has(line.remoteLineId) ? {coveredBy:{requestRef:covered.get(line.remoteLineId).requestRef,
+        transfers:covered.get(line.remoteLineId).transfers.filter(transfer=>!['closed','cancelled','rejected'].includes(String(transfer.status)))}} : {})})),
+    selectedRemoteLineIds:materials.map(line=>line.remoteLineId)};
   if (!input.sourceLocationId || [base.locationId,String(base.locationId)].includes(input.sourceLocationId)) return result;
   const route = deliveryRoute(input.sourceLocationId,base.locationId);
   if (noneSelected) return result;

@@ -136,8 +136,11 @@ test('only checked SO lines create transfer quantities and ownership; retry pres
   assert.equal((await submitDeliveryStockRequest(f.input,ctx,f.dependencies)).id,saved.id);
   assert.equal((await retryDeliveryStockRequest(saved.id,ctx,f.dependencies)).id,saved.id);assert.equal(f.calls.confirm,1);
   await assert.rejects(()=>submitDeliveryStockRequest({...f.input,selectedRemoteLineIds:[1,2]},ctx,f.dependencies),{code:'REGULAR_DELIVERY_SELECTION_CONFLICT'});
-  await assert.rejects(()=>submitDeliveryStockRequest({...f.input,selectedRemoteLineIds:[1]},ctx,f.dependencies),{code:'REGULAR_DELIVERY_SELECTION_CONFLICT'});
-  assert.equal(f.calls.confirm,1);assert.deepEqual(f.order,before);
+  assert.equal(f.calls.confirm,1);
+  // Line 1 was left out of the first TO, so it can get its own request and TO later.
+  const later=await submitDeliveryStockRequest({...f.input,selectedRemoteLineIds:[1]},ctx,f.dependencies);
+  assert.notEqual(later.id,saved.id);assert.deepEqual(later.regular.selectedRemoteLineIds,[1]);assert.equal(f.calls.confirm,2);
+  assert.deepEqual(f.order,before);
 });
 
 test('shortage on an unchecked line does not prevent selected preview or transfer',async()=>{

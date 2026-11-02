@@ -53,9 +53,10 @@ async function claim(id, input, context, readOrder, now) {
       const plan = { ...planRegularStockRouting(/** @type {Parameters<typeof planRegularStockRouting>[0]} */ ({ request, salesOrder: order, selectedLineIds: input.selectedLineIds || {} })), order };
       requireRegularStockConfirmation(id,plan,input.confirmationToken);
       for (const remoteLineId of plan.materialLineIds) {
-        const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2',[order.id,remoteLineId]);
+        const owner = await query('SELECT request_id FROM regular_stock_so_line_owners WHERE sales_order_id=$1 AND remote_line_id=$2 AND released_at IS NULL',[order.id,remoteLineId]);
         if (owner.rowCount && Number(owner.rows[0].request_id) !== Number(id)) throw regularError('An SO line already belongs to another stock request.');
-        await query('INSERT INTO regular_stock_so_line_owners(sales_order_id,remote_line_id,request_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',[order.id,remoteLineId,id]);
+        const itemId = plan.mappings.find(mapping=>mapping.remoteLineId===remoteLineId)?.itemId ?? order.lines.find(line=>line.remoteLineId===remoteLineId)?.itemId ?? null;
+        await query('INSERT INTO regular_stock_so_line_owners(sales_order_id,remote_line_id,request_id,item_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING',[order.id,remoteLineId,id,itemId]);
       }
       handoff = (await query(`INSERT INTO regular_stock_handoffs(request_id,sales_order_id,sales_order_ref,plan)
         VALUES($1,$2,$3,$4::jsonb) RETURNING *`,[id,order.id,order.ref,JSON.stringify(plan)])).rows[0];

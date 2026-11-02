@@ -11,9 +11,16 @@
     const {t,esc,number}=ui(),selected=new Set(preview.selectedRemoteLineIds);
     return `<section class="stock-request-section"><h3>${t('Select lines to transfer','选择调货行')}</h3>
       <p>${t('Only checked lines will be transferred. Unchecked backordered lines stay on the Sales Order.','仅调拨勾选行。未勾选的欠货行保留在销售订单上。')}</p>
-      ${preview.candidates.map(line=>`<label class="stock-request-line regular-delivery-line-option"><input type="checkbox" data-delivery-line-id="${line.remoteLineId}" ${selected.has(line.remoteLineId)?'checked':''} />
-        <span><strong>${esc(line.itemName)}</strong> · ${t('SO quantity','订单数量')}: ${number(line.quantity)} ${esc(line.uom)} · ${t('Backordered','欠货')}: ${number(line.backorderedQuantity)} ${esc(line.uom)}</span></label>`).join('')}
+      ${preview.candidates.map(line=>`<label class="stock-request-line regular-delivery-line-option"><input type="checkbox" data-delivery-line-id="${line.remoteLineId}" ${selected.has(line.remoteLineId)?'checked':''} ${line.coveredBy?'disabled':''} />
+        <span><strong>${esc(line.itemName)}</strong> · ${t('SO quantity','订单数量')}: ${number(line.quantity)} ${esc(line.uom)} · ${t('Backordered','欠货')}: ${number(line.backorderedQuantity)} ${esc(line.uom)}${covered(line)}</span></label>`).join('')}
     </section>`;
+  }
+  // Another request's open TO already covers this SO line; it cannot be selected again until that TO closes.
+  function covered(line) {
+    if(!line.coveredBy)return '';
+    const {t,esc}=ui(),transfers=line.coveredBy.transfers||[];
+    const detail=transfers.length?transfers.map(transfer=>`${esc(transfer.ref||'TO')} ${esc(String(transfer.status||'').replaceAll('_',' '))}`).join(', '):t('TO not created yet','尚未建立调货单');
+    return `<br><small class="stock-request-notice">${t('Already covered by','已由以下申请覆盖')} ${esc(line.coveredBy.requestRef)} (${detail})</small>`;
   }
   function composer(value,destinations,saving) {
     const {t,esc}=ui();
@@ -67,7 +74,7 @@
     }
   }
   async function selectLine(value,lineId,checked,api,render) {
-    const candidates=value.deliveryPreview?.candidates||[];
+    const candidates=(value.deliveryPreview?.candidates||[]).filter(line=>!line.coveredBy);
     if(!candidates.some(line=>line.remoteLineId===lineId))return;
     const selected=new Set(value.selectedRemoteLineIds||value.deliveryPreview.selectedRemoteLineIds);
     if(checked)selected.add(lineId);else selected.delete(lineId);

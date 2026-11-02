@@ -84,6 +84,20 @@ test('browser can uncheck either backordered line, recalculate and submit only t
       const saved=(await query('SELECT request_id,plan FROM regular_stock_handoffs WHERE sales_order_id=$1',[id])).rows[0];
       assert.deepEqual(saved.plan.materialLineIds,[22]);
       assert.deepEqual((await query('SELECT sales_qty FROM sales_stock_request_lines WHERE request_id=$1',[saved.request_id])).rows.map(row=>Number(row.sales_qty)),[200]);
+      // Line 22 now has an open TO and cannot be selected; line 11 can still get its own TO.
+      await page.goto(base+'/sales/stock-requests?tab=regular');
+      await page.locator('[data-sales-stock-action="new"]').click();
+      await page.locator('[data-regular-field="deliveryMethod"]').selectOption('delivery');
+      await page.locator('[data-regular-field="sourceLocationId"]').selectOption('28');
+      await page.locator('[data-regular-field="salesOrderRef"]').fill(ref);
+      await page.locator('[data-regular-field="salesOrderRef"]').blur();
+      await expect(second).toBeDisabled();await expect(second).not.toBeChecked();await expect(first).toBeChecked();
+      await expect(page.locator('[data-delivery-calculation]')).toContainText('Already covered by');
+      await expect(page.locator('[data-delivery-calculation]')).toContainText('PALLET: 1');
+      await page.locator('[data-sales-stock-form] button[type="submit"]').click();
+      await expect(page.locator('.regular-delivery-result')).toContainText('Transfer Order created');
+      assert.deepEqual((await query('SELECT plan FROM regular_stock_handoffs WHERE sales_order_id=$1 ORDER BY request_id',[id])).rows
+        .map(row=>row.plan.materialLineIds),[[22],[11]]);
       assert.deepEqual(errors,[]);
       const coverage=await page.coverage.stopJSCoverage();
       await writeFile(out+'/coverage-'+width+'.json',JSON.stringify(coverage.filter(entry=>/regular-stock-delivery\.js|sales-stock-requests\.js/.test(entry.url))));
