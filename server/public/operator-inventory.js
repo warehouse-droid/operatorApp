@@ -9,7 +9,7 @@
   function create(ctx) {
     const esc=ctx.escape;
     let module='damage',view='entry',config={reasons:[]},busy=false,error='',search='',suggestions=[],searchTimer,generation=0;
-    let item=null,values={},photos=[],reason='',requestId=crypto.randomUUID(),stream=/** @type {MediaStream|null} */(null),cameraGeneration=0,facing='environment',saved=null;
+    let item=null,values={},photos=[],reason='',requestId=crypto.randomUUID(),stream=/** @type {MediaStream|null} */(null),cameraGeneration=0,cameraOpening=false,facing='environment',saved=null;
     let month='',review={reports:[]},selectedReport=null,sheets=[],sheet=null,selectedItem=null,activeUnit='',expressions={},countValues={},loadedContext='';
     let pendingSheet=null,sheetReady=false;
     const drafts=root.MBBSDamageDraftCache.create();
@@ -31,7 +31,11 @@
       const available=physical.filter(unit=>Number(sku?.[unit[2]])>0).map(([key,label,factor])=>({key,label,factor:Number(sku[factor])}));
       return available.length ? available : [{key:damage?'sales':'pieces',label:(damage?sku?.sales_unit:sku?.stock_unit) || 'Qty',factor:1}];
     }
-    function stopCamera() {cameraGeneration++;if(stream){ctx.detachCameraPreviews?.();}stream?.getTracks().forEach(track=>track.stop());stream=null;}
+    function stopCamera() {cameraGeneration++;cameraOpening=false;if(stream){ctx.detachCameraPreviews?.();}stream?.getTracks().forEach(track=>track.stop());stream=null;}
+    // Share the Operator photo camera (also used by Customer Pickup) so Windows tablets pick and switch devices by label.
+    const cameraFacing=()=>ctx.cameraFacing?.() || facing;
+    function switchFacing() {if(ctx.switchCamera){ctx.switchCamera();}else{facing=facing==='environment'?'user':'environment';}}
+    function switchLabel() {const label=ctx.cameraFacingLabel?.();return t('switchCamera','Switch camera')+(label?` (${esc(label)})`:'');}
     function close() {generation++;postingGeneration++;clearTimeout(searchTimer);clearTimeout(postingTimer);stopCamera();}
     function resetDamage() {item=null;values={};photos=[];reason='';search='';suggestions=[];requestId=crypto.randomUUID();submission=null;saved=null;}
     function restoreDraft(draft) {
@@ -65,6 +69,7 @@
     }
     async function open(next) {
       close();
+      if(next==='damage') {ctx.useRearCamera?.();}
       const context=contextKey();
       if(loadedContext!==context) {resetDamage();review={reports:[]};selectedReport=null;month='';loadedContext=context;}
       module=next;busy=true;error='';view='entry';sheet=null;selectedItem=null;pendingSheet=null;sheetReady=false;render();
@@ -116,8 +121,8 @@
         ${renderPosting()}
         <div class="damage-entry-grid">
           <section class="damage-camera-panel"><h2>${t('photos','Damage photos')} <small>${t('photoRequired','At least one required')}</small></h2>
-            <div class="damage-camera-view">${stream?'<video id="damageCamera" autoplay muted playsinline></video>':`<div class="inventory-empty">${t('cameraHelp','Select a SKU and take a photo of the damaged stock.')}</div>`}</div>
-            <div class="inventory-actions">${button('camera',ctx.nativeCamera?.()?t('takePhoto','Take photo'):stream?t('stopCamera','Stop camera'):t('startCamera','Start camera'),!item || busy || damageLocked() || (ctx.nativeCamera?.() && photos.length>=5)?'disabled':'')}${ctx.nativeCamera?.()?'':button('capture',t('takePhoto','Take photo'),!stream || photos.length>=5 || busy || damageLocked()?'disabled':'')+button('flip',t('switchCamera','Switch camera'),!item || busy || damageLocked()?'disabled':'')}</div>
+            <div class="damage-camera-view">${stream?'<video id="damageCamera" autoplay muted playsinline></video>':`<div class="inventory-empty">${t('cameraHelp','Select a SKU and take a photo of the damaged stock.')}</div>`}${ctx.nativeCamera?.()?'':`<button class="primary-button damage-capture-button" data-inv-action="capture" type="button" ${!stream || photos.length>=5 || busy || damageLocked()?'disabled':''}>${t('takePhoto','Take photo')}</button>`}</div>
+            <div class="inventory-actions">${button('camera',ctx.nativeCamera?.()?t('takePhoto','Take photo'):cameraOpening?t('openingCamera','Opening camera…'):stream?t('stopCamera','Stop camera'):t('startCamera','Start camera'),!item || busy || damageLocked() || cameraOpening || (ctx.nativeCamera?.() && photos.length>=5)?'disabled':'')}${ctx.nativeCamera?.()?'':button('flip',switchLabel(),!item || busy || damageLocked()?'disabled':'')}</div>
             <div class="damage-photos">${photos.map((photo,index)=>`<figure><img ${ctx.photo(photo)} alt="${t('damagePhoto','Damage photo')} ${index+1}">${button('remove-photo',t('remove','Remove'),`data-index="${index}" ${busy || damageLocked()?'disabled':''}`)}</figure>`).join('')}</div>
           </section>
           <aside class="damage-quantity-panel"><h2>${item?esc(item.item_name):t('selectSku','Select a SKU')}</h2><p>${esc(item?.item_description || '')}</p>
@@ -150,17 +155,27 @@
     }
     async function camera() {
       if(stream){stopCamera();return render();}
-      if(!item) {return;}
+      if(!item || cameraOpening) {return;}
       if(ctx.nativeCamera?.()) {
         const report=requestId,selected=item;
-        const photo=await ctx.captureNativePhoto(facing);
+        const photo=await ctx.captureNativePhoto(cameraFacing());
         if(photo && ctx.active() && requestId===report && item===selected && view==='entry' && !busy && photos.length<5) {photos.push(photo);await saveDraft();render();}
         return;
       }
+      if(!navigator.mediaDevices?.getUserMedia) {throw new Error(t('cameraUnavailable','Camera is not available in this browser.'));}
       const version=++cameraGeneration;
-      const next=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:facing},width:{ideal:1280}}});
-      if(version!==cameraGeneration || module!=='damage' || view!=='entry') {next.getTracks().forEach(track=>track.stop());return;}
-      stream=next;render();
+      const current=()=>version===cameraGeneration && module==='damage' && view==='entry' && ctx.active();
+      cameraOpening=true;render();
+      try {
+        // ctx.openCamera tries exact facing, then a labelled or different device, as Customer Pickup does.
+        const next=ctx.openCamera?await ctx.openCamera(current):await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:facing},width:{ideal:1280}}});
+        if(!current()) {next.getTracks().forEach(track=>track.stop());return;}
+        stream=next;
+      } catch(failure) {
+        if(!current()) {return;}
+        throw new Error(ctx.cameraError?.(failure) || failure?.message || t('cameraOpenFailed','Camera could not be opened.'));
+      } finally {if(version===cameraGeneration){cameraOpening=false;}}
+      render();
     }
     async function capture() {
       const video=document.getElementById('damageCamera');
@@ -168,6 +183,7 @@
       const canvas=document.createElement('canvas');canvas.width=Math.min(video.videoWidth,1600);canvas.height=Math.round(video.videoHeight*canvas.width/video.videoWidth);
       canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);photos.push(canvas.toDataURL('image/jpeg',0.85));await saveDraft();render();
     }
+    async function flip() {stopCamera();switchFacing();await camera();}
     async function submitDamage() {
       if(!submission && !canSubmitDamage()) {return;}
       const key=loadedContext,state=structuredClone(draftState()),locationId=ctx.location();
@@ -277,7 +293,7 @@
     }
     const actions={
       menu:()=>{close();ctx.back();},refresh:()=>module==='damage'&&view==='review'?loadReview():module==='count-sheets'&&sheet?openSheet(sheet.id):open(module),
-      'damage-item':b=>selectDamage(b.dataset.id),camera,capture,flip:async()=>{stopCamera();facing=facing==='environment'?'user':'environment';await camera();},
+      'damage-item':b=>selectDamage(b.dataset.id),camera,capture,flip,
       'remove-photo':async b=>{photos.splice(Number(b.dataset.index),1);await saveDraft();render();},'submit-damage':submitDamage,
       'retry-saved-damage':retrySavedDamage,'retry-damage-save':submitDamage,
       'damage-review':loadReview,'damage-entry':()=>{view='entry';render();},report:b=>{selectedReport=review.reports.find(r=>r.id===b.dataset.id);render();},

@@ -10963,6 +10963,9 @@ const operatorInventory = window.MBBSOperatorInventory.create({
   back: () => openModule("inventory"), toast: showToast,
   upload: uploadOperatorPhoto, photo: photoImgAttributes, preview: openPhotoLightbox,
   nativeCamera: useBasicCameraCapture, captureNativePhoto: captureNativeCameraPhoto,
+  // Same camera selection as Customer Pickup, so Windows tablets can switch front/rear cameras.
+  openCamera: openCameraStream, cameraError: cameraErrorMessage,
+  cameraFacing: cameraCaptureMode, cameraFacingLabel, switchCamera: switchCameraFacing, useRearCamera: selectRearCamera,
   detachCameraPreviews, active: () => currentModule === "damage" && Boolean(operator)
 });
 window.addEventListener("pagehide", () => operatorInventory.close());

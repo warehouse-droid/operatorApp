@@ -1,14 +1,14 @@
-const CACHE_NAME = "mbbs-yard-operator-20261030-shell-repair-v1";
+const CACHE_NAME = "mbbs-yard-operator-20261102-damage-camera-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
   "/operator.html",
   "/operator-phone.css?v=20261028-return-summary&returnExchangeLayout=20261029",
   "/operator-phone.js?v=20261008-phone-keyboard-v1",
-  "/operator-inventory.css?v=20261008-input-font25-v1",
+  "/operator-inventory.css?v=20261008-input-font25-v1&damageCamera=20261102",
   "/counting-calculator.js?v=20260923-operator-inventory-v1",
   "/damage-draft-cache.js?v=20261001-damage-retry-v1",
-  "/operator-inventory.js?v=20261027-damage-reasons-zh-v1",
+  "/operator-inventory.js?v=20261027-damage-reasons-zh-v1&damageCamera=20261102",
   "/operator-display-settings.css?v=20261008-input-font25-v1&palletEntry=20261026",
   "/operator-display-settings.js?v=20261028-return-enhancements&returnExchangeLayout=20261029",
   "/operator-order-keypad.js?v=20261008-phone-keyboard-v1",
@@ -17,12 +17,12 @@ const APP_SHELL = [
   "/i18n.css?v=20260701-i18n-v2",
   "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029",
+  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&damageCamera=20261102",
   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
   "/operator-popup-audit.js?v=20261026-popup-v1",
-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029",
+  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&damageCamera=20261102",
   "/return-notifications.js?v=20261028-return-enhancements",
   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
   "/scm-special-alert.js?v=20260928-special-alert-v1",
