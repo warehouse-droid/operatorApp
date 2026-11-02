@@ -69,6 +69,20 @@ test('C5 location split requires an explicit final native validation rejection',
     { ...rejected, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: 'Insufficient inventory at location 14.' }] }
   ]) assert.equal(isMixedLocationRejection(error), false);
 });
+test('C5b the real Multi-Location Inventory rejection (SOB123827) authorizes a split', () => {
+  const sentence = 'Fulfillments can be shipped from only one location when using Multi-Location Inventory.';
+  const real = { status: 400, netsuiteResponseReceived: true, netsuiteErrorDetails: [
+    { 'o:errorCode': 'USER_ERROR', detail: `Error while accessing a resource. ${sentence}` }
+  ] };
+  assert.equal(isMixedLocationRejection(real), true);
+  assert.equal(isMixedLocationRejection({ ...real, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: sentence }] }), true);
+  for (const error of [{ ...real, status: 409 }, { ...real, ambiguous: true }, { ...real, netsuiteResponseReceived: false },
+    { ...real, netsuiteErrorDetails: [{ 'o:errorCode': 'INSUFFICIENT_PERMISSION', detail: `Error while accessing a resource. ${sentence}` }] },
+    { ...real, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: 'Error while accessing a resource. Insufficient inventory at location 14.' }] },
+    { ...real, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: 'Error while accessing a resource.' }] },
+    { ...real, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: `${sentence} Contact your administrator.` }] }
+  ]) assert.equal(isMixedLocationRejection(error), false);
+});
 test('C6 missing locations and duplicate REST lines cannot be split', () => {
   assert.throws(() => splitItemFulfillmentPayload({ ...payload, item: { items: [{ orderLine: 1, quantity: 2, itemReceive: true }] } }), /location/i);
   assert.throws(() => splitItemFulfillmentPayload({ ...payload, item: { items: [payload.item.items[0], payload.item.items[0]] } }), /line/i);

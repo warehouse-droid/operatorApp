@@ -49,17 +49,23 @@ export function splitItemFulfillmentPayload(payload) {
 // Only explicit native validation sentences qualify. A generic USER_ERROR or a
 // mention of a location is insufficient; unknown account scripts need review.
 const LOCATION_REJECTIONS = [
+  // Observed from this account's REST transform (SOB123827, 2026-11-02).
+  /^fulfillments can be shipped from only one location when using multi-location inventory[.!]?$/i,
   /^all (?:fulfilled )?(?:items|lines|line items) must (?:have|use|be (?:fulfilled )?from) the same (?:inventory )?location[.!]?$/i,
   /^you (?:can|may) only fulfill (?:items|lines|an order) from (?:a single|one) (?:inventory )?location(?: at a time)?[.!]?$/i,
   /^an item fulfillment (?:can only contain|cannot contain items from more than) (?:a single|one) (?:inventory )?location[.!]?$/i
 ];
+// NetSuite REST prefixes record validation sentences with this generic wrapper.
+const REST_RESOURCE_PREFIX = /^error while accessing a resource\.\s*/i;
+/** @param {any} detail */
+const validationSentence = detail => String(detail?.detail || '').trim().replace(REST_RESOURCE_PREFIX, '');
 /** @param {any} error */
 export function isMixedLocationRejection(error) {
   if (error?.status !== 400 || error.netsuiteResponseReceived !== true || error.ambiguous === true) {return false;}
   const details = error.netsuiteErrorDetails;
   return Array.isArray(details) && details.length > 0 && details.every(detail =>
     ['USER_ERROR', 'INVALID_FLD_VALUE'].includes(detail?.['o:errorCode'])
-      && LOCATION_REJECTIONS.some(pattern => pattern.test(String(detail.detail || '').trim())));
+      && LOCATION_REJECTIONS.some(pattern => pattern.test(validationSentence(detail))));
 }
 
 /** @param {any} step */

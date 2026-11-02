@@ -89,3 +89,18 @@ Deployment passed at 2026-09-18T06:50:59.749150+00:00. Image: `mbbs-operator-app
 Release manifest, rollback image, validated database backups, immutable live-test intent/attempt, transaction result and deployment result are retained under `/home/ubuntu/operatorapp-deploy-backups/child-location-20260918-v1`. The actual test called the shared posting adapter; it did not fabricate operator photos or local packing/completion records.
 
 After cutover, the deployed image independently read and verified IF154026 again. A scoped refresh then read SOB120598 from NetSuite and applied its authoritative status and single source line through the existing sync repository; see `test-artifacts/child-location-cache-refresh.log`. No additional NetSuite transaction was created.
+
+## 2026-11-02: first real mixed-location rejection (SOB123827)
+
+A customer pickup with line 1 at location 14 (3445 : Special) and lines 2–3 at
+location 1 (3445) failed six times. NetSuite answered the combined transform
+with HTTP 400 `USER_ERROR`: "Error while accessing a resource. Fulfillments can
+be shipped from only one location when using Multi-Location Inventory." This
+settles the known limit above: the account rejects mixed-location IFs. The
+original rejection patterns were anchored on guessed sentences, so no split ran.
+`isMixedLocationRejection` now accepts this exact sentence, with or without the
+REST "Error while accessing a resource." prefix. Tests C5b and P2b use the real
+text and the SOB123827 line/location shape (one IF for location 1, one for 14).
+Focused suite: 36/36 passed in the isolated runner. Deployed 2026-11-02 as
+`mbbs-operator-app:if-mli-split-20261102` (app only; record in
+`deployments/if-mli-split-20261102`).

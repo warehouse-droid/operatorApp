@@ -13,7 +13,7 @@ function rejection() { return Object.assign(new Error('All fulfilled items must 
   status: 400, netsuiteResponseReceived: true,
   netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail: 'All fulfilled items must have the same location.' }]
 }); }
-function setup({ combine = false, failPart = null, uncertain = false } = {}) {
+function setup({ combine = false, failPart = null, uncertain = false, reject = rejection, target = step } = {}) {
   let plan = null;
   let nextId = 100;
   let failed = false;
@@ -43,7 +43,7 @@ function setup({ combine = false, failPart = null, uncertain = false } = {}) {
     verify: verifyOperatorNetSuitePostingRecord,
     transform: async s => {
       calls.push(s.externalId);
-      if (s.externalId === step.externalId && !combine) throw rejection();
+      if (s.externalId === target.externalId && !combine) throw reject();
       if (s.externalId.endsWith(`-L${failPart}`) && !failed) {
         failed = true;
         throw Object.assign(new Error(uncertain ? 'timeout' : 'Insufficient stock'), uncertain
@@ -86,6 +86,27 @@ test('P2 explicit location rejection creates and verifies two durable parts', as
   assert.equal(record.fulfillmentParts.length, 2);
   assert.deepEqual(record.fulfillmentParts.map(p => p.inventoryLocationIds), [[1], [14]]);
   assert.deepEqual(env.calls, [step.externalId, `${step.externalId}-L1`, `${step.externalId}-L14`]);
+});
+test('P2b SOB123827: the real Multi-Location Inventory rejection posts one IF per location', async () => {
+  // Shape of the failed 2026-11-02 pickup: line 1 at 3445 : Special (14), lines 2-3 at 3445 (1).
+  const externalId = 'MBBS-OP-e5178cdb-3cb5-451b-9be6-9e8277bdc048-1';
+  const sob = { externalId, sourceOrderKind: 'SO', sourceNetSuiteId: 1108420, transactionType: 'IF',
+    payload: { externalId, item: { items: [
+      { orderLine: 1, quantity: 14, location: 14, itemReceive: true },
+      { orderLine: 2, quantity: 10, location: 1, itemReceive: true },
+      { orderLine: 3, quantity: 1, location: 1, itemReceive: true }
+    ] } } };
+  const detail = 'Error while accessing a resource. Fulfillments can be shipped from only one location when using Multi-Location Inventory.';
+  const reject = () => Object.assign(new Error(`NetSuite REST failed: 400 ${detail}`), {
+    status: 400, netsuiteResponseReceived: true, netsuiteErrorDetails: [{ 'o:errorCode': 'USER_ERROR', detail }] });
+  const env = setup({ reject, target: sob });
+  const result = await env.wrapped.transform(sob);
+  const record = await env.wrapped.fetchById(sob, result.id);
+  assert.equal(env.wrapped.verify(sob, record).id, result.id);
+  assert.deepEqual(env.calls, [externalId, `${externalId}-L1`, `${externalId}-L14`]);
+  assert.deepEqual(record.fulfillmentParts.map(p => p.inventoryLocationIds), [[1], [14]]);
+  const linesByPart = [...env.records.values()].map(r => r.item.items.map(i => [i.orderLine, i.quantity, i.location]));
+  assert.deepEqual(linesByPart, [[[2, 10, 1], [3, 1, 1]], [[1, 14, 14]]]);
 });
 test('P3 a definitive second-part failure retries only that part', async () => {
   const env = setup({ failPart: 14 });
