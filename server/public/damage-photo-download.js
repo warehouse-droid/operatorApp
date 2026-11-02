@@ -64,10 +64,20 @@
     end.view.setUint32(12,centralSize,true);end.view.setUint32(16,offset,true);
     return new Blob([...parts,...central,end.bytes],{type:'application/zip'});
   }
-  async function archive(entries,readPhoto,progress=()=>{}) {
+  // Retry only failures the reader marks transient; missing or denied photos still fail at once.
+  async function readWithRetry(readPhoto,reference,attempts,wait) {
+    for(let attempt=1;;attempt++) {
+      try {return await readPhoto(reference);}
+      catch(error) {
+        if(!error?.retryable || attempt>=attempts) {throw error;}
+        await wait(1000*3**(attempt-1));
+      }
+    }
+  }
+  async function archive(entries,readPhoto,progress=()=>{},{attempts=3,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
     const files=[];progress(0,entries.length);
     for(const entry of entries) {
-      const blob=await readPhoto(entry.reference),type=String(blob.type).split(';')[0].trim().toLowerCase();
+      const blob=await readWithRetry(readPhoto,entry.reference,attempts,wait),type=String(blob.type).split(';')[0].trim().toLowerCase();
       const extension=extensions[type];
       if(!blob.size || !extension) {throw new Error(`Invalid or unsupported photo image: ${entry.name}`);}
       files.push({name:`${entry.name}.${extension}`,bytes:new Uint8Array(await blob.arrayBuffer())});

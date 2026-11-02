@@ -211,6 +211,44 @@ export function createPhotoReadToken({ actor, key, options = {} } = {}) {
   };
 }
 
+// Gateway/rate-limit statuses from the R2 worker or Cloudflare edge that can succeed on retry.
+const TRANSIENT_R2_READ_STATUSES = new Set([408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+
+/**
+ * Read an R2 worker object with a bounded retry for transient network and
+ * gateway failures (for example an edge connect timeout). The whole read,
+ * including retries, fits inside `budgetMs` so browser callers do not time out
+ * first. A non-transient response (success, 403, 404, ...) is returned for the
+ * caller to relay; exhausted transient failures become one clear 502.
+ */
+export async function readR2Object(ticket, {
+  fetch: transport = fetch, attempts = 3, budgetMs = 45000, retryDelayMs = 500,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = () => Date.now()
+} = {}) {
+  const deadline = now() + budgetMs;
+  let failure = "";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const remaining = deadline - now();
+    if (remaining < 1000) break;
+    try {
+      const response = await transport(ticket.objectUrl, {
+        headers: { Authorization: `Bearer ${ticket.token}` },
+        signal: AbortSignal.timeout(remaining)
+      });
+      if (!TRANSIENT_R2_READ_STATUSES.has(response.status)) {
+        return { response, body: Buffer.from(await response.arrayBuffer()) };
+      }
+      failure = `HTTP ${response.status}`;
+      await response.body?.cancel().catch(() => {});
+    } catch (error) {
+      failure = String(error?.cause?.code || error?.code || error?.name || "NETWORK_ERROR");
+    }
+    if (attempt < attempts) await sleep(Math.min(retryDelayMs * 3 ** (attempt - 1), Math.max(0, deadline - now() - 1000)));
+  }
+  console.warn(JSON.stringify({ event: "r2_photo_read_unavailable", attempts, failure: failure.slice(0, 80) }));
+  throw Object.assign(httpError(502, "Photo storage is temporarily unreachable. Please try again."), { code: "PHOTO_STORAGE_UNAVAILABLE" });
+}
+
 export function createPhotoDeleteToken({ actor, key, options = {} } = {}) {
   const settings = photoUploadSettings();
   const secret = config.photoUpload?.tokenSecret || "";

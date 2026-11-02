@@ -56,6 +56,26 @@ test('Z3: missing, empty, non-image and unsupported-format photos fail the whole
     await assert.rejects(download.archive(entries,async()=>blob),/image|photo|format/i);
   }
 });
+test('Z3 retry: a transient photo failure is retried and the complete ZIP is still produced',async()=>{
+  const entries=[{reference:'r2://a',name:'IT00571_line-001_SKU_photo-01'},{reference:'r2://b',name:'IT00571_line-001_SKU_photo-02'}];
+  const calls=[],waits=[];
+  const blob=await download.archive(entries,async reference=>{
+    calls.push(reference);
+    if(reference==='r2://b' && calls.filter(value=>value===reference).length<3) {throw Object.assign(new Error('Photo storage is temporarily unreachable. Please try again.'),{status:502,retryable:true});}
+    return new Blob([picture],{type:'image/png'});
+  },()=>{},{wait:async ms=>{waits.push(ms);}});
+  assert.deepEqual(calls,['r2://a','r2://b','r2://b','r2://b']);assert.deepEqual(waits,[1000,3000]);
+  const bytes=Buffer.from(await blob.arrayBuffer());assert.equal(bytes.readUInt16LE(bytes.length-12),2);
+});
+test('Z3 retry: persistent transient failures and permanent failures still produce no ZIP',async()=>{
+  const entries=[{reference:'r2://a',name:'IT00571_line-001_SKU_photo-01'}];
+  let calls=0;
+  await assert.rejects(download.archive(entries,async()=>{calls++;throw Object.assign(new Error('Network error while downloading photos.'),{retryable:true});},()=>{},{wait:async()=>{}}),/Network error/);
+  assert.equal(calls,3);
+  calls=0;
+  await assert.rejects(download.archive(entries,async()=>{calls++;throw Object.assign(new Error('Missing original photo'),{status:404,retryable:false});},()=>{},{wait:async()=>{}}),/Missing original photo/);
+  assert.equal(calls,1);
+});
 test('Z4: ZIP supports Unicode names and exact bytes, and rejects duplicate entry paths',async()=>{
   const files=[{name:'IT00571_line-001_损坏砖_photo-01.webp',bytes:new Uint8Array([0,1,2,3,255])}];
   const bytes=Buffer.from(await download.zip(files).arrayBuffer());

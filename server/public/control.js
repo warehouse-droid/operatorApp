@@ -491,11 +491,19 @@ function photoImgAttributes(value, { thumbnail = false, lazy = false } = {}) {
 }
 
 async function readOriginalDamagePhoto(ref) {
-  const response = await fetch(`/api/photo-upload/preview?${new URLSearchParams({ ref })}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-    cache: "no-store",
-    signal: AbortSignal.timeout(60000)
-  });
+  // Network drops, timeouts and gateway/storage outages are marked retryable for the ZIP builder.
+  const networkFailure = (error) => Object.assign(new Error(error?.name === "TimeoutError"
+    ? "Photo download timed out. Please try again." : "Network error while downloading photos. Please try again."), { retryable: true });
+  let response;
+  try {
+    response = await fetch(`/api/photo-upload/preview?${new URLSearchParams({ ref })}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: "no-store",
+      signal: AbortSignal.timeout(60000)
+    });
+  } catch (error) {
+    throw networkFailure(error);
+  }
   if (response.status === 401) {
     clearStaffSession();
     operator = null;
@@ -504,9 +512,14 @@ async function readOriginalDamagePhoto(ref) {
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.error || "Photo download failed");
+    throw Object.assign(new Error(payload?.error || "Photo download failed"),
+      { status: response.status, retryable: response.status === 408 || response.status === 429 || response.status >= 500 });
   }
-  return response.blob();
+  try {
+    return await response.blob();
+  } catch (error) {
+    throw networkFailure(error);
+  }
 }
 
 function releaseSecurePhotoImage(image) {

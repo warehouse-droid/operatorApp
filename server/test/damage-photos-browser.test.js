@@ -19,7 +19,7 @@ before(async()=>{
   browser=await chromium.launch({headless:true,args:['--no-sandbox']});await mkdir(out,{recursive:true});
 });
 after(async()=>{await browser?.close();await new Promise(resolve=>server.close(resolve));await closeDb();});
-async function open({empty=false,fail=false,expired=false}={}) {
+async function open({empty=false,fail=false,expired=false,transient=false}={}) {
   const context=await browser.newContext({viewport:{width:1280,height:900},serviceWorkers:'block',acceptDownloads:true});
   await context.addInitScript(value=>localStorage.setItem('mbbs.staff.token',value),token);
   const page=await context.newPage();page.setDefaultTimeout(6000);
@@ -31,6 +31,7 @@ async function open({empty=false,fail=false,expired=false}={}) {
     if(original) originals.push(url.searchParams.get('ref'));
     if(original && expired) return route.fulfill({status:401,json:{error:'Login required'}});
     if(original && fail && url.searchParams.get('ref')==='r2://photo-2') return route.fulfill({status:404,json:{error:'Missing original photo'}});
+    if(original && transient && url.searchParams.get('ref')==='r2://photo-2' && originals.filter(value=>value==='r2://photo-2').length===1) return route.fulfill({status:502,json:{error:'Photo storage is temporarily unreachable. Please try again.',code:'PHOTO_STORAGE_UNAVAILABLE'}});
     await route.fulfill({contentType:'image/png',body:picture});
   });
   await page.route('**/api/control/damage/**',async route=>{
@@ -79,6 +80,15 @@ test('Z3 browser: a missing original shows the error and never downloads an inco
     await expect(page.locator('[data-cd-action="download-photos"]')).toBeEnabled();
     assert.equal(downloads,0);assert.deepEqual(writes,[]);
   } finally {await close(page,context,'failure');}
+});
+test('Z3 browser: a transient storage failure is retried and the complete ZIP downloads',async()=>{
+  const {page,context,originals,writes}=await open({transient:true});
+  try {
+    const saved=page.waitForEvent('download');await page.locator('[data-cd-action="download-photos"]').click();
+    const download=await saved;assert.equal(download.suggestedFilename(),'Damage-stock_3445_2026-10.zip');
+    assert.deepEqual(originals,['r2://photo-1','r2://photo-2','r2://photo-2','r2://photo-3']);assert.deepEqual(writes,[]);
+    await expect(page.locator('[data-cd-error]')).toHaveCount(0);
+  } finally {await close(page,context,'transient');}
 });
 test('Z3 browser: an empty review disables download',async()=>{
   const {page,context}=await open({empty:true});

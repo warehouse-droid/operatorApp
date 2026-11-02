@@ -458,7 +458,7 @@ import {
   releaseDriverOfflineReconciliationReceipt
 } from "./driver-offline-reconciliation-repository.js";
 import { createSamsaraDriverAuthToken, createSamsaraDriverVehicleAssignment, findSamsaraDriverByUsername, listSamsaraVehicleLocations, setSamsaraDriverDutyStatus, testSamsaraConnection } from "./samsara.js";
-import { createPhotoReadToken, createPhotoUploadToken, isJpegEvidenceBytes, isR2PhotoReference, normalizeR2Key, publicPhotoUploadConfig } from "./photo-upload.js";
+import { createPhotoReadToken, createPhotoUploadToken, isJpegEvidenceBytes, isR2PhotoReference, normalizeR2Key, publicPhotoUploadConfig, readR2Object } from "./photo-upload.js";
 import { cachePhotoThumbnail, createPhotoThumbnail, readCachedPhotoThumbnail } from "./photo-thumbnail.js";
 import {
   getDeliveryInstruction,
@@ -19110,14 +19110,10 @@ app.get("/api/photo-upload/preview", requirePhotoPreviewViewer, async (req, res,
       actor: req.photoViewer,
       key: ref || req.query.key
     });
-    const response = await fetch(readTicket.objectUrl, {
-      headers: { Authorization: `Bearer ${readTicket.token}` }
-    });
+    const { response, body: buffer } = await readR2Object(readTicket);
     if (!response.ok) {
-      const text = await response.text();
-      return res.status(response.status).json({ error: text || "R2 photo preview failed." });
+      return res.status(response.status).json({ error: buffer.toString("utf8") || "R2 photo preview failed." });
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
     if (wantsThumbnail) {
       try {
         const thumbnail = await createPhotoThumbnail(
