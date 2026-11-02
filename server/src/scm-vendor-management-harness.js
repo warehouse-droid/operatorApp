@@ -54,7 +54,13 @@ assert.ok(server.includes('app.put("/api/scm/local-vendors/:id", requireSmartScm
 assert.ok(server.includes('app.post("/api/scm/local-vendors/:id/yards", requireSmartScmWriteAccess'));
 assert.ok(server.includes('app.put("/api/scm/local-vendors/:id/yards/:yardRowId", requireSmartScmWriteAccess'));
 assert.ok(server.includes('app.get("/scm/vendors"'));
-assert.ok(repository.includes("const referencedIds = currentIds.length"));
+// A yard's original summary row (for example "Mon-Fri") keeps its ID: it is never
+// reused as a weekday row, and Item Master follows the picker's canonical row.
+assert.ok(repository.includes("const summaryRows = currentRows.filter"));
+assert.ok(repository.includes("const existing = byDay.get(day.dayLabel);"));
+assert.ok(!repository.includes("reusableRows.shift()"), "Summary rows must not be repurposed as weekday rows.");
+assert.ok(repository.includes("vendorScheduleLabelCovers(row.day_label, day.dayLabel)"));
+assert.ok(repository.includes("repointedItemPolicies = repointed.rowCount"));
 assert.ok(repository.includes("aliasValues.push(previousYard)"));
 assert.ok(repository.includes("UPDATE scm_smart_item_policies"));
 assert.ok(repository.includes("UPDATE purchase_orders po"));
@@ -67,5 +73,6 @@ console.log(JSON.stringify({
   scmNavigation: true,
   scmWriteProtection: true,
   vendorAndYardCrud: true,
-  renamePropagation: true
+  renamePropagation: true,
+  summaryRowIdentityPreserved: true
 }));

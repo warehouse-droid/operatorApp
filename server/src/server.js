@@ -12002,6 +12002,8 @@ async function saveScmVendorYard(req, res, next) {
         yard: saved.yard,
         previousYard: saved.previousYard,
         activeDays: saved.rows.filter((row) => row.active).map((row) => row.dayLabel),
+        canonicalRowId: saved.canonicalRowId,
+        repointedItemPolicies: saved.repointedItemPolicies,
         enriched
       }
     });

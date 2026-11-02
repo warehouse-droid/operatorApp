@@ -24,6 +24,7 @@ import { smartScmVendorUnitPriceEdit } from "./smart-scm-vendor-unit-price.js";
 import { applySmartScmVendorPalletUnitPrice } from "./smart-scm-vendor-unit-price-repository.js";
 import { listSmartScmBlanketPoolRows } from "./smart-scm-blanket-pool-repository.js";
 import { smartScmBlanketCoverageSnapshot } from "./smart-scm-blanket-coverage.js";
+import { canonicalVendorYardId, canonicalVendorYardIds } from "./vendor-yard-identity.js";
 import { resumeSmartScmBlanketCoveredPlanningExclusions } from "./smart-scm-planning-exclusion-repository.js";
 
 const EPSILON = 0.000001;
@@ -532,8 +533,10 @@ export function smartScmBlanketDraftGroupsForPlanning({ states = [] } = {}) {
 
 export function smartScmBlanketProposalSourceMatchesPolicy(proposal = {}, policy = {}) {
   if (!smartScmBlanketPolicyHasVendorYardOverride(policy)) return true;
-  const expectedId = integer(policy.vendor_yard_id);
-  const actualId = integer(proposal.source_vendor_yard_id);
+  // Callers that resolved canonical rows compare the yard rather than the
+  // schedule row, so items on another row of the same yard still match.
+  const expectedId = integer(policy.canonical_vendor_yard_id ?? policy.vendor_yard_id);
+  const actualId = integer(proposal.canonical_source_vendor_yard_id ?? proposal.source_vendor_yard_id);
   if (expectedId !== actualId) return false;
   const expectedName = text(
     policy.vendor_yard
@@ -548,7 +551,15 @@ export function smartScmBlanketProposalSourceMatchesPolicy(proposal = {}, policy
   );
 }
 
-async function assertBlanketProposalVendorYardCurrent(proposal = {}, lines = []) {
+async function withCanonicalSourceVendorYard(proposal = {}) {
+  return {
+    ...proposal,
+    canonical_source_vendor_yard_id: await canonicalVendorYardId(proposal.source_vendor_yard_id)
+  };
+}
+
+async function assertBlanketProposalVendorYardCurrent(sourceProposal = {}, lines = []) {
+  const proposal = await withCanonicalSourceVendorYard(sourceProposal);
   const checked = new Set();
   for (const line of lines || []) {
     const itemId = integer(line.item_id ?? line.itemId);
@@ -1032,9 +1043,11 @@ export async function mergeSmartScmBlanketProposals(proposalIds = [], operatorId
         || text(proposal.blanket_source_po_ref).toLowerCase() !== text(first.blanket_source_po_ref).toLowerCase())) {
       throw httpError("Selected loads must use the same source Blanket PO.", 409);
     }
-    const firstVendorYardId = integer(first.source_vendor_yard_id);
+    const canonicalYards = await canonicalVendorYardIds(selected.map((proposal) => proposal.source_vendor_yard_id));
+    const vendorYardOf = (proposal) => canonicalYards.get(integer(proposal.source_vendor_yard_id)) ?? integer(proposal.source_vendor_yard_id);
+    const firstVendorYardId = vendorYardOf(first);
     const firstSourceName = smartScmRouteRuleKey(first.source_name || first.plant);
-    if (selected.some((proposal) => integer(proposal.source_vendor_yard_id) !== firstVendorYardId
+    if (selected.some((proposal) => vendorYardOf(proposal) !== firstVendorYardId
       || smartScmRouteRuleKey(proposal.source_name || proposal.plant) !== firstSourceName)) {
       throw httpError("Selected loads must use the same Item Master vendor pickup yard.", 409);
     }
@@ -2077,6 +2090,7 @@ export async function searchSmartScmBlanketProposalSourceItems(proposalId, {
   limit = 20
 } = {}) {
   const proposal = await editableBlanketProposalForSourceItem(proposalId);
+  const yardMatchProposal = await withCanonicalSourceVendorYard(proposal);
   const destinationId = integer(destinationLocationId ?? proposal.destination_location_id);
   if (!BLANKET_DESTINATIONS.has(destinationId)) throw httpError("Select a valid destination yard.");
   const maxRows = Math.min(100, Math.max(1, Number(limit) || 20));
@@ -2101,7 +2115,7 @@ export async function searchSmartScmBlanketProposalSourceItems(proposalId, {
     const plannedPallets = positive(plannedBySourceLine.get(Number(row.source_line_id)));
     const availableForPlanningPallets = Math.max(0, Math.floor(physicalOpenPallets - plannedPallets + EPSILON));
     if (!policy
-      || !smartScmBlanketProposalSourceMatchesPolicy(proposal, policy)
+      || !smartScmBlanketProposalSourceMatchesPolicy(yardMatchProposal, policy)
       || Math.abs(positive(policy.to_plt) - positive(row.to_plt)) > EPSILON
       || positive(policy.pallet_weight_lbs) <= EPSILON
       || availableForPlanningPallets <= 0
@@ -2160,7 +2174,7 @@ export async function addSmartScmBlanketProposalSourceLine(proposalId, values = 
     if (!policy) {
       throw httpError("This source-PO item is not enabled for planning at the selected destination yard.", 409);
     }
-    if (!smartScmBlanketProposalSourceMatchesPolicy(proposal, policy)) {
+    if (!smartScmBlanketProposalSourceMatchesPolicy(await withCanonicalSourceVendorYard(proposal), policy)) {
       throw httpError(
         "This source-PO item's Item Master pickup yard does not match the selected Blanket load.",
         409,

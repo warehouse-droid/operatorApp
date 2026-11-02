@@ -1,4 +1,5 @@
 import {query,withTransaction} from './db.js';
+import {canonicalVendorYardIds} from './vendor-yard-identity.js';
 import {allocatePurchaseQuantity} from './regular-stock-purchase-domain.js';
 import {describePurchaseOrderLinePallets} from './scm-netsuite-po-unit-conversion.js';
 import {refreshStockingReplyStatus} from './regular-stock-line-actions.js';
@@ -59,11 +60,14 @@ export async function reconcilePurchaseStockAllocations() {
     const canonical=poIds.length?(await query(`SELECT l.*,COALESCE(l.location_id,p.destination_location_id) AS effective_location_id,p.netsuite_active AS order_active,p.status_text AS order_status
       FROM purchase_order_lines l JOIN purchase_orders p ON p.netsuite_id=l.purchase_order_id
       WHERE l.purchase_order_id=ANY($1::bigint[]) ORDER BY l.purchase_order_id,l.line_id,l.id`,[poIds])).rows:[];
+    // Demands and loads can reference different schedule rows of one vendor yard.
+    const yardIdentity=await canonicalVendorYardIds([...demands.map(d=>d.vendor_yard_id),...lines.map(l=>l.source_vendor_yard_id)]);
+    const yardOf=id=>yardIdentity.get(Number(id))??Number(id);
     const consumed=new Map();
     const desired=[];
     for(const line of lines){
       const linked=demands.filter(d=>idsFor(line).includes(Number(d.id)) && Number(d.item_id)===Number(line.item_id)
-        && Number(d.destination_location_id)===Number(line.destination_location_id) && Number(d.vendor_yard_id)===Number(line.source_vendor_yard_id));
+        && Number(d.destination_location_id)===Number(line.destination_location_id) && yardOf(d.vendor_yard_id)===yardOf(line.source_vendor_yard_id));
       if(!linked.length)continue;
       const append=(quantity,received,poId=null,poLineId=null)=>{
         // Allocate sales units, preserving accepted quantities if the current

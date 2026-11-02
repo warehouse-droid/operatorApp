@@ -105,7 +105,7 @@ export async function addPurchaseStockProposals(id,input,context,dependencies={}
         WHERE l.item_id=$1 AND l.status='approved' AND d.approved_quantity>d.released_quantity AND d.to_plt<>$2 LIMIT 1`,[line.itemId,quantity.toPlt]);
       if(changedConversion.rowCount)throw regularError(`The pallet conversion for ${line.itemName} changed. Receive or release its existing Purchase demand before accepting a different conversion.`);
       await query(`INSERT INTO regular_stock_purchase_demands(request_line_id,vendor_yard_id,vendor_id,policy_snapshot,requested_quantity,reviewed_quantity,approved_quantity,to_plt,accepted_by)
-        VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)`,[line.id,policy.vendor_yard_id,policy.vendor_id,JSON.stringify(policy),quantity.requestedQuantity,quantity.reviewedQuantity,quantity.approvedQuantity,quantity.toPlt,context.operatorId]);
+        VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9)`,[line.id,policy.canonical_vendor_yard_id??policy.vendor_yard_id,policy.vendor_id,JSON.stringify(policy),quantity.requestedQuantity,quantity.reviewedQuantity,quantity.approvedQuantity,quantity.toPlt,context.operatorId]);
       await query("UPDATE sales_stock_request_lines SET status='approved',regular_decision='po',decided_by=$2,decided_at=now(),updated_at=now() WHERE id=$1",[line.id,context.operatorId]);
     }
     await buildOutstandingPurchaseLoads();

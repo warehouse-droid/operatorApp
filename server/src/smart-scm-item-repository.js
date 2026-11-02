@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { TextDecoder } from "node:util";
 import { query, withTransaction } from "./db.js";
 import { writeAudit } from "./auth-repository.js";
+import { canonicalVendorYardIdSql } from "./vendor-yard-identity.js";
 import {
   defaultReturnPolicy,
   effectiveReturnPolicy,
@@ -351,7 +352,8 @@ export async function listSmartScmItems({
       throw Object.assign(new Error("Select a valid vendor yard override filter."), { status: 400 });
     }
     params.push(Number(match[1]));
-    clauses.push("p.vendor_yard_id = $" + params.length);
+    // Include items on any schedule row of the selected vendor yard.
+    clauses.push(`${canonicalVendorYardIdSql("p.vendor_yard_id")} = ${canonicalVendorYardIdSql(`$${params.length}::bigint`)}`);
   }
   const lowerStockPolicyFilter = String(lowerStockPolicy || "").trim().toLowerCase();
   if (lowerStockPolicyFilter === "any") {

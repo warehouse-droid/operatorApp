@@ -4,6 +4,7 @@ import { smartScmOrderedLines, smartScmLineKey } from "./smart-scm-line-order.js
 import { syncRegularReplenishments, creditRegularReplenishments, listRegularReplenishments } from './regular-stock-replenishment.js';
 import { hasActiveTransaction, query, withTransaction } from "./db.js";
 import { smartScmSplitRemainingSql } from "./smart-scm-split-inbound-sql.js";
+import { vendorYardIdentityTableSql } from "./vendor-yard-identity.js";
 import { writeAudit } from "./auth-repository.js";
 import { latestSmartScmForecastRunId, smartScmForecastMap } from "./smart-scm-forecast-repository.js";
 import { calculateSmartScmOrderRequirement, calculateSmartScmPolicyLevels } from "./smart-scm-policy-calculation.js";
@@ -400,6 +401,7 @@ export async function loadSmartScmPlanningPolicies({
             ) AS plant,
             p.vendor_yard AS configured_vendor_yard,
             p.plant AS configured_plant,
+            COALESCE(vendor_yard_identity.canonical_id, p.vendor_yard_id) AS canonical_vendor_yard_id,
             CASE WHEN COALESCE(i.item_weight, 0) > 0 AND COALESCE(i.to_plt, 0) > 0
                  THEN i.item_weight * i.to_plt ELSE p.pallet_weight_lbs END AS pallet_weight_lbs,
             COALESCE((
@@ -416,6 +418,7 @@ export async function loadSmartScmPlanningPolicies({
        JOIN scm_smart_item_yard_policies y ON y.item_id = p.item_id
        LEFT JOIN inventory_items i ON i.item_id = p.item_id
        LEFT JOIN dispatch_vendor_yards vy ON vy.id = p.vendor_yard_id
+       LEFT JOIN ${vendorYardIdentityTableSql()} vendor_yard_identity ON vendor_yard_identity.id = p.vendor_yard_id
        LEFT JOIN LATERAL (
          SELECT exclusion.item_id
            FROM scm_smart_planning_exclusions exclusion
@@ -437,8 +440,11 @@ export async function loadSmartScmPlanningPolicies({
     : smartScmAvailableBlanketBalanceByItem()]);
   return result.rows.map((row) => {
     const blanket = resolvedBlanketBalanceByItem.get(String(row.item_id)) || {};
+    const { canonical_vendor_yard_id: canonicalVendorYardId, ...policy } = row;
     return {
-      ...row,
+      ...policy,
+      // Plan every schedule row of one vendor yard as the same pickup point.
+      vendor_yard_id: canonicalVendorYardId ?? row.vendor_yard_id,
       blanket_available_sales_qty: positive(blanket.availableSalesQty),
       blanket_available_pallets: positive(blanket.availablePallets),
       blanket_coverage_available: positive(blanket.availablePallets) > EPSILON

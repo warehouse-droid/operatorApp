@@ -10,6 +10,7 @@ import { getSmartScmPlanningRun, getSmartScmProposal, smartScmPackWholePalletLin
   smartScmUrgencyLevel, smartScmUrgencyRank, smartScmUrgencySummary,
   loadSmartScmPlanningDemandStates } from "./smart-scm-planning-repository.js";
 import { getSmartScmRouteRule } from "./smart-scm-route-repository.js";
+import { canonicalVendorYardId, canonicalVendorYardIds, canonicalVendorYardIdSql } from "./vendor-yard-identity.js";
 
 const EPSILON = 0.000001;
 const MANUAL_CAPACITY_REASON_KEYS = Object.freeze([
@@ -640,10 +641,13 @@ export async function groupSmartScmProposals(proposalIds = [], operatorId = null
         throw Object.assign(new Error("TO loads can be grouped only when source and destination yards are the same."), { status: 409 });
       }
     } else {
-      const firstVendorYardId = first.source_vendor_yard_id === null ? null : Number(first.source_vendor_yard_id);
+      // Schedule rows of one vendor yard share a canonical row; compare that.
+      const canonicalYards = await canonicalVendorYardIds(selected.map((proposal) => proposal.source_vendor_yard_id));
+      const canonicalYardOf = (proposal) => canonicalYards.get(Number(proposal.source_vendor_yard_id)) ?? null;
+      const firstVendorYardId = first.source_vendor_yard_id === null ? null : canonicalYardOf(first);
       const vendor = normalized(first.vendor);
       const mismatchedVendorYard = firstVendorYardId
-        ? selected.some((proposal) => Number(proposal.source_vendor_yard_id) !== firstVendorYardId)
+        ? selected.some((proposal) => canonicalYardOf(proposal) !== firstVendorYardId)
         : selected.some((proposal) => proposal.source_vendor_yard_id !== null
           || normalized(proposal.plant || proposal.source_name) !== normalized(first.plant || first.source_name));
       if (mismatchedVendorYard || selected.some((proposal) => normalized(proposal.vendor) !== vendor)) {
@@ -861,6 +865,7 @@ async function itemPolicy(itemId, destinationLocationId, { allowExcluded = false
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
             policy.vendor_yard_id,
+            ${canonicalVendorYardIdSql("policy.vendor_yard_id")} AS canonical_vendor_yard_id,
             COALESCE(
               NULLIF(BTRIM(vendor_yard.yard), ''),
               NULLIF(BTRIM(policy.vendor_yard), ''),
@@ -1099,7 +1104,7 @@ export async function searchSmartScmManualLoadItems({
   const result = await query(
     `SELECT item.item_id, item.item_name, item.item_description, item.stock_unit, item.vendor_id,
             COALESCE(NULLIF(item.vendor, ''), NULLIF(policy.vendor, '')) AS vendor,
-            policy.vendor_yard_id,
+            ${canonicalVendorYardIdSql("policy.vendor_yard_id")} AS vendor_yard_id,
             COALESCE(NULLIF(BTRIM(vendor_yard.yard), ''), NULLIF(BTRIM(policy.vendor_yard), ''), NULLIF(BTRIM(policy.plant), ''), NULLIF(BTRIM(item.vendor), ''), NULLIF(BTRIM(policy.vendor), '')) AS source_name,
             COALESCE(item.to_plt, policy.to_plt) AS to_plt,
             CASE WHEN COALESCE(item.item_weight, 0) > 0 AND COALESCE(item.to_plt, policy.to_plt, 0) > 0
@@ -1230,7 +1235,7 @@ export async function createSmartScmManualLoad(runId, values = {}, operatorId = 
       phase: proposalType === "PO" ? "direct_vendor" : "internal_transfer",
       sourceKind: proposalType === "PO" ? "vendor" : "yard",
       sourceLocationId: proposalType === "TO" ? source.locationId : null,
-      sourceVendorYardId: proposalType === "PO" ? item.vendor_yard_id : null,
+      sourceVendorYardId: proposalType === "PO" ? (item.canonical_vendor_yard_id ?? item.vendor_yard_id) : null,
       sourceName,
       destinationLocationId: destination.locationId,
       destinationName: destination.code,
@@ -1303,8 +1308,10 @@ export async function searchSmartScmProposalItems(proposalId, { search = "", des
     params.push(Number(vendor.rows[0]?.vendor_id || 0));
     vendorClause = `AND item.vendor_id = $${params.length}`;
     if (proposal.source_vendor_yard_id !== null) {
+      // Match the yard, not the schedule row: items set up before and after a
+      // vendor-yard schedule change can point at different rows of one yard.
       params.push(Number(proposal.source_vendor_yard_id));
-      vendorClause += ` AND policy.vendor_yard_id = $${params.length}`;
+      vendorClause += ` AND ${canonicalVendorYardIdSql("policy.vendor_yard_id")} = ${canonicalVendorYardIdSql(`$${params.length}::bigint`)}`;
     }
   }
   const result = await query(
@@ -1353,7 +1360,7 @@ export async function addSmartScmProposalLine(proposalId, values = {}, operatorI
     if (proposal.proposal_type === "PO") {
       await assertSamePoVendor(id, item.vendor_id);
       if (proposal.source_vendor_yard_id !== null
-        && Number(item.vendor_yard_id) !== Number(proposal.source_vendor_yard_id)) {
+        && Number(item.canonical_vendor_yard_id) !== Number(await canonicalVendorYardId(proposal.source_vendor_yard_id))) {
         throw Object.assign(new Error("This item uses a different vendor pickup yard from the selected PO load."), { status: 409 });
       }
     }

@@ -183,6 +183,24 @@ export function normalizeDispatchVendorScheduleDays(days = []) {
   });
 }
 
+const VENDOR_DAY_ABBREVIATIONS = DISPATCH_VENDOR_WEEK_DAYS.map((day) => day.slice(0, 3).toLowerCase());
+
+// Which weekdays a non-weekday schedule label (for example "Mon-Fri") stands for.
+// Unrecognised labels are treated as covering every day.
+export function vendorScheduleLabelCovers(label, dayLabel) {
+  const dayIndex = DISPATCH_VENDOR_WEEK_DAYS.indexOf(dayLabel);
+  if (dayIndex < 0) return false;
+  const clean = String(label || "").trim().toLowerCase();
+  if (clean === DISPATCH_VENDOR_WEEK_DAYS[dayIndex].toLowerCase()) return true;
+  const range = clean.match(/^([a-z]{3})[a-z]*\s*-\s*([a-z]{3})[a-z]*$/);
+  if (range) {
+    const start = VENDOR_DAY_ABBREVIATIONS.indexOf(range[1]);
+    const end = VENDOR_DAY_ABBREVIATIONS.indexOf(range[2]);
+    if (start >= 0 && end >= start) return dayIndex >= start && dayIndex <= end;
+  }
+  return true;
+}
+
 function csv(value) {
   return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
@@ -689,24 +707,18 @@ export async function saveDispatchVendorYardSchedule({
       .join(",");
     const currentRows = rowsResult.rows;
     const currentIds = currentRows.map((row) => Number(row.id)).filter(Number.isInteger);
-    const referencedIds = currentIds.length
-      ? new Set((await client.query(
-        `SELECT DISTINCT vendor_yard_id AS id
-           FROM scm_smart_item_policies
-          WHERE vendor_yard_id = ANY($1::bigint[])`,
-        [currentIds]
-      )).rows.map((row) => Number(row.id)))
-      : new Set();
     const byDay = new Map(currentRows
       .filter((row) => DISPATCH_VENDOR_WEEK_DAYS.includes(row.day_label))
       .map((row) => [row.day_label, row]));
-    const reusableRows = currentRows
-      .filter((row) => !DISPATCH_VENDOR_WEEK_DAYS.includes(row.day_label))
-      .sort((left, right) => Number(referencedIds.has(Number(right.id))) - Number(referencedIds.has(Number(left.id))) || Number(left.id) - Number(right.id));
+    // A row that is not a single weekday (normally the original "Mon-Fri" row) is
+    // the yard's original identity: Item Master policies and planned loads point
+    // at it. Never turn it into a weekday row or switch it off while a day it
+    // covers is still open; a rename or new hours must keep the same yard ID.
+    const summaryRows = currentRows.filter((row) => !DISPATCH_VENDOR_WEEK_DAYS.includes(row.day_label));
     const savedRows = [];
 
     for (const day of cleanDays) {
-      const existing = byDay.get(day.dayLabel) || reusableRows.shift();
+      const existing = byDay.get(day.dayLabel);
       const values = [
         localVendor.name,
         cleanYard,
@@ -745,17 +757,35 @@ export async function saveDispatchVendorYardSchedule({
       savedRows.push(saved.rows[0]);
     }
 
-    if (reusableRows.length) {
+    for (const row of summaryRows) {
+      const openCoveredDays = cleanDays.filter((day) => day.active && vendorScheduleLabelCovers(row.day_label, day.dayLabel));
+      const mirroredDay = openCoveredDays.find((day) => day.windowStart && day.windowEnd) || openCoveredDays[0] || null;
+      // An already inactive summary row stays inactive; an active one follows the
+      // opening days it covers and mirrors their hours for dispatch pickup notes.
+      const staysActive = Boolean(row.active) && Boolean(mirroredDay);
       await client.query(
         `UPDATE dispatch_vendor_yards
             SET vendor = $2,
                 yard = $3,
                 aliases = $4,
                 address = $5,
-                active = false,
+                active = $6,
+                window_start = CASE WHEN $6 THEN $7 ELSE window_start END,
+                window_end = CASE WHEN $6 THEN $8 ELSE window_end END,
+                instructions = CASE WHEN $6 THEN $9 ELSE instructions END,
                 updated_at = now()
-          WHERE id = ANY($1::bigint[])`,
-        [reusableRows.map((row) => row.id), localVendor.name, cleanYard, aliasesText, cleanAddress]
+          WHERE id = $1`,
+        [
+          row.id,
+          localVendor.name,
+          cleanYard,
+          aliasesText,
+          cleanAddress,
+          staysActive,
+          mirroredDay?.windowStart || "",
+          mirroredDay?.windowEnd || "",
+          mirroredDay?.instructions || ""
+        ]
       );
     }
 
@@ -843,11 +873,41 @@ export async function saveDispatchVendorYardSchedule({
       );
     }
 
+    // Item Master must reference the row the vendor-yard picker offers for this
+    // yard (lowest active row, else lowest row). Move items left on any other
+    // schedule row of the same yard so new and existing items share one pickup.
+    const canonicalResult = await client.query(
+      `SELECT id
+         FROM dispatch_vendor_yards
+        WHERE LOWER(vendor) = LOWER($1)
+          AND LOWER(yard) = LOWER($2)
+        ORDER BY active DESC, id
+        LIMIT 1`,
+      [localVendor.name, cleanYard]
+    );
+    const canonicalRowId = canonicalResult.rows[0] ? Number(canonicalResult.rows[0].id) : null;
+    const yardRowIds = [...new Set([...currentIds, ...savedRows.map((row) => Number(row.id))])];
+    let repointedItemPolicies = 0;
+    if (canonicalRowId && yardRowIds.length) {
+      const repointed = await client.query(
+        `UPDATE scm_smart_item_policies
+            SET vendor_yard_id = $1,
+                updated_by = COALESCE(NULLIF($3, ''), updated_by),
+                updated_at = now()
+          WHERE vendor_yard_id = ANY($2::bigint[])
+            AND vendor_yard_id <> $1`,
+        [canonicalRowId, yardRowIds, operator]
+      );
+      repointedItemPolicies = repointed.rowCount;
+    }
+
     await client.query("COMMIT");
     return {
       vendor: rowToLocalVendor({ ...localVendor, yard_count: 0, mapping_count: 0 }),
       yard: cleanYard,
       previousYard,
+      canonicalRowId,
+      repointedItemPolicies,
       rows: savedRows.map(rowToVendorYard)
     };
   } catch (error) {
