@@ -108,6 +108,7 @@ export function createOperatorNetSuitePostingAdmission({
     };
   }
   return (/** @type {Record<string, any>} */ input = {}) => telemetry.context({ commandId: input.requestId,
+    actorOperatorId: input.actorOperatorId, orderId: input.orderId,
     functionKey: input.functionKey, transactionType: input.functionKey === "receiving" ? "IR" : "IF", stage: "admission" },
   () => telemetry.time({ operation: "posting.admission" }, () => admit(input)));
 }

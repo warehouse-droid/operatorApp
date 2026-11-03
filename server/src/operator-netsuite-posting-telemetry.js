@@ -1,7 +1,8 @@
 // @ts-check
 import { AsyncLocalStorage } from "node:async_hooks";
+import { netSuiteFailureAudit } from './netsuite-failure-runtime.js';
 
-const fields = ["commandId", "transactionType", "functionKey", "sourceOrderKind", "sourceNetSuiteId", "stepIndex", "stage", "operation", "method", "attempt", "photoId", "queue"];
+const fields = ["actorOperatorId", "orderId", "orderRef", "commandId", "transactionType", "functionKey", "sourceOrderKind", "sourceNetSuiteId", "stepIndex", "stage", "operation", "method", "attempt", "photoId", "queue"];
 
 /** @param {Record<string, any>} value */
 function safeFields(value) {
@@ -28,12 +29,12 @@ function errorFields(error) {
   return { errorCode: /^[A-Z0-9_]{1,80}$/.test(errorCode) ? errorCode : "REQUEST_FAILED" };
 }
 
-/** @param {{now?: () => number, log?: (entry: Record<string, any>) => void}} [options] */
-export function createOperatorPostingTelemetry({ now = () => performance.now(), log = (entry) => console.info(JSON.stringify(entry)) } = {}) {
+/** @param {{now?: () => number, log?: (entry: Record<string, any>) => void, recordFailure?: (error: unknown, details: Record<string, any>) => Promise<unknown>}} [options] */
+export function createOperatorPostingTelemetry({ now = () => performance.now(), log = (entry) => console.info(JSON.stringify(entry)), recordFailure = async () => {} } = {}) {
   const storage = new AsyncLocalStorage();
   /** @template T @param {Record<string, any>} details @param {() => T} work @returns {T} */
   function context(details, work) {
-    return storage.run({ ...storage.getStore(), ...safeFields(details) }, work);
+    return netSuiteFailureAudit.context(safeFields(details), () => storage.run({ ...storage.getStore(), ...safeFields(details) }, work));
   }
   /** @param {Record<string, any>} details @param {number} started @param {unknown} [value] @param {unknown} [error] */
   function emit(details, started, value, error) {
@@ -53,6 +54,8 @@ export function createOperatorPostingTelemetry({ now = () => performance.now(), 
       value = await work();
     } catch (error) {
       emit(details, started, undefined, error);
+      try { await recordFailure(error, { ...storage.getStore(), ...safeFields(details) }); }
+      catch { /* Preserve the business error if diagnostic storage is unavailable. */ }
       throw error;
     }
     emit(details, started, value);
@@ -67,4 +70,4 @@ export function createOperatorPostingTelemetry({ now = () => performance.now(), 
   return { context, time, queued };
 }
 
-export const operatorPostingTelemetry = createOperatorPostingTelemetry();
+export const operatorPostingTelemetry = createOperatorPostingTelemetry({ recordFailure: (error, details) => netSuiteFailureAudit.record(error, details) });

@@ -230,6 +230,8 @@ import { createOperatorReceiptRecoveryRouter } from "./operator-receipt-recovery
 import { startPostingPhotoWorker } from "./operator-netsuite-posting-photo-worker.js";
 import { startBackgroundPhotoWorker } from "./operator-background-photo-worker.js";
 import { withOperatorPhotoAction, isBackgroundPhotoReference, getBackgroundPhoto, getBackgroundPhotoAction, receiveBackgroundPhoto } from "./operator-background-photos.js";
+import { netSuiteFailureAudit, netSuiteFailureRequestContext } from './netsuite-failure-runtime.js';
+import { createOperatorNetSuiteFailureRouter } from './operator-netsuite-failure-router.js';
 import {
   enqueueSalesOrderAutoFulfillmentCandidate,
   startSalesOrderAutoFulfillmentRuntime
@@ -655,6 +657,7 @@ import {
   voidReturnRecord
 } from "./return-repository.js";
 const app = express();
+app.use(netSuiteFailureRequestContext);
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
 const qrScannerDir = path.resolve(dirname, "../node_modules/qr-scanner");
@@ -5367,14 +5370,15 @@ function requiredPhotoDataUrls(values, minimum = 2) {
 function operatorPhotoAction(req, functionKey, run, { minimum = 2, batch = null } = {}) {
   const order = req.operatorYardOrder;
   const backgroundPhotos = req.body?.backgroundPhotos;
-  return withOperatorPhotoAction({
+  return netSuiteFailureAudit.capture({ actorOperatorId: req.operator?.id, requestId: batch?.id || req.body?.requestId,
+    orderId: req.params.id, orderRef: order?.tranid, functionKey, stage: 'submission' }, () => withOperatorPhotoAction({
     actor: req.operator, requestId: batch?.id || req.body?.requestId, functionKey,
     orderId: req.params.id, orderType: batch ? "consolidation_load" : functionKey === "customer_pickup" ? "sales_order" : req.body?.orderType,
     locationId: batch?.locationId || (functionKey === "receiving" ? order?.destination_location_id
       : order?.pickup_location_id ?? outboundYardLocationId(order?.outbound_location_id ?? order?.source_location_id)),
     backgroundPhotos, minimum,
     legacyPhotos: backgroundPhotos === undefined ? requiredPhotoDataUrls(batch ? req.body?.photoRefs : req.body?.photoDataUrls, minimum) : []
-  }, run);
+  }, run));
 }
 
 async function requireRegisteredForegroundDvirEvidence(req, type, photoReferences) {
@@ -8813,6 +8817,7 @@ const stockCheckRuntime = createStockCheckRuntime({ authenticate: requireOperato
 app.use('/api/scm/stock-check', stockCheckRuntime.router);
 
 app.use("/api/driver/upload-failures", express.json({ limit: "16kb" }));
+app.use('/api/operator/netsuite-failures', express.json({ limit: '16kb' }));
 app.use(express.json({
   limit: "25mb",
   verify(req, res, buffer) {
@@ -8921,6 +8926,7 @@ app.use((req, res, next) => {
   if (!req.path.startsWith("/api/")
       || !MUTATING_API_METHODS.has(req.method)
       || isHighFrequencyPollRequest(req)
+      || req.path.replace(/\/+$/u, '') === '/api/operator/netsuite-failures'
       || req.get("x-mbbs-rollback-test") === "1") {
     return next();
   }
@@ -19041,6 +19047,7 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
 // Account preferences and phone layout policy are independent of the selected yard.
 app.use("/api/operator/preferences", requireOperator, requireOperatorAccess, createOperatorPreferencesRouter());
 app.use("/api/operator/phone-layout-policy", requireOperator, requireOperatorAccess, createOperatorPhonePolicyRouter());
+app.use('/api/operator/netsuite-failures', requireOperator, requireOperatorAccess, createOperatorNetSuiteFailureRouter());
 
 app.use("/api/operator", requireOperator, requireOperatorAccess, requireOperatorYardRequest, operatorNetSuitePriority);
 

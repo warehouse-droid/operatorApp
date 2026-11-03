@@ -1,6 +1,7 @@
 import { config } from "./config.js";
 import { NetSuiteM2mTokenProvider } from "./netsuite-m2m-auth.js";
 import { NetSuiteM2mSettingsStore } from "./netsuite-m2m-settings.js";
+import { netSuiteFailureAudit } from './netsuite-failure-runtime.js';
 
 const OAUTH_ENDPOINT_PATH = "/services/rest/auth/oauth2/v1/token";
 const METADATA_PATH = "/services/rest/record/v1/metadata-catalog";
@@ -116,7 +117,11 @@ const settingsStore = new NetSuiteM2mSettingsStore({
 async function runtimeFetch(url, options = {}) {
   const timeoutMs = Math.max(1_000, Number(config.netsuite.requestTimeoutMs || 120_000));
   const signal = options.signal || (AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined);
-  return fetch(url, { ...options, signal });
+  return netSuiteFailureAudit.capture({ stage: 'authentication', method: options.method || 'GET', path: String(url) }, async () => {
+    const response = await fetch(url, { ...options, signal });
+    if (!response.ok) { await netSuiteFailureAudit.response({ response, text: await response.clone().text() }, { stage: 'authentication' }); }
+    return response;
+  });
 }
 
 const tokenProvider = new NetSuiteM2mTokenProvider({

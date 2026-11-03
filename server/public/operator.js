@@ -892,6 +892,23 @@ function renderReleaseDraftButton() {
 }
 
 async function api(path, options = {}) {
+  const actorOperatorId = operator?.id;
+  const failureLocation = locationId;
+  try { return await apiRequest(path, options); }
+  catch (error) {
+    if (/^\/api\/(?:receiving|customer-pickup|delivery|returns|inventory|cycle-count)(?:\/|$)/u.test(path)) {
+      let input = {};
+      try { input = typeof options.body === 'string' ? JSON.parse(options.body) : {}; } catch { /* No body is needed for diagnostics. */ }
+      reportOperatorNetSuiteFailure(error, { actorOperatorId, locationId: failureLocation, requestId: input.requestId,
+        orderId: path.match(/\/orders\/([^/?]+)/u)?.[1], stage: 'api_request',
+        functionKey: path.startsWith('/api/receiving') ? 'receiving' : path.startsWith('/api/customer-pickup') ? 'customer_pickup'
+          : path.startsWith('/api/delivery') ? 'delivery_prep' : path.startsWith('/api/returns') ? 'returns' : 'inventory' });
+    }
+    throw error;
+  }
+}
+
+async function apiRequest(path, options = {}) {
   const requestToken = authToken;
   const requestLocation = locationId;
   const response = await fetch(path, {
@@ -2703,7 +2720,7 @@ function renderMenu() {
       </button>
     </section>
   `, `
-    <button class="secondary-button" data-action="repair-requests" type="button">Repair requests</button>
+    <button class="secondary-button" data-action="repair-requests" type="button">${t("repair.requests", "Repair requests")}</button>
     <button class="secondary-button display-settings-button" data-action="open-display-settings" type="button" aria-label="${t("operator.displaySettings", "Display and input settings")}" title="${t("operator.displaySettings", "Display and input settings")}">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m9.5 3-.6 2-2 .9L5 5l-2 3.5 1.6 1.4-.1 2.2L3 13.5 5 17l2-.7 1.9 1.1.6 2.1h4l.6-2.1 1.9-1.1 2 .7 2-3.5-1.5-1.4-.1-2.2L20 8.5 18 5l-1.9.9-2-.9-.6-2z"/><circle cx="11.5" cy="11.3" r="3.2"/></svg>
     </button>
@@ -6199,6 +6216,7 @@ async function confirmConsolidationLoad() {
   if (fulfillmentSubmitting || !state.batch) return;
   const batchId = state.batch.id;
   const pending = state.batch.status === "pending";
+  let failureStage = 'source_validation';
   if (!pending) {
     fulfillmentSubmitting = true;
     try {
@@ -6206,7 +6224,7 @@ async function confirmConsolidationLoad() {
       if (state.batchId !== batchId) return;
       state.batch = latest;
       if (!await confirmMissingLoadLines(latest.confirmationSummaries)) return;
-    } catch (error) { showToast(error.message); return; }
+    } catch (error) { reportOperatorNetSuiteFailure(error, { order: { netsuite_id: batchId }, requestId: batchId, functionKey: 'delivery_prep', stage: failureStage }); showToast(error.message); return; }
     finally { fulfillmentSubmitting = false; }
   }
   const photos = fulfillmentPhotoDataUrls.filter(Boolean);
@@ -6214,10 +6232,12 @@ async function confirmConsolidationLoad() {
   fulfillmentSubmitting = true; fulfillmentJobStage = "Saving proof"; fulfillmentStatusText = "Saving the selected load...";
   stopFulfillmentCamera(); render();
   try {
+    failureStage = 'photo_preparation';
     const photoInput = pending ? {} : await prepareOperatorBackgroundPhotos(batchId, photos);
     const photoRefs = pending ? state.photoRefs : photos;
     if (state.batchId !== batchId) return;
     state.photoRefs = photoRefs;
+    failureStage = 'submission';
     const batch = await api(`/api/delivery/consolidation-loads/${batchId}/${pending ? "resume" : "submit"}`, { method: "POST", body: JSON.stringify(pending ? {} : photoInput.backgroundPhotos ? photoInput : { photoRefs: photoInput.photoDataUrls }) });
     if (state.batchId !== batchId) return;
     resumeOperatorBackgroundPhotos();
@@ -6225,6 +6245,7 @@ async function confirmConsolidationLoad() {
     if (batch.status === "completed") fulfillmentResult = batch.result;
   } catch (error) {
     if (state.batchId !== batchId) return;
+    reportOperatorNetSuiteFailure(error, { order: { netsuite_id: batchId }, requestId: batchId, functionKey: 'delivery_prep', stage: failureStage });
     fulfillmentJobStage = "Load failed"; fulfillmentStatusText = error.message; showToast(error.message);
   } finally {
     resumeOperatorBackgroundPhotos();
@@ -7569,6 +7590,8 @@ async function confirmFulfillment() {
   if (fulfillmentOrder.posting?.loadBlocked) return;
   const requestId = fulfillmentLoadRequestId;
   const orderId = fulfillmentOrder.netsuite_id;
+  const failureOrder = fulfillmentOrder;
+  let failureStage = 'source_validation';
   const isCurrent = () => fulfillmentOrder?.netsuite_id === orderId && fulfillmentLoadRequestId === requestId;
   let retryWithNewRequest = false;
   fulfillmentSubmitting = true;
@@ -7589,6 +7612,7 @@ async function confirmFulfillment() {
       fulfillmentOrder = { ...latest, loadConfirmationAcknowledged: JSON.stringify(latest.confirmationSummary) };
     } catch (error) {
       if (!isCurrent()) return;
+      reportOperatorNetSuiteFailure(error, { order: failureOrder, requestId, stage: failureStage, functionKey: currentModule === 'customer-pickup-load' ? 'customer_pickup' : 'delivery_prep' });
       fulfillmentSubmitting = false; showToast(error.message); render(); return;
     }
   }
@@ -7624,6 +7648,7 @@ async function confirmFulfillment() {
       fulfillmentSubmitting = false;
       fulfillmentNetSuitePolicy = null;
       fulfillmentNetSuitePolicyError = error.message || "Could not verify the live NetSuite posting mode.";
+      reportOperatorNetSuiteFailure(error, { order: failureOrder, requestId, stage: 'policy', functionKey: postingFunction });
       showToast(fulfillmentNetSuitePolicyError);
       render();
       return;
@@ -7642,6 +7667,7 @@ async function confirmFulfillment() {
   render();
   try {
     const deferPhotos = !localOnlyPosting && fulfillmentNetSuitePolicy?.effective;
+    failureStage = 'photo_preparation';
     const photoInput = await prepareOperatorBackgroundPhotos(fulfillmentLoadRequestId, photos);
     const activeOrder = fulfillmentOrder;
     if (!isCurrent() || !activeOrder) return;
@@ -7653,6 +7679,7 @@ async function confirmFulfillment() {
       : "Saving local loaded status...";
     showFulfillmentPostingStage(deferPhotos);
     rememberFulfillmentPosting({ status: "submitting", loadBlocked: true, submittedAt: Date.now() });
+    failureStage = 'submission';
     const started = await api(path, {
       method: "POST",
       body: JSON.stringify({
@@ -7665,6 +7692,7 @@ async function confirmFulfillment() {
     });
     if (!isCurrent()) return;
     resumeOperatorBackgroundPhotos();
+    failureStage = 'verification';
     if (started.status === "error") throw Object.assign(new Error(started.error || "NetSuite posting could not be verified."), {
       payload: { posting: started.posting }
     });
@@ -7690,6 +7718,7 @@ async function confirmFulfillment() {
     showToast(fulfillmentNetSuitePolicy?.effective ? "NetSuite verified and order loaded" : "Order loaded locally");
   } catch (error) {
     if (!isCurrent()) return;
+    reportOperatorNetSuiteFailure(error, { order: failureOrder, requestId, stage: failureStage, functionKey: postingFunction });
     const job = error.payload?.posting;
     retryWithNewRequest = job?.status === "failed";
     if (job) rememberFulfillmentPosting(["completed", "failed"].includes(job.status) ? null : postingSummaryFromJob(job));
@@ -8218,6 +8247,7 @@ async function confirmReceipt() {
   if (receiptPhotoDataUrls.filter(Boolean).length < 2) return;
   const activeOrder = receiptOrder;
   const requestId = receiptRequestId;
+  let failureStage = 'policy';
   const isCurrent = () => receiptOrder === activeOrder && receiptRequestId === requestId;
   let retryWithNewRequest = false;
   const localOnlyPosting = operatorNetSuitePostingIsLocalOnly(receiptOrder, "receiving");
@@ -8231,6 +8261,7 @@ async function confirmReceipt() {
     } catch (error) {
       if (!isCurrent()) return;
       receiptNetSuitePolicy = null;
+      reportOperatorNetSuiteFailure(error, { order: activeOrder, requestId, stage: failureStage, functionKey: 'receiving' });
       receiptNetSuitePolicyError = error.message || "Could not verify the live NetSuite posting mode.";
       showToast(receiptNetSuitePolicyError);
       render();
@@ -8251,9 +8282,11 @@ async function confirmReceipt() {
   try {
     const deferPhotos = !localOnlyPosting && receiptNetSuitePolicy?.effective;
     showReceiptPostingStage(deferPhotos);
+    failureStage = 'photo_preparation';
     const photoInput = await prepareOperatorBackgroundPhotos(receiptRequestId, receiptPhotoDataUrls.filter(Boolean));
     if (!isCurrent()) return;
     if (deferPhotos) rememberReceiptPosting({ jobId: receiptRequestId, status: "submitting", receiveBlocked: true, transactions: [] });
+    failureStage = 'submission';
     const started = await api(`/api/receiving/orders/${receiptOrder.netsuite_id}/receive`, {
       method: "POST",
       body: JSON.stringify({
@@ -8268,6 +8301,7 @@ async function confirmReceipt() {
     });
     if (!isCurrent()) return;
     resumeOperatorBackgroundPhotos();
+    failureStage = 'verification';
     if (started.status === "complete" && started.result) {
       receiptResult = started.result;
       if (receiptOrder.posting) rememberReceiptPosting({ ...receiptOrder.posting, status: "completed", receiveBlocked: false });
@@ -8301,6 +8335,7 @@ async function confirmReceipt() {
     if (receiptOrder.posting) rememberReceiptPosting({ ...receiptOrder.posting, status: "completed", receiveBlocked: false });
     showToast(started.posting ? "NetSuite verified and receiving completed" : "Receiving recorded locally");
   } catch (caught) {
+    reportOperatorNetSuiteFailure(caught, { order: activeOrder, requestId, stage: failureStage, functionKey: 'receiving' });
     if (!isCurrent()) return;
     const error = /** @type {Record<string, any>} */ (caught);
     const job = error.payload?.posting;
@@ -8692,7 +8727,7 @@ function renderPersonalHistory() {
   shell("Personal History", operator?.display_name || "", `
     <section class="history-shell">
       <div class="history-toolbar">
-        <button class="secondary-button" data-action="repair-requests" type="button">Repair requests</button>
+        <button class="secondary-button" data-action="repair-requests" type="button">${t("repair.requests", "Repair requests")}</button>
         <label>
           <span>${t("operator.date", "Date")}</span>
           <input id="historyDate" type="date" value="${escapeHtml(personalHistoryDate)}" />
@@ -9970,7 +10005,7 @@ app.addEventListener("click", async (event) => {
     input.focus({ preventScroll: true }); return;
   }
   const button = event.target.closest("button");
-  if (button?.dataset.action === "repair-requests") { location.assign("/operator/repair"); return; }
+  if (button?.dataset.action === "repair-requests") { location.assign("/operator/repair?language=" + encodeURIComponent(document.documentElement.lang || window.MBBS_I18N?.language?.() || "en")); return; }
   if (!button) return;
 
   try {
@@ -10943,6 +10978,17 @@ app.addEventListener("change", async (event) => {
 
 /** @type {any} */
 const operatorBackgroundQueue = /** @type {any} */ (window).OperatorPhotoOutbox;
+/** @type {any} */ (window).OperatorNetSuiteFailureReporter = /** @type {any} */ (window).OperatorNetSuiteFailures?.create({
+  actorId: () => operator?.id || null, locationId: () => locationId,
+  request: failure => apiRequest('/api/operator/netsuite-failures', { method: 'POST', body: JSON.stringify(failure) })
+});
+
+/** @param {unknown} error @param {Record<string, any>} [context] */
+function reportOperatorNetSuiteFailure(error, context = {}) {
+  const order = context.order || {};
+  /** @type {any} */ (window).OperatorNetSuiteFailureReporter?.report({ ...context, error,
+    orderId: context.orderId ?? order.netsuite_id, orderRef: context.orderRef ?? order.tranid, orderType: order.order_type });
+}
 
 /** @param {string} requestId @param {string[]} photos */
 async function prepareOperatorBackgroundPhotos(requestId, photos) {
@@ -10955,6 +11001,7 @@ function resumeOperatorBackgroundPhotos() {
 }
 
 function configureOperatorBackgroundPhotos() {
+  void /** @type {any} */ (window).OperatorNetSuiteFailureReporter?.flush();
   operatorBackgroundQueue?.configure({
     actorId: () => operator?.id || null,
     request: (/** @type {string} */ path, /** @type {RequestInit} */ options = {}) => api(path, { ...options, headers: {

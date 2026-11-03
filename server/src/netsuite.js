@@ -4,6 +4,7 @@ import { normalizeSalesOrderPackPayload } from '../public/order-pack-quantities.
 import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
 import { createIfirPostingClient } from './netsuite-ifir-posting-client.js';
 import { getIfirPostingRestletEnabled } from './netsuite-ifir-posting-policy.js';
+import { netSuiteFailureAudit } from './netsuite-failure-runtime.js';
 
 export function createBossApprovalNetSuite() {
   return createBossNetSuiteAdapter({rest:netsuiteRest,queryAll:suiteqlAll,mutate:queueNetSuiteMutation});
@@ -75,7 +76,12 @@ async function netsuiteFetch(url, options = {}) {
   const signal = options.signal || (AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined);
   assertNetSuiteDirectAccessEnabled();
   try {
-    return await fetch(url, { ...options, signal });
+    const response = await fetch(url, { ...options, signal });
+    if (!response.ok) {
+      const text = await response.clone().text();
+      await netSuiteFailureAudit.response({ response, text }, { method: options.method || 'GET', path: String(url), stage: 'netsuite_http' });
+    }
+    return response;
   } catch (error) {
     if (error.name === "AbortError" || error.name === "TimeoutError") {
       const timeoutError = new Error(
@@ -84,22 +90,25 @@ async function netsuiteFetch(url, options = {}) {
       timeoutError.code = "NETSUITE_REQUEST_TIMEOUT";
       timeoutError.timeoutMs = timeoutMs;
       timeoutError.cause = error;
+      await netSuiteFailureAudit.record(timeoutError, { method: options.method || 'GET', path: String(url), stage: 'transport' });
       throw timeoutError;
     }
+    await netSuiteFailureAudit.record(error, { method: options.method || 'GET', path: String(url), stage: 'transport' });
     throw error;
   }
 }
 
 async function scheduledNetSuiteRequest(url, options, consume, attempt = 1) {
-  return netSuiteRequestScheduler.run(signal => operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
+  return netSuiteFailureAudit.capture({ operation: 'netsuite.http', method: options.method || 'GET', path: String(url), attempt }, () => netSuiteRequestScheduler.run(signal => operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
     path: new URL(url).pathname, attempt }, async () => {
     const response = await netsuiteFetch(url, { ...options, signal });
     return { response, value: await consume(response) };
-  }), { timeoutMs: Number(config.netsuite.requestTimeoutMs || 120000), signal: options.signal });
+  }), { timeoutMs: Number(config.netsuite.requestTimeoutMs || 120000), signal: options.signal }));
 }
 
 async function timedNetSuiteTextRequest(url, options, attempt) {
   const { response, value: text } = await scheduledNetSuiteRequest(url, options, received => received.text(), attempt);
+  if (response.ok) { await netSuiteFailureAudit.response({ response, text }, { method: options.method || 'GET', path: String(url), attempt }); }
   return { response, text };
 }
 
@@ -653,6 +662,10 @@ async function refreshAccessToken(refreshToken) {
 }
 
 async function getAccessToken() {
+  return netSuiteFailureAudit.capture({ stage: 'authentication' }, getAccessTokenValue);
+}
+
+async function getAccessTokenValue() {
   if (await isNetSuiteM2mActive()) return getNetSuiteM2mAccessToken();
   const result = await query("SELECT * FROM netsuite_tokens WHERE id = 1");
   const token = result.rows[0];
@@ -694,49 +707,51 @@ function netSuiteRestErrorCodes(data) {
 }
 
 async function netsuiteRest(path, { method = "GET", body = null, headers = {} } = {}) {
-  requireConfig(["netsuite.restBaseUrl"]);
-  let lastError;
-  let m2mAuthRetry = false;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
-    const { response, text } = await timedNetSuiteTextRequest(`${config.netsuite.restBaseUrl}${path}`, {
-      method,
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        ...headers
-      },
-      body: body ? JSON.stringify(body) : undefined
-    }, attempt + 1);
-    const contentType = response.headers.get("content-type") || "";
-    let data = text;
-    if (text && (contentType.includes("application/json") || /^[\s\r\n]*[\[{]/.test(text))) {
-      data = JSON.parse(text);
-    }
-    if (!response.ok) {
-      lastError = new Error(`NetSuite REST failed: ${response.status} ${typeof data === "string" ? data : JSON.stringify(data)}`);
-      lastError.status = response.status;
-      lastError.netsuiteResponseReceived = true;
-      lastError.netsuiteErrorCodes = netSuiteRestErrorCodes(data);
-      lastError.netsuiteErrorDetails = typeof data === "object" ? data?.["o:errorDetails"] || [] : [];
-      if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
-        invalidateNetSuiteM2mAccessToken();
-        m2mAuthRetry = true;
-        continue;
+  return netSuiteFailureAudit.capture({ stage: 'netsuite_operation', operation: 'netsuite.rest', method, path: `${config.netsuite.restBaseUrl || ''}${path}` }, async () => {
+    requireConfig(["netsuite.restBaseUrl"]);
+    let lastError;
+    let m2mAuthRetry = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
+      const { response, text } = await timedNetSuiteTextRequest(`${config.netsuite.restBaseUrl}${path}`, {
+        method,
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          ...headers
+        },
+        body: body ? JSON.stringify(body) : undefined
+      }, attempt + 1);
+      const contentType = response.headers.get("content-type") || "";
+      let data = text;
+      if (text && (contentType.includes("application/json") || /^[\s\r\n]*[\[{]/.test(text))) {
+        data = JSON.parse(text);
       }
-      const safeToRetry = method === 'GET' || response.status === 429
-        || lastError.netsuiteErrorCodes.includes('CONCURRENT_REQUEST_LIMIT_EXCEEDED');
-      if (safeToRetry && isConcurrencyLimit(response.status, text) && attempt < 3) {
-        await delay(2000 * (attempt + 1));
-        continue;
+      if (!response.ok) {
+        lastError = new Error(`NetSuite REST failed: ${response.status} ${typeof data === "string" ? data : JSON.stringify(data)}`);
+        lastError.status = response.status;
+        lastError.netsuiteResponseReceived = true;
+        lastError.netsuiteErrorCodes = netSuiteRestErrorCodes(data);
+        lastError.netsuiteErrorDetails = typeof data === "object" ? data?.["o:errorDetails"] || [] : [];
+        if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
+          invalidateNetSuiteM2mAccessToken();
+          m2mAuthRetry = true;
+          continue;
+        }
+        const safeToRetry = method === 'GET' || response.status === 429
+          || lastError.netsuiteErrorCodes.includes('CONCURRENT_REQUEST_LIMIT_EXCEEDED');
+        if (safeToRetry && isConcurrencyLimit(response.status, text) && attempt < 3) {
+          await delay(2000 * (attempt + 1));
+          continue;
+        }
+        throw lastError;
       }
-      throw lastError;
+      const location = response.headers.get("location") || "";
+      const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|inventoryTransfer|transferOrder|intercompanyTransferOrder|purchaseOrder|salesOrder|returnAuthorization|creditMemo)\/(\d+)/i);
+      return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
     }
-    const location = response.headers.get("location") || "";
-    const idMatch = location.match(/\/(?:itemFulfillment|itemReceipt|inventoryTransfer|transferOrder|intercompanyTransferOrder|purchaseOrder|salesOrder|returnAuthorization|creditMemo)\/(\d+)/i);
-    return { status: response.status, location, id: idMatch ? Number(idMatch[1]) : null, data };
-  }
-  throw lastError;
+    throw lastError;
+  });
 }
 
 export async function repairNetSuiteRecord(type,id,{method='GET',body=null,replaceItems=false}={}) {
@@ -1560,40 +1575,42 @@ export async function suiteql(q, params = [], options = {}) {
 }
 
 async function runSuiteql(q, params = [], options = {}) {
-  requireConfig(["netsuite.restBaseUrl"]);
-  const body = params.length ? { q, params } : { q };
-  const url = new URL(`${config.netsuite.restBaseUrl}/query/v1/suiteql`);
-  if (options.limit) url.searchParams.set("limit", String(options.limit));
-  if (options.offset) url.searchParams.set("offset", String(options.offset));
-  let response;
-  let text;
-  let m2mAuthRetry = false;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
-    ({ response, text } = await timedNetSuiteTextRequest(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "Prefer": "transient"
-      },
-      body: JSON.stringify(body)
-    }, attempt + 1));
-    if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
-      invalidateNetSuiteM2mAccessToken();
-      m2mAuthRetry = true;
-      continue;
+  return netSuiteFailureAudit.capture({ stage: 'netsuite_operation', operation: 'netsuite.suiteql', method: 'POST', path: `${config.netsuite.restBaseUrl || ''}/query/v1/suiteql` }, async () => {
+    requireConfig(["netsuite.restBaseUrl"]);
+    const body = params.length ? { q, params } : { q };
+    const url = new URL(`${config.netsuite.restBaseUrl}/query/v1/suiteql`);
+    if (options.limit) url.searchParams.set("limit", String(options.limit));
+    if (options.offset) url.searchParams.set("offset", String(options.offset));
+    let response;
+    let text;
+    let m2mAuthRetry = false;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const accessToken = await operatorPostingTelemetry.time({ operation: "netsuite.auth" }, getAccessToken);
+      ({ response, text } = await timedNetSuiteTextRequest(url, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "Prefer": "transient"
+        },
+        body: JSON.stringify(body)
+      }, attempt + 1));
+      if (response.status === 401 && !m2mAuthRetry && await isNetSuiteM2mActive()) {
+        invalidateNetSuiteM2mAccessToken();
+        m2mAuthRetry = true;
+        continue;
+      }
+      if (response.status !== 429) break;
+      const retryAfter = Number(response.headers.get("retry-after") || 0);
+      await new Promise((resolve) => setTimeout(resolve, retryAfter ? retryAfter * 1000 : 2000 * (attempt + 1)));
     }
-    if (response.status !== 429) break;
-    const retryAfter = Number(response.headers.get("retry-after") || 0);
-    await new Promise((resolve) => setTimeout(resolve, retryAfter ? retryAfter * 1000 : 2000 * (attempt + 1)));
-  }
 
-  if (!response.ok) {
-    throw new Error(`NetSuite SuiteQL failed: ${response.status} ${text}`);
-  }
+    if (!response.ok) {
+      throw new Error(`NetSuite SuiteQL failed: ${response.status} ${text}`);
+    }
 
-  return JSON.parse(text);
+    return JSON.parse(text);
+  });
 }
 
 export async function suiteqlAll(q, params = [], { pageSize = 1000 } = {}) {

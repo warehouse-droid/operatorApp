@@ -233,6 +233,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     if (!command) {return repository.get(commandId);}
     const runStep = (/** @type {Record<string, any>} */ step) =>
       telemetry.context({ commandId: command.id, functionKey: command.functionKey,
+          actorOperatorId: command.actorOperatorId, orderId: step.sourceNetSuiteId, orderRef: step.sourceOrderRef,
           transactionType: step.transactionType, sourceOrderKind: step.sourceOrderKind,
           sourceNetSuiteId: step.sourceNetSuiteId, stepIndex: step.stepIndex, stage: "posting" },
         () => telemetry.time({ operation: "posting.step" }, () => withLeaseHeartbeat(command, () => postStep(command, step))));
@@ -277,6 +278,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         result: completionResult(command),
         ...(lockFinalization ? { lockLocalOrder: () => lockFinalization(command) } : {}),
         finalize: () => telemetry.context({ commandId: command.id, transactionType: command.transactionType,
+          actorOperatorId: command.actorOperatorId, orderId: command.steps?.[0]?.sourceNetSuiteId, orderRef: command.steps?.[0]?.sourceOrderRef,
           functionKey: command.functionKey, stage: "finalization" }, () => telemetry.time({ operation: "posting.finalization" }, () => finalize(command)))
       });
     } catch (error) {
