@@ -4,6 +4,10 @@
   const ZH = "zh-CN";
 
   const dictionary = {
+    "repair.requests": "维修申请",
+    "sidebar.repair": "维修",
+    "sidebar.repair.portal": "维修门户",
+    "sidebar.repair.team": "维修团队",
     "inventory.status.removed": "已从转移单移除",
     "inventory.status.missing": "找不到转移单",
     "inventory.originalReport": "原始报损",
