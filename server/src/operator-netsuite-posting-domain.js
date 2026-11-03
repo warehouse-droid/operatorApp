@@ -3,6 +3,7 @@ import { EXISTING_PICKUP_IF_STRATEGY } from './operator-pickup-existing-if-domai
 
 import crypto from "node:crypto";
 import { postingPhotoIdentity, validatePostingPhotos } from "./operator-netsuite-posting-photos.js";
+import { normalizeOperatorNetSuiteLocationId } from "./operator-netsuite-posting-policy.js";
 import { operatorKitError } from './operator-netsuite-posting-kits.js';
 import { isSqftPostingUnit, netSuitePostingQuantity, localReceiptNetSuiteQuantities } from './operator-netsuite-posting-quantity.js';
 import { operatorPostingPackEvidence, mergeOperatorPostingPackEvidence, operatorPostingPackFields } from './operator-netsuite-posting-packs.js';
@@ -661,4 +662,55 @@ function normalizedAllocationReceiptEvidence(evidence,requestId) {
   }
   return {receiptJobId:requestId,deliveryJobRecordId:positiveInteger(evidence.deliveryJobRecordId,'Delivery record'),
     executionEventIds:[...new Set(evidence.executionEventIds.map((/** @type {unknown} */ id)=>positiveInteger(id,'Allocation execution')))].sort((a,b)=>a-b)};
+}
+
+/** @param {unknown} left @param {unknown} right */
+function sameReplayText(left, right) {
+  const value = String(left ?? "").trim().toLowerCase();
+  return value !== "" && value === String(right ?? "").trim().toLowerCase();
+}
+
+/** @param {Record<string, any>} command @param {Record<string, any>} operation @param {Record<string, any>} input */
+function sameReplayIdentity(command, operation, input) {
+  return sameReplayText(command.requestId, input.requestId)
+    && sameReplayText(command.actorOperatorId, input.actorOperatorId)
+    && command.functionKey === input.functionKey
+    && sameReplayText(operation.orderId, input.orderId);
+}
+
+/** @param {Record<string, any>} command @param {Record<string, any>} input */
+function sameReplayLocation(command, input) {
+  const submitted = input.clientLocationId;
+  if (submitted === undefined || submitted === null || submitted === "") {return true;}
+  return normalizeOperatorNetSuiteLocationId(submitted) === Number(command.canonicalLocationId);
+}
+
+/** @param {Record<string, any>} command @param {Record<string, any>} input */
+function sameReplayPhotos(command, input) {
+  /** @type {string[]} */ let photos;
+  try {
+    photos = [...new Set((Array.isArray(input.photoRefs) ? input.photoRefs : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean))].sort().map(postingPhotoIdentity);
+  } catch {
+    return false;
+  }
+  const stored = Array.isArray(command.inputSnapshot?.photoRefs) ? command.inputSnapshot.photoRefs : [];
+  return photos.length === stored.length && photos.every((photo, index) => photo === stored[index]);
+}
+
+/**
+ * True only when a repeated submit is the same Operator action as an accepted
+ * command: same request, actor, function, local order, yard and photos. Any
+ * other repeat goes through full admission, where the stored input hash decides.
+ *
+ * @param {Record<string, any> | null | undefined} command
+ * @param {Record<string, any>} [input]
+ */
+export function isOperatorNetSuitePostingReplay(command, input = {}) {
+  const operation = command?.inputSnapshot?.localOperation;
+  if (!command || !operation) {return false;}
+  return sameReplayIdentity(command, operation, input)
+    && sameReplayLocation(command, input)
+    && sameReplayPhotos(command, input);
 }

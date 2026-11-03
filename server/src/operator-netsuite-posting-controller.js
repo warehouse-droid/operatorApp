@@ -16,11 +16,13 @@ import { resolveOperatorNetSuitePostingTargets } from "./operator-netsuite-posti
 import {
   assertNoActiveOperatorNetSuitePostingClaims,
   createOrReplayOperatorNetSuitePostingCommand,
+  findReplayableOperatorNetSuitePostingCommand,
   getOperatorNetSuitePostingCommand,
   listOperatorNetSuitePostingAttentionCommands,
   resumeOperatorNetSuitePostingCommand
 } from "./operator-netsuite-posting-repository.js";
 import { operatorNetSuitePostingRuntime } from "./operator-netsuite-posting-runtime.js";
+import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 
 /** @param {Record<string, any>} input @param {Record<string, any>} resolution */
 async function preflightExistingLocalCompletion(input, resolution) {
@@ -64,6 +66,13 @@ async function preflightExistingLocalCompletion(input, resolution) {
   }, { rollback: true });
 }
 
+/** @param {Record<string, any>} command */
+async function enqueueAfterCommit(command) {
+  afterTransactionCommit(() => {
+    void operatorNetSuitePostingRuntime.enqueue(command.id);
+  });
+}
+
 const admit = createOperatorNetSuitePostingAdmission({
   resolveTargets: resolveOperatorNetSuitePostingTargets,
   getPolicy: getOperatorNetSuitePostingPolicy,
@@ -73,21 +82,77 @@ const admit = createOperatorNetSuitePostingAdmission({
     functionKey: resolution.functionKey,
     localOrderKeys: resolution.localOrderKeys
   }),
-  onAccepted: async (/** @type {Record<string, any>} */ command) => {
-    afterTransactionCommit(() => {
-      void operatorNetSuitePostingRuntime.enqueue(command.id);
-    });
-  }
+  onAccepted: enqueueAfterCommit
 });
 
-/** @param {Record<string, any>} input */
-export async function submitOperatorNetSuitePostingAction(input) {
-  if (input.functionKey === 'customer_pickup') {await ensureOutboundLocationDirectory();}
-  if (["delivery_prep", "customer_pickup"].includes(input.functionKey)) {
-    return withConsolidatedLoadMutation(() => getDeliveryOrder(input.orderId, { includeNetSuiteClosed: true }), () => admit(input));
-  }
-  return withTransaction(() => admit(input));
+/**
+ * How long a Load submit waits for its order lock. Another Load for the same
+ * order can hold that lock through slow NetSuite validation; a repeat should
+ * report "in progress" instead of queueing behind it.
+ */
+export const LOAD_SUBMIT_ORDER_LOCK_TIMEOUT_MS = 5000;
+
+function loadSubmitInProgressError() {
+  return Object.assign(
+    new Error("This order is still being processed by an earlier Load. Check its status before loading again."),
+    { code: "OPERATOR_NETSUITE_POSTING_IN_PROGRESS", status: 409 }
+  );
 }
+
+/**
+ * @param {object} dependencies
+ * @param {(input: Record<string, any>) => Promise<Record<string, any>>} dependencies.admit
+ * @param {(input: Record<string, any>) => Promise<Record<string, any> | null>} dependencies.findReplay
+ * @param {(orderId: unknown, options: Record<string, any>) => Promise<Record<string, any> | null>} dependencies.readDeliveryOrder
+ * @param {(command: Record<string, any>) => Promise<unknown>} [dependencies.onReplayed]
+ * @param {() => Promise<unknown>} [dependencies.beforeCustomerPickup]
+ * @param {number} [dependencies.lockTimeoutMs]
+ */
+export function createOperatorNetSuitePostingSubmission({
+  admit: admitCommand,
+  findReplay,
+  readDeliveryOrder,
+  onReplayed = async () => {},
+  beforeCustomerPickup = async () => {},
+  lockTimeoutMs = LOAD_SUBMIT_ORDER_LOCK_TIMEOUT_MS
+}) {
+  /** @param {Record<string, any>} input */
+  async function replayOrAdmit(input) {
+    // An exact repeat of an accepted request returns that job before any
+    // NetSuite call; NetSuite allows only a few concurrent requests.
+    const command = await findReplay(input);
+    if (!command) {return admitCommand(input);}
+    await onReplayed(command);
+    return telemetry.context({ commandId: command.id, actorOperatorId: input.actorOperatorId, orderId: input.orderId,
+      functionKey: input.functionKey, transactionType: command.transactionType, stage: "admission" },
+    () => telemetry.time({ operation: "posting.replay" }, async () => ({
+      mode: "netsuite",
+      policy: null,
+      replayed: true,
+      command
+    })));
+  }
+
+  return async function submitOperatorNetSuitePostingAction(/** @type {Record<string, any>} */ input) {
+    if (input.functionKey === "customer_pickup") {await beforeCustomerPickup();}
+    if (["delivery_prep", "customer_pickup"].includes(input.functionKey)) {
+      return withConsolidatedLoadMutation(
+        () => readDeliveryOrder(input.orderId, { includeNetSuiteClosed: true }),
+        () => replayOrAdmit(input),
+        { lockTimeoutMs, onLockTimeout: loadSubmitInProgressError }
+      );
+    }
+    return withTransaction(() => replayOrAdmit(input));
+  };
+}
+
+export const submitOperatorNetSuitePostingAction = createOperatorNetSuitePostingSubmission({
+  admit,
+  findReplay: findReplayableOperatorNetSuitePostingCommand,
+  readDeliveryOrder: getDeliveryOrder,
+  onReplayed: enqueueAfterCommit,
+  beforeCustomerPickup: ensureOutboundLocationDirectory
+});
 
 /**
  * Freeze every local draft/quantity mutation while an accepted command owns

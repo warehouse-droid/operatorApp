@@ -6,7 +6,8 @@ import { localReceiptNetSuiteQuantities, verifiedLocalNetSuiteSalesQuantities } 
 import { query } from "./db.js";
 import { finalizeTransferPosting } from './transfer-order-posting-repository.js';
 import { completeConsolidatedLoad } from "./consolidation-load-repository.js";
-import { recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
+import { getDeliveryOrder, recordCustomerPickupLoad, recordDeliveryLoad } from "./delivery-repository.js";
+import { deliveryLoadLockOrderIds, lockDeliveryLoadOrders } from "./consolidation-load-locks.js";
 import { recordReceivingReceipt } from "./receiving-repository.js";
 import { enqueuePurchaseReceiptRefresh } from './purchase-receipt-refresh-repository.js';
 import {
@@ -245,6 +246,33 @@ export function createOperatorNetSuitePostingFinalizer({
     return handler(command, operation, photos);
   };
 }
+
+/** Local operations whose finalization runs inside the delivery order lock. */
+const ORDER_LOCKED_FINALIZATIONS = new Set(["customer_pickup_load", "delivery_prep_load"]);
+
+/**
+ * Take the same delivery order locks that a Load submit takes, so completion
+ * can lock them before it locks the command row (see
+ * completeOperatorNetSuitePostingCommand). Finalization takes them again;
+ * a transaction re-entering a lock it holds does not wait.
+ *
+ * @param {object} dependencies
+ * @param {(orderId: unknown, options: Record<string, any>) => Promise<Record<string, any> | null>} dependencies.readDeliveryOrder
+ * @param {(orderIds: unknown[]) => Promise<unknown>} dependencies.lockOrders
+ */
+export function createOperatorNetSuitePostingFinalizationLock({ readDeliveryOrder, lockOrders }) {
+  return async function lockOperatorNetSuitePostingFinalization(/** @type {Record<string, any>} */ command) {
+    const operation = command?.inputSnapshot?.localOperation;
+    if (!ORDER_LOCKED_FINALIZATIONS.has(operation?.kind)) {return;}
+    const order = await readDeliveryOrder(operation.orderId, { includeNetSuiteClosed: true });
+    if (order) {await lockOrders(deliveryLoadLockOrderIds(order));}
+  };
+}
+
+export const lockOperatorNetSuitePostingFinalization = createOperatorNetSuitePostingFinalizationLock({
+  readDeliveryOrder: getDeliveryOrder,
+  lockOrders: lockDeliveryLoadOrders
+});
 
 export const finalizeOperatorNetSuitePosting = createOperatorNetSuitePostingFinalizer({
   recordCustomerPickupLoad,

@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 
 import { query, withTransaction } from "./db.js";
+import { isOperatorNetSuitePostingReplay } from "./operator-netsuite-posting-domain.js";
 import { enqueuePostingPhotos } from "./operator-netsuite-posting-photo-queue.js";
 
 /** @param {string} code @param {string} message @param {number} [status] */
@@ -259,6 +260,30 @@ export async function createOrReplayOperatorNetSuitePostingCommand(draft) {
 /** @param {string} commandId */
 export async function getOperatorNetSuitePostingCommand(commandId) {
   return hydratedCommand(requiredText(commandId, "Operator posting command ID"));
+}
+
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/**
+ * Return the accepted command for an exact repeat of the same Operator action,
+ * so the repeat does not re-run NetSuite validation. Plain reads only: the
+ * caller holds the order lock, and a row lock here could wait on this
+ * command's own finalization.
+ *
+ * @param {Record<string, any>} input
+ */
+export async function findReplayableOperatorNetSuitePostingCommand(input) {
+  const requestId = String(input?.requestId || "").trim();
+  if (!REQUEST_ID_PATTERN.test(requestId)) {return null;}
+  const found = await query(
+    `SELECT id
+       FROM operator_netsuite_posting_commands
+      WHERE request_id = $1`,
+    [requestId]
+  );
+  if (!found.rows[0]) {return null;}
+  const command = await hydratedCommand(found.rows[0].id);
+  return isOperatorNetSuitePostingReplay(command, input) ? command : null;
 }
 
 /**
@@ -774,7 +799,8 @@ export async function resumeOperatorNetSuitePostingCommand(commandId) {
  *   commandId: string,
  *   leaseToken: string,
  *   result?: Record<string, any>,
- *   finalize: () => Promise<unknown>
+ *   finalize: () => Promise<unknown>,
+ *   lockLocalOrder?: () => Promise<unknown>
  * }} input
  */
 export async function completeOperatorNetSuitePostingCommand(input) {
@@ -787,7 +813,17 @@ export async function completeOperatorNetSuitePostingCommand(input) {
       400
     );
   }
+  if (input.lockLocalOrder !== undefined && typeof input.lockLocalOrder !== "function") {
+    throw repositoryError(
+      "OPERATOR_NETSUITE_POSTING_INPUT_INVALID",
+      "The local order lock must be a callback.",
+      400
+    );
+  }
   return withTransaction(async () => {
+    // Admission takes the order lock before it writes this command. Take the
+    // same lock before locking the command row so the two cannot deadlock.
+    if (input.lockLocalOrder) {await input.lockLocalOrder();}
     const current = await query(
       `SELECT *
          FROM operator_netsuite_posting_commands

@@ -13,7 +13,7 @@ import {
   startOperatorNetSuitePostingAttempt
 } from "./operator-netsuite-posting-repository.js";
 import { operatorNetSuitePostingAdapter } from "./operator-netsuite-posting-netsuite-adapter.js";
-import { finalizeOperatorNetSuitePosting } from "./operator-netsuite-posting-finalizer.js";
+import { finalizeOperatorNetSuitePosting, lockOperatorNetSuitePostingFinalization } from "./operator-netsuite-posting-finalizer.js";
 import { createOperatorNetSuitePostingProcessor } from "./operator-netsuite-posting-service.js";
 
 /**
@@ -67,6 +67,7 @@ const processor = createOperatorNetSuitePostingProcessor({
   repository,
   adapter: operatorNetSuitePostingAdapter,
   finalize: finalizeOperatorNetSuitePosting,
+  lockFinalization: lockOperatorNetSuitePostingFinalization,
   workerId: `operator-netsuite-${process.pid}`
 });
 

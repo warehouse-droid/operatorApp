@@ -62,8 +62,11 @@ function safeRemoteEvidence(record) {
  * @param {{findByExternalId: Function, verify: Function, transform: Function, fetchById: Function}} dependencies.adapter
  * @param {(command: Record<string, any>) => Promise<unknown>} dependencies.finalize
  * @param {string} dependencies.workerId
+ * @param {(command: Record<string, any>) => Promise<unknown>} [dependencies.lockFinalization]
+ *   Takes the local order lock(s) at the start of the completion transaction,
+ *   before the command row is locked (the same order admission uses).
  */
-export function createOperatorNetSuitePostingProcessor({ repository, adapter, finalize, workerId }) {
+export function createOperatorNetSuitePostingProcessor({ repository, adapter, finalize, workerId, lockFinalization }) {
   const leaseSeconds = 180;
 
   /** @param {Record<string, any>} command @param {() => Promise<unknown>} work */
@@ -272,6 +275,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         commandId: command.id,
         leaseToken: command.leaseToken,
         result: completionResult(command),
+        ...(lockFinalization ? { lockLocalOrder: () => lockFinalization(command) } : {}),
         finalize: () => telemetry.context({ commandId: command.id, transactionType: command.transactionType,
           functionKey: command.functionKey, stage: "finalization" }, () => telemetry.time({ operation: "posting.finalization" }, () => finalize(command)))
       });

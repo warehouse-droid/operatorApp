@@ -7652,7 +7652,7 @@ async function confirmFulfillment() {
       ? "Creating and verifying the NetSuite fulfillment..."
       : "Saving local loaded status...";
     showFulfillmentPostingStage(deferPhotos);
-    rememberFulfillmentPosting({ status: "submitting", loadBlocked: true });
+    rememberFulfillmentPosting({ status: "submitting", loadBlocked: true, submittedAt: Date.now() });
     const started = await api(path, {
       method: "POST",
       body: JSON.stringify({
@@ -7746,13 +7746,29 @@ function rememberFulfillmentPosting(posting) {
   } catch { /* Durable server claims remain authoritative if browser storage is unavailable. */ }
 }
 
+// How long an unanswered Load submit keeps its order held on this device.
+const LOAD_SUBMIT_JOURNAL_HOLD_MS = 3 * 60 * 1000;
+
+// A Load still checking NetSuite has no job yet, so its job lookup fails (404).
+// Keep a recent submit held instead of letting the same Load start again.
+function recentLoadSubmitHold(journal) {
+  const age = Date.now() - Number(journal?.submittedAt);
+  if (journal?.status !== "submitting" || !(age >= 0 && age < LOAD_SUBMIT_JOURNAL_HOLD_MS)) return null;
+  return { status: "submitting", loadBlocked: true, transactions: [],
+    reason: t("operator.previousLoadStillProcessing", "The previous Load is still being processed. Check status in a moment before loading again.") };
+}
+
 async function resumePreviousLoadJournal(order) {
   const previous = loadPostingJournal(order);
   if (!previous || order.posting?.loadBlocked) return;
   // The request UUID is also the durable command ID, even if admission's
   // response was lost before the browser learned the job ID.
   const job = await api(`/api/operator/netsuite-posting-jobs/${encodeURIComponent(previous.jobId || previous.requestId)}`).catch(() => null);
-  if (!job) return;
+  if (!job) {
+    const held = recentLoadSubmitHold(previous);
+    if (held) order.posting = held;
+    return;
+  }
   if (["completed", "failed"].includes(job.status)) {
     try { window.localStorage?.removeItem(loadPostingJournalKey(order)); } catch { /* Server state still prevents duplicate completion. */ }
   } else order.posting = postingSummaryFromJob(job);
@@ -7833,6 +7849,10 @@ async function refreshLoadPostingStatus() {
         fulfillmentResult = job.result?.localFinalization || job.result;
         rememberFulfillmentPosting(null);
       } else if (job) refreshed.posting = postingSummaryFromJob(job);
+      else if (!refreshed.posting?.loadBlocked) {
+        const held = recentLoadSubmitHold(loadPostingJournal(order));
+        if (held) refreshed.posting = held;
+      }
     }
     fulfillmentOrder = { ...refreshed, loadConfirmationAcknowledged: fulfillmentOrder.loadConfirmationAcknowledged };
     if (!refreshed.posting?.loadBlocked && !fulfillmentResult && !hasDraftPackedQty(refreshed)) {
