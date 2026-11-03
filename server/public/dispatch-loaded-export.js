@@ -30,10 +30,10 @@ const loadedState = {
   itemSearch: "",
   direction: localStorage.getItem("mbbs.dispatch.loaded.direction") === "inbound" ? "inbound" : "outbound",
   typeByDirection: {
-    inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
+    inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.inboundType")
       : "purchase_order",
-    outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
+    outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order", "custom_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.outboundType")
       : "sales_order"
   },
@@ -101,8 +101,8 @@ function loadedAllowedYards() {
 }
 
 const DISPATCH_YARD_TYPES = {
-  inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"]
+  inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"],
+  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order", "custom_order"]
 };
 
 function selectedMovementType() {
@@ -112,22 +112,26 @@ function selectedMovementType() {
 function movementTypeCode(orderType) {
   return {
     sales_order: "SO",
+    sor_order: "SOR",
     transfer_order: "TO",
     purchase_order: "PO",
     co_order: "CO",
     vrma_order: "VRMA",
-    custom_order: "Custom"
+    custom_order: "Custom",
+    sor_return: "SOR-Return"
   }[orderType] || String(orderType || "").toUpperCase();
 }
 
 function movementTypeLabel(orderType) {
   return {
     sales_order: loadedT("yard.salesOrder", "Sales Order"),
+    sor_order: loadedT("yard.sorOrder", "SOR Rental Order"),
     transfer_order: loadedT("yard.transferOrder", "Transfer Order"),
     purchase_order: loadedT("yard.purchaseOrder", "Purchase Order"),
     co_order: loadedT("yard.coOrder", "CO Order"),
     vrma_order: "VRMA",
-    custom_order: loadedT("dispatch.customOrders", "Custom Order")
+    custom_order: loadedT("dispatch.customOrders", "Custom Order"),
+    sor_return: loadedT("yard.sorReturn", "SOR Return")
   }[orderType] || orderType;
 }
 
@@ -527,7 +531,7 @@ function renderLoadedDetail() {
     </div>
     <div class="dispatch-loaded-lines">${lines.map((line) => `<div class="dispatch-loaded-line">
       <div><strong>${loadedEscape(line.sku || line.item_name || "")}</strong><span>${loadedEscape(line.item_name || "")}</span>${line.item_description ? `<em>${loadedEscape(line.item_description)}</em>` : ""}</div>
-      <div class="dispatch-loaded-qty">${renderMovementQuantityEquation(line)}<small>${loadedEscape(line.location || order.yard_location || "")}</small></div>
+      <div class="dispatch-loaded-qty">${renderMovementQuantityEquation(line)}${line.quantity_basis === "ordered" ? `<small><strong>${loadedT("yard.orderedQuantity", "Ordered quantity · no yard load")}</strong></small>` : ""}<small>${loadedEscape(line.location || order.yard_location || "")}</small></div>
     </div>`).join("") || `<div class="dispatch-loaded-notice">${driverOnly ? loadedT("yard.noYardLinesYet", "No yard processing record yet. Driver delivery data is shown below.") : loadedT("yard.noProcessedLines", "No processed lines")}</div>`}</div>
     ${renderDriverRecords(driverRecords)}
     ${!driverOnly || photos.length ? renderLoadedPhotoSection(loadedT("yard.yardPhotos", "Yard photos"), photos, "yard") : ""}

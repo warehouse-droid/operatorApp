@@ -380,10 +380,10 @@ let loadedSearchTerm = "";
 let loadedItemSearchTerm = "";
 let loadedDirection = localStorage.getItem("mbbs.control.loaded.direction") === "inbound" ? "inbound" : "outbound";
 const loadedTypeByDirection = {
-  inbound: ["purchase_order", "transfer_order", "co_order"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
+  inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
     ? localStorage.getItem("mbbs.control.loaded.inboundType")
     : "purchase_order",
-  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
+  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
     ? localStorage.getItem("mbbs.control.loaded.outboundType")
     : "sales_order"
 };
@@ -2749,8 +2749,8 @@ function loadedOrderKey(order) {
 }
 
 const YARD_MOVEMENT_TYPES = {
-  inbound: ["purchase_order", "transfer_order", "co_order"],
-  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
+  inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"],
+  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order"]
 };
 
 function selectedLoadedOrderType() {
@@ -2760,20 +2760,26 @@ function selectedLoadedOrderType() {
 function movementTypeCode(orderType) {
   return {
     sales_order: "SO",
+    sor_order: "SOR",
     transfer_order: "TO",
     purchase_order: "PO",
     co_order: "CO",
-    vrma_order: "VRMA"
+    vrma_order: "VRMA",
+    custom_order: "Custom",
+    sor_return: "SOR-Return"
   }[orderType] || String(orderType || "").toUpperCase();
 }
 
 function movementTypeLabel(orderType) {
   return {
     sales_order: t("yard.salesOrder", "Sales Order"),
+    sor_order: t("yard.sorOrder", "SOR Rental Order"),
     transfer_order: t("yard.transferOrder", "Transfer Order"),
     purchase_order: t("yard.purchaseOrder", "Purchase Order"),
     co_order: t("yard.coOrder", "CO Order"),
-    vrma_order: "VRMA"
+    vrma_order: "VRMA",
+    custom_order: t("dispatch.customOrders", "Custom Order"),
+    sor_return: t("yard.sorReturn", "SOR Return")
   }[orderType] || orderType;
 }
 
@@ -3048,7 +3054,7 @@ function renderLoadedExportSection() {
       <div class="section-heading">
         <div>
           <h2>${t("control.loadedExportTitle", "In/Outbound Record")}</h2>
-          <p class="muted">${t("control.loadedExportHelp", "Review processed receipts and loads for PO, TO, CO, SO, and VRMA orders.")}</p>
+          <p class="muted">${t("control.loadedExportHelp", "Review processed receipts and loads for PO, TO, CO, SO, SOR, SOR-Return, and VRMA orders.")}</p>
         </div>
         <button data-action="refresh-loaded-orders" type="button">${t("common.refresh", "Refresh")}</button>
       </div>
@@ -3164,7 +3170,7 @@ function renderLoadedOrderDetail() {
   const driverRecords = loadedOrderDetail.driverRecords || loadedOrderDetail.driverEvents || [];
   const driverPhotos = loadedOrderDetail.driverPhotos || [];
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
-  const salesOrderReloadEligible = order.direction === "outbound" && order.order_type === "sales_order" && !order.driver_only;
+  const salesOrderReloadEligible = order.direction === "outbound" && ["sales_order", "sor_order"].includes(order.order_type) && !order.driver_only;
   const reloadCanCancel = activeReloadCycle?.status === "authorized" && !activeReloadCycle?.activityStartedAt;
   return `
     <div class="loaded-detail-head">
@@ -3199,6 +3205,7 @@ function renderLoadedOrderDetail() {
           </div>
           <div class="loaded-line-qty">
             ${renderMovementQuantityEquation(line)}
+            ${line.quantity_basis === "ordered" ? `<small><strong>${t("yard.orderedQuantity", "Ordered quantity · no yard load")}</strong></small>` : ""}
             <small>${escapeHtml(line.location || order.yard_location || "")}</small>
           </div>
         </div>

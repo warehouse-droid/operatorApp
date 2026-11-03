@@ -6,13 +6,59 @@ import {
   getLatestSalesOrderReattemptForOrder,
   listSalesOrderLoadAttempts
 } from "./sales-order-reload-repository.js";
+import { RENTAL_YARD } from "./sor-rental-policy.js";
 
 const VALID_DIRECTIONS = new Set(["inbound", "outbound"]);
-const VALID_ORDER_TYPES = new Set(["sales_order", "transfer_order", "purchase_order", "co_order", "vrma_order", "custom_order"]);
+const VALID_ORDER_TYPES = new Set([
+  "sales_order",
+  "sor_order",
+  "transfer_order",
+  "purchase_order",
+  "co_order",
+  "vrma_order",
+  "custom_order",
+  "sor_return"
+]);
+// SOR rental deliveries are sales orders and keep sales-order load history.
+const SALES_ORDER_MOVEMENT_TYPES = new Set(["sales_order", "sor_order"]);
+// Matches isSorDeliveryRef; collections are the system-managed `<ref>-Return`.
+const SOR_DELIVERY_REF_SQL = "'^SOR[0-9]+(-S[0-9]+)?$'";
+const SOR_TRANSPORT_REF_SQL = "'^SOR[0-9]+(-S[0-9]+)?(-Return)?$'";
+const SOR_RETURN_KIND_SQL = "'sor_rental_return'";
+
+function salesOrderTypeSql(tranidExpression) {
+  return `CASE
+    WHEN ${isSorDeliverySql(tranidExpression)} THEN 'sor_order'::text
+    ELSE 'sales_order'::text
+  END`;
+}
+
+function isSorDeliverySql(tranidExpression) {
+  return `BTRIM(COALESCE(${tranidExpression}, '')) ~* ${SOR_DELIVERY_REF_SQL}`;
+}
+
+// SOR rentals ship from the rental yard; their NetSuite location ("Rental") is not a yard.
+function sorUsesRentalYardSql(alias = "o") {
+  return `(${isSorDeliverySql(`${alias}.tranid`)} AND NOT EXISTS (
+    SELECT 1 FROM mbt_yards yard WHERE yard.dispatch_location_id = ${alias}.outbound_location_id
+  ))`;
+}
+
+function salesOrderYardLocationIdSql(alias = "o") {
+  return `CASE WHEN ${sorUsesRentalYardSql(alias)} THEN ${Number(RENTAL_YARD.locationId)}::bigint
+    ELSE ${alias}.outbound_location_id END`;
+}
+
+function salesOrderYardLocationSql(alias = "o") {
+  return `CASE WHEN ${sorUsesRentalYardSql(alias)} THEN '${RENTAL_YARD.code}'::text
+    ELSE ${alias}.outbound_location END`;
+}
 
 function salesModuleLocationIdSql(alias = "movement") {
+  // SOR rentals and their collections belong to the rental yard's Sales store.
   return `CASE
     WHEN ${alias}.order_type = 'sales_order' THEN ${salesStoreLocationIdSql(`${alias}.tranid`)}
+    WHEN ${alias}.order_type IN ('sor_order', 'sor_return') THEN ${Number(RENTAL_YARD.locationId)}::bigint
     ELSE ${alias}.yard_location_id
   END`;
 }
@@ -122,12 +168,12 @@ function movementRecordsSql({ fromParam = null, toParam = null } = {}) {
   const recordWindow = (alias) => activityWindowSql(`${alias}.created_at`, fromParam, toParam);
   return `
     SELECT 'outbound'::text AS direction,
-           'sales_order'::text AS order_type,
+           ${salesOrderTypeSql("o.tranid")} AS order_type,
            o.netsuite_id AS order_id,
            o.tranid,
            o.customer AS party,
-           o.outbound_location_id AS yard_location_id,
-           o.outbound_location AS yard_location,
+           ${salesOrderYardLocationIdSql("o")} AS yard_location_id,
+           ${salesOrderYardLocationSql("o")} AS yard_location,
            NULL::text AS source_location,
            o.outbound_location AS destination_location,
            COALESCE(NULLIF(o.local_yard_order_status, ''), o.operator_status) AS movement_status,
@@ -215,12 +261,14 @@ function movementRecordsSql({ fromParam = null, toParam = null } = {}) {
 function selectedOrderReferencesSql() {
   return [
     ['sales_order', 'sales_orders', 'netsuite_id', 'tranid'],
+    ['sor_order', 'sales_orders', 'netsuite_id', 'tranid'],
     ['purchase_order', 'purchase_orders', 'netsuite_id', 'tranid'],
     ['purchase_order', 'purchase_orders', 'netsuite_id', 'dispatch_ref'],
     ['transfer_order', 'transfer_orders', 'netsuite_id', 'tranid'],
     ['co_order', 'local_co_orders', 'id', 'co_ref'],
     ['vrma_order', 'scm_vrma_orders', 'id', 'vrma_ref'],
-    ['custom_order', 'dispatch_custom_orders', 'id', 'ref_number']
+    ['custom_order', 'dispatch_custom_orders', 'id', 'ref_number'],
+    ['sor_return', 'dispatch_custom_orders', 'id', 'ref_number']
   ].map(([type, table, id, reference]) => `SELECT LOWER(BTRIM(${reference})) FROM ${table}
     WHERE $2::text = '${type}' AND ${id} = $3::bigint`).join('\nUNION ALL\n');
 }
@@ -259,7 +307,12 @@ function driverOrderCtes({ fromParam = null, toParam = null, selectedOrder = fal
         CROSS JOIN LATERAL jsonb_array_elements_text(
           CASE
             WHEN jsonb_typeof(COALESCE(r.order_refs, '[]'::jsonb)) = 'array'
+              AND jsonb_array_length(COALESCE(r.order_refs, '[]'::jsonb)) > 0
               THEN COALESCE(r.order_refs, '[]'::jsonb)
+            -- BIN transport jobs name their SOR source only on the cargo legs.
+            WHEN r.job_details->'mbt'->>'actionCode' IN ('cargo_pickup_1', 'cargo_dropoff_1')
+              AND BTRIM(COALESCE(r.job_details->'mbt'->>'sourceRef', '')) ~* ${SOR_TRANSPORT_REF_SQL}
+              THEN jsonb_build_array(BTRIM(r.job_details->'mbt'->>'sourceRef'))
             ELSE '[]'::jsonb
           END
         ) WITH ORDINALITY AS ref(order_ref, ref_index)
@@ -272,12 +325,12 @@ function driverOrderCtes({ fromParam = null, toParam = null, selectedOrder = fal
     `driver_order_matches AS (
       SELECT refs.*,
              'outbound'::text AS direction,
-             'sales_order'::text AS order_type,
+             ${salesOrderTypeSql("o.tranid")} AS order_type,
              o.netsuite_id AS order_id,
              o.tranid,
              o.customer AS party,
-             o.outbound_location_id AS yard_location_id,
-             o.outbound_location AS yard_location,
+             ${salesOrderYardLocationIdSql("o")} AS yard_location_id,
+             ${salesOrderYardLocationSql("o")} AS yard_location,
              NULL::text AS source_location,
              o.outbound_location AS destination_location,
              10 AS match_priority
@@ -340,6 +393,19 @@ function driverOrderCtes({ fromParam = null, toParam = null, selectedOrder = fal
         FROM driver_record_refs refs
         JOIN dispatch_custom_orders o
           ON LOWER(BTRIM(o.ref_number)) = LOWER(BTRIM(refs.order_ref))
+       WHERE o.order_kind <> ${SOR_RETURN_KIND_SQL}
+      UNION ALL
+      -- An SOR collection brings rental equipment back into its drop-off yard.
+      SELECT refs.*,
+             'inbound', 'sor_return', o.id, o.ref_number,
+             COALESCE(NULLIF(BTRIM(o.sor_customer), ''), o.parent_order_ref),
+             ${customOrderYardLocationIdSql("o.dropoff_location")},
+             o.dropoff_location, o.pickup_location, o.dropoff_location,
+             60
+        FROM driver_record_refs refs
+        JOIN dispatch_custom_orders o
+          ON LOWER(BTRIM(o.ref_number)) = LOWER(BTRIM(refs.order_ref))
+       WHERE o.order_kind = ${SOR_RETURN_KIND_SQL}
     )`,
     `driver_order_events AS (
       SELECT ranked.*
@@ -420,12 +486,23 @@ function recordEventsSql() {
   `;
 }
 
+function jsonBigintSql(expression) {
+  return `CASE WHEN BTRIM(COALESCE(${expression}, '')) ~ '^[0-9]{1,18}$'
+    THEN BTRIM(${expression})::bigint END`;
+}
+
+function jsonNumericSql(expression) {
+  return `CASE WHEN BTRIM(COALESCE(${expression}, '')) ~ '^-?[0-9]{1,15}([.][0-9]{1,6})?$'
+    THEN BTRIM(${expression})::numeric END`;
+}
+
 function movementLinesSql() {
   const poReceived = receivedSalesSql("l");
   const toReceived = receivedSalesSql("l");
   const coReceived = receivedSalesSql("l", { hasSalesColumn: false });
-  return `
-    SELECT 'outbound'::text AS direction, 'sales_order'::text AS order_type,
+  const sorLine = (key) => `snapshot.line->>'${key}'`;
+  const processedLines = `
+    SELECT 'outbound'::text AS direction, ${salesOrderTypeSql("o.tranid")} AS order_type,
            l.sales_order_id AS order_id, l.id, l.line_id, l.item_id, l.item_name, l.sku,
            l.item_description, COALESCE(l.loaded_qty, 0) AS processed_qty,
            COALESCE(NULLIF(l.loaded_uom, ''), l.unit) AS processed_uom,
@@ -435,6 +512,7 @@ function movementLinesSql() {
            COALESCE(l.fulfilled_section_qty, 0) AS processed_section_qty,
            COALESCE(l.fulfilled_piece_qty, 0) AS processed_piece_qty
       FROM sales_order_lines l
+      LEFT JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
      WHERE COALESCE(l.loaded_qty, 0) > 0
     UNION ALL
     SELECT 'outbound', 'transfer_order', l.transfer_order_id, l.id, l.line_id, l.item_id,
@@ -512,6 +590,53 @@ function movementLinesSql() {
            NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric,
            0::numeric, 0::numeric, 0::numeric, 0::numeric
       FROM dispatch_custom_orders o
+     WHERE o.order_kind <> ${SOR_RETURN_KIND_SQL}
+    UNION ALL
+    -- The collection's line snapshot is the rental equipment being returned.
+    SELECT 'inbound', 'sor_return', o.id, snapshot.ordinality,
+           COALESCE(${jsonBigintSql(sorLine("lineId"))}, snapshot.ordinality),
+           ${jsonBigintSql(sorLine("itemId"))},
+           COALESCE(NULLIF(${sorLine("itemName")}, ''), ${sorLine("sku")}),
+           COALESCE(NULLIF(${sorLine("sku")}, ''), ${sorLine("itemName")}),
+           ${sorLine("description")},
+           COALESCE(${jsonNumericSql(sorLine("quantity"))}, ${jsonNumericSql(sorLine("salesQty"))}, 0),
+           NULLIF(${sorLine("unit")}, ''), NULLIF(${sorLine("unit")}, ''), NULL::text,
+           source_line.to_plt, source_line.to_lyr, source_line.to_sec, source_line.to_pcs,
+           COALESCE(${jsonNumericSql(sorLine("pallets"))}, 0),
+           COALESCE(${jsonNumericSql(sorLine("layers"))}, 0),
+           COALESCE(${jsonNumericSql(sorLine("sections"))}, 0),
+           COALESCE(${jsonNumericSql(sorLine("pieces"))}, 0)
+      FROM dispatch_custom_orders o
+      CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(o.line_snapshot) = 'array' THEN o.line_snapshot ELSE '[]'::jsonb END
+      ) WITH ORDINALITY AS snapshot(line, ordinality)
+      LEFT JOIN sales_order_lines source_line
+        ON source_line.sales_order_id = o.parent_sales_order_id
+       AND source_line.id = ${jsonBigintSql(sorLine("lineRowId"))}
+     WHERE o.order_kind = ${SOR_RETURN_KIND_SQL}
+  `;
+  // Drivers take SOR rentals straight out, so nothing is yard-loaded; the order's
+  // lines then describe the movement (and make it item-searchable) as ordered quantities.
+  return `
+    SELECT processed.*, 'processed'::text AS quantity_basis
+      FROM (${processedLines}) processed
+    UNION ALL
+    SELECT 'outbound', 'sor_order', l.sales_order_id, l.id, l.line_id, l.item_id, l.item_name, l.sku,
+           l.item_description, COALESCE(l.quantity, 0), l.unit, l.unit, l.location,
+           l.to_plt, l.to_lyr, l.to_sec, l.to_pcs,
+           COALESCE(l.pallet_qty, 0), COALESCE(l.layer_qty, 0),
+           COALESCE(l.section_qty, 0), COALESCE(l.piece_qty, 0),
+           'ordered'::text
+      FROM sales_order_lines l
+      JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
+     WHERE ${isSorDeliverySql("o.tranid")}
+       AND COALESCE(l.netsuite_active, true)
+       AND COALESCE(l.quantity, 0) > 0
+       AND NOT EXISTS (
+         SELECT 1 FROM sales_order_lines loaded
+          WHERE loaded.sales_order_id = l.sales_order_id
+            AND COALESCE(loaded.loaded_qty, 0) > 0
+       )
   `;
 }
 
@@ -526,9 +651,12 @@ function movementPhotosSql() {
     END
   )`;
   return `
-    SELECT 'outbound'::text AS direction, r.order_family AS order_type, r.order_id,
-           r.id, r.created_at, photo.photo_data_url, r.response, 'yard'::text AS source
+    SELECT 'outbound'::text AS direction,
+           CASE WHEN r.order_family = 'sales_order' THEN ${salesOrderTypeSql("so.tranid")}
+             ELSE r.order_family END AS order_type,
+           r.order_id, r.id, r.created_at, photo.photo_data_url, r.response, 'yard'::text AS source
       FROM operator_load_records r
+      LEFT JOIN sales_orders so ON r.order_family = 'sales_order' AND so.netsuite_id = r.order_id
       CROSS JOIN LATERAL ${arrayRows("r.photo_data_urls", "r.photo_data_url")} photo(photo_data_url)
      WHERE (r.order_family = 'sales_order' AND r.load_type IN ('sales_order_delivery_load', 'customer_pickup_load'))
         OR (r.order_family = 'transfer_order' AND r.load_type = 'transfer_order_load')
@@ -923,7 +1051,7 @@ export async function getYardMovementDetail({
     detailParams
   );
   const isSalesOrderLoad = normalizedDirection === "outbound"
-    && normalizedType === "sales_order"
+    && SALES_ORDER_MOVEMENT_TYPES.has(normalizedType)
     && /^\d+$/.test(String(orderId || ""));
   const [
     lineResult,
@@ -1016,7 +1144,7 @@ export async function listYardMovementCsvRows(filters = {}) {
       driver_photo_count: order.driver_photo_count
     };
     const loadAttempts = detail?.loadAttempts || [];
-    if (order.direction === "outbound" && order.order_type === "sales_order" && loadAttempts.length) {
+    if (order.direction === "outbound" && SALES_ORDER_MOVEMENT_TYPES.has(order.order_type) && loadAttempts.length) {
       for (const attempt of loadAttempts) {
         const attemptCommon = {
           ...common,
@@ -1046,7 +1174,13 @@ export async function listYardMovementCsvRows(filters = {}) {
       rows.push(common);
       continue;
     }
-    for (const line of lines) rows.push({ ...common, ...line });
+    for (const line of lines) {
+      rows.push({
+        ...common,
+        ...line,
+        ...(line.quantity_basis === "ordered" ? { attempt_quantity_basis: "ordered" } : {})
+      });
+    }
   }
   return rows;
 }
