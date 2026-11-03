@@ -44,11 +44,12 @@ export function attachPurchaseOrders(c){
   const usage=await one('SELECT * FROM repair_part_usages WHERE id=$1 AND job_id=$2 FOR UPDATE',[d.uuid(usageId),id]);if(!usage)throw d.fail('Parts usage not found for this job.',404);
   await requireApproved(job,usage.quote_line_id);
   const qty=d.quantity(input.quantity),reason=d.text(input.reason,'Correction reason'),description=d.text(input.description||'','Description',2000,false);
+  const technician=await c.usageTechnician(job,input.technicianId,usage.data?.technician),data={...usage.data,technician,...input.repairItemId?{repairItemId:d.reference(input.repairItemId)}:{}};
   const sign=usage.kind==='issue'?1:-1,delta=(Number(usage.quantity_milli)-qty)*sign;
   const net=Number((await one("SELECT coalesce(sum(CASE kind WHEN 'issue' THEN quantity_milli ELSE -quantity_milli END),0) AS qty FROM repair_part_usages WHERE job_id=$1 AND part_id=$2 AND quote_line_id IS NOT DISTINCT FROM $3",[id,usage.part_id,usage.quote_line_id])).qty);
   if(net-delta<0)throw d.fail('Cannot return more parts than this job used.',409);
   if(delta)await moveStock(actor,{partId:usage.part_id,jobId:id,kind:'adjustment',qty:delta,reason});
-  await query('UPDATE repair_part_usages SET quantity_milli=$2,description=$3 WHERE id=$1',[usageId,qty,description]);
-  await event(actor,job,'part_usage_corrected',{usageId,kind:usage.kind,partId:usage.part_id,previousQuantityMilli:Number(usage.quantity_milli),quantityMilli:qty,previousDescription:usage.description,description,reason});return save(job);
+  await query('UPDATE repair_part_usages SET quantity_milli=$2,description=$3,data=$4 WHERE id=$1',[usageId,qty,description,data]);
+  await event(actor,job,'part_usage_corrected',{usageId,kind:usage.kind,partId:usage.part_id,previousQuantityMilli:Number(usage.quantity_milli),quantityMilli:qty,previousDescription:usage.description,description,previousTechnician:usage.data?.technician||null,technician,previousRepairItemId:usage.data?.repairItemId||null,repairItemId:data.repairItemId||null,reason});return save(job);
  });};
 }

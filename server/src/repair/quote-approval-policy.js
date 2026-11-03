@@ -7,6 +7,7 @@ export function updateQuoteApprovalPolicy(value,current){
  return {...quoteApprovalPolicy(current),...value};
 }
 export function quoteApprovalCategory(job){
+ if(job.data?.repairType==='other')return null;
  if(job.company==='EXTERNAL')return 'externalCustomers';
  if(job.data?.equipmentTypeConfirmed!==true)return null;
  if(job.data.equipmentType==='truck')return 'trucks';

@@ -1,0 +1,25 @@
+@import url('/i18n.css?v=20261030-repair-language');
+.repair-language{display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.repair-language .language-toggle button{min-width:44px;min-height:44px;padding:0 10px;font-size:14px}
+.repair-language-bar{display:flex;justify-content:center;gap:8px;max-width:1200px;margin:0 auto;padding:10px 18px}
+/* Equal outer columns keep the language switch centered independently of titles and actions. */
+:is(.topbar,.repair-topbar,.requester-topbar,.team-section-heading,header).repair-language-header{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);grid-template-areas:'identity language actions';align-items:center;gap:14px}
+.repair-team .topbar.repair-language-header{grid-template-columns:minmax(0,1fr) auto minmax(0,1fr)}
+.repair-language-header>:first-child{grid-area:identity;min-width:0}
+.repair-language-header>:nth-child(2){grid-area:actions;justify-self:end;min-width:0;max-width:100%}
+.repair-language-header>.repair-language{grid-area:language;justify-self:center;min-width:0;margin:0}
+.requester-identity{display:flex;align-items:center;gap:14px;min-width:0}
+.requester-title{min-width:0}.requester-back{flex-shrink:0}
+.repair-language-header.repair-topbar .repair-header-tools{width:100%;flex-wrap:wrap}
+.repair-language-header.topbar .topbar-actions{flex-wrap:wrap}
+@media(max-width:759px){
+ .requester-topbar.repair-language-header{grid-template-areas:'identity language actions' 'title title title';gap:8px 10px}
+ .requester-topbar.repair-language-header>.requester-identity{display:contents}
+ .requester-topbar .requester-back{grid-area:identity;justify-self:start}
+ .requester-topbar .requester-title{grid-area:title}
+}
+@media(max-width:550px){
+ .repair-language .language-toggle button{min-width:40px;padding:0 8px}
+ .repair-topbar.repair-language-header,.repair-team #repairApp>.topbar.repair-language-header{grid-template-areas:'language language language' 'identity identity identity' 'actions actions actions'}
+ .repair-topbar.repair-language-header>:nth-child(2),.repair-team #repairApp>.topbar.repair-language-header>:nth-child(2){justify-self:stretch}
+}

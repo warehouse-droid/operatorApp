@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import * as d from '../../public/repair/domain.js';
+import {worChildren} from './wor-lines.js';
 
 /** Local readiness and durable, explicitly authorized financial posting leases. */
 export function attachManualPosting(c){
@@ -33,14 +34,15 @@ export function attachManualPosting(c){
   const inspectionHours=s.work.filter(w=>w.phase==='inspection').reduce((n,w)=>n+Number(w.data.hoursMilli||0),0);
   if(!inspectionHours)blockers.push('Review actual inspection hours.');
   for(const job of s.jobs.filter(j=>j.outcome==='repaired'))if(!s.work.some(w=>w.job_id===job.id&&w.phase==='repair'&&Number(w.data.hoursMilli)>0))blockers.push('Review actual repair hours for every completed repair job.');
-  if(!s.job.data.vehicle.netsuiteId)blockers.push('Link a verified NetSuite vehicle master for the WOR.');
+  if(!d.isOther(s.job)&&!s.job.data.vehicle.netsuiteId)blockers.push('Link a verified NetSuite vehicle master for the WOR.');
   if(!s.job.data.vehicle.customerId)blockers.push('Verify the NetSuite equipment owner.');
   if(s.job.data.equipmentReconciliation)blockers.push('Reconcile the corrected equipment and its existing NetSuite records.');
   const approved=s.quotes.flatMap(q=>q.lines).filter(l=>l.decision==='approved');
   if(approved.some(l=>!l.itemId))blockers.push('Map every approved quote line to a NetSuite item.');
+  try{worChildren(s.job,s.settings.mappings,s.quotes.flatMap(q=>q.lines.map(line=>({...line,jobId:q.job_id}))),s.usages,s.work);}catch(error){blockers.push(error.message);}
   const wor=state(s,'wor',[...new Set(blockers)]),sos=s.job.company==='MBR'?{status:'not_required',blockers:[]} :state(s,'sos',[...new Set([...blockers,...(!s.job.data.worPostedAt?['Post the completed WOR first so SOS can link to it.']:[])])]);
   const bills=s.purchases.map(p=>({id:p.id,revision:p.revision,number:p.data.poNumber||p.number,stage:d.purchaseStage(p),...state(s,'bill',billBlockers(p),p)}));
-  return {mode:'manual',enabled:s.settings.postingEnabled===true,wor,sos,bills,ready:!blockers.length&&bills.every(p=>!p.blockers.length),workforce:s.work.map(w=>({id:w.id,jobId:w.job_id,phase:w.phase,actor:w.actor,technician:w.data.technician||w.actor,hoursMilli:Number(w.data.hoursMilli||0),hourlyCostMinor:Number(w.data.hourlyCostMinor||0),done:w.data.done||'',revision:w.data.officeRevision||0})),workforceEditable:!s.job.data.worPostedAt&&!s.tasks.some(p=>(p.payload.documentType==='wor'&&['working','uncertain','attention'].includes(p.state)||p.payload.manual!==true&&['working','uncertain'].includes(p.state)))};
+  return {quoteItems:s.quotes.flatMap(q=>q.lines.filter(l=>l.decision==='approved').map(l=>({id:l.id,itemId:l.itemId,description:l.description,kind:l.kind,jobId:q.job_id}))),mode:'manual',enabled:s.settings.postingEnabled===true,wor,sos,bills,ready:!blockers.length&&bills.every(p=>!p.blockers.length),parts:s.usages.map(u=>({id:u.id,jobId:u.job_id,description:u.description||u.name,kind:u.kind,quantityMilli:u.quantityMilli,technician:u.data.technician||null,repairItemId:u.data.repairItemId||'',revision:u.data.officeRevision||0})),workforce:s.work.map(w=>({id:w.id,jobId:w.job_id,phase:w.phase,actor:w.actor,technician:w.data.technician||w.actor,performers:w.data.performers||[],quoteLineId:w.data.quoteLineId||'',hoursMilli:Number(w.data.hoursMilli||0),hourlyCostMinor:Number(w.data.hourlyCostMinor||0),done:w.data.done||'',revision:w.data.officeRevision||0})),workforceEditable:!s.job.data.worPostedAt&&!s.tasks.some(p=>(p.payload.documentType==='wor'&&['working','uncertain','attention'].includes(p.state)||p.payload.manual!==true&&['working','uncertain'].includes(p.state)))};
  }
  api.postingStatus=async(actor,id)=>{office(actor);return present(await snapshot(id));};
  api.correctWorkforce=async(actor,id,input)=>{office(actor);return command(actor,`actual_workforce:${id}`,input,async()=>{
@@ -49,9 +51,18 @@ export function attachManualPosting(c){
   if((entry.data.officeRevision||0)!==input.entryRevision)throw d.fail('Actual labour changed. Refresh before saving.',409);
   const reason=d.text(input.reason,'Labour correction reason'),hoursMilli=String(input.hours)==='0'?0:d.quantity(input.hours),hourlyCostMinor=d.money(input.hourlyCost),technician=d.text(input.technician,'Technician',200);
   const data={...entry.data,hoursMilli,hourlyCostMinor,technician,officeRevision:(entry.data.officeRevision||0)+1};
+  if(input.technicianIds!==undefined){data.performers=await c.selectTechnicians(input.technicianIds);data.technician=data.performers.map(p=>p.name).join(' / ');}else if(technician!==entry.data.technician)data.performers=[];
+  if(input.quoteLineId){const quote=s.quotes.find(q=>q.job_id===entry.job_id&&q.lines.some(l=>l.id===input.quoteLineId&&l.kind==='labor'&&l.decision==='approved'));if(!quote)throw d.fail('Choose the approved repair item on this job.');data.quoteLineId=input.quoteLineId;}
   const target=entry.job_id===s.child.id?s.child:await raw(entry.job_id,true);
   await query('UPDATE repair_work_entries SET data=$2 WHERE id=$1',[entry.id,data]);await query('UPDATE repair_jobs SET revision=revision+1 WHERE id=$1',[target.id]);
   await event(actor,target,'actual_labour_corrected',{entryId:entry.id,previous:entry.data,current:data,reason});return {ok:true};
+ });};
+ api.correctActualParts=async(actor,id,input)=>{office(actor);return command(actor,`actual_parts:${id}`,input,async()=>{
+  const s=await snapshot(id);revision(s.child,input);if(!present(s).workforceEditable)throw d.fail('Reconcile the WOR before changing its posted or in-progress parts.',409);
+  const usage=await one('SELECT * FROM repair_part_usages WHERE id=$1 AND request_id=$2 FOR UPDATE',[d.uuid(input.usageId),s.job.id]);if(!usage)throw d.fail('Parts usage not found.',404);if((usage.data.officeRevision||0)!==input.usageRevision)throw d.fail('Parts attribution changed. Refresh before saving.',409);
+  const reason=d.text(input.reason,'Parts attribution correction reason'),technician=(await c.selectTechnicians([input.technicianId]))[0],data={...usage.data,technician,officeRevision:(usage.data.officeRevision||0)+1};
+  if(input.repairItemId){const ids=s.quotes.filter(q=>q.job_id===usage.job_id).flatMap(q=>q.lines.filter(l=>l.kind==='part'&&l.decision==='approved').map(l=>l.itemId));if(!ids.includes(input.repairItemId)&&!(ids.length===0&&input.repairItemId==='10555'))throw d.fail('Choose the parts repair item on this job.');data.repairItemId=d.reference(input.repairItemId);}
+  await query('UPDATE repair_part_usages SET data=$2 WHERE id=$1',[usage.id,data]);const target=usage.job_id===s.child.id?s.child:await raw(usage.job_id,true);await query('UPDATE repair_jobs SET revision=revision+1 WHERE id=$1',[target.id]);await event(actor,target,'actual_parts_corrected',{usageId:usage.id,previous:usage.data,current:data,reason});return {ok:true};
  });};
  api.beginManualPosting=async(actor,id,input)=>{office(actor);return command(actor,`manual_post:${id}`,input,async()=>{
   await query("UPDATE repair_postings SET state='uncertain',error='Posting lease expired. Reconcile NetSuite before retrying.',lease_token=NULL WHERE state='working' AND lease_until<now() AND payload->>'manual'='true'");

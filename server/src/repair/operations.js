@@ -14,7 +14,7 @@ export function createRepairOperations({repo,adapter,enabled=()=>true}){
    const remember=async data=>{const saved=await query("UPDATE repair_requests SET data=data||$2::jsonb WHERE id=$1 AND EXISTS(SELECT 1 FROM repair_postings WHERE id=$3 AND lease_token=$4 AND state='working')",[task.request_id,data,task.id,prepared.token]);if(!saved.rowCount)throw d.fail('Posting lease lost. Reconcile NetSuite before retrying.',409);};
    try{
     const type=task.payload.documentType,s=type==='bill'?{settings:{mappings:await repo.directoryMappings()}}:await repo.manualSnapshot(id);let result;
-    if(type==='wor')result=await adapter.postWor(s.job,s.settings.mappings,s.quotes.flatMap(q=>q.lines),s.usages,s.work,remember);
+    if(type==='wor')result=await adapter.postWor(s.job,s.settings.mappings,s.quotes.flatMap(q=>q.lines.map(line=>({...line,jobId:q.job_id}))),s.usages,s.work,remember);
     else if(type==='sos')result=await adapter.postSos(s.job,s.settings.mappings,s.quotes.flatMap(q=>q.lines),remember);
     else result=await adapter.bill(await repo.getPurchase(actor,task.purchase_id),s.settings.mappings);
     const at=new Date().toISOString();

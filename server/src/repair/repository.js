@@ -4,6 +4,7 @@ import * as d from '../../public/repair/domain.js';
 import {createRepairJobs,workJobRow} from './jobs.js';
 import {attachQuotes} from './quotes.js';
 import {attachActions} from './actions.js';
+import {attachTechnicians} from './technicians.js';
 import {attachPurchasing} from './purchasing.js';
 import {attachPurchaseOrders} from './purchase-orders.js';
 import {attachHandover} from './handover.js';
@@ -12,7 +13,7 @@ import {attachManualPosting} from './manual-posting.js';
 import {AUTO_QUOTE_APPROVER,quoteApprovalPolicy,updateQuoteApprovalPolicy,automaticQuoteCategory} from './quote-approval-policy.js';
 export const hash=value=>createHash('sha256').update(value).digest('hex');
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
-export const requestRow=r=>r&&({id:r.id,number:r.number,vehicleId:r.vehicle_id,company:r.company,requesterType:r.requester_type,requesterId:r.requester_id,yardId:r.yard_id,status:r.status,condition:r.condition,priority:r.priority,receipt:r.receipt,outcome:r.outcome,inspectionFeeMinor:Number(r.inspection_fee_minor),inspectionTaxBps:r.inspection_tax_bps,revision:r.revision,data:r.data,createdAt:r.created_at,updatedAt:r.updated_at});
+export const requestRow=r=>r&&({id:r.id,number:r.number,vehicleId:r.vehicle_id,company:r.company,requesterType:r.requester_type,requesterId:r.requester_id,yardId:r.data?.repairType==='other'&&r.yard_id?Number(r.yard_id):r.yard_id,status:r.status,condition:r.condition,priority:r.priority,receipt:r.receipt,outcome:r.outcome,inspectionFeeMinor:Number(r.inspection_fee_minor),inspectionTaxBps:r.inspection_tax_bps,revision:r.revision,data:r.data,createdAt:r.created_at,updatedAt:r.updated_at});
 export const vehicleRow=r=>r&&({id:r.id,netsuiteId:r.netsuite_id?String(r.netsuite_id):null,machineId:r.machine_id&&String(r.machine_id),dispatchTruckId:r.dispatch_truck_id,company:r.company,customerId:r.customer_id,plate:r.plate,alias:r.alias,serial:r.serial,...r.data,equipmentType:r.data?.equipmentType||d.equipmentType(r.data?.netSuiteVehicleType)});
 export function date(value,optional=false){if(optional&&!value)return null;if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}$/u.test(value)||!Number.isFinite(Date.parse(value))||new Date(value).toISOString().slice(0,10)!==value)throw d.fail('Enter a valid date.');return value;}
 export function createRepairRepository({query=dbQuery,transaction=withTransaction}={}) {
@@ -42,6 +43,7 @@ export function createRepairRepository({query=dbQuery,transaction=withTransactio
  async function requireApproved(job,lineId){const quotes=await activeQuotes(job),quote=quotes.find(q=>q.status==='decided'&&q.lines.some(line=>line.decision==='approved'&&(!lineId||line.id===lineId)));if(!quote)throw d.fail('An approved quote line is required before repair work or parts purchases.',409);return quote;}
  function publicRequest(actor,job){const result=structuredClone(job);delete result.data.handoverAccess;if(!d.canViewCosts(actor)&&!d.canApprove(actor,job)){delete result.inspectionFeeMinor;delete result.inspectionTaxBps;}return result;}
  const c={api,query,one,transaction,jobs,raw,revision,mutable,command,event,notify,save,posting,currentQuote,activeQuotes,requireApproved,publicRequest,requestRow};
+ attachTechnicians(c);
  attachHandover(c);
  api.settings=async actor=>{d.requireAllowed(d.canViewCosts(actor));const row=await one('SELECT * FROM repair_settings');return {...row.data,quoteAutoApproval:quoteApprovalPolicy(row.data.quoteAutoApproval),revision:row.revision};};
  api.configure=async(actor,input)=>{d.requireAllowed(d.canViewCosts(actor));return command(actor,'settings',input,async()=>{
@@ -59,6 +61,15 @@ export function createRepairRepository({query=dbQuery,transaction=withTransactio
  api.vehicles=async(actor,search='')=>{const company=d.has(actor,'driver')?'MBT':d.has(actor,'operator')&&!d.canViewCosts(actor)&&!d.canWorkshop(actor)?'MBBS':null;return (await query(`SELECT * FROM repair_vehicles WHERE active AND ($1::text IS NULL OR company=$1) AND (NOT $3 OR coalesce(data->>'equipmentType','unknown') IN ('unknown','forklift','loader')) AND concat_ws(' ',plate,alias,serial,data->>'netSuiteVehicleType',data->>'equipmentType',data->>'masterName',data->>'masterDisplayName',data->>'machineName',data->>'machineAlias',data->>'machineSerial',data->>'model',data->>'manufacturer') ILIKE $2 ORDER BY alias,plate LIMIT 200`,[company,`%${d.text(search,'Search',100,false)}%`,company==='MBBS'])).rows.map(vehicleRow);};
  api.create=async(actor,input)=>publicRequest(actor,await command(actor,'create',input,async()=>{
   d.validateIntake(input);
+  if(input.repairType==='other'){
+   d.requireAllowed(d.canViewCosts(actor)||d.has(actor,'operator','driver'));
+   const address=d.repairAddress(input),settings=(await one('SELECT data FROM repair_settings')).data;
+   const driver=actor.role==='driver',company=driver?'MBT':'MBBS',operator=d.has(actor,'operator')&&!d.canViewCosts(actor),yardId=address.yardId||(operator?Number((actor.operatorYardLocationIds||actor.yardLocationIds||[])[0])||null:null);
+   if(operator&&!yardId)throw d.fail('Your operator account needs a responsible yard for custom-address repairs.');
+   const data={repairType:'other',address,accountingVehicle:{netsuiteId:'109',masterName:'VEH00109'},vehicle:{alias:address.label,company,customerId:settings.mappings[driver?'mbtCustomerId':'mbbsCustomerId']||'',equipmentType:'other'},equipmentType:'other',equipmentTypeConfirmed:true,defect:d.text(input.defect,'Repair details'),inspectionComplete:false,phase:'inspection'};
+   const job=requestRow(await one(`INSERT INTO repair_requests(id,vehicle_id,company,requester_type,requester_id,yard_id,condition,priority,inspection_fee_minor,inspection_tax_bps,data) VALUES($1,NULL,$2,$3,$4,$5,'can_operate',$6,$7,$8,$9) RETURNING *`,[randomUUID(),company,driver?'driver':'staff',String(actor.id),yardId,input.priority==='urgent'?'urgent':'normal',settings.inspectionFeeMinor,settings.taxBps,data]));
+   await jobs.initialize(job);await event(actor,job,'created',{repairType:'other',address});await notify('role:repair_technician',job,'new',`${job.number}: new inspection at ${address.label}`);await notify('role:repair_office',job,'new',`${job.number}: new repair request at ${address.label}`);return raw(job.id);
+  }
   const vehicle=vehicleRow(await one('SELECT * FROM repair_vehicles WHERE id=$1 AND active',[d.uuid(input.vehicleId)]));if(!vehicle)throw d.fail('Choose a registered vehicle.',404);if(!vehicle.customerId)throw d.fail('This equipment has no verified owner. Ask the office to update its NetSuite master.',409);
   d.requireAllowed(d.canViewCosts(actor)||(vehicle.company==='MBT'&&d.has(actor,'driver'))||(vehicle.company==='MBBS'&&d.has(actor,'operator')));
   const yardId=input.yardId?d.integer(Number(input.yardId),'Yard',1):null;
@@ -72,7 +83,7 @@ export function createRepairRepository({query=dbQuery,transaction=withTransactio
    if(input.meterUnit!=='hours')throw d.fail('Operator repairs use hour-meter readings in hours.');
   }
   const equipmentTypeConfirmed=equipmentType!=='unknown'&&equipmentType===vehicle.equipmentType;
-  const data={vehicle,equipmentType,equipmentTypeConfirmed,originalEquipment:{vehicleId:vehicle.id,equipmentType},meter,meterUnit:d.choice(input.meterUnit,['km','hours'],'meter unit'),defect:d.text(input.defect,'Defect description'),inspectionComplete:false,phase:'inspection'};
+  const data={repairType:'equipment',vehicle,equipmentType,equipmentTypeConfirmed,originalEquipment:{vehicleId:vehicle.id,equipmentType},meter,meterUnit:d.choice(input.meterUnit,['km','hours'],'meter unit'),defect:d.text(input.defect,'Defect description'),inspectionComplete:false,phase:'inspection'};
   const job=requestRow(await one(`INSERT INTO repair_requests(id,vehicle_id,company,requester_type,requester_id,yard_id,condition,priority,inspection_fee_minor,inspection_tax_bps,data) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[randomUUID(),vehicle.id,vehicle.company,actor.role==='driver'?'driver':'staff',String(actor.id),yardId,d.choice(input.condition,d.CONDITIONS,'operating condition'),input.priority==='urgent'?'urgent':'normal',settings.inspectionFeeMinor,settings.taxBps,data]));
   await jobs.initialize(job);
   await event(actor,job,'created',{condition:job.condition});await posting(job,'inspection');await notify('role:repair_technician',job,'new',`${job.number}: new inspection`);await notify('role:repair_office',job,'new',`${job.number}: new repair request`);
@@ -96,6 +107,7 @@ export function createRepairRepository({query=dbQuery,transaction=withTransactio
   result.request=project(actor,parent,allQuotes,allParts,await c.incomingFor(parent.id,true));if(financial)result.request.totals=d.totals(allQuotes.flatMap(q=>q.lines),parent.inspectionFeeMinor,parent.inspectionTaxBps);
   if(d.canViewCosts(actor))result.purchaseOrders=await api.jobPurchaseOrders(actor,id);
   result.permissions={office:d.canViewCosts(actor),technician:d.canWorkshop(actor),approve:d.canApprove(actor,job),condition:d.canChangeCondition(actor,job),receive:d.canReceive(actor,{...job,id:job.requestId})};
+  if(result.permissions.office||result.permissions.technician)result.technicians=await api.technicians(actor);
   if(d.canViewCosts(actor)){result.autoApproveQuote=Boolean(automaticQuoteCategory((await one('SELECT data FROM repair_settings')).data,job));result.postings=(await query('SELECT id,kind,state,error,result,created_at FROM repair_postings WHERE request_id=$1 ORDER BY created_at',[parent.id])).rows;result.postingStatus=await api.postingStatus(actor,id);}
   if(id===parent.id&&(requestView||d.has(actor,'driver','operator')&&!d.canViewCosts(actor)&&!d.canWorkshop(actor))){Object.assign(result,publicRequest(actor,result.request),{revision:job.revision});result.partRequests=allParts;result.work=(await query('SELECT * FROM repair_work_entries WHERE request_id=$1 ORDER BY created_at',[parent.id])).rows;result.attachments=(await query('SELECT id,kind,filename,mime_type,byte_size,caption,created_at FROM repair_attachments WHERE request_id=$1 ORDER BY created_at',[parent.id])).rows;}
   if(!d.canViewCosts(actor)){

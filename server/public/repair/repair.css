@@ -39,3 +39,11 @@ fieldset{min-width:0;border:0;border-top:1px solid #e0e7e1;padding:20px 0;margin
 .po-board-status{display:block;font-size:12px;color:#63746b;margin-top:6px;overflow-wrap:anywhere}
 
 .quote-policy-switches{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));gap:14px;border:0;padding:0;margin:20px 0}.quote-policy-switch{display:flex;align-items:center;gap:12px;padding:16px;border:1px solid #d8e2da;border-radius:10px;cursor:pointer}.quote-policy-switch input{width:22px;min-height:22px;height:22px;margin:0;flex:none;accent-color:#17614e}.quote-policy-switches:disabled .quote-policy-switch{cursor:default}
+.repair-item-picker{position:relative;min-width:220px}.repair-item-results{position:absolute;z-index:30;top:100%;left:0;right:0;max-height:280px;overflow:auto;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 8px 22px #0f172a20}.repair-item-results button{display:block;width:100%;text-align:left;border:0;border-radius:0;padding:12px;background:#fff}.repair-item-results button:hover,.repair-item-results button:focus{background:#eff6ff}.performer-choices{grid-column:1/-1;border:1px solid #dbe3ec;border-radius:8px;display:flex;gap:14px;flex-wrap:wrap}.performer-choices label{display:flex;align-items:center;gap:8px}.performer-choices input{width:20px;height:20px}
+
+/* Quote fields follow the same visual and keyboard order. */
+.quote-line{grid-template-columns:86px minmax(160px,1.5fr) minmax(190px,2fr) 80px 104px 76px 44px}.quote-line>.repair-item-picker{min-width:0}
+@media(max-width:1100px){.quote-line{grid-template-columns:repeat(3,minmax(0,1fr))}.quote-line>.repair-item-picker{grid-column:span 2}.quote-line>.line-description{grid-column:1/-1}.quote-line>button[data-do=remove-line]{grid-column:3;justify-self:end;width:44px}}
+@media(max-width:550px){.quote-line{grid-template-columns:minmax(0,1fr)}.quote-line>.repair-item-picker,.quote-line>.line-description{grid-column:1}.quote-line>button[data-do=remove-line]{grid-column:1}}
+
+.equipment-search-row{grid-template-columns:minmax(0,1fr)}

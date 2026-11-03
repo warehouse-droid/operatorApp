@@ -1,6 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import * as d from '../../public/repair/domain.js';
-const childKeys=['inspectionRequired','inspectionComplete','phase','defect','nextStep','assignedTechnician','completedAt','completedBy','eta','quoteId'];
+const childKeys=['inspectionRequired','inspectionComplete','phase','defect','nextStep','assignedTechnician','performers','startedAt','startedBy','startedPhase','completedAt','completedBy','eta','quoteId'];
 const parentKeys=['vehicle','equipmentType','equipmentTypeConfirmed','originalEquipment','equipmentReconciliation','accountingReview','conditionReason','recipient','delegationReason','handover','cancellationReason'];
 export function workJobRow(parent,child){return {...parent,id:child.id,requestId:parent.id,requestNumber:parent.number,number:child.number,inspectionFeeMinor:child.sequence===1?parent.inspectionFeeMinor:0,requestCompletedAt:parent.data.completedAt,sequence:child.sequence,revision:child.revision,status:child.status,priority:child.priority,outcome:child.outcome,parentReceipt:parent.receipt,parentStatus:parent.status,data:{...parent.data,quoteNeeded:false,...child.data},createdAt:child.created_at,updatedAt:child.updated_at};}
 export function createRepairJobs({query,one,requestRow,notify,posting}){

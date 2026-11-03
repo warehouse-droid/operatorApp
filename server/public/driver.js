@@ -3117,7 +3117,7 @@ function renderNoJob() {
       <div class="empty-actions">
         <button class="primary" data-action="refresh" type="button">${t("common.refresh", "Refresh")}</button>
         <button class="secondary" data-action="open-history" type="button">${t("common.history", "History")}</button>
-        <button class="secondary compact" data-action="repair-requests" type="button" style="grid-column:1/-1">Repair requests</button>
+        <button class="secondary compact" data-action="repair-requests" type="button" style="grid-column:1/-1">${t("repair.requests", "Repair requests")}</button>
       </div>
     </section>
     ${activeRest ? renderRestModal() : ""}
@@ -5549,7 +5549,7 @@ function renderDriverHistory() {
             <p>${escapeHtml(driver?.name || t("stats.driver", "Driver"))}</p>
             <h2>${t("driver.personalHistory", "Personal History")}</h2>
           </div>
-          <div class="empty-actions"><button class="secondary compact" data-action="repair-requests" type="button">Repair requests</button><button class="secondary compact history-back-button" data-action="back-job" type="button">${t("common.back", "Back")}</button></div>
+          <div class="empty-actions"><button class="secondary compact" data-action="repair-requests" type="button">${t("repair.requests", "Repair requests")}</button><button class="secondary compact history-back-button" data-action="back-job" type="button">${t("common.back", "Back")}</button></div>
         </div>
         <div class="history-filter">
             <input id="driverHistoryDate" type="date" value="${escapeHtml(historyDate)}" />
@@ -5915,7 +5915,7 @@ function disconnectEvents() {
 
 app.addEventListener("click", async (event) => {
   const button = event.target.closest("button");
-  if (button?.dataset.action === "repair-requests") { location.assign("/driver/repair"); return; }
+  if (button?.dataset.action === "repair-requests") { location.assign("/driver/repair?language=" + encodeURIComponent(document.documentElement.lang || window.MBBS_I18N?.language?.() || "en")); return; }
   if (!button) return;
   const action = button.dataset.action;
   if (action === 'start-job' && currentJob?.sorReturnReadiness?.some(state => !state.allowed)) {

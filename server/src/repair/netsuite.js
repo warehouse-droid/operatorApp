@@ -1,6 +1,10 @@
+import {isOther,OTHER_WOR_VEHICLE} from '../../public/repair/targets.js';
 import {reference,fail,amount,tax,totals} from '../../public/repair/domain.js';
 import {createHash} from 'node:crypto';
+import {worChildren,verifyWorChild} from './wor-lines.js';
+import {servicePrices} from './service-prices.js';
 export function orderFingerprint(order){return createHash('sha256').update(JSON.stringify({customer:String(order.entity?.id),form:String(order.customForm?.id),wor:String(order.custbody14?.id),total:Number(order.total),lines:(order.item?.items||[]).map(line=>({item:String(line.item?.id),quantity:Number(line.quantity),rate:Number(line.rate),description:line.description||'',tax:String(line.taxCode?.id)}))})).digest('hex');}
+const postingVehicle=job=>isOther(job)?{...job.data.vehicle,...OTHER_WOR_VEHICLE}:job.data.vehicle;
 const ref=value=>({id:reference(value)});
 const approved=lines=>lines.filter(line=>line.decision==='approved');
 function taxCode(bps,mapping) {
@@ -9,7 +13,7 @@ function taxCode(bps,mapping) {
  return ref(id);
 }
 export function inspectionWor(job,_mapping) {
- const v=job.data.vehicle;
+ const v=postingVehicle(job);
  return {externalId:`repair-${job.id}-wor`,altName:v.alias||v.plate||v.serial,
   custrecord_wo_vehicle:ref(v.netsuiteId),custrecord_wo_customer:ref(v.customerId),custrecord_wo_status:ref('1'),
   custrecord147:job.data.defect,custrecord124:v.plate||'',custrecord126:v.serial||'',custrecord129:v.alias||'',
@@ -21,7 +25,7 @@ function inspectionLine(job,mapping) {
 }
 export function inspectionSos(job,mapping,worId) {
  if(job.company==='MBR') throw fail('Internal MBR repairs do not create an SOS.');
- const v=job.data.vehicle,fee=inspectionLine(job,mapping);fee.price={id:'-1'};
+ const v=postingVehicle(job),fee=inspectionLine(job,mapping);fee.price={id:'-1'};
  return {externalId:`repair-${job.id}-sos`,customForm:ref(mapping.sosFormId),subsidiary:ref(mapping.subsidiaryId),
   location:ref(mapping.locationId),currency:ref(mapping.currencyId),entity:ref(v.customerId),custbody14:ref(worId),
   custbody17:v.serial||'',custbody18:v.plate||'',custbody19:v.alias||'',custbody3:ref('1'),custbody5:ref('1'),
@@ -87,14 +91,14 @@ export function createRepairNetSuite({record,queryAll}) {
   const types={wor:'customrecord_mbr_work_order',sos:'salesOrder',bill:'vendorBill'};
   if(!types[kind]) throw fail('Choose WOR, SOS or Bill.');
   const result=await read(types[kind],reference(id));if(!result) throw fail('NetSuite record was not found.',404);
-  if(kind==='wor'&&String(result.custrecord_wo_vehicle?.id)!==String(job.data.vehicle.netsuiteId)) throw fail('WOR belongs to another vehicle.',409);
+  if(kind==='wor'&&String(result.custrecord_wo_vehicle?.id)!==String(postingVehicle(job).netsuiteId)) throw fail('WOR belongs to another vehicle.',409);
   if(kind==='sos'&&(job.company==='MBR'||String(result.entity?.id)!==String(job.data.vehicle.customerId)||String(result.customForm?.id)!=='183')) throw fail('SOS customer or form does not match this repair.',409);
   if(kind==='bill'&&(String(result.entity?.id)!==purchase.vendorId||String(result.tranId)!==purchase.invoiceRef)) throw fail('Bill supplier or invoice does not match.',409);
   return result;
  }
  async function inspection(job,mapping,remember) {
   const wor=job.data.worId?await read('customrecord_mbr_work_order',job.data.worId):await create('customrecord_mbr_work_order',inspectionWor(job,mapping));
-  if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(job.data.vehicle.netsuiteId)) throw fail('Linked WOR is missing or belongs to another vehicle.',409);await remember({worId:String(wor.id),worRef:wor.name});
+  if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(postingVehicle(job).netsuiteId)) throw fail('Linked WOR is missing or belongs to another vehicle.',409);await remember({worId:String(wor.id),worRef:wor.name});
   await create('customrecord246',inspectionLabor(job,mapping,wor.id));
   if(job.company==='MBR') return {worId:String(wor.id),worRef:wor.name};
   const sos=job.data.sosId?await read('salesOrder',job.data.sosId):await create('salesOrder',inspectionSos(job,mapping,wor.id));
@@ -114,7 +118,7 @@ export function createRepairNetSuite({record,queryAll}) {
    if(!job.data.sosFingerprint||orderFingerprint(sos)!==job.data.sosFingerprint)throw fail('SOS was changed outside Repair or lacks a verified snapshot. Office reconciliation is required.',409,'REPAIR_EXTERNAL_CHANGE');
   }
   const wor=await read('customrecord_mbr_work_order',job.data.worId);
-  if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(job.data.vehicle.netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR equipment or customer changed outside Repair. Office reconciliation is required.',409,'REPAIR_REMOTE_IDENTITY');
+  if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(postingVehicle(job).netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR equipment or customer changed outside Repair. Office reconciliation is required.',409,'REPAIR_REMOTE_IDENTITY');
   const children=workChildren(job,mapping,job.data.worId,lines,usages,work),activeIds=new Set(children.map(child=>child.payload.externalId));
   for(const [type,parent,zero] of [['customrecord246','custrecord141',{custrecord156:0,custrecord157:0}],['customrecord247','custrecord159',{custrecord169:0,custrecord170:0}]]){
    const existing=await queryAll(`SELECT id,externalid FROM ${type} WHERE ${parent}=${reference(job.data.worId)}`);
@@ -133,19 +137,18 @@ export function createRepairNetSuite({record,queryAll}) {
  }
  return {read,create,update,link,inspection,complete,fingerprint:orderFingerprint,
   async postWor(job,mapping,lines,usages,work,remember){
+   const children=worChildren(job,mapping,lines,usages,work);
    const wor=job.data.worId?await read('customrecord_mbr_work_order',job.data.worId):await create('customrecord_mbr_work_order',inspectionWor(job,mapping));
-   if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(job.data.vehicle.netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR equipment or customer does not match this request.',409,'REPAIR_REMOTE_IDENTITY');
+   if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(postingVehicle(job).netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR equipment or customer does not match this request.',409,'REPAIR_REMOTE_IDENTITY');
    if(wor.custrecord_wo_so?.id&&String(wor.custrecord_wo_so.id)!==String(job.data.sosId||''))throw fail('WOR is linked to another SOS. Reconcile the link before posting.',409,'REPAIR_REMOTE_IDENTITY');
    await remember({worId:String(wor.id),worRef:wor.name||wor.altName});
-   const children=work.map(entry=>{const line=lines.find(l=>l.id===entry.data.quoteLineId),hours=Number(entry.data.hoursMilli||0)/1000;return {type:'customrecord246',payload:{externalId:`repair-${job.id}-work-${entry.id}`,custrecord141:ref(wor.id),custrecord209:ref(entry.phase==='inspection'?mapping.inspectionItemId:line?.itemId||'10650'),custrecord148:entry.phase==='inspection'?'Inspection':line?.description||'Actual repair work',custrecord152:hours,custrecord156:hours,custrecord157:Number(entry.data.hourlyCostMinor||0)/100,custrecord154:true,custrecord155:new Date(entry.created_at).toISOString().slice(0,10),custrecord153:[entry.data.diagnosis,entry.data.done,entry.data.nextStep].filter(Boolean).join('\n').slice(0,3900),custrecord212:`${entry.data.technician||entry.actor} · ${job.number}`}};});
-   const parts=new Map();for(const entry of usages){const key=`${entry.job_id||''}:${entry.partId||entry.description}`;if(!parts.has(key))parts.set(key,{entry,issued:0,returned:0});const part=parts.get(key);part[entry.kind==='return'?'returned':'issued']+=entry.quantityMilli;}
-   for(const {entry,issued,returned} of parts.values())children.push({type:'customrecord247',payload:{externalId:`repair-${job.id}-usage-${entry.id}`,custrecord159:ref(wor.id),custrecord160:ref('10555'),custrecord161:entry.description||entry.name||'Parts used',custrecord162:issued/1000,custrecord167:returned/1000,custrecord169:(issued-returned)/1000,custrecord170:entry.unitCostMinor/100}});
+   for(const child of children)child.payload[child.type==='customrecord246'?'custrecord141':'custrecord159']=ref(wor.id);
    const active=new Set(children.map(child=>child.payload.externalId));
    for(const [type,parent,zero] of [['customrecord246','custrecord141',{custrecord152:0,custrecord156:0,custrecord157:0}],['customrecord247','custrecord159',{custrecord162:0,custrecord167:0,custrecord169:0,custrecord170:0}]]){
     const existing=await queryAll(`SELECT id,externalid FROM ${type} WHERE ${parent}=${reference(wor.id)}`);
     for(const child of existing)if(String(child.externalid||'').startsWith(`repair-${job.id}-`)&&!active.has(child.externalid))await update(type,child.id,zero);
    }
-   for(const child of children){const found=await create(child.type,child.payload);const parent=child.type==='customrecord246'?'custrecord141':'custrecord159';if(String(found[parent]?.id)!==String(wor.id))throw fail('A workforce or parts record belongs to another WOR.',409,'REPAIR_REMOTE_IDENTITY');await update(child.type,found.id,child.payload);}
+   for(const child of children){const found=await create(child.type,child.payload);const parent=child.type==='customrecord246'?'custrecord141':'custrecord159';if(String(found[parent]?.id)!==String(wor.id))throw fail('A workforce or parts record belongs to another WOR.',409,'REPAIR_REMOTE_IDENTITY');verifyWorChild(await update(child.type,found.id,child.payload),child.payload);}
    const completed=await update('customrecord_mbr_work_order',wor.id,{custrecord_wo_status:ref('4')});if(String(completed.custrecord_wo_status?.id)!=='4')throw fail('WOR completion could not be verified.',409,'REPAIR_REMOTE_VERIFY');
    return {worId:String(wor.id),worRef:completed.name||wor.name||wor.altName};
   },
@@ -153,7 +156,7 @@ export function createRepairNetSuite({record,queryAll}) {
    if(job.company==='MBR')throw fail('Internal rental repairs do not require SOS.',409);
    if(!job.data.worId||!job.data.worPostedAt)throw fail('Post the completed WOR first.',409);
    const wor=await read('customrecord_mbr_work_order',job.data.worId);
-   if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(job.data.vehicle.netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR identity changed. Reconcile before linking the SOS.',409,'REPAIR_REMOTE_IDENTITY');
+   if(!wor?.id||String(wor.custrecord_wo_vehicle?.id)!==String(postingVehicle(job).netsuiteId)||String(wor.custrecord_wo_customer?.id)!==String(job.data.vehicle.customerId))throw fail('WOR identity changed. Reconcile before linking the SOS.',409,'REPAIR_REMOTE_IDENTITY');
    const payload={...completionSos(job,mapping,wor.id,lines),orderStatus:{id:'B'}};
    let sos=job.data.sosId?await read('salesOrder',job.data.sosId):await read('salesOrder',`eid:${payload.externalId}`);
    if(sos){
@@ -181,6 +184,14 @@ export function createRepairNetSuite({record,queryAll}) {
   async machines(){return queryAll('SELECT id,name,altname,custrecord1 AS item_id,custrecord2 AS serial,custrecord50 AS alias,custrecord30 AS subsidiary_id,custrecord48 AS manufacturer,custrecord49 AS model,custrecord51 AS description,isinactive FROM customrecord_mrb_machine_master ORDER BY id');},
   async customers(search){const clean=String(search||'').slice(0,100).replaceAll("'","''");return queryAll(`SELECT id,entityid,companyname FROM customer WHERE isinactive='F' AND (LOWER(entityid) LIKE LOWER('%${clean}%') OR LOWER(companyname) LIKE LOWER('%${clean}%')) ORDER BY entityid FETCH FIRST 30 ROWS ONLY`);},
   async vendors(search){const clean=String(search||'').slice(0,100).replaceAll("'","''");return queryAll(`SELECT id,entityid,companyname FROM vendor WHERE isinactive='F' AND (LOWER(entityid) LIKE LOWER('%${clean}%') OR LOWER(companyname) LIKE LOWER('%${clean}%')) ORDER BY entityid FETCH FIRST 30 ROWS ONLY`);},
-  async services(){return queryAll("SELECT id,itemid,displayname FROM item WHERE isinactive='F' AND (itemid LIKE 'SVC-%' OR id=10555) ORDER BY itemid FETCH FIRST 100 ROWS ONLY");}
+  async services(currencyId='1'){
+   const currency=reference(currencyId),rows=await queryAll(`SELECT i.id,i.itemid,i.displayname,i.saleunit AS unit_id,p.saleunit AS price_unit_id,p.unitprice AS base_price,p.currency AS currency_id,BUILTIN.DF(p.currency) AS currency_name,p.pricelevel AS price_level_id,BUILTIN.DF(p.pricelevel) AS price_level,BUILTIN.DF(p.quantity) AS minimum_quantity FROM item i LEFT JOIN pricing p ON p.item=i.id AND p.currency=${currency} AND BUILTIN.DF(p.pricelevel)='Base Price' WHERE i.isinactive='F' AND (UPPER(i.itemid) LIKE 'SVC-%' OR i.id=10555) ORDER BY i.itemid,p.quantity FETCH FIRST 1000 ROWS ONLY`);
+   return servicePrices(rows,currency);
+  },
+  async technicians(){
+   const [work,parts]=await Promise.all([queryAll('SELECT DISTINCT custrecord149 AS first_id,BUILTIN.DF(custrecord149) AS first_name,custrecord214 AS second_id,BUILTIN.DF(custrecord214) AS second_name,custrecord215 AS third_id,BUILTIN.DF(custrecord215) AS third_name FROM customrecord246'),queryAll('SELECT DISTINCT custrecord165 AS id,BUILTIN.DF(custrecord165) AS name FROM customrecord247 WHERE custrecord165 IS NOT NULL')]);
+   const people=[...parts,...work.flatMap(row=>['first','second','third'].map(key=>({id:row[key+'_id'],name:row[key+'_name']})))].filter(row=>row.id&&row.name);
+   return [...new Map(people.map(row=>[String(row.id),{id:String(row.id),name:row.name.trim(),active:true,source:'wor'}])).values()];
+  }
  };
 }

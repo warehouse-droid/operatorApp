@@ -1,6 +1,8 @@
+import {REPAIR_ADDRESSES,isOther} from './targets.js';
+export {isOther};
 /** @typedef {{id?:string|number,role?:string,roles?:string[],yardLocationIds?:(number|string)[],requestId?:string}} Actor */
 /** @typedef {{id?:string,status:string,lines?:{decision:string}[],hasApproved?:boolean}} QuoteState */
-/** @typedef {{id?:string,company?:string,requesterType?:string,requesterId?:string,yardId?:number|string|null,data?:{recipient?:string,equipmentType?:string,equipmentTypeConfirmed?:boolean,inspectionComplete?:boolean,phase?:string,quoteNeeded?:boolean},condition?:string,status?:string,receipt?:string,outcome?:string,stage?:string,quote?:QuoteState|null,quotes?:QuoteState[],partsStatus?:string|null,partRequests?:{status:string,quantity_milli?:number|string,ordered_milli?:number|string}[],incomingParts?:{quantityMilli:number,receivedMilli:number}[]}} Job */
+/** @typedef {{id?:string,company?:string,requesterType?:string,requesterId?:string,yardId?:number|string|null,data?:{repairType?:string,address?:{label:string},recipient?:string,equipmentType?:string,equipmentTypeConfirmed?:boolean,inspectionComplete?:boolean,phase?:string,quoteNeeded?:boolean},condition?:string,status?:string,receipt?:string,outcome?:string,stage?:string,quote?:QuoteState|null,quotes?:QuoteState[],partsStatus?:string|null,partRequests?:{status:string,quantity_milli?:number|string,ordered_milli?:number|string}[],incomingParts?:{quantityMilli:number,receivedMilli:number}[]}} Job */
 /** @typedef {{id:string,kind:string,description:string,itemId:string,quantityMilli:number,unitMinor:number,amountMinor:number,taxBps:number,taxMinor:number,decision:string,decisionNote?:string}} QuoteLine */
 /** @typedef {{decision:string,amountMinor:number,taxMinor:number}} BillingLine */
 export const STAGES = ['queuing','in_progress','waiting_for_parts','completed','re_inspect','cancelled'];
@@ -50,10 +52,12 @@ export function purchaseStage(purchase){
  return received?'parts_received':'po_placed';
 }
 /** Validate before an external equipment registration can be attempted.
- * @param {{commandId?:unknown,meter?:unknown,meterUnit?:unknown,defect?:unknown,condition?:unknown,yardId?:unknown,equipmentType?:unknown,priority?:unknown}} input
+ * @param {{commandId?:unknown,meter?:unknown,meterUnit?:unknown,defect?:unknown,condition?:unknown,yardId?:unknown,equipmentType?:unknown,priority?:unknown,repairType?:unknown,addressChoice?:unknown,customAddress?:unknown,vehicleId?:unknown,newEquipment?:unknown}} input
  */
 export function validateIntake(input){
  uuid(input.commandId);
+ choice(input.repairType||'equipment',['equipment','other'],'repair type');
+ if(input.repairType==='other'){if(input.vehicleId||input.newEquipment)throw fail('Others repairs use an address, not equipment registration.');repairAddress(input);text(input.defect,'Repair details');if(input.priority)choice(input.priority,['normal','urgent'],'priority');return;}
  if(!/^\d{1,9}(?:\.\d{1,2})?$/u.test(String(input.meter??'')))throw fail('Enter the odometer or hour meter reading.');
  choice(input.meterUnit,['km','hours'],'meter unit');text(input.defect,'Defect description');choice(input.condition,CONDITIONS,'operating condition');
  if(input.yardId)integer(Number(input.yardId),'Yard',1);
@@ -63,6 +67,12 @@ export function validateIntake(input){
 export const CONDITIONS = ['can_operate','out_of_service'];
 export const COMPANIES = ['MBT','MBBS','MBR','EXTERNAL'];
 export const EQUIPMENT_TYPES = ['truck','forklift','loader','other','unknown'];
+/** @param {{addressChoice?:unknown,customAddress?:unknown}} input */
+export function repairAddress(input){
+ const choice=String(input.addressChoice||'');
+ if(choice==='custom')return {choice,label:text(input.customAddress,'Custom address',500),yardId:null};
+ const address=REPAIR_ADDRESSES.find(row=>row.choice===choice);if(!address)throw fail('Choose a repair address.');return {...address};
+}
 /** @param {unknown} value */
 export function equipmentType(value) {
  const name=typeof value==='string'?value.trim().toLowerCase().replace(/\s+/gu,' '):'';
@@ -73,6 +83,7 @@ export function equipmentType(value) {
 }
 /** @param {Job} job */
 export function quoteRecipient(job) {
+ if(isOther(job))return job.requesterType==='driver'?'role:dispatcher':job.yardId?`yard:${job.yardId}`:'role:repair_office';
  if(job.company==='MBR')return 'role:mbr_sales';
  if(job.company==='EXTERNAL')return 'role:repair_office';
  if(job.data?.equipmentTypeConfirmed!==true)return null;
@@ -124,7 +135,7 @@ export function quoteLines(input) {
   const quantityMilli=quantity(row.quantity),unitMinor=money(row.unitPrice),amountMinor=amount(quantityMilli,unitMinor);
   const taxBps=integer(row.taxBps??1300,'Tax rate',0,10000);
   return {id,kind:choice(row.kind,['labor','part'],'line type'),description:text(row.description,'Description'),
-   itemId:reference(row.itemId||'10555'),quantityMilli,unitMinor,amountMinor,taxBps,taxMinor:tax(amountMinor,taxBps),decision:'pending'};
+   itemId:reference(row.itemId||(row.kind==='labor'?'10650':'10555')),quantityMilli,unitMinor,amountMinor,taxBps,taxMinor:tax(amountMinor,taxBps),decision:'pending'};
  });
 }
 /** @param {unknown} value */
@@ -169,6 +180,7 @@ export function canApprove(actor,job) {
  if(job.company==='MBR') return has(actor,'mbr_sales');
  if(job.company==='EXTERNAL')return actor?.role==='repair_customer'&&actor.requestId===job.id;
  const recipient=quoteRecipient(job);
+ if(recipient==='role:repair_office'&&isOther(job))return canViewCosts(actor);
  if(recipient==='role:dispatcher')return has(actor,'dispatcher');
  if(recipient?.startsWith('yard:'))return has(actor,'yard_manager')&&(actor.yardLocationIds||[]).map(Number).includes(Number(job.yardId));
  return false;
@@ -182,6 +194,7 @@ export function canRead(actor,job) {
 /** Receipt delegation grants only the handover view, never the full request.
  * @param {Actor} actor @param {Job} job */
 export function canReceive(actor,job) {
+ if(isOther(job))return actorKey(actor)===(job.data?.recipient||`${job.requesterType}:${job.requesterId}`);
  if(job.company==='EXTERNAL')return actor?.role==='repair_recipient'&&actor.requestId===job.id;
  if(job.company==='MBR')return false;
  const recipient=job.data?.recipient||`${job.requesterType}:${job.requesterId}`;

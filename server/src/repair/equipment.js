@@ -4,6 +4,7 @@ import {vehicleRow} from './repository.js';
 export async function correctEquipment(c,actor,job,input){
  const {query,one,event,notify,save}=c;
  d.requireAllowed(d.canViewCosts(actor)||d.canWorkshop(actor));
+ if(d.isOther(job))throw d.fail('Address repairs cannot be changed into equipment repairs.');
  const reason=d.text(input.reason,'Equipment correction reason');
  const vehicle=vehicleRow(await one('SELECT * FROM repair_vehicles WHERE id=$1 AND active',[d.uuid(input.vehicleId)]));
  if(!vehicle)throw d.fail('Choose a registered, active vehicle or machine.',404);

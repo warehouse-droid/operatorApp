@@ -1,4 +1,4 @@
-import {partsStage} from './domain.js?v=20261029-quote-policy';
+import {partsStage} from './domain.js?v=20261030-repair-language';
 function patchJob(job,patch){if(job&&job.id===patch.id){job.revision=patch.revision;job.status=patch.status;job.data.eta=patch.eta;}}
 function stages(state,jobId){
  const job=state.job?.id===jobId?state.job:state.jobs?.find(j=>j.id===jobId);if(!job)return;

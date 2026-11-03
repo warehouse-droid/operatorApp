@@ -215,7 +215,7 @@
   }
 
   function currentItems() {
-    if (path === "/repair" || path.startsWith("/repair/")) return {title: "Repair", items: [
+    if (path === "/repair" || path.startsWith("/repair/")) return {title: t("sidebar.repair", "Repair"), items: [
       {label:"Repair portal",href:"/repair",icon:"RP"},
       {label:"Repair Team",href:"/repair/workshop",icon:"RT",authorities:["admin","repair_technician"]}
     ].filter(item=>itemAllowedByAuthority(item))};

@@ -6,18 +6,21 @@ const present=q=>({id:q.id,jobId:q.job_id,requestId:q.request_id,version:q.versi
 export function attachQuotes(c){
  const {api,query,one,raw,revision,mutable,command,event,notify,save,currentQuote,activeQuotes,jobs}=c;
  async function rejectJob(job,actor){job.status='completed';job.data.phase='quote_rejected';job.outcome='declined';job.data.completedBy=d.actorKey(actor);job.data.completedAt=(await one('SELECT now() AS now')).now.toISOString();}
- api.approvals=async actor=>{
-  d.requireAllowed(d.has(actor,'yard_manager'),'Control repair approvals require Yard Manager authority for the responsible yard.');
+ api.approvals=async(actor,scope='control')=>{
+  d.choice(scope,['control','dispatch'],'approval screen');
+  d.requireAllowed(d.has(actor,scope==='control'?'yard_manager':'dispatcher'),scope==='control'?'Control repair approvals require Yard Manager authority for the responsible yard.':'Dispatch repair approvals require Dispatcher authority.');
   const yards=(actor.yardLocationIds||[]).map(Number).filter(Number.isSafeInteger);
   const rows=(await query(`SELECT q.id,q.version,q.title,q.lines,j.id AS job_id,j.number AS job_number,j.sequence,j.priority,j.data->>'defect' AS defect,
-   r.id AS request_id,r.number AS request_number,r.company,r.yard_id,r.data,r.inspection_fee_minor,r.inspection_tax_bps
+   r.id AS request_id,r.number AS request_number,r.company,r.requester_type,r.yard_id,r.data,r.inspection_fee_minor,r.inspection_tax_bps
    FROM repair_quotes q JOIN repair_jobs j ON j.id=q.job_id JOIN repair_requests r ON r.id=j.request_id
    WHERE q.status='pending' AND j.status NOT IN ('completed','cancelled') AND r.status<>'cancelled' AND r.receipt<>'accepted'
-   AND r.company IN ('MBBS','MBT') AND r.data->>'equipmentTypeConfirmed'='true' AND r.data->>'equipmentType' IN ('forklift','loader')
-   AND r.yard_id=ANY($1::bigint[]) ORDER BY CASE j.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.created_at LIMIT 200`,[yards])).rows;
-  return rows.filter(row=>d.canApprove(actor,{company:row.company,yardId:row.yard_id,data:row.data})).map(row=>{
+   AND r.company IN ('MBBS','MBT') AND (
+    ($2='control' AND r.yard_id=ANY($1::bigint[]) AND ((r.data->>'equipmentTypeConfirmed'='true' AND r.data->>'equipmentType' IN ('forklift','loader')) OR (r.data->>'repairType'='other' AND r.requester_type='staff')))
+    OR ($2='dispatch' AND ((r.data->>'equipmentTypeConfirmed'='true' AND r.data->>'equipmentType'='truck') OR (r.data->>'repairType'='other' AND r.requester_type='driver')))
+   ) ORDER BY CASE j.priority WHEN 'urgent' THEN 0 ELSE 1 END,q.created_at LIMIT 200`,[yards,scope])).rows;
+  return rows.filter(row=>d.canApprove(actor,{company:row.company,requesterType:row.requester_type,yardId:row.yard_id,data:row.data})).map(row=>{
    const fee=row.sequence===1?Number(row.inspection_fee_minor):0;
-   return {quoteId:row.id,version:row.version,title:row.title,jobId:row.job_id,jobNumber:row.job_number,requestId:row.request_id,requestNumber:row.request_number,yardId:Number(row.yard_id),priority:row.priority,defect:row.defect||row.data.defect,equipment:[row.data.vehicle?.plate,row.data.vehicle?.alias].filter(v=>v&&v!=='#').join(' · '),lines:row.lines,inspectionFeeMinor:fee,inspectionTaxBps:row.inspection_tax_bps,proposedTotals:d.totals(row.lines.map(line=>({...line,decision:'approved'})),fee,row.inspection_tax_bps)};
+   return {quoteId:row.id,version:row.version,title:row.title,jobId:row.job_id,jobNumber:row.job_number,requestId:row.request_id,requestNumber:row.request_number,yardId:row.yard_id===null?null:Number(row.yard_id),priority:row.priority,defect:row.defect||row.data.defect,equipment:[row.data.vehicle?.plate,row.data.vehicle?.alias].filter(v=>v&&v!=='#').join(' · '),lines:row.lines,inspectionFeeMinor:fee,inspectionTaxBps:row.inspection_tax_bps,proposedTotals:d.totals(row.lines.map(line=>({...line,decision:'approved'})),fee,row.inspection_tax_bps)};
   });
  };
  api.quote=async(actor,id,input)=>{d.requireAllowed(d.canViewCosts(actor));return command(actor,`quote:${id}`,input,async()=>{

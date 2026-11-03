@@ -5,6 +5,11 @@ import * as d from '../../public/repair/domain.js';
 const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
 export function createRepairDirectory({adapter,repo,enabled=()=>false,logger=console}){
  let expiresAt=0,inflight;
+ let technicianExpires=0,technicianRefresh;
+ async function refreshTechnicians(){
+  if(!technicianRefresh)technicianRefresh=(async()=>{await repo.cacheTechnicians(await adapter.technicians());technicianExpires=Date.now()+600000;})();
+  try{await technicianRefresh;}finally{technicianRefresh=null;}
+ }
  async function refresh(force=false){
   if(inflight)return inflight;if(!force&&expiresAt>Date.now())return;
   inflight=(async()=>{
@@ -47,11 +52,12 @@ export function createRepairDirectory({adapter,repo,enabled=()=>false,logger=con
   });
  }
  return {register,
+  async technicians(actor){d.requireAllowed(d.canWorkshop(actor)||d.canViewCosts(actor));const cached=await repo.technicians(actor);if(!cached.length)await refreshTechnicians();else if(technicianExpires<Date.now())void refreshTechnicians().catch(()=>logger.warn('[Repair] Technician refresh unavailable; using verified cached references.'));return repo.technicians(actor);},
   async sync(actor){d.requireAllowed(d.canViewCosts(actor));return refresh(true);},
   async search(actor,search=''){void refresh().catch(()=>{expiresAt=Date.now()+15000;logger.warn('[Repair] Master refresh failed; using cached equipment.');});return repo.vehicles(actor,search);},
   customers:async(actor,q)=>{d.requireAllowed(d.canViewCosts(actor));return adapter.customers(d.text(q||'','Search',100,false));},
   vendors:async(actor,q)=>{d.requireAllowed(d.canViewCosts(actor));return adapter.vendors(d.text(q||'','Search',100,false));},
-  services:async actor=>{d.requireAllowed(d.canViewCosts(actor));return adapter.services();},
+  services:async actor=>{d.requireAllowed(d.canViewCosts(actor));return adapter.services(d.reference((await repo.directoryMappings()).currencyId));},
   async classify(actor,input){d.requireAllowed(d.canViewCosts(actor));const mapping=await repo.directoryMappings(),company=d.choice(input.company,d.COMPANIES,'company');
    return withTransaction(async()=>{await query("SELECT pg_advisory_xact_lock(hashtext('dispatch_fleet_planning_mutation'))");
     const row=(await query('SELECT * FROM repair_vehicles WHERE id=$1 FOR UPDATE',[d.uuid(input.id)])).rows[0];if(!row)throw d.fail('Vehicle not found.',404);

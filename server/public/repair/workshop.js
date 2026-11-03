@@ -1,10 +1,12 @@
-import {openAttachment,previewImage,handoverLink,api,esc,formData,uploadFiles,message,vehicleCaption} from './client.js?v=20261029-quote-policy';
-import {approved,shell,jobCards} from './workshop-view.js?v=20261029-quote-policy';
-import {canWorkshop,canViewCosts,teamJobOpen,requireJobStarted,workflowStage} from './domain.js?v=20261029-quote-policy';
-import {applyReceipt} from './local-parts.js?v=20261029-quote-policy';
-import {saveJobParts} from './job-parts.js?v=20261029-quote-policy';
+import {html as rh,ui as ru} from './i18n.js?v=20261030-repair-language';
+import {installEquipmentAutocomplete} from './equipment-picker.js?v=20261030-repair-language';
+import {openAttachment,previewImage,handoverLink,api,esc,formData,uploadFiles,message} from './client.js?v=20261030-repair-language';
+import {approved,shell,jobCards} from './workshop-view.js?v=20261030-repair-language';
+import {canWorkshop,canViewCosts,teamJobOpen,requireJobStarted,workflowStage} from './domain.js?v=20261030-repair-language';
+import {applyReceipt} from './local-parts.js?v=20261030-repair-language';
+import {saveJobParts} from './job-parts.js?v=20261030-repair-language';
 const root=document.querySelector('#repairApp');
-const state={actor:null,tab:'jobs',jobs:[],parts:[],requests:[],incoming:[],equipment:[],job:null,search:'',partsSearch:'',mobileDetail:Boolean(location.hash),drafts:new Map(),partRequest:null,installPrompt:null,receiving:null,receiptCommands:new Map()};
+const state={actor:null,tab:'jobs',jobs:[],parts:[],requests:[],incoming:[],equipment:[],job:null,search:'',partsSearch:'',mobileDetail:Boolean(location.hash),drafts:new Map(),partRequest:null,installPrompt:null,receiving:null,receiptCommands:new Map(),starting:null,technicians:[]};
 let busy=false,selection=0;
 function draft(id=state.job?.id){if(!state.drafts.has(id))state.drafts.set(id,{done:'',hours:'',files:[],commands:{}});return state.drafts.get(id);}
 function applyAction(saved){const patch=job=>{if(job?.id!==saved.id)return job;const next={...job,...saved,data:{...job.data,...saved.data},work:saved.recordedWork?[...(job.work||[]),saved.recordedWork]:job.work};next.stage=workflowStage(next);next.requestStatus=next.stage;return next;};state.job=patch(state.job);state.jobs=state.jobs.map(patch);}
@@ -16,12 +18,7 @@ async function refresh(){await load();if(state.job){state.job=await api(`/jobs/$
 async function exclusive(fn){if(busy)return;busy=true;root.inert=true;root.setAttribute('aria-busy','true');try{await fn();}catch(error){message(error.message,true);}finally{busy=false;root.inert=false;root.removeAttribute('aria-busy');}}
 function clearDraft(id){const current=draft(id);for(const file of current.files)URL.revokeObjectURL(file.url);state.drafts.delete(id);draft(id);}
 async function savePhotos(jobId){for(const item of draft(jobId).files){if(!item.saved){requireJobStarted(state.job);const [photo]=await uploadFiles([item.file],{requestId:jobId,kind:'work'});item.saved=photo.id;state.job.attachments.push(photo);}}}
-async function loadEquipment(form){
- const job=state.job,selected=form.elements.vehicleId.value,prior=state.equipment.find(v=>v.id===selected),rows=await api(`/vehicles?search=${encodeURIComponent(form.elements.equipmentSearch.value)}`);
- if(!form.isConnected||state.job.id!==job.id)return;
- state.equipment=[...new Map([job.data.vehicle,prior,...rows].filter(v=>v&&v.company===job.company&&v.customerId===job.data.vehicle.customerId).map(v=>[v.id,v])).values()];
- form.elements.vehicleId.innerHTML=state.equipment.map(v=>`<option value="${esc(v.id)}">${esc(vehicleCaption(v))}</option>`).join('');form.elements.vehicleId.value=selected;
-}
+const loadEquipment=installEquipmentAutocomplete(root,async(_form,search)=>{const job=state.job,rows=await api(`/vehicles?search=${encodeURIComponent(search)}`);const visible=rows.filter(v=>v.company===job.company&&v.customerId===job.data.vehicle.customerId);state.equipment=[...new Map([job.data.vehicle,...state.equipment,...visible].map(v=>[v.id,v])).values()];return visible;});
 async function openParts(partId=''){
  const part=state.parts.find(p=>p.id===partId),job=state.job&&!['pending','accepted'].includes(state.job.receipt)&&!['completed','cancelled'].includes(state.job.status)?state.job:null;
  state.partRequest={job,partId,description:part?.name||'',quantity:'1',files:[],partSearch:'',commandId:crypto.randomUUID()};render();root.querySelector('[role=dialog] select')?.focus();
@@ -38,9 +35,10 @@ root.addEventListener('input',event=>{
  if(event.target.id==='teamJobSearch'){state.search=event.target.value;root.querySelector('.team-job-list').innerHTML=jobCards(state);}
  if(event.target.id==='teamPartsSearch'){state.partsSearch=event.target.value;filterParts();}
  if(['done','hours'].includes(event.target.name)&&event.target.closest('[data-form=team-work]'))draft()[event.target.name]=event.target.value;
- if(event.target.closest('[data-form=part-request]')&&state.partRequest&&event.target.name!=='photos'){state.partRequest[event.target.name]=event.target.value;if(event.target.name==='partSearch'){const select=event.target.form.elements.partId,current=select.value,rows=state.parts.filter(p=>`${p.name} ${p.sku}`.toLowerCase().includes(event.target.value.toLowerCase()));select.innerHTML='<option value="">Part not listed</option>'+rows.map(p=>`<option value="${p.id}">${esc(p.name+' · '+p.sku)}</option>`).join('');select.value=rows.some(p=>p.id===current)?current:'';state.partRequest.partId=select.value;}}
+ if(event.target.closest('[data-form=part-request]')&&state.partRequest&&event.target.name!=='photos'){state.partRequest[event.target.name]=event.target.value;if(event.target.name==='partSearch'){const select=event.target.form.elements.partId,current=select.value,rows=state.parts.filter(p=>`${p.name} ${p.sku}`.toLowerCase().includes(event.target.value.toLowerCase()));select.innerHTML=rh('<option value="">Part not listed</option>')+rows.map(p=>rh`<option value="${p.id}">${esc(p.name+' · '+p.sku)}</option>`).join('');select.value=rows.some(p=>p.id===current)?current:'';state.partRequest.partId=select.value;}}
 });
 root.addEventListener('change',event=>{
+ if(event.target.name==='technicianIds'&&state.starting){state.starting.technicianIds=[...event.target.form.querySelectorAll('[name=technicianIds]:checked')].map(el=>el.value);event.target.form.querySelector('button').disabled=!state.starting.technicianIds.length||state.starting.technicianIds.length>3;return;}
  const requestSelect=event.target.closest('[data-form=part-request]')&&['jobId','partId'].includes(event.target.name),equipmentSelect=event.target.name==='vehicleId'&&event.target.closest('[data-form=equipment]');
  if(event.target.name!=='photos'&&!requestSelect&&!equipmentSelect)return;
  void exclusive(async()=>{
@@ -71,8 +69,9 @@ root.addEventListener('click',event=>{
   if(button.dataset.previewDraft!==undefined){const photo=draft().files[Number(button.dataset.previewDraft)];previewImage(photo.file,photo.file.name);return;}
   if(button.dataset.previewRequest!==undefined){const photo=state.partRequest.files[Number(button.dataset.previewRequest)];previewImage(photo.file,photo.file.name);return;}
   if(button.dataset.removePhoto!==undefined){const [file]=draft().files.splice(Number(button.dataset.removePhoto),1);URL.revokeObjectURL(file.url);render();return;}
-  if(button.dataset.teamStart){const saved=await api(`/jobs/${state.job.id}/actions`,{body:{commandId:crypto.randomUUID(),revision:state.job.revision,action:button.dataset.teamStart}});applyAction(saved);render();return;}
+  if(button.dataset.teamStart){if(button.dataset.teamStart==='complete_rental'){const saved=await api(`/jobs/${state.job.id}/actions`,{body:{commandId:crypto.randomUUID(),revision:state.job.revision,action:button.dataset.teamStart}});applyAction(saved);render();return;}state.technicians=await api('/directory/technicians');state.starting={jobId:state.job.id,revision:state.job.revision,action:button.dataset.teamStart,technicianIds:(state.job.data.performers||[]).map(p=>p.id).filter(id=>state.technicians.some(p=>p.id===id)),commandId:crypto.randomUUID()};render();return;}
   switch(button.dataset.teamAction){
+   case 'cancel-start':state.starting=null;render();break;
    case 'handover-link':await handoverLink(state.job.requestId||state.job.id,root.querySelector('#customerHandoverLink'));break;
    case 'back':state.mobileDetail=false;render();break;
    case 'refresh':await refresh();break;
@@ -90,6 +89,7 @@ root.addEventListener('submit',event=>{
  void exclusive(async()=>{
   if(form.dataset.form==='receive-incoming'){const input=formData(form),signature=JSON.stringify(input);if(!state.receiptCommands.has(signature))state.receiptCommands.set(signature,crypto.randomUUID());const result=await api(`/purchases/${input.purchaseId}/lines/${input.lineId}/receive`,{body:{commandId:state.receiptCommands.get(signature),quantity:input.quantity,expectedReceivedMilli:Number(input.expectedReceivedMilli)}});if(applyReceipt(state,result))render();else await refresh();message('Parts received.');return;}
   if(['use-part','edit-usage'].includes(form.dataset.form)){form.dataset.commandId||=crypto.randomUUID();await saveJobParts(state.job,form,{...formData(form),commandId:form.dataset.commandId});await refresh();message('Parts usage saved.');return;}
+  if(form.dataset.form==='start-job'){const start=state.starting;const saved=await api(`/jobs/${start.jobId}/actions`,{body:{...start}});applyAction(saved);state.starting=null;render();return;}
   if(form.dataset.form==='team-work')await saveWork(form,event.submitter?.value||'work');
   if(form.dataset.form==='equipment'){
    form.dataset.commandId||=crypto.randomUUID();await api(`/jobs/${state.job.id}/actions`,{body:{...formData(form),commandId:form.dataset.commandId,revision:state.job.revision,action:'equipment'}});await refresh();message('Equipment corrected.');
@@ -107,13 +107,13 @@ window.addEventListener('beforeinstallprompt',event=>{event.preventDefault();sta
 window.addEventListener('hashchange',()=>{if(location.hash&&!busy)void exclusive(()=>selectJob(location.hash.slice(1)));});
 window.addEventListener('beforeunload',event=>{if([...state.drafts.values()].some(d=>d.done||d.files.some(file=>!file.saved))){event.preventDefault();event.returnValue='';}});
 async function boot(){
- if('serviceWorker' in navigator)void navigator.serviceWorker.register('/repair/sw.js?v=20261029-quote-policy',{scope:'/repair/',updateViaCache:'none'}).catch(()=>{});
+ if('serviceWorker' in navigator)void navigator.serviceWorker.register('/repair/sw.js?v=20261030-repair-language',{scope:'/repair/',updateViaCache:'none'}).catch(()=>{});
  try{
   const available=await api('/availability');if(!available.enabled)throw new Error('Repair is not enabled.');
   state.actor=(await api('/me')).actor;
   if(!canWorkshop(state.actor)&&!canViewCosts(state.actor))throw new Error('Open Repair Team with a Repair Team or office account.');
   await load();const selected=location.hash.slice(1)||state.jobs[0]?.id;
   if(selected)await selectJob(selected,{mobile:Boolean(location.hash)});else render();
- }catch(error){root.innerHTML=`<section class="team-empty"><h1>Repair Team</h1><p>${esc(error.message)}</p><a href="/login?returnTo=%2Frepair%2Fworkshop">Sign in</a></section>`;}
+ }catch(error){root.innerHTML=rh`<section class="team-empty"><h1>Repair Team</h1><p>${esc(ru(error.message))}</p><a href="/login?returnTo=%2Frepair%2Fworkshop">Sign in</a></section>`;}
 }
 void boot();

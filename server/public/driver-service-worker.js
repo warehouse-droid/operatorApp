@@ -7,15 +7,15 @@ importScripts("/driver-offline-sync.js?v=20260910-route-prefix-cursor-v1");
 
 const DRIVER_PWA_CLIENT_VERSION = "2026.08.12.3";
 const DRIVER_CACHE_PREFIX = "mbbs-driver-shell-";
-const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v56`;
-const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v56`;
+const DRIVER_CACHE_NAME = `${DRIVER_CACHE_PREFIX}v57`;
+const DRIVER_REFRESH_CACHE_NAME = `${DRIVER_CACHE_PREFIX}refresh-v57`;
 const DRIVER_OFFLINE_MODE_REQUEST = "/__mbbs_driver_offline_mode__";
 const DRIVER_SHELL = [
   "/driver",
   "/driver.html",
   "/driver.css?v=20261016-driver-reconnect-v1",
   "/i18n.css?v=20260910-route-prefix-cursor-v1",
-  "/i18n.js?v=20260918-operator-display-settings-v1",
+  "/i18n.js?v=20260918-operator-display-settings-v1&repairLanguage=20261030",
   "/driver-offline-db.js?v=20260924-sor-v1",
   "/driver-photo-hash.js?v=20260910-route-prefix-cursor-v1",
   "/driver-offline-photos.js?v=20260910-route-prefix-cursor-v1",
@@ -23,7 +23,7 @@ const DRIVER_SHELL = [
   "/driver-upload.js?v=20261023-driver-upload-wait-v1",
   "/driver-bin-ui.js?v=20260910-route-prefix-cursor-v1",
   "/driver-location-override.js?v=20260910-route-prefix-cursor-v1",
-  "/driver.js?v=20261028-repair-pwa",
+  "/driver.js?v=20261028-repair-pwa&repairLanguage=20261030",
   "/sor-rentals.css?v=20260924-sor-v1",
   "/sor-signature.js?v=20260924-sor-v1",
   "/sor-driver-signature.js?v=20260924-sor-v1",

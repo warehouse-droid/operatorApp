@@ -29,10 +29,12 @@ export function createRepairRouter({repo,authenticate,authenticateDriver,enabled
  const get=(url,fn)=>router.get(url,wrap(async(req,res)=>res.json(await fn(req.repairActor,req))));
  const post=(url,fn)=>router.post(url,wrap(async(req,res)=>res.json(await fn(req.repairActor,req))));
  get('/me',(actor)=>({actor:{id:actor.id,role:actor.role,roles:actor.roles,display_name:actor.display_name,name:actor.name,username:actor.username,yardLocationIds:actor.yardLocationIds,operatorYardLocationIds:actor.operatorYardLocationIds},pushPublicKey:push?.publicKey||''}));
- get('/approvals',actor=>repo.approvals(actor));
+ get('/directory/technicians',actor=>directory.technicians(actor));
+ get('/approvals',(actor,req)=>repo.approvals(actor,req.query.scope||'control'));
  get('/vehicles',(a,r)=>directory.search(a,r.query.search||''));get('/jobs',(a,r)=>repo.list(a,{...r.query,mine:r.query.mine==='true',active:r.query.active==='true',workJobs:r.query.workJobs==='true'}));
  post('/jobs',async(a,r)=>{
   const input=r.body;
+  if(input.repairType==='other')d.validateIntake(input);
   if(!input.newEquipment)return repo.create(a,input);
   d.requireAllowed(d.canViewCosts(a));d.validateIntake(input);d.uuid(input.masterCommandId);
   if(input.commandId===input.masterCommandId)throw d.fail('Equipment and request commands must be different.');
@@ -67,6 +69,7 @@ export function createRepairRouter({repo,authenticate,authenticateDriver,enabled
  get('/directory/customers',(a,r)=>directory.customers(a,r.query.search));get('/directory/vendors',(a,r)=>directory.vendors(a,r.query.search));get('/directory/services',a=>directory.services(a));post('/directory/sync',a=>directory.sync(a));post('/directory/vehicles',(a,r)=>directory.register(a,r.body));post('/directory/classify',(a,r)=>directory.classify(a,r.body));
  post('/jobs/:id/link',(a,r)=>operations.link(a,r.params.id,r.body));post('/purchases/:id/link',(a,r)=>operations.linkBill(a,r.params.id,r.body));post('/postings/:id/retry',(a,r)=>operations.retry(a,r.params.id,r.body));
  get('/jobs/:id/posting-status',(a,r)=>operations.status(a,r.params.id));post('/jobs/:id/post',(a,r)=>operations.post(a,r.params.id,r.body));post('/jobs/:id/actual-workforce',(a,r)=>repo.correctWorkforce(a,r.params.id,r.body));
+ post('/jobs/:id/actual-parts',(a,r)=>repo.correctActualParts(a,r.params.id,r.body));
  post('/purchases/:id/post',(a,r)=>operations.postBill(a,r.params.id,r.body));
  router.use((error,_req,res,_next)=>{const duplicate=error.code==='23505';const status=duplicate?409:error.status||500;const expected=error instanceof d.RepairError||['entity.parse.failed','entity.too.large'].includes(error.type);if(!expected&&!duplicate)logger.error('[Repair] Request failed.',{code:error.code,status});res.status(status>=400&&status<600?status:500).json({error:duplicate?'This record already exists. Refresh before creating another.':expected?error.message:'Repair is temporarily unavailable.',code:expected?error.code||'REPAIR_INVALID':duplicate?'REPAIR_DUPLICATE':'REPAIR_ERROR'});});return router;
 }
