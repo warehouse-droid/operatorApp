@@ -2447,7 +2447,7 @@ export async function claimSpecialOrderOperation(requestId, {
         throw workflowError("Unplan the Sales Order before creating its Special Item Purchase Order.", 409, "SPECIAL_PO_SO_ALREADY_PLANNED");
       }
       assertSpecialPurchaseRelease((await lineRows(id, { forUpdate: true })).map(mapLine));
-      if (!independentPurchase) await reconcileCanonicalOrderLines(id, 'sales_order', special.sales_order_netsuite_id, { required: true });
+      // The PO is standalone: its lines are never compared with, or written to, the SO.
     }
     await query(
       `UPDATE sales_special_stock_cases
@@ -3274,7 +3274,7 @@ export async function markSpecialOrderSubmitted(requestId, { expectedRevision: r
         throw workflowError('The Sales Order must remain approved and active before PO submission.', 409, 'SPECIAL_PO_SO_NOT_APPROVED');
       }
       if (row.canonical_sales_dispatch_planned) throw workflowError('Unplan the Sales Order before creating its Special Item Purchase Order.', 409, 'SPECIAL_PO_SO_ALREADY_PLANNED');
-      await reconcileCanonicalOrderLines(requestId, 'sales_order', row.sales_order_netsuite_id);
+      // SO line content is not a PO submission condition; the PO is standalone.
     }
     if (field === 'sales_order' && row.fulfillment_method === 'mbt_delivery') assertSpecialDeliveryDate(dateValue(row.delivery_date));
     if (row[`${field}_operation_status`] !== 'creating' || row[`${field}_operation_id`] !== operationId || row[`${field}_submission_started_at`]) {

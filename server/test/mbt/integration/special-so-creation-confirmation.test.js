@@ -52,7 +52,7 @@ test('confirmed SO links without comparing the saved draft to edited mirror cont
   assert.deepEqual(after.salesOrderLines, beforeScm.salesOrderLines);
 }));
 
-test('native PO claim resolves exact SO line identities at the PO boundary', () => fixture(async detail => {
+test('standalone PO claim leaves SO lines alone; the linked PO resolves exact SO line identities', () => fixture(async detail => {
   await query("UPDATE sales_orders SET customer_id=8877477,order_location_id=1 WHERE netsuite_id=8877480");
   await query("UPDATE sales_order_lines SET item_description='TEST Material',quantity=10,unit='PC' WHERE sales_order_id=8877480");
   let linked = await link(detail);
@@ -60,10 +60,18 @@ test('native PO claim resolves exact SO line identities at the PO boundary', () 
   linked = await repo.prepareSpecialPurchaseOrder(detail.id, { expectedRevision: linked.revision,
     pallet: { quantity: 0 }, lines: [{ caseLineId: detail.lines[0].id, description: 'TEST Material', quantity: 10,
       uom: 'PC', unitPurchaseCost: 2, vendorDiscountPercent: 0 }] }, context);
+  const operationId = '01911111-1111-7111-8111-111111122477';
   const claimed = await repo.claimSpecialOrderOperation(detail.id, { expectedRevision: linked.revision,
-    orderKind: 'purchase_order', operationId: '01911111-1111-7111-8111-111111122477' }, context);
-  assert.equal(claimed.salesOrderLines[0].remoteLineId, 88774801);
+    orderKind: 'purchase_order', operationId }, context);
+  assert.equal(claimed.salesOrderLines[0].remoteLineId, null);
   assert.equal(claimed.salesOrderOperationStatus, 'linked');
+  const submitted = await repo.markSpecialOrderSubmitted(detail.id, { expectedRevision: claimed.revision,
+    orderKind: 'purchase_order', operationId }, context);
+  await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES(8877481,88774811,2055,'MBBS-Special Order','TEST Material',10,'PC',true)");
+  const purchased = await repo.linkSpecialPurchaseOrder(detail.id, { expectedRevision: submitted.revision,
+    purchaseOrderId: 8877481, purchaseOrderRef: 'TEST-PO-CONFIRMED', operationId, verifiedRemote: true }, context);
+  assert.equal(purchased.salesOrderLines[0].remoteLineId, 88774801);
+  assert.equal(purchased.attention, false);
 }));
 
 test('confirmed SO keeps local revision and yard authorization checks', () => fixture(async detail => {

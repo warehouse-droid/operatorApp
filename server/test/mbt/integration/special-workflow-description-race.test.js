@@ -269,10 +269,7 @@ test('loss of SO approval during the claimed operation blocks PO submission', ()
 
 for (const [name, sql, expected] of [
   ['case closes', "UPDATE sales_special_stock_cases SET close_status='closed' WHERE request_id=$1", 'SPECIAL_CASE_CLOSED'],
-  ['SO becomes planned', 'UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=$1', 'SPECIAL_PO_SO_ALREADY_PLANNED'],
-  ['SO quantity changes', 'UPDATE sales_order_lines SET quantity=501 WHERE sales_order_id=$1 AND line_id=90101', 'SPECIAL_ORDER_COVERAGE_MISMATCH'],
-  ['SO UOM changes', "UPDATE sales_order_lines SET unit='SQFT' WHERE sales_order_id=$1 AND line_id=90101", 'SPECIAL_ORDER_COVERAGE_MISMATCH'],
-  ['SO description is unreviewed', "UPDATE sales_order_lines SET item_description='Unreviewed' WHERE sales_order_id=$1 AND line_id=90101", 'SPECIAL_ORDER_COVERAGE_MISMATCH']
+  ['SO becomes planned', 'UPDATE sales_orders SET dispatch_planned=true WHERE netsuite_id=$1', 'SPECIAL_PO_SO_ALREADY_PLANNED']
 ]) {
   test(`owned PO submission still blocks when ${name}`, () => fixture(async (d, review) => {
     d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
@@ -281,6 +278,25 @@ for (const [name, sql, expected] of [
     if (name !== 'case closes') await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
     await assert.rejects(repo.markSpecialOrderSubmitted(d.id, { expectedRevision: owned.revision, orderKind: 'purchase_order', operationId }, context), { code: expected });
     assert.equal((await repo.getSpecialStockCase(d.id)).purchaseOrderSubmissionStartedAt, null);
+  }));
+}
+
+// The PO is standalone: SO line content is not a PO submission condition.
+for (const [name, sql] of [
+  ['SO quantity changes', 'UPDATE sales_order_lines SET quantity=501 WHERE sales_order_id=$1 AND line_id=90101'],
+  ['SO UOM changes', "UPDATE sales_order_lines SET unit='SQFT' WHERE sales_order_id=$1 AND line_id=90101"],
+  ['SO description is unreviewed', "UPDATE sales_order_lines SET item_description='Unreviewed' WHERE sales_order_id=$1 AND line_id=90101"],
+  ['SO item changes', 'UPDATE sales_order_lines SET item_id=1987 WHERE sales_order_id=$1 AND line_id=90101']
+]) {
+  test(`owned PO submission is not blocked when ${name}`, () => fixture(async (d, review) => {
+    d = await repo.prepareSpecialPurchaseOrder(d.id, { pallet: {quantity:0}, vendorDiscountAmount: 0, expectedRevision: d.revision, lines: review }, context);
+    const owned = await repo.claimSpecialOrderOperation(d.id, { expectedRevision: d.revision, orderKind: 'purchase_order', operationId }, context);
+    await query(sql, [soId]);
+    await repo.reconcileSpecialOrderWebhook({ orderKind: 'sales_order', orderId: soId });
+    const before = (await repo.getSpecialStockCase(d.id, { audience: 'scm' })).salesOrderLines;
+    const submitted = await repo.markSpecialOrderSubmitted(d.id, { expectedRevision: owned.revision, orderKind: 'purchase_order', operationId }, context);
+    assert.ok(submitted.purchaseOrderSubmissionStartedAt);
+    assert.deepEqual(submitted.salesOrderLines, before);
   }));
 }
 

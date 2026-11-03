@@ -137,9 +137,16 @@ test('a locally adjusted PO with an uncertain submission is recovered without re
   assert.equal(calls.created.length, 0);
 }));
 
-test('unadjusted SO mismatches and pending adjustments still prevent PO creation', () => fixture(async detail => {
+test('an unadjusted NetSuite SO edit does not prevent standalone PO creation or change the SO', () => fixture(async detail => {
+  const d = await prepare(await link(detail));
+  const before = await salesSnapshot(d.id);
+  const claimed = await claim(d);
+  assert.equal(claimed.purchaseOrderOperationStatus, 'creating');
+  assert.deepEqual(await salesSnapshot(d.id), before);
+}));
+
+test('a pending quantity adjustment still prevents PO creation', () => fixture(async detail => {
   let d = await prepare(await link(detail));
-  await assert.rejects(claim(d), { code: 'SPECIAL_ORDER_COVERAGE_MISMATCH' });
   d = await repo.requestSpecialQuantityChange(d.id, { expectedRevision: d.revision,
     lines: [{ caseLineId: d.lines[0].id, quantity: 20 }] }, context);
   await assert.rejects(claim(d), { code: 'SPECIAL_QUANTITY_REVIEW_REQUIRED' });

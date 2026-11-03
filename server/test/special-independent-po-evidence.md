@@ -123,3 +123,17 @@ second is a source-pattern expectation in the Sales UI.
   PO creation path; there is no new credential or external messaging mechanism.
 - Test databases, containers, networks, logs, coverage and screenshots were removed
   by the runner. Temporary pre-task source copies are removed at task completion.
+
+## Follow-up 2026-11-03 — SO lines no longer gate PO creation (SPREQ-000178)
+
+Cause: SO SOB123911's PALLET line became inactive in NetSuite while the case SO
+snapshot and reviewed PO kept PALLET; PO claim/submission reconciled the SO and
+raised `SPECIAL_ORDER_COVERAGE_MISMATCH`. Both SO reconciliations were removed.
+
+Release `server/deployments/special-po-so-independent-20261103` (tool
+`tools/special-po-so-independent-release.py`), deployed 15:24:42 UTC with the
+user's `deploy` instruction; app-only swap, ~6.6 s unavailable. Validation ran 154
+Special unit/integration files on captured live vs candidate: live 1054 passed /
+13 failed (7 new regression tests reproduce the block), candidate 1061 passed /
+6 failed — the same 6 pre-existing failures as live (vendor-confirmation stage
+projections and one test-skip ETA case), none introduced.

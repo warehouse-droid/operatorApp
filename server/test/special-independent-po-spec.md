@@ -50,3 +50,12 @@ and rollback mechanism. Check for in-flight writes, apply only migration 322 in
 a bounded transaction, preserve the prior constraint definition and image, and
 verify health, asset hashes, authentication and read-only NetSuite UOM metadata.
 Do not create test orders or change any customer SO/PO in production.
+
+Follow-up 2026-11-03 (SPREQ-000178): PO claim and PO submission no longer
+reconcile the SO lines. A NetSuite SO whose item, quantity, UOM or description
+differs from the issued snapshot (and from the reviewed PO) cannot block the
+standalone PO, and nothing is written to the SO. SO approval/active, Dispatch
+planned, closed-case, quantity-review and operation fences still apply. After
+the PO links, the SO's own reconciliation still raises case Attention if the SO
+no longer matches its snapshot. Regression tests: `special-independent-po`,
+`special-po-warning` and `special-workflow-description-race` integration files.

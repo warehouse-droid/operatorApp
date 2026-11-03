@@ -51,18 +51,16 @@ test('invalid PO-only items and packing roll back the entire review',()=>fixture
   }
 }));
 
-for(const lostResponse of [false,true]) test(`independent PO creation preserves the SO through ${lostResponse?'lost-response recovery':'the complete database workflow'}`,()=>fixture(async d=>{
-  const before=await query('SELECT * FROM sales_order_lines WHERE sales_order_id=8899601');
-  const saved=structuredClone(d.salesOrderLines);
-  let posted=0,payload;
-  const service=createSpecialStockRequestService({
+function purchaseService({lostResponse=false}={}) {
+  const state={posted:0,payload:null};
+  state.service=createSpecialStockRequestService({
     resolveLocations:async()=>[{netsuiteLocationId:1}],
     resolveOrderUnits:async lines=>lines.map(line=>({...line,unitId:line.uom==='PLT'?2:line.uom?1:null})),
-    findMarkerOrders:async()=>posted?[{id:8899603,entity_id:8899602,location_id:1}]:[],
+    findMarkerOrders:async()=>state.posted?[{id:8899603,entity_id:8899602,location_id:1}]:[],
     findLinkedPurchaseOrder:async()=>assert.fail('New PO must not inspect native SO links'),
     synchronizeSalesDescriptions:async()=>assert.fail('SO writes are forbidden'),
     createPurchaseOrder:async input=>{
-      posted++;payload=input;
+      state.posted++;state.payload=input;
       await query("INSERT INTO purchase_orders(netsuite_id,tranid,vendor_id,destination_location_id,status_text,netsuite_active) VALUES(8899603,'TEST-PO-INDEP',8899602,1,'Pending Receipt',true)");
       for(const [index,line] of input.item.items.entries()) {
         await query("INSERT INTO purchase_order_lines(purchase_order_id,line_id,item_id,item_name,item_description,quantity,unit,netsuite_active) VALUES(8899603,$1,$2,'TEST',$3,$4,$5,true)",
@@ -74,13 +72,44 @@ for(const lostResponse of [false,true]) test(`independent PO creation preserves 
     fetchPurchaseOrderReference:async()=>({tranid:'TEST-PO-INDEP',status_text:'Pending Receipt'}),
     recordPurchaseOrderCreation:async()=>{},sleep:async()=>{}
   });
+  return state;
+}
+
+for(const lostResponse of [false,true]) test(`independent PO creation preserves the SO through ${lostResponse?'lost-response recovery':'the complete database workflow'}`,()=>fixture(async d=>{
+  const before=await query('SELECT * FROM sales_order_lines WHERE sales_order_id=8899601');
+  const saved=structuredClone(d.salesOrderLines);
+  const state=purchaseService({lostResponse}),{service}=state;
   const result=await service.createPurchaseOrder(d.id,{...review(d),operationId:crypto.randomUUID()},context);
+  const {posted,payload}=state;
   assert.equal(posted,1);assert.equal(result.purchaseOrderId,8899603);assert.equal(result.attention,false);
   assert.deepEqual(result.salesOrderLines,saved);assert.deepEqual((await query('SELECT * FROM sales_order_lines WHERE sales_order_id=8899601')).rows,before.rows);
   assert.deepEqual(payload.item.items.map(line=>[line.item.id,line.quantity,line.rate]),[['2055',2,50],['9001',1,25],['4981',1,-10]]);
   assert.equal(payload.item.items[0].custcol_pcs,30);assert.equal(payload.createdFrom,undefined);
   await assert.rejects(()=>service.createPurchaseOrder(d.id,{expectedRevision:result.revision,operationId:crypto.randomUUID()},context),{code:'SPECIAL_PO_ALREADY_LINKED'});
-  assert.equal(posted,1);
+  assert.equal(state.posted,1);
+}));
+
+// SPREQ-000178: the issued SO was later edited in NetSuite, so its lines no
+// longer equal the case's SO snapshot or the reviewed PO. PO creation is
+// standalone and must neither compare nor rewrite the SO.
+test('PO creation is not blocked when the NetSuite SO item differs from the SO snapshot and the PO',()=>fixture(async d=>{
+  await query("INSERT INTO inventory_items(item_id,item_name,stock_unit,raw,synced_at) VALUES(9002,'TEST Stock Item','PC','{}',now()) ON CONFLICT DO NOTHING");
+  await query("UPDATE sales_order_lines SET item_id=9002,item_name='TEST Stock Item',item_description='Edited in NetSuite',quantity=20 WHERE sales_order_id=8899601");
+  const before=(await query('SELECT * FROM sales_order_lines WHERE sales_order_id=8899601 ORDER BY id')).rows;
+  const saved=structuredClone(d.salesOrderLines);
+  const state=purchaseService();
+  const result=await state.service.createPurchaseOrder(d.id,{...review(d),operationId:crypto.randomUUID()},context);
+  assert.equal(state.posted,1);
+  assert.equal(result.purchaseOrderId,8899603);assert.equal(result.purchaseOrderRef,'TEST-PO-INDEP');
+  assert.equal(result.purchaseOrderOperationStatus,'linked');
+  // The SO's own reconciliation (NetSuite SO vs its issued snapshot) is separate
+  // from PO creation: the edited SO is surfaced for review after the PO links.
+  assert.equal(result.attention,true);
+  assert.match(result.attentionReason,/^Sales Order does not contain/);
+  assert.equal(state.payload.createdFrom,undefined);
+  assert.deepEqual(state.payload.item.items.map(line=>[line.item.id,line.description]),[['2055','Vendor description'],['9001','Vendor delivery fee'],['4981',state.payload.item.items[2].description]]);
+  assert.deepEqual(result.salesOrderLines,saved,'The case SO snapshot must not be adjusted to the PO or NetSuite');
+  assert.deepEqual((await query('SELECT * FROM sales_order_lines WHERE sales_order_id=8899601 ORDER BY id')).rows,before,'The NetSuite SO mirror must not be rewritten');
 }));
 
 test('PO review keeps approval, stale-revision and already-submitted fences',()=>fixture(async d=>{
