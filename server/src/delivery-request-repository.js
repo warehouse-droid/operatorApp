@@ -249,10 +249,10 @@ export function createDeliveryRequestService({ resolveDistance, emit = () => {},
     return evidence;
   }
   async function normalizePricing(input) {
-    if(input.loadType==='bin' && input.quantityUnit==='yard') {
+    if(input.loadType==='bin') {
       const bins=await query('SELECT nominal_yards FROM mbt_bin_types WHERE active AND type_code=$1',[String(input.binTypeCode || '').trim().toUpperCase()]);
-      if(!bins.rowCount) {throw failure('DELIVERY_REQUEST_INVALID','Choose an active BIN size.');}
-      return normalizeDeliveryPricing({...input,binCapacityYards:Number(bins.rows[0].nominal_yards)});
+      if(!bins.rowCount) {throw failure(input.quantityUnit==='yard'?'DELIVERY_REQUEST_INVALID':'DELIVERY_QUOTE_UNAVAILABLE','Choose an active BIN size.');}
+      if(input.quantityUnit==='yard') {return normalizeDeliveryPricing({...input,binCapacityYards:Number(bins.rows[0].nominal_yards)});}
     }
     return normalizeDeliveryPricing(input);
   }
@@ -451,7 +451,8 @@ export function createDeliveryRequestService({ resolveDistance, emit = () => {},
   async function options(actor,audience) {
     const yards = requireAudience(actor,audience);
     const bins = await query(`SELECT DISTINCT bt.type_code,bt.display_name,bt.nominal_yards FROM mbt_bin_types bt
-      JOIN mbt_rate_distance_bands b USING(bin_type_id) JOIN mbt_rate_card_versions v USING(rate_card_version_id)
+      JOIN mbt_rate_distance_bands b ON b.bin_type_id=bt.bin_type_id OR b.bin_type_id IS NULL
+      JOIN mbt_rate_card_versions v USING(rate_card_version_id)
       JOIN mbt_rate_cards c USING(rate_card_id) WHERE bt.active AND c.active AND v.status='active'
       AND c.rate_card_code='DELIVERY_CHARGE_MBT_2026_RATE' ORDER BY bt.type_code`);
     return { requestingYards:yards.map(id => ({id,code:DELIVERY_YARDS[id]})),outboundYards:Object.values(DELIVERY_YARDS),

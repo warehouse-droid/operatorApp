@@ -1,6 +1,7 @@
 // @ts-check
 
 import { MbtError } from "./errors.js";
+import { calculateDistanceBandChargeMinor, normalizedDistancePricingBasis } from "./distance-band-pricing.js";
 
 export const CUSTOMER_CHARGE_REQUEST_KINDS = Object.freeze([
   "initial_bin",
@@ -385,17 +386,23 @@ function aggregateBandRangeInvalid(band) {
 /** @param {Record<string, any>} band @param {number} index */
 function aggregateBaseBandInvalid(band, index) {
   return index === 0
-    && (band.minimumMetres !== 0 || band.maximumMetres !== 30_000 || band.amountMinor !== 15_000);
+    && (band.minimumMetres !== 0 || band.maximumMetres !== 30_000 || band.amountMinor !== 15_000
+      || band.pricingBasis !== "flat");
 }
 
-/** @param {Record<string, any>} band @param {number} index @param {Record<string, any> | undefined} previous */
+/** @param {Record<string, any> & {amountMinor: number}} band @param {number} index
+ * @param {(Record<string, any> & {amountMinor: number}) | undefined} previous */
 function aggregateLaterBandInvalid(band, index, previous) {
   return index > 0
-    && (!previous || previous.maximumMetres !== band.minimumMetres || band.amountMinor <= previous.amountMinor);
+    && (!previous || previous.maximumMetres !== band.minimumMetres
+      || calculateDistanceBandChargeMinor(band, band.minimumMetres + 1)
+        <= calculateDistanceBandChargeMinor(previous, band.minimumMetres));
 }
 
-/** @param {Record<string, any>} band @param {number} index @param {Record<string, any> | undefined} previous */
+/** @param {Record<string, any> & {amountMinor: number}} band @param {number} index
+ * @param {(Record<string, any> & {amountMinor: number}) | undefined} previous */
 function assertAggregateDistanceBand(band, index, previous) {
+  calculateDistanceBandChargeMinor(band, band.minimumMetres);
   if ([
     aggregateBandRangeInvalid(band),
     aggregateBaseBandInvalid(band, index),
@@ -418,7 +425,10 @@ function normalizedAggregateDistanceBands(value) {
       maximumMetres: band.maximumMetres === null
         ? null
         : nonnegativeInteger(band.maximumMetres, "Aggregate band maximum"),
-      amountMinor: nonnegativeInteger(band.amountMinor, "Aggregate delivery amount")
+      amountMinor: nonnegativeInteger(band.amountMinor, "Aggregate delivery amount"),
+      pricingBasis: normalizedDistancePricingBasis(band.pricingBasis),
+      baseAmountMinor: band.baseAmountMinor ?? null,
+      includedMetres: band.includedMetres ?? null
     };
   }).sort((left, right) => left.minimumMetres - right.minimumMetres);
   for (const [index, band] of bands.entries()) {
@@ -443,7 +453,7 @@ function standaloneAggregateDeliveryLine(input) {
     lineType: "aggregate_delivery",
     label: "Aggregate delivery",
     itemCode: "AGG_DELIVERY",
-    configuredAmountMinor: selected.amountMinor,
+    configuredAmountMinor: calculateDistanceBandChargeMinor(selected, distanceMetres),
     taxable: true,
     paymentTiming: "due_now",
     source: {
@@ -451,7 +461,10 @@ function standaloneAggregateDeliveryLine(input) {
       bandCode: selected.bandCode,
       distanceMetres,
       minimumMetres: selected.minimumMetres,
-      maximumMetres: selected.maximumMetres
+      maximumMetres: selected.maximumMetres,
+      pricingBasis: selected.pricingBasis,
+      baseAmountMinor: selected.baseAmountMinor,
+      includedMetres: selected.includedMetres
     }
   };
 }

@@ -334,7 +334,7 @@ function quoteOutbound(pricing, yard, graph, metres, capacityPerTrip) {
   }
   const rateOriginYardCode = ['3445','2967'].includes(yard.originYardCode) ? yard.originYardCode : '3445';
   const bands = (graph.bands || []).filter(band => band.itemCode === (pos ? 'DELIVERY_CHARGE_MBBS' : 'DELIVERY_CHARGE_MBT')
-    && band.originYardCodes?.includes(rateOriginYardCode) && (pos ? !band.binTypeCode : band.binTypeCode === pricing.binTypeCode));
+    && band.originYardCodes?.includes(rateOriginYardCode) && (!band.binTypeCode || (!pos && band.binTypeCode === pricing.binTypeCode)));
   if (!bands.length) {throw new DeliveryRequestError('DELIVERY_QUOTE_UNAVAILABLE', `No transport rate covers yard ${yard.originYardCode} and this load type/size.`);}
   let rate;
   try {

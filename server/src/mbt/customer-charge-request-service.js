@@ -412,7 +412,7 @@ async function itemOwnedAggregateDistanceBands(rateCardVersionId) {
   const result = await query(
     `SELECT rate_distance_band_id::text, item_code, sequence_number::int,
             minimum_metres::int, maximum_metres::int, amount_minor,
-            pricing_basis, currency, description
+            pricing_basis, base_amount_minor, included_metres, currency, description
        FROM mbt_rate_distance_bands
       WHERE rate_card_version_id = $1::uuid
         AND service_code = 'aggregate_delivery'
@@ -514,6 +514,9 @@ export async function getFrontdeskCustomerChargeConfiguration(input) {
       minimumMetres: Number(row.minimum_metres),
       maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
       amountMinor: Number(row.amount_minor),
+      pricingBasis: String(row.pricing_basis || "flat"),
+      baseAmountMinor: (row.base_amount_minor === null || row.base_amount_minor === undefined) ? null : Number(row.base_amount_minor),
+      includedMetres: (row.included_metres === null || row.included_metres === undefined) ? null : Number(row.included_metres),
       currency: String(row.currency),
       description: String(row.description || "")
     }))
@@ -886,7 +889,7 @@ async function aggregateDistanceBands(rateCardVersionId) {
   let result = await query(
     `SELECT rate_distance_band_id::text AS band_code,
             minimum_metres::int, maximum_metres::int, amount_minor,
-            pricing_basis
+            pricing_basis, base_amount_minor, included_metres
        FROM mbt_rate_distance_bands
       WHERE rate_card_version_id = $1::uuid
         AND service_code = 'aggregate_delivery'
@@ -907,7 +910,9 @@ async function aggregateDistanceBands(rateCardVersionId) {
     minimumMetres: Number(row.minimum_metres),
     maximumMetres: row.maximum_metres === null ? null : Number(row.maximum_metres),
     amountMinor: Number(row.amount_minor),
-    ...(row.pricing_basis ? { pricingBasis: String(row.pricing_basis) } : {})
+    ...(row.pricing_basis ? { pricingBasis: String(row.pricing_basis) } : {}),
+    baseAmountMinor: (row.base_amount_minor === null || row.base_amount_minor === undefined) ? null : Number(row.base_amount_minor),
+    includedMetres: (row.included_metres === null || row.included_metres === undefined) ? null : Number(row.included_metres)
   }));
 }
 
