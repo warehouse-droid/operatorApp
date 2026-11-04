@@ -196,7 +196,9 @@ export function applyTransferLoadedQuantities(lines,loaded) {
 
 export async function listTransferPostingJobs() {
   const jobs=(await query(`SELECT job.id,job.local_to_id,job.transaction_type,job.order_ref,job.status,job.last_error,job.command_id,
-      job.snapshot->'driverTarget' AS driver_target,job.snapshot->'lines' AS lines,job.created_at,command.status AS command_status,command.last_error AS command_error
+      job.snapshot->'driverTarget' AS driver_target,job.snapshot->'lines' AS lines,job.created_at,command.status AS command_status,command.last_error AS command_error,
+      CASE WHEN job.command_id IS NULL THEN job.auto_retry_count ELSE command.auto_retry_count END AS auto_retry_count,
+      CASE WHEN job.command_id IS NULL THEN job.next_retry_at ELSE command.next_auto_retry_at END AS next_auto_retry_at
     FROM transfer_order_posting_jobs job LEFT JOIN operator_netsuite_posting_commands command ON command.id=job.command_id
     WHERE job.status<>'completed' ORDER BY job.created_at DESC LIMIT 100`)).rows;
   const dependencies=await readTransferDriverDependencies(jobs.map((/** @type {Record<string,any>} */ job)=>job.local_to_id));

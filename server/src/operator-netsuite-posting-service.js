@@ -3,6 +3,7 @@ import { fulfillmentTransactions } from "./item-fulfillment-parts-domain.js";
 import { pickupExistingFulfillmentTransactions } from './operator-pickup-existing-if-domain.js';
 import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import { operatorStepHasKits } from './operator-netsuite-posting-kits.js';
+import { POSTING_AUTO_RETRY_DELAYS_MINUTES, isPostingTimeoutOrConnectionFailure } from './posting-auto-retry-policy.js';
 
 /** @param {unknown} error */
 function failureDetails(error) {
@@ -217,6 +218,25 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     replaceStep(command, updated);
   }
 
+  /**
+   * Timeouts and lost connections get an automatic Resume verification. A
+   * command already on automatic retry keeps verifying while NetSuite cannot
+   * yet confirm the earlier attempt; it never posts a second time.
+   * @param {Record<string, any>} command @param {unknown} error @param {unknown} priorAutoRetries
+   */
+  async function scheduleAutoRetry(command, error, priorAutoRetries) {
+    const continuing = Number(priorAutoRetries) > 0
+      && failureDetails(error).code === "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED";
+    if (!repository.scheduleAutoRetry || command?.status !== "attention"
+      || !(continuing || isPostingTimeoutOrConnectionFailure(error))) {return command;}
+    try {
+      const scheduled = await repository.scheduleAutoRetry({ commandId: command.id, delaysMinutes: POSTING_AUTO_RETRY_DELAYS_MINUTES });
+      return scheduled ? { ...command, nextAutoRetryAt: scheduled.nextAutoRetryAt } : command;
+    } catch {
+      return command; // An unscheduled command stays in Admin attention, as before.
+    }
+  }
+
   /** @param {Record<string, any>} command @param {unknown} error */
   function requiresAttention(command, error) {
     return command.inputSnapshot?.localOperation?.kind === "delivery_consolidation_load"
@@ -253,6 +273,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         for (const step of pending) {await runStep(step);}
       }
     } catch (error) {
+        const priorAutoRetries = command.autoRetryCount;
         command = requiresAttention(command, error)
           ? await repository.attention({
               commandId: command.id,
@@ -264,7 +285,7 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
               leaseToken: command.leaseToken,
               error
             });
-        return command;
+        return scheduleAutoRetry(command, error, priorAutoRetries);
     }
     try {
       await repository.renew({
@@ -283,13 +304,14 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return repository.attention({
+      const attention = await repository.attention({
         commandId: command.id,
         leaseToken: command.leaseToken,
         error: Object.assign(new Error(`NetSuite posted, but local finalization needs attention: ${message}`), {
           cause: error
         })
       });
+      return scheduleAutoRetry(attention, error, command.autoRetryCount);
     }
   }
 

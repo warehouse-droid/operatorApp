@@ -194,6 +194,8 @@ export function publicOperatorNetSuitePostingCommand(command) {
     gateRevision: command.gateRevision,
     status: command.status,
     lastError: command.lastError,
+    autoRetryCount: command.autoRetryCount ?? 0,
+    nextAutoRetryAt: command.nextAutoRetryAt ?? null,
     result: command.status === "completed" ? command.result : {},
     createdAt: command.createdAt,
     updatedAt: command.updatedAt,

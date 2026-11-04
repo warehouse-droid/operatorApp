@@ -10,8 +10,13 @@ import {
   recordOperatorNetSuitePostingStepFailure,
   recordOperatorNetSuitePostingStepSuccess,
   renewOperatorNetSuitePostingLease,
+  resumeDueOperatorNetSuitePostingAutoRetries,
+  scheduleOperatorNetSuitePostingAutoRetry,
   startOperatorNetSuitePostingAttempt
 } from "./operator-netsuite-posting-repository.js";
+import { withTransaction } from "./db.js";
+import { writeAudit } from "./auth-repository.js";
+import { POSTING_AUTO_RETRY_LIMIT } from "./posting-auto-retry-policy.js";
 import { operatorNetSuitePostingAdapter } from "./operator-netsuite-posting-netsuite-adapter.js";
 import { finalizeOperatorNetSuitePosting, lockOperatorNetSuitePostingFinalization } from "./operator-netsuite-posting-finalizer.js";
 import { createOperatorNetSuitePostingProcessor } from "./operator-netsuite-posting-service.js";
@@ -21,8 +26,9 @@ import { createOperatorNetSuitePostingProcessor } from "./operator-netsuite-post
  * @param {(commandId: string) => Promise<unknown>} dependencies.process
  * @param {() => Promise<string[]>} dependencies.listRunnable
  * @param {(error: Error, commandId: string) => void} dependencies.logError
+ * @param {() => Promise<unknown>} [dependencies.resumeDueAutoRetries]
  */
-export function createOperatorNetSuitePostingRuntime({ process: processCommand, listRunnable, logError }) {
+export function createOperatorNetSuitePostingRuntime({ process: processCommand, listRunnable, logError, resumeDueAutoRetries }) {
   const inFlight = new Map();
 
   function enqueue(/** @type {unknown} */ value) {
@@ -43,6 +49,9 @@ export function createOperatorNetSuitePostingRuntime({ process: processCommand, 
   }
 
   async function tick() {
+    if (resumeDueAutoRetries) {
+      try {await resumeDueAutoRetries();} catch (error) {logError(/** @type {Error} */ (error), "automatic-retry");}
+    }
     const commandIds = await listRunnable();
     await Promise.all(commandIds.map((commandId) => enqueue(commandId)));
     return { discovered: commandIds.length };
@@ -60,8 +69,26 @@ const repository = {
   failure: recordOperatorNetSuitePostingStepFailure,
   attention: markOperatorNetSuitePostingCommandAttention,
   fail: failOperatorNetSuitePostingCommand,
-  complete: completeOperatorNetSuitePostingCommand
+  complete: completeOperatorNetSuitePostingCommand,
+  scheduleAutoRetry: scheduleOperatorNetSuitePostingAutoRetry
 };
+
+/** Requeue due automatic retries and audit each one in the same transaction. */
+async function resumeDueAutoRetriesWithAudit() {
+  return withTransaction(async () => {
+    const resumed = await resumeDueOperatorNetSuitePostingAutoRetries({ limit: 10 });
+    for (const retry of resumed) {
+      await writeAudit({
+        actorType: "system",
+        source: "admin",
+        action: "operator_netsuite_posting.command.auto_resumed",
+        details: { commandId: retry.commandId, autoRetry: retry.autoRetryCount, limit: POSTING_AUTO_RETRY_LIMIT,
+          reason: "timeout_or_lost_connection", previousError: retry.previousError }
+      });
+    }
+    return resumed;
+  });
+}
 
 const processor = createOperatorNetSuitePostingProcessor({
   repository,
@@ -74,6 +101,7 @@ const processor = createOperatorNetSuitePostingProcessor({
 export const operatorNetSuitePostingRuntime = createOperatorNetSuitePostingRuntime({
   process: processor.process,
   listRunnable: () => listRunnableOperatorNetSuitePostingCommandIds({ limit: 25 }),
+  resumeDueAutoRetries: resumeDueAutoRetriesWithAudit,
   logError: (error, commandId) => {
     console.error(`Operator NetSuite posting command ${commandId} worker failed:`, error.message);
   }

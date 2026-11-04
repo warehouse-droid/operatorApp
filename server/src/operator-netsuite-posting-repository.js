@@ -76,6 +76,8 @@ function publicCommand(row, steps, claims) {
     leaseToken: row.lease_token,
     leaseExpiresAt: row.lease_expires_at,
     lastError: row.last_error,
+    autoRetryCount: Number(row.auto_retry_count || 0),
+    nextAutoRetryAt: row.next_auto_retry_at || null,
     result: row.result || {},
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -667,6 +669,7 @@ export async function markOperatorNetSuitePostingCommandAttention(input) {
               lease_token = NULL,
               lease_expires_at = NULL,
               last_error = $2,
+              next_auto_retry_at = NULL,
               updated_at = now()
         WHERE id = $1`,
       [commandId, errorText(input?.error)]
@@ -766,6 +769,8 @@ export async function resumeOperatorNetSuitePostingCommand(commandId) {
       `UPDATE operator_netsuite_posting_commands
           SET status = 'queued',
               last_error = NULL,
+              auto_retry_count = 0,
+              next_auto_retry_at = NULL,
               updated_at = now()
         WHERE id = $1
           AND status = 'attention'
@@ -789,6 +794,69 @@ export async function resumeOperatorNetSuitePostingCommand(commandId) {
     }
     return hydratedCommand(id);
   });
+}
+
+/**
+ * Schedule the next automatic "Resume verification" for a command that went to
+ * attention after a timeout or lost connection. No-op once the limit is used.
+ *
+ * @param {{ commandId: string, delaysMinutes: readonly number[] }} input
+ */
+export async function scheduleOperatorNetSuitePostingAutoRetry(input) {
+  const id = requiredText(input?.commandId, "Operator posting command ID");
+  const delays = [...(input?.delaysMinutes || [])].map(Number);
+  if (!delays.length || delays.some((delay) => !Number.isSafeInteger(delay) || delay <= 0)) {
+    throw new Error("Automatic retry delays must be positive whole minutes.");
+  }
+  const result = await query(
+    `UPDATE operator_netsuite_posting_commands
+        SET next_auto_retry_at = now() + make_interval(mins => ($2::int[])[auto_retry_count + 1]),
+            updated_at = now()
+      WHERE id = $1
+        AND status = 'attention'
+        AND auto_retry_count < cardinality($2::int[])
+      RETURNING id, auto_retry_count, next_auto_retry_at`,
+    [id, delays]
+  );
+  const row = result.rows[0];
+  return row ? { commandId: String(row.id), autoRetryCount: Number(row.auto_retry_count), nextAutoRetryAt: row.next_auto_retry_at } : null;
+}
+
+/**
+ * Requeue attention commands whose automatic retry is due. This is the same
+ * transition as the Admin "Resume verification" action: the processor checks
+ * NetSuite for an existing record before it may post.
+ *
+ * @param {{ limit?: number }} [input]
+ */
+export async function resumeDueOperatorNetSuitePostingAutoRetries({ limit = 10 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 10, 1), 100);
+  const result = await query(
+    `WITH due AS (
+       SELECT id, last_error
+         FROM operator_netsuite_posting_commands
+        WHERE status = 'attention'
+          AND next_auto_retry_at <= now()
+        ORDER BY next_auto_retry_at ASC, id ASC
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE operator_netsuite_posting_commands command
+        SET status = 'queued',
+            last_error = NULL,
+            auto_retry_count = command.auto_retry_count + 1,
+            next_auto_retry_at = NULL,
+            updated_at = now()
+       FROM due
+      WHERE command.id = due.id
+      RETURNING command.id, command.auto_retry_count, due.last_error AS previous_error`,
+    [safeLimit]
+  );
+  return result.rows.map((/** @type {Record<string, any>} */ row) => ({
+    commandId: String(row.id),
+    autoRetryCount: Number(row.auto_retry_count),
+    previousError: row.previous_error || ""
+  }));
 }
 
 /**

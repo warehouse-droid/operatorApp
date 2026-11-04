@@ -7,6 +7,8 @@ import {createOperatorNetSuitePostingRealSourceResolver,fetchLiveSourceFromNetSu
 import {createOrReplayOperatorNetSuitePostingCommand,getOperatorNetSuitePostingCommand} from './operator-netsuite-posting-repository.js';
 import {buildTransferPostingDraft,transferPostingCompletion} from './transfer-order-posting-domain.js';
 import {readTransferCompletionEvents,readTransferPhysicalStatus,readTransferFulfillmentEvidence} from './transfer-order-posting-repository.js';
+import {POSTING_AUTO_RETRY_LIMIT,isPostingTimeoutOrConnectionFailure,postingAutoRetryDelayMinutes} from './posting-auto-retry-policy.js';
+import {writeAudit} from './auth-repository.js';
 
 const resolveStored=createOperatorNetSuitePostingRealSourceResolver({query,fetchLiveSource:fetchLiveSourceFromNetSuite,useStoredOrderLines:true});
 
@@ -74,7 +76,7 @@ export async function prepareTransferPostingJob(id,{resolveSource=resolveTransfe
       const created=await createOrReplayOperatorNetSuitePostingCommand(draft);
       const completionIds=(event.linkedEvents || [event]).filter((/** @type {Record<string,any>} */ e)=>e.id!==null)
         .map((/** @type {Record<string,any>} */ e)=>String(e.id)).sort();
-      await query(`UPDATE transfer_order_posting_jobs SET command_id=$2,completion_event_id=$3,status='admitted',last_error=NULL,
+      await query(`UPDATE transfer_order_posting_jobs SET command_id=$2,completion_event_id=$3,status='admitted',last_error=NULL,next_retry_at=NULL,
         snapshot=snapshot||jsonb_build_object('completionEventIds',$4::jsonb)
           ||CASE WHEN $5::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('verifiedFulfillment',$5::jsonb) END,updated_at=now() WHERE id=$1`,
       [id,created.command.id,event.id,JSON.stringify(completionIds),admission.serializedFulfillment]);
@@ -82,12 +84,35 @@ export async function prepareTransferPostingJob(id,{resolveSource=resolveTransfe
     });
   } catch(error) {
     const details=/** @type {any} */(error);
+    const message=error instanceof Error?error.message:String(error);
+    if(details?.code!=='OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED' && isPostingTimeoutOrConnectionFailure(error)) {
+      const retry=await scheduleTransferAutoRetry(id,message);
+      if(retry){return retry;}
+    }
     const status=details?.code==='OPERATOR_NETSUITE_POSTING_ORDER_CLAIMED'?'waiting_posting':'attention';
     await query('UPDATE transfer_order_posting_jobs SET status=$2,last_error=$3,updated_at=now() WHERE id=$1 AND command_id IS NULL',
-      [id,status,error instanceof Error?error.message:String(error)]);
+      [id,status,message]);
     if(status==='attention'){throw error;}
     return {id,status};
   }
+}
+
+/** Nothing has been sent to NetSuite before admission, so a timeout or lost
+ * connection simply waits and prepares again. Returns null once the automatic
+ * retries are used up (the job then goes to Admin attention as before).
+ * @param {string} id @param {string} message */
+async function scheduleTransferAutoRetry(id,message) {
+  return withTransaction(async()=>{
+    const job=(await query('SELECT auto_retry_count,order_ref,local_to_id,transaction_type FROM transfer_order_posting_jobs WHERE id=$1 AND command_id IS NULL FOR UPDATE',[id])).rows[0];
+    const delay=job ? postingAutoRetryDelayMinutes(Number(job.auto_retry_count)) : null;
+    if(delay===null){return null;}
+    const updated=(await query(`UPDATE transfer_order_posting_jobs SET status='waiting_posting',last_error=$2,auto_retry_count=auto_retry_count+1,
+      next_retry_at=now()+make_interval(mins => $3::int),updated_at=now() WHERE id=$1 RETURNING auto_retry_count,next_retry_at`,[id,message,delay])).rows[0];
+    await writeAudit({actorType:'system',source:'admin',action:'transfer_order_posting.auto_retry_scheduled',orderId:job.local_to_id,
+      details:{jobId:id,orderRef:job.order_ref,transactionType:job.transaction_type,autoRetry:Number(updated.auto_retry_count),
+        limit:POSTING_AUTO_RETRY_LIMIT,nextRetryAt:updated.next_retry_at,reason:'timeout_or_lost_connection',error:message}});
+    return {id,status:'waiting_posting',autoRetryCount:Number(updated.auto_retry_count),nextRetryAt:updated.next_retry_at};
+  });
 }
 
 /** Audited by the Admin route. The immutable command and external ID survive retries. */
@@ -101,9 +126,13 @@ export async function retryTransferPostingJob(id) {
       const command=(await query('SELECT status FROM operator_netsuite_posting_commands WHERE id=$1 FOR UPDATE',[job.command_id])).rows[0];
       if(['failed','attention'].includes(command.status)) {
         await query('UPDATE operator_netsuite_posting_order_claims SET active=true,released_at=NULL WHERE command_id=$1',[job.command_id]);
-        await query("UPDATE operator_netsuite_posting_commands SET status='queued',last_error=NULL,updated_at=now() WHERE id=$1",[job.command_id]);
+        await query("UPDATE operator_netsuite_posting_commands SET status='queued',last_error=NULL,auto_retry_count=0,next_auto_retry_at=NULL,updated_at=now() WHERE id=$1",[job.command_id]);
       }
-    } else {await waitFor(id,job.snapshot.driverTarget || job.snapshot.linkError?'waiting_driver':'waiting_posting');}
+    } else {
+      await waitFor(id,job.snapshot.driverTarget || job.snapshot.linkError?'waiting_driver':'waiting_posting');
+      // A person's retry starts a fresh automatic-retry budget.
+      await query('UPDATE transfer_order_posting_jobs SET auto_retry_count=0,next_retry_at=NULL WHERE id=$1',[id]);
+    }
     return job;
   });
 }
@@ -115,7 +144,8 @@ export async function transferPostingTick({directAccessEnabled=config.netsuite.d
   ticking=true;
   try {
     const jobs=(await query(`SELECT id FROM transfer_order_posting_jobs
-      WHERE command_id IS NULL AND status NOT IN ('completed','attention') ORDER BY updated_at,created_at LIMIT 10`)).rows;
+      WHERE command_id IS NULL AND status NOT IN ('completed','attention') AND (next_retry_at IS NULL OR next_retry_at<=now())
+      ORDER BY updated_at,created_at LIMIT 10`)).rows;
     for(const job of jobs) {
       try {const ready=await prepare(job.id);if(ready?.command){void enqueue(ready.command.id);}}
       catch(error){console.error(`Transfer posting job ${job.id}:`,error instanceof Error?error.message:String(error));}

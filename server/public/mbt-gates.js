@@ -416,6 +416,17 @@ function renderHistoricalFulfillmentEvents() {
   }
 }
 
+/** Shown while a timeout or lost connection is waiting for its automatic retry. */
+function automaticRetryText(command) {
+  const at = command.nextAutoRetryAt ? new Date(command.nextAutoRetryAt) : null;
+  if (!at || Number.isNaN(at.valueOf())) return "";
+  const next = command.transferJob ? command.nextAutoRetry : Number(command.autoRetryCount || 0) + 1;
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return at > new Date()
+    ? `Timeout or lost connection: automatic retry ${next} of 5 at ${time}.`
+    : `Timeout or lost connection: automatic retry ${next} of 5 is starting.`;
+}
+
 function renderAttentionCommands() {
   if (!operatorNetSuiteAttention) return;
   operatorNetSuiteAttention.replaceChildren();
@@ -433,6 +444,8 @@ function renderAttentionCommands() {
     lastError:job.command_error || job.last_error || (job.status==='waiting_driver' && (job.driver_order_refs || []).length
       ? `Waiting for ${job.driver_order_refs.join(' / ')} delivery completion.`
       : `${job.command_status || job.status}: Waiting for the required completion evidence.`),
+    // A job counts its retry when scheduling it; a command counts it when it resumes.
+    nextAutoRetry:Number(job.auto_retry_count || 0)+(job.command_id?1:0),nextAutoRetryAt:job.next_auto_retry_at || null,
     steps:[{sourceOrderRef:(job.lines || []).map(line=>`Item ${line.itemId}: ${line.quantity}`).join(' · '),status:job.command_status || job.status}]}))];
   if (!commands.length) {
     const empty = document.createElement("p");
@@ -462,6 +475,13 @@ function renderAttentionCommands() {
         ` · ${part.transactionRef || part.externalId} / location ${(part.inventoryLocationIds || []).join(' / ')} / ${part.status}`).join('')}`
     )).join(" · ");
     copy.append(title, identity, detail, steps);
+    const autoRetry = automaticRetryText(command);
+    if (autoRetry) {
+      const scheduled = document.createElement("p");
+      scheduled.className = "mbt-attention-auto-retry";
+      scheduled.textContent = autoRetry;
+      copy.append(scheduled);
+    }
     const button = document.createElement("button");
     button.type = "button";
     button.dataset.postingResume = command.id;
