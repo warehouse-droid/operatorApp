@@ -91,6 +91,7 @@ test('Special and Backorder wait for a PO reference with Queued, including accep
     const original=(await query('SELECT * FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0];
     await query(readFileSync(new URL('../../../migrations/289_special_po_dispatch_stage.sql',import.meta.url),'utf8'));
     await query(readFileSync(new URL('../../../migrations/296_special_vendor_confirmation.sql',import.meta.url),'utf8'));
+    await query(readFileSync(new URL('../../../migrations/331_special_vendor_pickup_completion.sql',import.meta.url),'utf8'));
     await projections(await load(d),'dispatch_arrangement');
     assert.deepEqual((await query('SELECT * FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0],original);
   }

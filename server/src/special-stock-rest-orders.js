@@ -41,15 +41,28 @@ function header(record) {
   if (!result.discountItem) result.discountRate = '';
   return result;
 }
-/** @param {Raw} line @param {Raw|undefined} row @returns {SnapshotLine} */
-function snapshotLine(line, row) {
-  if (!row || Number(row.rest_line_id) !== id(line.line) || Number(row.item) !== id(line.item?.id)) {
+/** Subtotal and Description rows use NetSuite's non-positive item IDs; discount rows have no (or zero) quantity.
+ * @param {Raw} line @returns {{itemId:number}|null} */
+function summaryLine(line) {
+  const raw = line.item?.id, item = Number(raw);
+  if (raw === null || raw === undefined || String(raw).trim() === '' || !Number.isSafeInteger(item)) return null;
+  const quantity = line.quantity === null || line.quantity === undefined ? '' : String(line.quantity).trim();
+  return item <= 0 || !quantity || Number(quantity) === 0 ? { itemId: item } : null;
+}
+/** @param {Raw} line @param {Raw|undefined} row @param {{allowSummaryLines?:boolean}} [options] @returns {SnapshotLine} */
+function snapshotLine(line, row, { allowSummaryLines = false } = {}) {
+  const summary = allowSummaryLines ? summaryLine(line) : null;
+  if (!row || Number(row.rest_line_id) !== id(line.line) || Number(row.item) !== (summary ? summary.itemId : id(line.item?.id))) {
     throw conflict('NetSuite returned inconsistent order line identities.');
   }
   if (line.lineUniqueKey != null && id(line.lineUniqueKey) !== id(row.uniquekey)) throw conflict('NetSuite returned inconsistent stable line keys.');
   if (!['A', 'B'].includes(row.status) || row.execution_quantity == null || Number(row.execution_quantity) !== 0
     || row.billed_quantity == null || Number(row.billed_quantity) !== 0 || !['F', false].includes(row.line_closed)
     || line.isClosed === true) throw conflict('Only pending, unfulfilled, unreceived, unbilled and open orders can be adjusted.');
+  // Sales can add these rows to a manually created SO. A delivery-only update compares them and never rewrites them.
+  if (summary) return { remoteLineId: id(row.uniquekey), itemId: summary.itemId, quantity: null, unitId: null,
+    rate: line.rate === null || line.rate === undefined ? '' : String(line.rate), description: String(line.description || ''),
+    locationId: line.location?.id ? id(line.location.id) : null, taxCode: String(line.taxCode?.id || ''), createdPoId: null, createPo: '' };
   if (line.rate == null || !Number.isFinite(Number(line.rate))) throw conflict('The complete remote rate is required.');
   const percentage = row.ratepercent == null ? null : Number(row.ratepercent);
   if (percentage !== null && !Number.isFinite(percentage)) throw conflict('The native discount rate could not be verified.');
@@ -62,8 +75,9 @@ function snapshotLine(line, row) {
     createPo: String(line.createPo?.id ?? line.createPo ?? ''),
     ...(Number(line.item.id) === 2055 ? { pack: Object.fromEntries(Object.entries(SPECIAL_PACK_FIELDS).map(([field, native]) => [field, Number(line[native] ?? 0)])) } : {}) };
 }
-/** @param {Identity} order @param {Transport} transport @param {{allowHeaderDiscount?:boolean}} options @returns {Promise<{record:Raw,snapshot:Snapshot}>} */
-export async function readSpecialRestOrder(order, { rest, queryAll }, { allowHeaderDiscount = false } = {}) {
+/** `allowSummaryLines` is for delivery-only header updates, which compare but never rewrite the item sublist.
+ * @param {Identity} order @param {Transport} transport @param {{allowHeaderDiscount?:boolean,allowSummaryLines?:boolean}} options @returns {Promise<{record:Raw,snapshot:Snapshot}>} */
+export async function readSpecialRestOrder(order, { rest, queryAll }, { allowHeaderDiscount = false, allowSummaryLines = false } = {}) {
   const [response, rows] = await Promise.all([
     rest(`${recordPath(order)}?expandSubResources=true`),
     queryAll(`SELECT tl.uniquekey, tl.id AS rest_line_id, tl.item, t.status,
@@ -82,7 +96,7 @@ export async function readSpecialRestOrder(order, { rest, queryAll }, { allowHea
   if (!record || !Array.isArray(source) || !source.length || source.length > 200 || headerDiscounts.length > 1
     || rows.length - headerDiscounts.length !== source.length
     || new Set(rows.map(row => String(row.uniquekey))).size !== rows.length) throw conflict('A complete, distinct NetSuite order is required.');
-  const lines = source.map(line => snapshotLine(line, rows.find(row => Number(row.rest_line_id) === id(line.line))));
+  const lines = source.map(line => snapshotLine(line, rows.find(row => Number(row.rest_line_id) === id(line.line)), { allowSummaryLines }));
   if (new Set(lines.map(line => line.remoteLineId)).size !== lines.length) throw conflict('NetSuite returned duplicate line identities.');
   return { record, snapshot: { header: header(record), lines } };
 }

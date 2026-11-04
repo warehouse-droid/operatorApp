@@ -73,6 +73,7 @@ before(async () => {
   await query(readFileSync('migrations/283_special_customer_confirmation.sql', 'utf8'));
   await query(readFileSync('migrations/296_special_vendor_confirmation.sql', 'utf8'));
   await query(readFileSync('migrations/321_special_child_po.sql', 'utf8'));
+  await query(readFileSync('migrations/331_special_vendor_pickup_completion.sql', 'utf8'));
   await query("INSERT INTO netsuite_customers(netsuite_id,entity_number,legal_name,display_name,currency,active,source_modified_at,source_version,payload_hash) VALUES(8899397,'TEST-QUOTE-CUSTOMER','TEST Quote Customer','TEST Quote Customer','CAD',true,now(),'test',repeat('f',64)) ON CONFLICT DO NOTHING");
   flag = (await query("SELECT enabled FROM mbt_feature_flags WHERE flag_key='special_stock_request_workflow'")).rows[0].enabled;
   await query("UPDATE mbt_feature_flags SET enabled=true WHERE flag_key='special_stock_request_workflow'");

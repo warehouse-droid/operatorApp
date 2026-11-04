@@ -111,9 +111,10 @@ test('test skips keep accepted production ETAs Confirmed and vendor collection w
   detail = await skip(detail);
   detail = await skip(detail, 'purchase_order', { lines: purchaseLines(detail) });
   assert.equal(detail.stage, 'confirmed');
+  // A ready, skipped PO step arranges customer collection like a queued native PO.
   detail = await repository.checkSpecialStockReadiness(detail.id, detail.lines[0].id, { expectedRevision: detail.revision, ready: true }, context);
-  assert.equal(detail.stage, 'confirmed');
+  assert.equal(detail.stage, 'dispatch_arrangement');
   detail = await repository.completeSpecialVendorPickup(detail.id, { expectedRevision: detail.revision, pickupDate: '2099-01-21', pickupReference: 'TEST collection only' }, context);
-  assert.equal(detail.stage, 'confirmed');
-  assert.equal((await repository.listSpecialStockCases({ stages: ['confirmed'], limit: 150 })).some(row => row.id === detail.id), true);
+  assert.equal(detail.stage, 'dispatch_arrangement', 'Recorded collection alone does not complete without native order evidence.');
+  assert.equal((await repository.listSpecialStockCases({ stages: ['dispatch_arrangement'], limit: 150 })).some(row => row.id === detail.id), true);
 }));

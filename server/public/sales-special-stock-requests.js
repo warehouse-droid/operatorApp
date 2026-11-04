@@ -117,6 +117,7 @@
   let preserveSpecialScroll;
   const state = {
     operator: null,
+    replaceOrderOpen: false,
     yards: [],
     enabled: null,
     storeLocationIds: [],
@@ -405,7 +406,7 @@
         <span><small>Vendor ref</small><strong>${escapeHtml(line.vendorReference || "—")}</strong></span>
       </div>
       ${line.originalRate != null ? `<p>Original rate: ${rateLabel(line.originalRate)} / ${escapeHtml(line.rateUom)} · Discount: ${number(line.discountPercent)}% · Current subtotal: ${money(line.subtotal)}</p>` : ''}
-      ${line.salesVisibleNote ? `<div class="stock-request-notice">${escapeHtml(line.salesVisibleNote)}</div>` : ""}
+      ${line.salesVisibleNote ? `<div class="stock-request-notice special-scm-reply"><small>SCM reply${line.salesVisibleNoteUpdatedAt ? ` · ${escapeHtml(displayDate(line.salesVisibleNoteUpdatedAt))}` : ''}</small><div>${escapeHtml(line.salesVisibleNote)}</div></div>` : ""}
       ${line.itemResolution ? `<div class="stock-request-muted">Mapped to ${escapeHtml(line.itemResolution.itemName)} · ${number(line.itemResolution.salesQuantity)} ${escapeHtml(line.itemResolution.salesUom)}</div>` : ""}
       ${specialLineNotes(line)}
       ${decisionForm(line)}
@@ -475,6 +476,26 @@
         || detail.salesOrderSubmissionStartedAt || detail.salesOrderOperationStatus === 'creating') return '';
     return `<section class="stock-request-section"><h3>Manual Sales Order link</h3>
       <form class="stock-request-line-fields special-inline-form" data-special-link-so-form><label class="stock-request-item-search"><span>Sales Order number</span><input name="salesOrderRef" data-special-so-link-search autocomplete="off" required placeholder="Search or enter synced SO number" /><div class="stock-request-suggestions" data-special-so-link-suggestions></div></label><button type="submit">Link existing SO</button></form></section>`;
+  }
+
+  /** @param {any} detail */
+  function orderReplacementHistory(detail) {
+    const rows = (detail.events || []).filter(/** @param {any} event */ event => ['special_sales_order_replaced', 'special_purchase_order_replaced'].includes(event.eventType));
+    if (!rows.length) return '';
+    return `<ul class="special-order-replacements">${rows.map(/** @param {any} event */ event => `<li><strong>${event.eventType === 'special_sales_order_replaced' ? 'SO' : 'PO'} ${escapeHtml(event.details?.previous?.ref || '—')} → ${escapeHtml(event.details?.replacement?.ref || '—')}</strong> · ${escapeHtml(event.details?.reason || '')} <small>${escapeHtml(event.actorName)} · ${escapeHtml(displayDate(event.createdAt))}</small></li>`).join('')}</ul>`;
+  }
+
+  /** Sales replaces the linked SO after it was closed and re-created in NetSuite. @param {any} detail */
+  function salesOrderReplacement(detail) {
+    const history = orderReplacementHistory(detail);
+    const allowed = detail.workflowKind !== 'backorder' && detail.salesOrderId && !detail.salesOrderSkipped
+      && detail.closeStatus === 'active' && !['closed', 'completed'].includes(detail.stage) && !state.caseEditDraft
+      && !detail.quantityReviewPending && !['creating', 'attention'].includes(detail.salesOrderOperationStatus)
+      && !['creating', 'attention'].includes(detail.purchaseOrderOperationStatus);
+    if (!allowed && !history) return '';
+    return `<section class="stock-request-section"><h3>Order replacements</h3>${history}${allowed ? `<details class="special-order-replace" data-special-replace-toggle ${state.replaceOrderOpen ? 'open' : ''}><summary>Replace ${escapeHtml(detail.salesOrderRef || 'the linked SO')}</summary>
+      <p>Use this when the SO was closed and re-created in NetSuite. The request follows the new synced SO. Like a manually linked SO, SO and PO lines are then tracked independently, so Dispatch arranges the PO via the yard.</p>
+      <form class="stock-request-line-fields special-inline-form" data-special-replace-so-form><label class="stock-request-item-search"><span>Replacement SO number *</span><input name="salesOrderRef" data-special-so-replace-search autocomplete="off" required maxlength="120" placeholder="Search or enter synced SO number" /><div class="stock-request-suggestions" data-special-so-replace-suggestions></div></label><label><span>Reason *</span><input name="reason" required maxlength="2000" /></label><button class="danger" type="submit">Replace SO</button></form></details>` : ''}</section>`;
   }
 
   function soEditor() {
@@ -591,6 +612,7 @@
       ${caseLinesView(detail, showSaveDecisions, showAddItems)}
       ${addItemsView(detail)}
       ${manualSalesLink(detail)}
+      ${salesOrderReplacement(detail)}
       ${detail.informationRequest?.status !== 'pending' && !state.caseEditDraft && (detail.salesOrderId || detail.salesOrderSkipped || (detail.closeStatus === 'active' && detail.lines.every(line => ['accepted','declined','closed'].includes(line.salesDecision)))) ? soEditor() : ''}
       ${(detail.purchaseOrderId || detail.purchaseOrderSkipped) ? `<section class="stock-request-section"><h3>Fulfillment</h3><div class="stock-request-summary"><span><small>Dispatch route</small><strong>${escapeHtml(detail.handoffRoute || (detail.fulfillmentMethod === "vendor_pickup" ? "Not required" : "Waiting Dispatch"))}</strong></span><span><small>Completion</small><strong>${detail.operationallyComplete ? "Operationally complete" : "In progress"}</strong></span></div>${detail.vendorPickupDate ? `<div class="stock-request-muted">Customer pickup: ${escapeHtml(detail.vendorPickupDate)} · ${escapeHtml(detail.vendorPickupReference)}</div>` : ""}</section>` : ""}
       ${(detail.purchaseOrderId || detail.purchaseOrderSkipped) && (!detail.purchaseOrderId || detail.purchaseOrderApproved !== false) && detail.fulfillmentMethod === "vendor_pickup" && !detail.operationallyComplete && detail.lines.filter(line => line.salesDecision === "accepted").every(line => specialStockAvailable(line.supplyStatus)) ? `<form class="stock-request-line-fields special-inline-form" data-special-vendor-pickup-form><label><span>Customer pickup date *</span><input name="pickupDate" type="date" required value="${todayToronto()}" /></label><label><span>Pickup reference / evidence *</span><input name="pickupReference" required /></label><button class="primary" type="submit">Complete vendor pickup</button></form>` : ""}
@@ -682,7 +704,7 @@
     const detail = state.requests.find(row => String(row.id) === String(id));
     if (!detail || detail.id === state.detail?.id) return;
     state.formDrafts.clear(); state.composer = null; state.soDraft = null; state.soDraftDirty = false;
-    state.adjustmentEditing = false;
+    state.adjustmentEditing = false; state.replaceOrderOpen = false;
     state.copySource = null; state.addItemsDraft = null;
     state.caseEditDraft = null; state.caseEditSource = null;
     state.detail = detail; state.error = ''; state.notice = '';
@@ -881,18 +903,19 @@
         } catch (error) { state.error = error.message; render(); }
       }, 250);
     }
-    if (event.target.matches("[data-special-so-link-search]")) {
+    for (const [kind, action] of /** @type {Array<[string,string]>} */ ([['link', 'choose-so-link'], ['replace', 'choose-so-replace']])) {
+      if (!event.target.matches(`[data-special-so-${kind}-search]`)) continue;
       const search = event.target.value;
       window.clearTimeout(state.soLinkTimer);
       state.soLinkTimer = window.setTimeout(async () => {
         try {
           const payload = await api(`/api/sales/special-stock-requests/order-links?kind=sales_order&search=${encodeURIComponent(search)}`);
-          const current = mount.querySelector("[data-special-so-link-search]");
+          const current = mount.querySelector(`[data-special-so-${kind}-search]`);
           if (!current || current.value !== search) return;
-          const html = (payload.orders || []).map((order) => `<button data-special-sales-action="choose-so-link" data-order-id="${order.id}" data-order-ref="${escapeHtml(order.ref)}" type="button"><strong>${escapeHtml(order.ref)} · ${escapeHtml(order.entityName)}</strong><small>${escapeHtml(order.status)}</small></button>`).join("");
-          replaceSuggestions("[data-special-so-link-suggestions]", html);
+          const html = (payload.orders || []).map((order) => `<button data-special-sales-action="${action}" data-order-id="${order.id}" data-order-ref="${escapeHtml(order.ref)}" type="button"><strong>${escapeHtml(order.ref)} · ${escapeHtml(order.entityName)}</strong><small>${escapeHtml(order.status)}</small></button>`).join("");
+          replaceSuggestions(`[data-special-so-${kind}-suggestions]`, html);
         } catch (error) {
-          replaceSuggestions("[data-special-so-link-suggestions]", `<small>${escapeHtml(error.message)}</small>`);
+          replaceSuggestions(`[data-special-so-${kind}-suggestions]`, `<small>${escapeHtml(error.message)}</small>`);
         }
       }, 250);
     }
@@ -944,7 +967,7 @@
   mount.addEventListener("submit", async (event) => {
     const form = /** @type {HTMLFormElement} */ (event.target);
     if (state.busy) { event.preventDefault(); return; }
-    if (!form.matches("[data-special-note-form], [data-special-internal-remark-form], [data-special-information-reply-form], [data-special-case-form], [data-special-case-edit-form], [data-special-add-items-form], [data-special-expiry-form], [data-special-fulfillment-form], [data-special-decisions-form], [data-special-so-form], [data-special-link-so-form], [data-special-close-form], [data-special-ack-form], [data-special-vendor-pickup-form], [data-special-quantity-form]")) return;
+    if (!form.matches("[data-special-note-form], [data-special-internal-remark-form], [data-special-information-reply-form], [data-special-case-form], [data-special-case-edit-form], [data-special-add-items-form], [data-special-expiry-form], [data-special-fulfillment-form], [data-special-decisions-form], [data-special-so-form], [data-special-link-so-form], [data-special-replace-so-form], [data-special-close-form], [data-special-ack-form], [data-special-vendor-pickup-form], [data-special-quantity-form]")) return;
     event.preventDefault();
     state.busy = true;
     syncSoActionAvailability();
@@ -1102,6 +1125,12 @@
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/sales-order/link`, {
           method: "POST", body: JSON.stringify({ expectedRevision: state.detail.revision, salesOrderRef: values.salesOrderRef })
         });
+      } else if (form.matches("[data-special-replace-so-form]")) {
+        const values = Object.fromEntries(new FormData(form));
+        state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/sales-order/replace`, {
+          method: "POST", body: JSON.stringify({ expectedRevision: state.detail.revision, salesOrderRef: values.salesOrderRef, reason: values.reason })
+        });
+        state.notice = `Sales Order replaced with ${state.detail.salesOrderRef}.`; state.replaceOrderOpen = false;
       } else if (form.matches("[data-special-close-form]")) {
         const values = Object.fromEntries(new FormData(form));
         state.detail = await api(`/api/sales/special-stock-requests/${state.detail.id}/close`, {
@@ -1239,11 +1268,12 @@
         replaceSuggestions('[data-special-customer-suggestions]', '');
         return;
       }
-      if (action === "choose-so-link") {
-        const form = mount.querySelector("[data-special-link-so-form]");
+      if (action === "choose-so-link" || action === "choose-so-replace") {
+        const kind = action === "choose-so-link" ? "link" : "replace";
+        const form = mount.querySelector(`[data-special-${kind}-so-form]`);
         form.querySelector("[name=salesOrderRef]").value = button.dataset.orderRef;
         rememberSpecialForm(state.formDrafts, /** @type {HTMLFormElement} */ (form));
-        replaceSuggestions("[data-special-so-link-suggestions]", "");
+        replaceSuggestions(`[data-special-so-${kind}-suggestions]`, "");
         return;
       }
       if (action === "add-ancillary") { markSoDraftDirty(); syncSoFromDom(); state.soDraft.ancillaryLines.push({ key: crypto.randomUUID(), itemId: "", itemName: "", description: "", quantity: 1, uom: "EA", rate: "" }); return render(); }
@@ -1292,6 +1322,12 @@
       render();
     }
   });
+
+  // Renders recreate the panel; keep the replace form open while Sales works in it. Toggle does not bubble.
+  mount.addEventListener('toggle', event => {
+    const details = /** @type {HTMLDetailsElement} */ (event.target);
+    if (details.matches?.('[data-special-replace-toggle]')) state.replaceOrderOpen = details.open;
+  }, true);
 
   mount.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || !event.target.matches("[data-special-search]")) return;

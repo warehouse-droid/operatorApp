@@ -66,3 +66,37 @@ test('property: only one matching header discount may be outside the material su
   assert.equal(state.patches.length,0);
  }),{seed:631017,numRuns:40});
 });
+/** SOB123994 shape: Sales created the SO in NetSuite with Subtotal, a quantity-less discount and a delivery charge. */
+function manualSalesOrderFixture(){
+ const fixed=fixture(),original=fixed.boundary.queryAll;
+ fixed.state.record.item.items.push({line:2,item:{id:'-2'},description:'Subtotal',amount:20},
+  {line:3,item:{id:'2022'},description:'10% discount',rate:-10,amount:-2},{line:4,item:{id:'1987'},quantity:1,units:'1',rate:0,description:'Delivery Charge',location:{id:'1'}});
+ fixed.boundary.queryAll=async()=>[...await original(),{uniquekey:102,rest_line_id:2,item:-2,status:'B',execution_quantity:0,billed_quantity:0,line_closed:'F'},
+  {uniquekey:103,rest_line_id:3,item:2022,status:'B',execution_quantity:0,billed_quantity:0,line_closed:'F',ratepercent:-0.1},
+  {uniquekey:104,rest_line_id:4,item:1987,status:'B',execution_quantity:0,billed_quantity:0,line_closed:'F'}];
+ return fixed;
+}
+test('delivery header updates a manually created SO with Subtotal, discount and charge rows without rewriting them',async()=>{
+ const {boundary,state}=manualSalesOrderFixture(),before=structuredClone(state.record.item);
+ const plan=await prepareSpecialFulfillmentPlan({salesOrderId:10,fulfillmentMethod:'mbt_delivery',deliveryAddress:'1 TEST Crescent',deliveryDate:'2099-02-01'},boundary);
+ assert.deepEqual(plan.before.commercial.lines.map(line=>line.itemId),[2055,-2,2022,1987]);
+ const result=await applySpecialFulfillmentPlan(plan,boundary);
+ assert.equal(result.deliveryMethodId,2);assert.equal(state.patches.length,1);assert.deepEqual(state.record.item,before);
+ assert.deepEqual(Object.keys(state.patches[0]).sort(),['custbody3','custbody4','custbody7','shipOverride','shippingAddress']);
+ // Order adjustments still require exact material identities.
+ await assert.rejects(readSpecialRestOrder({id:10,kind:'sales_order'},boundary),{code:'SPECIAL_ADJUSTMENT_CONFLICT'});
+});
+test('a changed summary row between delivery prepare and apply rejects before PATCH',async()=>{
+ for(const change of [record=>{record.item.items[2].rate=-15;},record=>{record.item.items[1].description='Changed subtotal';},record=>{record.item.items.splice(1,1);}]){
+  const {boundary,state}=manualSalesOrderFixture();
+  const plan=await prepareSpecialFulfillmentPlan({salesOrderId:10,fulfillmentMethod:'vendor_pickup'},boundary);
+  change(state.record);
+  await assert.rejects(()=>applySpecialFulfillmentPlan(plan,boundary),{code:/SPECIAL_(FULFILLMENT|ADJUSTMENT)_CONFLICT/});
+  assert.equal(state.patches.length,0);
+ }
+});
+test('summary rows on fulfilled or closed SOs still reject the delivery update',async()=>{
+ const {boundary}=manualSalesOrderFixture(),original=boundary.queryAll;
+ boundary.queryAll=async()=>(await original()).map(row=>row.item===-2?{...row,line_closed:'T'}:row);
+ await assert.rejects(()=>prepareSpecialFulfillmentPlan({salesOrderId:10,fulfillmentMethod:'vendor_pickup'},boundary),{code:'SPECIAL_ADJUSTMENT_CONFLICT'});
+});

@@ -46,12 +46,12 @@ export function specialStage(evidence = {}) {
       || evidence.hasPendingSalesDecision || evidence.linesResolved ? 'await_customer_confirmation' : 'new_enquiry';
   }
   if (evidence.purchaseOrderId) {
-    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)
-        && evidence.fulfillmentMethod !== 'vendor_pickup') return 'dispatch_arrangement';
+    // Customer pickup at the vendor yard also arranges collection once SCM queues the PO reference.
+    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return 'dispatch_arrangement';
     return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';
   }
   if (evidence.waitingForProduction) return 'confirmed';
-  if (evidence.purchaseOrderSkipped && evidence.fulfillmentMethod !== 'vendor_pickup') return 'dispatch_arrangement';
+  if (evidence.purchaseOrderSkipped) return 'dispatch_arrangement';
   return 'confirmed';
 }
 

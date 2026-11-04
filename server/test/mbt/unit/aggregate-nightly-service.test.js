@@ -52,3 +52,23 @@ test('S1 actual timer defers overlapping probes and recovers after probe errors'
   assert.equal((await aggregateReconciliationNightlyTick({ operationalSyncRunning: () => { throw Object.assign(new Error('active worker'), { status: 409 }); } })).reason, 'reconciliation_active');
   assert.equal((await aggregateReconciliationNightlyTick({ operationalSyncRunning: () => true })).reason, 'operational_sync_running');
 });
+
+test('the nightly aggregate run also refreshes open Special vendor pickups, even when the run fails', async () => {
+  const order = [];
+  const context = vm.createContext({ Date, String, Error,
+    claimAggregateNightlyRun: async () => ({ started: true, run: { id: 7 } }),
+    executeScmReconciliationRun: async () => { order.push('run'); return { status: 'succeeded' }; },
+    refreshOpenSpecialVendorPickupOrders: async () => { order.push('vendor-pickup'); return { requests: 1, updated: 1, completedRequestIds: [9] }; } });
+  vm.runInContext(source, context);
+  const result = await context.aggregateReconciliationNightlyTick({});
+  assert.deepEqual(order, ['run', 'vendor-pickup']);
+  assert.equal(result.run.status, 'succeeded'); assert.deepEqual(result.specialVendorPickup.completedRequestIds, [9]);
+  order.length = 0;
+  context.executeScmReconciliationRun = async () => { order.push('run'); throw new Error('NetSuite timeout'); };
+  await assert.rejects(context.aggregateReconciliationNightlyTick({}), /NetSuite timeout/);
+  assert.deepEqual(order, ['run', 'vendor-pickup']);
+  context.executeScmReconciliationRun = async () => ({ status: 'succeeded' });
+  context.refreshOpenSpecialVendorPickupOrders = async () => { throw new Error('refresh failed'); };
+  const isolated = await context.aggregateReconciliationNightlyTick({});
+  assert.equal(isolated.run.status, 'succeeded'); assert.match(isolated.specialVendorPickup.error, /refresh failed/);
+});

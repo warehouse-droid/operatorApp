@@ -83,6 +83,7 @@
   let specialFormKey, rememberSpecialForm, restoreSpecialForms, preserveSpecialScroll;
   const state = {
     operator: null,
+    replaceOrderOpen: false,
     enabled: null,
     storeLocationIds: [],
     vendorNames: [],
@@ -164,9 +165,21 @@
       ? `<button type="button" data-special-scm-action="revise-stock-check" data-line-id="${line.id}">Revise stock check</button>` : '';
     const pendingTransfer = isSpecialTransferEta(line) && !state.detail.salesOrderId;
     const datedReadiness = requiresSupplyEta(line.supplyStatus) || line.supplyStatus === 'allocation' || (line.supplyStatus === 'vendor_transfer' && !pendingTransfer);
-    if (line.salesDecision === 'accepted') return `<div class="stock-request-line-fields" data-special-stock-line="${line.id}" data-kind="readiness" data-line-id="${line.id}" data-transfer-pending="${pendingTransfer}" data-original-status="${escapeHtml(line.supplyStatus)}">
-      <label><span>Stock readiness</span><select name="supplyStatus">${supplyStatusOptions(line.supplyStatus)}</select></label>
-      <label data-special-eta ${datedReadiness ? '' : 'hidden'}><span>ETA *</span><input name="eta" type="date" ${datedReadiness ? 'required' : 'disabled'} value="${escapeHtml(line.availableDate || '')}" /></label><p data-special-transfer-eta ${pendingTransfer ? '' : 'hidden'}>SO placement +5 working days</p></div>`;
+    // Accepted lines stay editable after SO/PO creation. These details change this request only.
+    if (line.salesDecision === 'accepted') return `<div class="stock-request-form special-response-form" data-special-stock-line="${line.id}" data-kind="readiness" data-line-id="${line.id}" data-transfer-pending="${pendingTransfer}" data-original-status="${escapeHtml(line.supplyStatus)}" data-saved-vendor="${escapeHtml(line.responseVendorName || state.detail.vendorName)}">
+      <input name="vendorId" type="hidden" value="${escapeHtml(line.responseVendorId || state.detail.vendorId || '')}" />
+      <div class="stock-request-line-fields special-response-stock-row${datedReadiness || pendingTransfer ? ' has-eta' : ''}">
+      <label><span>Required date *</span><input name="requiredDate" type="date" ${line.requiredDate ? 'required' : ''} value="${escapeHtml(line.requiredDate || '')}" /></label>
+      <label><span>Supply status *</span><select name="supplyStatus">${supplyStatusOptions(line.supplyStatus)}</select></label>
+      <label class="stock-request-item-search"><span>Vendor *</span><input name="vendorName" data-special-scm-vendor-search data-line-id="${line.id}" required value="${escapeHtml(line.responseVendorName || state.detail.vendorName)}" /><div class="stock-request-suggestions" data-special-scm-vendor-suggestions="${line.id}"></div></label>
+      <label data-special-eta ${datedReadiness ? '' : 'hidden'}><span>ETA *</span><input name="eta" type="date" ${datedReadiness ? 'required' : 'disabled'} value="${escapeHtml(line.availableDate || '')}" /></label><p data-special-transfer-eta ${pendingTransfer ? '' : 'hidden'}>SO placement +5 working days</p>
+      </div>
+      <div class="special-response-notes-row">
+      <label><span>Vendor pickup location *</span><input name="vendorYard" ${line.supplyStatus === "no_stock" ? "" : "required"} value="${escapeHtml(line.vendorYard || '')}" /></label>
+      <label><span>Sales-visible reply</span><textarea name="salesVisibleNote" rows="2">${escapeHtml(line.salesVisibleNote || '')}</textarea></label>
+      <label><span>SCM internal note</span><textarea name="scmInternalNote" rows="2">${escapeHtml(line.scmInternalNote || '')}</textarea></label></div>
+      ${state.detail.purchaseOrderId ? '<small class="special-vendor-po-note">A vendor change updates this request only. The linked NetSuite PO keeps its vendor; use Replace PO if it was issued to the wrong vendor.</small>' : ''}
+      </div>`;
     const editingItem = state.editingStockLineIds.has(line.id);
     return `<div class="stock-request-form special-response-form" data-special-stock-line="${line.id}" data-kind="response" data-line-id="${line.id}">
       <div class="special-response-heading"><h4>SCM stock check</h4><button type="button" data-special-scm-action="edit-stock-line" data-line-id="${line.id}" aria-expanded="${editingItem}" aria-controls="special-scm-item-fields-${line.id}">${editingItem ? 'Hide details' : 'Edit'}</button></div>
@@ -187,13 +200,19 @@
       </div>`;
   }
 
+  /** The saved reply Sales sees, with the time SCM last changed it. @param {any} line */
+  function scmReply(line) {
+    if (!line.salesVisibleNote) return '';
+    return `<div class="stock-request-notice special-scm-reply"><small>Reply to Sales${line.salesVisibleNoteUpdatedAt ? ` · ${escapeHtml(displayDate(line.salesVisibleNoteUpdatedAt))}` : ''}</small><div>${escapeHtml(line.salesVisibleNote)}</div></div>`;
+  }
+
   function lineCard(line) {
     const alert = state.detail.readinessAlerts?.some(item => item.lineId === line.id);
     const html = `<article class="stock-request-line"><header><div><strong>MBBS-Special</strong><p class="special-scm-item-description">${escapeHtml(specialItemDescription(line))}</p><small>${number(line.quantity)} ${escapeHtml(line.uom)}</small></div>${pill(line.salesDecision)}</header>
       <p>${escapeHtml([line.requiredDate ? `Required: ${line.requiredDate}` : '',line.customerNote,`PLT ${line.palletQty ?? '—'} · LYR ${line.layerQty ?? '—'} · SEC ${line.sectionQty ?? '—'} · PCS ${line.pieceQty ?? '—'}`].filter(Boolean).join(' · '))}</p>
       <p class="stock-live-summary"><span>${specialStockAvailable(line.supplyStatus) ? (line.supplyStatus === 'low_inventory' ? 'Low inventory' : 'Stock ready') : `${line.supplyStatus === 'vendor_transfer' ? 'Wait for Transfer · ' : line.supplyStatus === 'production' ? 'Waiting for Production · ' : ''}ETA: ${escapeHtml(specialSupplyEtaLabel(line, 'Not available'))}`} · Pickup: ${escapeHtml(line.vendorYard || 'Awaiting check')}</span>${window.SCMStockCheckLines?.line(state.detail,line) || ''}</p>
       ${alert ? '<div class="stock-request-notice stock-request-error" role="status">Readiness check due. This alert stays active until SCM confirms stock is ready.</div>' : ''}
-      ${line.salesCustomerNote || line.salesDecisionReason ? `<p>Sales: ${escapeHtml(line.salesCustomerNote || line.salesDecisionReason)}</p>` : ''}${responseForm(line)}</article>`;
+      ${line.salesCustomerNote || line.salesDecisionReason ? `<p>Sales: ${escapeHtml(line.salesCustomerNote || line.salesDecisionReason)}</p>` : ''}${scmReply(line)}${responseForm(line)}</article>`;
     return window.SCMRequestLineVisibility?.wrap(state.detail, line, html) || html;
   }
 
@@ -205,6 +224,26 @@
     if (detail.purchaseOrderId || detail.purchaseOrderSkipped || detail.salesOrderSkipped
         || detail.purchaseOrderSubmissionStartedAt || detail.purchaseOrderOperationStatus === 'creating') return '';
     return '<label style="max-width:22rem"><span>Manual PO link</span><input name="purchaseOrderRef" maxlength="120" placeholder="Existing synced PO number" style="width:100%" /><small>Link the order number without comparing request or order details.</small></label><button type="submit" data-special-link-po formnovalidate>Link PO</button>';
+  }
+
+  /** @param {any} detail */
+  function orderReplacementHistory(detail) {
+    const rows = (detail.events || []).filter(/** @param {any} event */ event => ['special_sales_order_replaced', 'special_purchase_order_replaced'].includes(event.eventType));
+    if (!rows.length) return '';
+    return `<ul class="special-order-replacements">${rows.map(/** @param {any} event */ event => `<li><strong>${event.eventType === 'special_sales_order_replaced' ? 'SO' : 'PO'} ${escapeHtml(event.details?.previous?.ref || '—')} → ${escapeHtml(event.details?.replacement?.ref || '—')}</strong> · ${escapeHtml(event.details?.reason || '')} <small>${escapeHtml(event.actorName)} · ${escapeHtml(displayDate(event.createdAt))}</small></li>`).join('')}</ul>`;
+  }
+
+  /** SCM replaces the linked PO after it was closed and re-issued in NetSuite. @param {any} detail */
+  function purchaseOrderReplacement(detail) {
+    const history = orderReplacementHistory(detail);
+    const allowed = detail.workflowKind !== 'backorder' && detail.purchaseOrderId && !detail.purchaseOrderSkipped
+      && detail.closeStatus === 'active' && !['closed', 'completed'].includes(detail.stage) && !detail.quantityReviewPending
+      && !['creating', 'attention'].includes(detail.purchaseOrderOperationStatus)
+      && !['creating', 'attention'].includes(detail.salesOrderOperationStatus);
+    if (!allowed && !history) return '';
+    return `<section class="stock-request-section"><h3>Order replacements</h3>${history}${allowed ? `<details class="special-order-replace" data-special-replace-toggle ${state.replaceOrderOpen ? 'open' : ''}><summary>Replace ${escapeHtml(detail.purchaseOrderRef || 'the linked PO')}</summary>
+      <p>Use this when the PO was closed and replaced in NetSuite. The request follows the new synced PO with independent (custom) linkage. Mark it sent to the vendor again if needed.</p>
+      <form class="stock-request-line-fields special-inline-form" data-special-po-replace-form><label><span>Replacement PO number *</span><input name="purchaseOrderRef" required maxlength="120" placeholder="Existing synced PO number" /></label><label><span>Reason *</span><input name="reason" required maxlength="2000" /></label><button class="danger" type="submit">Replace PO</button></form></details>` : ''}</section>`;
   }
 
   /** @param {any} detail */
@@ -225,7 +264,7 @@
     if (detail.quantityReviewPending) return `<p>PO creation waits for the order adjustment review above.</p>${manualForm}`;
     if (!detail.salesOrderId && !detail.salesOrderSkipped) return `<div class="stock-request-notice">Sales can create the SO after the customer confirms the available stock or accepts the ETA.</div>
       ${manualForm}${detail.lines.every(line => line.supplyStatus === 'no_stock' && !line.availableDate) ? `<form data-special-scm-close-form><label>Closure reason<input name="reason" required /></label><button class="danger" type="submit">Close request — no stock or ETA</button></form>` : ''}`;
-    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? 'Customer pickup at vendor yard' : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
+    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? (detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement · Customer pickup at vendor yard' : 'Customer pickup at vendor yard') : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
     const independentPurchase = detail.salesOrderSource === 'manual_link';
     if (!detail.salesOrderApproved && !independentPurchase) return `<section><h3>SO approval pending</h3><p>NetSuite status updates automatically.</p></section>${manualForm}`;
     const retry = detail.purchaseOrderOperationStatus === 'attention' && Boolean(detail.purchaseOrderSubmissionStartedAt);
@@ -275,7 +314,7 @@
   function detail() {
     const detail = state.detail;
     if (!detail) return `<div class="stock-request-empty"><strong>Select a case</strong><span>Review the stock checks and save them together.</span></div>`;
-    return `<div class="stock-request-heading"><div><h2>${escapeHtml(detail.requestRef)}</h2><p>${escapeHtml(detail.customerName)} · ${escapeHtml(detail.customerPhone || "No phone")}</p></div>${pill(detail.stage)}</div><div class="stock-request-summary"><span><small>Vendor</small><strong>${escapeHtml(detail.vendorName)}</strong></span><span><small>Store</small><strong>${escapeHtml(detail.storeName)}</strong></span><span><small>Delivery method</small><strong>${escapeHtml(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span><span><small>Case inquiry date</small><strong>${escapeHtml(detail.inquiryDate)}</strong></span><span><small>Sales Rep</small><strong>${escapeHtml(detail.netsuiteSalesRepName || detail.requestedByName || "—")}</strong></span><span><small>Expiry</small><strong>${escapeHtml(detail.expiresOn || "—")}</strong></span>${detail.netsuiteCustomerName ? `<span><small>NetSuite customer account</small><strong>${escapeHtml(detail.netsuiteCustomerName)}</strong></span>` : ""}<span><small>Revision</small><strong>${detail.revision}</strong></span></div>${detail.fulfillmentMethod === 'mbt_delivery' ? `<p class="stock-request-notice">${escapeHtml([detail.deliveryAddress,detail.deliveryContactName,detail.deliveryContactPhone,detail.deliveryDate].filter(Boolean).join(' · '))}</p>` : ''}${detail.attention ? `<div class="stock-request-notice stock-request-error">${escapeHtml(detail.attentionReason)}</div>` : ''}${specialPlanningStatus(detail)}${specialClosureStatus(detail, "scm")}${quantityReviewView(detail)}${detail.closeStatus === "closed" && detail.closureReason ? `<div class="stock-request-notice">Closed: ${escapeHtml(detail.closureReason)}</div>` : ''}${detail.remarks ? `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escapeHtml(detail.remarks)}</div></div>` : ""}${detail.postPoChangePending ? `<div class="stock-request-notice stock-request-error">A post-PO vendor change is waiting for Sales to record customer acknowledgement. The existing SO, PO, and Dispatch handoff were not silently changed.</div>` : ""}${poRoutingHtml(detail, state.poRouting)}${specialInformationPanel(detail, 'scm')}<section class="stock-request-section" data-scm-line-visibility="${detail.id}">${window.SCMStockCheckLines?.header(detail) || '<h3>Line responses</h3>'}${window.SCMRequestLineVisibility?.controls(detail) || ""}<form data-special-stock-check-form><div class="stock-request-lines" id="scm-request-lines-${detail.id}">${detail.lines.map(lineCard).join("")}${specialRequestPalletLine(detail)}</div>${detail.lines.some(canCheckStock) ? '<div class="stock-request-actions"><button class="primary" type="submit" data-scm-line-save>Save stock check</button></div>' : ''}</form></section>${orderControls(detail)}<section class="stock-request-section"><h3>Audit trail</h3>${detail.events.slice(0, 20).map((event) => `<div class="stock-request-event"><strong>${escapeHtml(event.eventType.replaceAll("_", " "))}</strong><small>${escapeHtml(event.actorName)} · ${displayDate(event.createdAt)}</small></div>`).join("")}</section>${specialDocumentActions(detail)}`;
+    return `<div class="stock-request-heading"><div><h2>${escapeHtml(detail.requestRef)}</h2><p>${escapeHtml(detail.customerName)} · ${escapeHtml(detail.customerPhone || "No phone")}</p></div>${pill(detail.stage)}</div><div class="stock-request-summary"><span><small>Vendor</small><strong>${escapeHtml(detail.vendorName)}</strong></span><span><small>Store</small><strong>${escapeHtml(detail.storeName)}</strong></span><span><small>Delivery method</small><strong>${escapeHtml(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span><span><small>Case inquiry date</small><strong>${escapeHtml(detail.inquiryDate)}</strong></span><span><small>Sales Rep</small><strong>${escapeHtml(detail.netsuiteSalesRepName || detail.requestedByName || "—")}</strong></span><span><small>Expiry</small><strong>${escapeHtml(detail.expiresOn || "—")}</strong></span>${detail.netsuiteCustomerName ? `<span><small>NetSuite customer account</small><strong>${escapeHtml(detail.netsuiteCustomerName)}</strong></span>` : ""}<span><small>Revision</small><strong>${detail.revision}</strong></span></div>${detail.fulfillmentMethod === 'mbt_delivery' ? `<p class="stock-request-notice">${escapeHtml([detail.deliveryAddress,detail.deliveryContactName,detail.deliveryContactPhone,detail.deliveryDate].filter(Boolean).join(' · '))}</p>` : ''}${detail.attention ? `<div class="stock-request-notice stock-request-error">${escapeHtml(detail.attentionReason)}</div>` : ''}${specialPlanningStatus(detail)}${specialClosureStatus(detail, "scm")}${quantityReviewView(detail)}${detail.closeStatus === "closed" && detail.closureReason ? `<div class="stock-request-notice">Closed: ${escapeHtml(detail.closureReason)}</div>` : ''}${detail.remarks ? `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escapeHtml(detail.remarks)}</div></div>` : ""}${detail.postPoChangePending ? `<div class="stock-request-notice stock-request-error">A post-PO vendor change is waiting for Sales to record customer acknowledgement. The existing SO, PO, and Dispatch handoff were not silently changed.</div>` : ""}${poRoutingHtml(detail, state.poRouting)}${specialInformationPanel(detail, 'scm')}<section class="stock-request-section" data-scm-line-visibility="${detail.id}">${window.SCMStockCheckLines?.header(detail) || '<h3>Line responses</h3>'}${window.SCMRequestLineVisibility?.controls(detail) || ""}<form data-special-stock-check-form><div class="stock-request-lines" id="scm-request-lines-${detail.id}">${detail.lines.map(lineCard).join("")}${specialRequestPalletLine(detail)}</div>${detail.lines.some(canCheckStock) ? '<div class="stock-request-actions"><button class="primary" type="submit" data-scm-line-save>Save stock check</button></div>' : ''}</form></section>${orderControls(detail)}${purchaseOrderReplacement(detail)}<section class="stock-request-section"><h3>Audit trail</h3>${detail.events.slice(0, 20).map((event) => `<div class="stock-request-event"><strong>${escapeHtml(event.eventType.replaceAll("_", " "))}</strong><small>${escapeHtml(event.actorName)} · ${displayDate(event.createdAt)}</small></div>`).join("")}</section>${specialDocumentActions(detail)}`;
   }
 
   function render({detailOnly=false} = {}) {
@@ -386,7 +425,7 @@
     state.formDrafts.clear(); state.dirty = false; poEditor?.reset();
     state.revisingDeclinedLineIds.clear();
     state.editingStockLineIds.clear();
-    state.poRouting = null;
+    state.poRouting = null; state.replaceOrderOpen = false;
     state.detail = detail; state.error = ''; state.notice = '';
     render({detailOnly:true});
   }
@@ -498,6 +537,12 @@
     mount.querySelector(".special-stage-filter").open = true;
   });
 
+  // Renders recreate the panel; keep the replace form open while SCM works in it. Toggle does not bubble.
+  mount.addEventListener('toggle', event => {
+    const details = /** @type {HTMLDetailsElement} */ (event.target);
+    if (details.matches?.('[data-special-replace-toggle]')) state.replaceOrderOpen = details.open;
+  }, true);
+
   mount.addEventListener("keydown", (event) => {
     const input = /** @type {HTMLInputElement|null} */ (event.target);
     if (event.key === 'Enter' && input?.form && input.matches('[data-special-po-form] [name=purchaseOrderRef]')) {
@@ -511,7 +556,7 @@
 
   mount.addEventListener('submit', async event => {
     const form = /** @type {HTMLFormElement} */ (event.target);
-    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-split-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
+    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-split-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-po-replace-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
     event.preventDefault();
     if (state.busy) return;
     state.busy = true; state.error = '';
@@ -532,7 +577,13 @@
           }));
           const element = /** @type {HTMLElement} */ (group);
           const line = { lineId: Number(element.dataset.specialStockLine), kind: element.dataset.kind };
-          if (line.kind === 'readiness') return { ...line, supplyStatus: fields.supplyStatus, eta: fields.eta || null };
+          if (line.kind === 'readiness') {
+            // An unchanged legacy vendor without an ID is kept; a changed vendor must come from the suggestions.
+            if (!fields.vendorId && fields.vendorName !== element.dataset.savedVendor) throw new Error('Select a vendor from the suggestions for every stock check.');
+            return { ...line, supplyStatus: fields.supplyStatus, eta: fields.eta || null, requiredDate: fields.requiredDate || '',
+              ...(fields.vendorId ? { vendorId: fields.vendorId, vendorName: fields.vendorName } : {}), vendorYard: fields.vendorYard || '',
+              salesVisibleNote: fields.salesVisibleNote || '', scmInternalNote: fields.scmInternalNote || '' };
+          }
           if (!fields.vendorId) throw new Error('Select a vendor from the suggestions for every stock check.');
           const eta = requiresSupplyEta(fields.supplyStatus) ? fields.availableDate : null;
           if (requiresSupplyEta(fields.supplyStatus) && !eta) throw new Error('Enter an ETA for stock awaiting supply.');
@@ -544,6 +595,11 @@
         state.poRouting = null;
       } else if (form.matches('[data-special-po-sent-form]')) {
         path = 'purchase-order/sent-to-vendor';
+      } else if (form.matches('[data-special-po-replace-form]')) {
+        path = 'purchase-order/replace';
+        payload.purchaseOrderRef = String(values.purchaseOrderRef || '').trim();
+        payload.reason = String(values.reason || '').trim();
+        if (!payload.purchaseOrderRef) throw new Error('Enter the replacement PO number.');
       } else if (form.matches('[data-special-po-routing-form]')) {
         await poRoutingReady;
         const routing = state.poRouting;
@@ -593,7 +649,8 @@
       }
       state.formDrafts.delete(specialFormKey(form));
       if (path === 'stock-check') { state.revisingDeclinedLineIds.clear(); state.editingStockLineIds.clear(); }
-      state.dirty = state.formDrafts.size > 0; state.notice = path === 'purchase-order/skip' ? 'PO creation skipped for testing.' : 'Saved.';
+      state.dirty = state.formDrafts.size > 0; state.notice = path === 'purchase-order/skip' ? 'PO creation skipped for testing.' : path === 'purchase-order/replace' ? `Purchase Order replaced with ${state.detail.purchaseOrderRef}.` : 'Saved.';
+      if (path === 'purchase-order/replace') state.replaceOrderOpen = false;
       if (stockCheckRefreshError) state.notice = `Stock check saved. The latest status could not be reloaded: ${stockCheckRefreshError} Use Refresh to try again.`;
       const index = state.requests.findIndex(request => request.id === state.detail.id);
       if (index >= 0) state.requests[index] = state.detail;
@@ -646,8 +703,13 @@
       if (action === "regular") return window.MBBSStockRequestTabs ? window.MBBSStockRequestTabs.open("regular") : location.reload();
       if (action === "choose-vendor") {
         const form = mount.querySelector(`[data-special-stock-line="${button.dataset.lineId}"]`);
-        form.querySelector("[name=vendorId]").value = button.dataset.vendorId;
-        form.querySelector("[name=vendorName]").value = button.dataset.vendorName;
+        // A Special Item case has one vendor, so the correction applies to every line being saved.
+        for (const line of form.closest('form').querySelectorAll('[data-special-stock-line]')) {
+          const vendorId = line.querySelector("[name=vendorId]"), vendorName = line.querySelector("[name=vendorName]");
+          if (!vendorId || !vendorName) continue;
+          vendorId.value = button.dataset.vendorId;
+          vendorName.value = button.dataset.vendorName;
+        }
         state.dirty = true;
         rememberSpecialForm(state.formDrafts, form.closest('form'));
         replaceSuggestions(`[data-special-scm-vendor-suggestions="${button.dataset.lineId}"]`, "");

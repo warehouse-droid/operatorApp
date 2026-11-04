@@ -108,8 +108,8 @@ test('created PO routing saves the real Note and exact schedule revision, preser
   try {
     const form=page.locator('[data-special-po-routing-form]');
     await expect(form.locator('.scm-mini-routing-row')).toBeVisible();
-    assert.deepEqual(await page.getByLabel('Stock readiness').locator('option').evaluateAll(options=>options.map(option=>option.value)), ['in_stock','low_inventory','production','vendor_transfer','no_stock']);
-    await expect(page.getByLabel('Stock readiness').locator('option[value="in_stock"]')).toHaveText('In stock');
+    assert.deepEqual(await page.getByLabel('Supply status').locator('option').evaluateAll(options=>options.map(option=>option.value)), ['in_stock','low_inventory','production','vendor_transfer','no_stock']);
+    await expect(page.getByLabel('Supply status').locator('option[value="in_stock"]')).toHaveText('In stock');
     await expect(page.getByRole('link',{name:'Open PO Split',exact:true})).toHaveCount(0);
     const layouts=[];
     for(const width of [1440,1280,1024]) {

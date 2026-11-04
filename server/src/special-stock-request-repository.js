@@ -192,6 +192,7 @@ function mapLine(row = {}) {
     vendorYard: row.vendor_yard || "",
     vendorReference: row.vendor_reference || "",
     salesVisibleNote: row.sales_visible_note || "",
+    salesVisibleNoteUpdatedAt: row.sales_visible_note_updated_at || (row.sales_visible_note ? row.responded_at || null : null),
     scmInternalNote: row.scm_internal_note || "",
     unitPurchaseCost: numberOrNull(row.unit_purchase_cost),
     currency: row.purchase_currency || null,
@@ -279,7 +280,7 @@ function mapCase(row = {}) {
     salesInternalRemark: row.sales_internal_remark || '',
     informationRequest: row.information_request || null,
     lineEditState: row.line_edit_state || {},
-    lineDecisionsNeedReview: row.line_edit_state?.orderReviewRequired === true,
+    lineDecisionsNeedReview: specialLineDecisionReviewRequired(row),
     fulfillmentMethod: row.fulfillment_method || null,
     operationalYardLocationId: numberOrNull(row.operational_yard_location_id),
     deliveryAddress: row.delivery_address || "",
@@ -1321,6 +1322,10 @@ async function writeSpecialSupplyResponse(requestId, lineId, input, { operatorId
             response_vendor_id = $6, response_vendor_name = $7, brand = $7,
             product_name = COALESCE($15, product_name),
             vendor_yard = $8, vendor_reference = $9,
+            sales_visible_note_updated_at = CASE WHEN $10 = '' THEN NULL
+              WHEN COALESCE(sales_visible_note, '') <> $10 THEN now() ELSE sales_visible_note_updated_at END,
+            sales_visible_note_updated_by = CASE WHEN $10 = '' THEN NULL
+              WHEN COALESCE(sales_visible_note, '') <> $10 THEN $14 ELSE sales_visible_note_updated_by END,
             sales_visible_note = $10, scm_internal_note = $11,
             unit_purchase_cost = $12, purchase_currency = $13,
             sales_decision = CASE WHEN $16::boolean OR sales_decision = 'request_update' THEN 'pending' ELSE sales_decision END,
@@ -1548,6 +1553,7 @@ export async function saveSpecialStockChecks(requestId, input = {}, context = {}
   const lines = specialBatchLines(input, ['response', 'readiness']);
   const id = positiveId(requestId, 'Special Item case');
   await withTransaction(async () => {
+    await correctSpecialCaseVendor(id, lines, { expectedRevision: input.expectedRevision, operatorId: context.operatorId });
     for (const line of lines) {
       const write = line.kind === 'readiness' ? writeSpecialReadiness : writeSpecialSupplyResponse;
       await write(id, line.lineId, { ...line, expectedRevision: input.expectedRevision }, context);
@@ -1866,9 +1872,17 @@ async function materializeSpecialDeliveryInstructions(requestId) {
   return true;
 }
 
+/** A manually linked SO was authored outside the SO draft, so changed customer
+ * decisions no longer require a draft review for that request.
+ * @param {Record<string,any>} special */
+function specialLineDecisionReviewRequired(special) {
+  return special.line_edit_state?.orderReviewRequired === true
+    && !(special.sales_order_source === 'manual_link' && special.sales_order_netsuite_id);
+}
+
 /** @param {Record<string,any>} special */
 function assertNoSpecialLineDecisionReview(special) {
-  if (special.line_edit_state?.orderReviewRequired === true) throw workflowError(
+  if (specialLineDecisionReviewRequired(special)) throw workflowError(
     'Save the SO draft after changing line decisions before creating or linking an order.', 409, 'SPECIAL_DECISION_REVIEW_REQUIRED');
 }
 
@@ -1967,6 +1981,7 @@ export async function linkSpecialSalesOrder(requestId, {
                 attention_reason = NULL,
                 order_customer_netsuite_id = COALESCE($8::bigint, order_customer_netsuite_id),
                 order_customer_name = COALESCE($9::text, order_customer_name),
+                line_edit_state = line_edit_state - 'orderReviewRequired',
                 sales_order_placed_date = $10::date, updated_at = now()
           WHERE request_id = $1`,
         [id, source, remoteId, remoteRef, resolvedSalesOrderStatus, resolvedSalesOrderApproved, operationId,
@@ -2384,6 +2399,170 @@ export async function linkSpecialPurchaseOrder(requestId, {
     });
   });
   return getSpecialStockCase(id, { audience: "scm" });
+}
+
+const REPLACEMENT_KINDS = Object.freeze({
+  sales_order: { label: 'Sales Order', table: 'sales_orders',
+    entity: 'customer_id AS entity_id, customer AS entity_name' },
+  purchase_order: { label: 'Purchase Order', table: 'purchase_orders',
+    entity: 'vendor_id AS entity_id, vendor AS entity_name' }
+});
+
+/** @param {unknown} value */
+function replacementReason(value) {
+  const reason = String(value ?? '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ').trim();
+  if (!reason) throw workflowError('Enter the reason for replacing the order.', 400, 'SPECIAL_ORDER_REPLACE_REASON_REQUIRED');
+  if (reason.length > 2_000) throw workflowError('The replacement reason is too long.', 400, 'SPECIAL_ORDER_REPLACE_REASON_TOO_LONG');
+  return reason;
+}
+
+/** Shared guards; the caller holds the case lock.
+ * @param {Record<string,any>} special @param {'sales_order'|'purchase_order'} kind */
+async function assertSpecialOrderReplaceable(special, kind) {
+  const { label } = REPLACEMENT_KINDS[kind];
+  if (special.workflow_kind !== 'special') throw workflowError('Special Item case was not found.', 404, 'SPECIAL_CASE_NOT_FOUND');
+  if (special.close_status !== 'active' || special.request_status === 'cancelled' || mapCase(special).operationallyComplete) {
+    throw workflowError('A closed or completed request cannot replace its orders.', 409, 'SPECIAL_CASE_CLOSED');
+  }
+  if (!special[`${kind}_netsuite_id`] || special[`${kind}_skipped`]) {
+    throw workflowError(`Link a ${label} before replacing it.`, 409, 'SPECIAL_ORDER_REPLACE_UNLINKED');
+  }
+  assertNoSpecialQuantityReview(special);
+  assertCaseEditable(special, { allowPendingUpdate: true });
+  const handoff = (await query('SELECT route,status FROM sales_special_stock_handoffs WHERE request_id=$1 FOR UPDATE', [special.request_id])).rows[0];
+  const salesRefs = [special.sales_order_ref].filter(Boolean);
+  const purchaseRefs = [special.purchase_order_ref, special.purchase_order_target_ref, special.purchase_order_reference].filter(Boolean);
+  const refs = [...new Set(kind === 'sales_order' ? salesRefs : purchaseRefs)];
+  const busy = await query(`SELECT 1 WHERE EXISTS (
+      SELECT 1 FROM dispatch_plan_order_assignments assignment JOIN dispatch_plans plan ON plan.id=assignment.plan_id
+      WHERE plan.status<>'cancelled' AND (lower(assignment.order_ref)=ANY($1::text[]) OR lower(assignment.planned_order_ref)=ANY($1::text[])))
+    OR EXISTS (SELECT 1 FROM driver_job_records WHERE status IN ('in_progress','complete') AND order_refs ?| $2::text[])`,
+  [refs.map(ref => ref.toLowerCase()), refs]);
+  if (['planned', 'in_progress', 'completed'].includes(handoff?.status) || busy.rowCount) {
+    throw workflowError(`The current ${label} is already in a Dispatch plan or driver job. Unplan it before replacing the order.`, 409, 'SPECIAL_ORDER_REPLACE_PLANNED');
+  }
+  // Direct-route and SCM dependency allocations bind exact SO/PO lines.
+  const allocated = special.sales_order_netsuite_id && special.purchase_order_netsuite_id && await query(
+    `SELECT 1 FROM dispatch_so_po_allocations WHERE status='active' AND sales_order_id=$1 AND po_order_id=ANY($2::bigint[]) LIMIT 1`,
+    [special.sales_order_netsuite_id, [special.purchase_order_netsuite_id, special.purchase_order_target_id].filter(Boolean)]);
+  if (allocated && allocated.rowCount) {
+    throw workflowError('This SO and PO have an active line allocation. Unlink it in SCM Dependency Management before replacing the order.', 409, 'SPECIAL_ORDER_REPLACE_ALLOCATED');
+  }
+  return handoff || null;
+}
+
+/** @param {'sales_order'|'purchase_order'} kind @param {unknown} reference @param {number} currentId */
+async function findReplacementOrder(kind, reference, currentId) {
+  const { label, table, entity } = REPLACEMENT_KINDS[kind];
+  const ref = cleanSearch(reference, 120);
+  if (!ref) throw workflowError(`Enter the replacement ${label} number.`, 400, 'SPECIAL_ORDER_REPLACE_REFERENCE_REQUIRED');
+  const rows = (await query(`SELECT netsuite_id, tranid, status, status_text, netsuite_active, ${entity}
+      FROM ${table} WHERE lower(btrim(tranid))=lower($1) ORDER BY netsuite_id FOR SHARE`, [ref])).rows;
+  if (rows.length > 1) throw workflowError(`More than one ${label} has this number. Verify it before replacing.`, 409, 'SPECIAL_ORDER_REPLACE_AMBIGUOUS');
+  const order = rows[0];
+  if (!order) throw workflowError(`${ref} was not found in the local NetSuite mirror. Wait for it to synchronize, then retry.`, 404, 'SPECIAL_ORDER_REPLACE_NOT_FOUND');
+  if (Number(order.netsuite_id) === Number(currentId)) {
+    throw workflowError(`${order.tranid} is already the linked ${label}.`, 409, 'SPECIAL_ORDER_REPLACE_SAME');
+  }
+  if (order.netsuite_active === false || /closed|cancel/i.test(`${order.status_text || ''}`)) {
+    throw workflowError(`The replacement ${label} ${order.tranid} is closed or inactive.`, 409, 'SPECIAL_ORDER_REPLACE_INACTIVE');
+  }
+  return order;
+}
+
+/** Repoint the handoff; a direct route bound the previous lines, so Dispatch selects again.
+ * @param {number} id @param {'sales_order'|'purchase_order'} kind @param {number} orderId @param {Record<string,any>|null} handoff */
+async function repointSpecialHandoff(id, kind, orderId, handoff) {
+  if (!handoff) return false;
+  const resetRoute = handoff.route === 'direct';
+  await query(`UPDATE sales_special_stock_handoffs SET ${kind}_netsuite_id=$2,
+      route=CASE WHEN $3 THEN NULL ELSE route END, status=CASE WHEN $3 THEN 'waiting_route' ELSE status END,
+      route_selected_by=CASE WHEN $3 THEN NULL ELSE route_selected_by END,
+      route_selected_at=CASE WHEN $3 THEN NULL ELSE route_selected_at END, updated_at=now()
+    WHERE request_id=$1`, [id, orderId, resetRoute]);
+  if (resetRoute) await query('UPDATE sales_special_stock_cases SET handoff_route=NULL WHERE request_id=$1', [id]);
+  return resetRoute;
+}
+
+/** @param {Record<string,any>} special @param {'sales_order'|'purchase_order'} kind @param {Record<string,any>} order */
+function replacementEventDetails(special, kind, order, reason, routeReset) {
+  return { orderKind: kind, reason, routeReset,
+    previous: { id: Number(special[`${kind}_netsuite_id`]), ref: special[`${kind}_ref`] || null,
+      status: kind === 'sales_order' ? mapCase(special).salesOrderStatus : mapCase(special).purchaseOrderStatus },
+    replacement: { id: Number(order.netsuite_id), ref: order.tranid, status: order.status_text || order.status || null,
+      entityId: numberOrNull(order.entity_id), entityName: order.entity_name || '' } };
+}
+
+/** Sales replaces a linked SO with another synced SO; later work follows the manual link rules.
+ * @param {number|string} requestId @param {{expectedRevision?:number,salesOrderRef?:string,reason?:string}} [input]
+ * @param {{operatorId?:string,authorizedStoreLocationIds?:number[]}} [context] */
+export async function replaceSpecialSalesOrder(requestId, input = {}, { operatorId, authorizedStoreLocationIds = undefined } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  const reason = replacementReason(input.reason);
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    assertScope(mapCase(special), authorizedStoreLocationIds);
+    const handoff = await assertSpecialOrderReplaceable(special, 'sales_order');
+    const order = await findReplacementOrder('sales_order', input.salesOrderRef, special.sales_order_netsuite_id);
+    const statusText = `${order.status || ''} ${order.status_text || ''}`;
+    const approved = order.netsuite_active === true && Boolean(statusText.trim()) && !/pending approval|closed|cancel/i.test(statusText);
+    // A replaced SO no longer matches the reviewed SO lines, so SO and PO become independent (manual link rules).
+    await query(`UPDATE sales_special_stock_cases
+        SET sales_order_source='manual_link', sales_order_netsuite_id=$2, sales_order_ref=$3,
+            sales_order_status=$4, sales_order_approved=$5, sales_order_operation_status='linked',
+            sales_order_operation_error=NULL,
+            order_customer_netsuite_id=COALESCE($6::bigint, order_customer_netsuite_id),
+            order_customer_name=COALESCE($7::text, order_customer_name),
+            purchase_order_custom_linkage=purchase_order_custom_linkage OR purchase_order_netsuite_id IS NOT NULL,
+            line_edit_state=line_edit_state - 'orderReviewRequired',
+            remotely_reconciled=false, remotely_reconciled_at=NULL,
+            attention=false, attention_reason=NULL, updated_at=now()
+      WHERE request_id=$1`,
+    [id, order.netsuite_id, order.tranid, order.status_text || order.status || null, approved,
+      numberOrNull(order.entity_id), cleanSearch(order.entity_name, 500) || null]);
+    await query(`UPDATE sales_special_stock_order_lines SET remote_line_id=NULL, updated_at=now()
+      WHERE request_id=$1 AND order_kind='sales_order'`, [id]);
+    const routeReset = await repointSpecialHandoff(id, 'sales_order', Number(order.netsuite_id), handoff);
+    if (special.purchase_order_netsuite_id && await canonicalLinksReady(id)) await upsertHandoff(id, await selectCaseRow(id, { forUpdate: true }));
+    await materializeSpecialDeliveryInstructions(id);
+    await bumpCase(id);
+    await appendEvent(id, 'special_sales_order_replaced', operatorId, replacementEventDetails(special, 'sales_order', order, reason, routeReset));
+  });
+  return getSpecialStockCase(id, { audience: 'sales', authorizedStoreLocationIds });
+}
+
+/** SCM replaces a linked PO with another synced PO; the new PO uses custom (independent) linkage.
+ * @param {number|string} requestId @param {{expectedRevision?:number,purchaseOrderRef?:string,reason?:string}} [input]
+ * @param {{operatorId?:string}} [context] */
+export async function replaceSpecialPurchaseOrder(requestId, input = {}, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  const reason = replacementReason(input.reason);
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    const handoff = await assertSpecialOrderReplaceable(special, 'purchase_order');
+    const order = await findReplacementOrder('purchase_order', input.purchaseOrderRef, special.purchase_order_netsuite_id);
+    // The vendor acknowledgement and any child PO selection belonged to the previous PO.
+    await query(`UPDATE sales_special_stock_cases
+        SET purchase_order_netsuite_id=$2, purchase_order_ref=$3, purchase_order_status=$4,
+            purchase_order_operation_status='linked', purchase_order_operation_error=NULL,
+            purchase_order_custom_linkage=true, purchase_order_split_id=NULL,
+            purchase_order_sent_to_vendor_at=NULL, purchase_order_sent_to_vendor_by=NULL,
+            remotely_reconciled=false, remotely_reconciled_at=NULL,
+            attention=CASE WHEN COALESCE(attention_reason,'') LIKE 'Sales Order%' THEN attention ELSE false END,
+            attention_reason=CASE WHEN COALESCE(attention_reason,'') LIKE 'Sales Order%' THEN attention_reason ELSE NULL END,
+            updated_at=now()
+      WHERE request_id=$1`, [id, order.netsuite_id, order.tranid, order.status_text || order.status || null]);
+    await query(`UPDATE sales_special_stock_order_lines SET remote_line_id=NULL, updated_at=now()
+      WHERE request_id=$1 AND order_kind='purchase_order'`, [id]);
+    const routeReset = await repointSpecialHandoff(id, 'purchase_order', Number(order.netsuite_id), handoff);
+    const updated = await selectCaseRow(id, { forUpdate: true });
+    if (updated.sales_order_netsuite_id && !updated.attention
+        && await reconcileCanonicalOrderLines(id, 'purchase_order', Number(order.netsuite_id))
+        && await canonicalLinksReady(id)) await upsertHandoff(id, updated);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_replaced', operatorId, replacementEventDetails(special, 'purchase_order', order, reason, routeReset));
+  });
+  return getSpecialStockCase(id, { audience: 'scm' });
 }
 
 async function upgradeUnsubmittedDiscountDraft(requestId) {
@@ -3227,11 +3406,102 @@ async function writeSpecialReadiness(requestId, lineId, input = {}, { operatorId
   if ((special.purchase_order_netsuite_id || special.purchase_order_skipped) && !ready && (specialStockAvailable(line.supply_status) || line.supply_status !== supplyStatus || dateValue(line.available_date) !== eta)) {
     await query('UPDATE sales_special_stock_cases SET post_po_change_pending=true, post_po_change_details=$2::jsonb WHERE request_id=$1', [id, JSON.stringify({ lineId: Number(line.id), previousSupplyStatus: line.supply_status, supplyStatus, previousEta: dateValue(line.available_date), eta, ready: false })]);
   }
+  await writeSpecialLineDetails(id, line, normalizeSpecialLineDetails(input, supplyStatus), operatorId);
   if (ready && await canonicalLinksReady(id)) await upsertHandoff(id, special);
   await appendEvent(id, 'special_stock_readiness_checked', operatorId, {
     previousSupplyStatus: line.supply_status, supplyStatus, ready, previousEta: dateValue(line.available_date), eta,
     previousAvailabilityMode: line.availability_mode, availabilityMode: mode, reminderDueDate: due
   }, { lineId: line.id });
+}
+
+/** SCM keeps the reply, notes, pickup location and required date current at any
+ * time, including after order creation. These are request details only: the
+ * NetSuite SO and PO are unchanged. Omitted fields stay as saved.
+ * @param {Record<string,any>} input @param {string} supplyStatus */
+function normalizeSpecialLineDetails(input, supplyStatus) {
+  /** @type {Record<string,string|null>} */
+  const fields = {};
+  /** @param {string} field @param {string} label @param {number} max */
+  const textField = (field, label, max) => {
+    const value = String(input[field] ?? '').trim().replace(/\r\n?/g, '\n');
+    if (value.length > max) throw workflowError(`${label} is too long.`, 400, 'SPECIAL_FIELD_TOO_LONG');
+    fields[field] = value;
+  };
+  if (Object.hasOwn(input, 'requiredDate')) {
+    const value = String(input.requiredDate ?? '').trim(), parsed = new Date(`${value}T12:00:00Z`);
+    if (value && (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value)) {
+      throw workflowError('Required date must be a valid date.', 400, 'SPECIAL_DATE_INVALID');
+    }
+    fields.requiredDate = value || null;
+  }
+  if (Object.hasOwn(input, 'vendorYard')) {
+    textField('vendorYard', 'Vendor pickup location', 1_000);
+    if (!fields.vendorYard && supplyStatus !== 'no_stock') throw workflowError('Vendor pickup location is required.', 400, 'SPECIAL_RESPONSE_YARD_REQUIRED');
+  }
+  if (Object.hasOwn(input, 'salesVisibleNote')) textField('salesVisibleNote', 'Sales-visible reply', 8_000);
+  if (Object.hasOwn(input, 'scmInternalNote')) textField('scmInternalNote', 'SCM internal note', 8_000);
+  return fields;
+}
+
+/** Caller holds the case lock. @param {number} id @param {Record<string,any>} line
+ * @param {Record<string,string|null>} fields @param {string|undefined} operatorId */
+async function writeSpecialLineDetails(id, line, fields, operatorId) {
+  const saved = { requiredDate: dateValue(line.required_date), vendorYard: line.vendor_yard || '',
+    salesVisibleNote: line.sales_visible_note || '', scmInternalNote: line.scm_internal_note || '' };
+  const changed = Object.keys(fields).filter(field => (fields[field] ?? '') !== (saved[/** @type {keyof typeof saved} */ (field)] ?? ''));
+  if (!changed.length) return;
+  const value = (/** @type {string} */ field) => changed.includes(field) ? fields[field] : saved[/** @type {keyof typeof saved} */ (field)];
+  await query(`UPDATE sales_special_stock_lines SET required_date=$3::date, vendor_yard=$4, scm_internal_note=$6,
+      sales_visible_note_updated_at=CASE WHEN $5='' THEN NULL WHEN COALESCE(sales_visible_note,'')<>$5 THEN now() ELSE sales_visible_note_updated_at END,
+      sales_visible_note_updated_by=CASE WHEN $5='' THEN NULL WHEN COALESCE(sales_visible_note,'')<>$5 THEN $7 ELSE sales_visible_note_updated_by END,
+      sales_visible_note=$5, updated_at=now()
+    WHERE request_id=$1 AND id=$2`,
+  [id, line.id, value('requiredDate'), value('vendorYard'), value('salesVisibleNote'), value('scmInternalNote'), operatorId || null]);
+  const shared = changed.filter(field => field !== 'scmInternalNote');
+  if (shared.length) await appendEvent(id, 'special_line_details_updated', operatorId, {
+    before: Object.fromEntries(shared.map(field => [field, saved[/** @type {keyof typeof saved} */ (field)]])),
+    after: Object.fromEntries(shared.map(field => [field, fields[field]]))
+  }, { lineId: Number(line.id), audience: 'sales_scm' });
+  if (changed.includes('scmInternalNote')) await appendEvent(id, 'special_scm_internal_note_updated', operatorId, {
+    before: saved.scmInternalNote, after: fields.scmInternalNote
+  }, { lineId: Number(line.id), audience: 'scm' });
+}
+
+/** SCM corrects the one vendor of a Special Item case at any time while it is open.
+ * A linked NetSuite PO keeps its own vendor; replace the PO when it was issued to the wrong vendor.
+ * Caller holds the transaction. @param {number} id @param {Array<Record<string,any>>} lines
+ * @param {{expectedRevision?:unknown,operatorId?:string}} context */
+async function correctSpecialCaseVendor(id, lines, { expectedRevision: revision, operatorId }) {
+  const requested = lines.filter(line => line.vendorId !== undefined && line.vendorId !== null && String(line.vendorId).trim() !== '');
+  if (!requested.length) return;
+  const special = await lockCase(id, revision);
+  if (special.workflow_kind !== 'special') return;
+  const vendors = new Map(requested.map(line => {
+    const vendorId = Number(line.vendorId), vendorName = String(line.vendorName ?? '').trim();
+    if (!Number.isSafeInteger(vendorId) || vendorId <= 0 || !vendorName || vendorName.length > 500) {
+      throw workflowError('Select a vendor from the suggestions for every stock check.', 400, 'SPECIAL_RESPONSE_VENDOR_INVALID');
+    }
+    return [vendorId, vendorName];
+  }));
+  if (vendors.size > 1) throw workflowError('Every line in a Special Item case must use the same vendor.', 409, 'SPECIAL_RESPONSE_MIXED_VENDOR');
+  const [[vendorId, vendorName]] = [...vendors];
+  // The first stock check sets a case vendor that Sales entered as free text.
+  if (special.vendor_id === null || special.vendor_id === undefined || Number(special.vendor_id) === vendorId) return;
+  assertCaseEditable(special);
+  if (special.close_status !== 'active' || mapCase(special).operationallyComplete) {
+    throw workflowError('This request is already closed or completed.', 409, 'SPECIAL_CASE_CLOSED');
+  }
+  await query('UPDATE sales_special_stock_cases SET vendor_id=$2, vendor_name=$3, updated_at=now() WHERE request_id=$1', [id, vendorId, vendorName]);
+  await query(`UPDATE sales_special_stock_lines
+      SET response_vendor_id=CASE WHEN response_vendor_id IS NULL THEN NULL ELSE $2::bigint END,
+          response_vendor_name=CASE WHEN response_vendor_id IS NULL THEN response_vendor_name ELSE $3 END,
+          brand=CASE WHEN response_vendor_id IS NOT NULL OR brand IS NOT DISTINCT FROM $4 THEN $3 ELSE brand END,
+          updated_at=now()
+    WHERE request_id=$1 AND removed_at IS NULL`, [id, vendorId, vendorName, special.vendor_name]);
+  await appendEvent(id, 'special_vendor_corrected', operatorId, {
+    from: { vendorId: numberOrNull(special.vendor_id), vendorName: special.vendor_name || '' }, to: { vendorId, vendorName },
+    purchaseOrderRef: special.purchase_order_ref || null, purchaseOrderVendorUnchanged: Boolean(special.purchase_order_netsuite_id)
+  }, { audience: 'sales_scm' });
 }
 
 export async function checkSpecialStockReadiness(requestId, lineId, input = {}, context = {}) {

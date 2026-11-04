@@ -172,7 +172,8 @@ test('accepted SCM readiness offers the same stock statuses and submits each exa
       await page.getByRole('button', { name: 'Save stock check', exact: true }).click();
       await expect.poll(() => state.posts.length).toBe(previous + 1);
       await expect(page.locator('.stock-request-feedback')).toContainText('Saved.');
-      assert.deepEqual(state.posts.at(-1).lines[0], { lineId: 1, kind: 'readiness', supplyStatus, eta: supplyStatus === 'production' ? '2099-03-01' : null });
+      assert.deepEqual(state.posts.at(-1).lines[0], { lineId: 1, kind: 'readiness', supplyStatus, eta: supplyStatus === 'production' ? '2099-03-01' : null,
+        requiredDate: '2099-02-01', vendorId: '331', vendorName: 'TEST Vendor', vendorYard: 'TEST Yard', salesVisibleNote: '', scmInternalNote: '' });
       await expect(line.locator('[name=supplyStatus]')).toHaveValue(supplyStatus);
     }
     assert.deepEqual(state.errors, []);

@@ -46,9 +46,19 @@ test('closure, actual completion and information requests retain precedence',()=
   assert.equal(backorderStage({linesResolved:true,hasAcceptedLines:false}),'closed');
 });
 
-test('Special approval, customer vendor pickup and deliberate PO skips keep their existing rules',()=>{
+test('Special approval and deliberate PO skips keep their existing rules',()=>{
   assert.equal(specialStage({...queued,purchaseOrderApproved:false}),'confirmed');
   assert.equal(backorderStage({...queued,purchaseOrderApproved:false}),'dispatch_arrangement');
-  assert.equal(specialStage({...queued,fulfillmentMethod:'vendor_pickup'}),'confirmed');
   assert.equal(specialStage({salesOrderSkipped:true,purchaseOrderSkipped:true,fulfillmentMethod:'yard_pickup'}),'dispatch_arrangement');
+  assert.equal(specialStage({salesOrderSkipped:true,purchaseOrderSkipped:true,fulfillmentMethod:'vendor_pickup'}),'dispatch_arrangement');
+});
+
+test('customer pickup at the vendor yard reaches Dispatch Arrangement with a queued PO reference',()=>{
+  const pickup={...queued,fulfillmentMethod:'vendor_pickup'};
+  assert.equal(specialStage(pickup),'dispatch_arrangement');
+  assert.equal(specialStage({...pickup,purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'}),'dispatch_arrangement');
+  assert.equal(specialStage({...pickup,purchaseOrderDispatchStatus:'Hold',purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'}),'waiting_vendor_confirmation');
+  assert.equal(specialStage({...pickup,purchaseOrderReference:''}),'confirmed');
+  assert.equal(specialStage({...pickup,purchaseOrderApproved:false}),'confirmed');
+  assert.equal(specialStage({...pickup,operationallyComplete:true}),'completed');
 });

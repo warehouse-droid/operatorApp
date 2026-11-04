@@ -201,7 +201,7 @@ test('all 48 local and NetSuite evidence combinations obey the three delivery-me
       const netsuiteSo = Boolean(flags & 1), netsuitePo = Boolean(flags & 2);
       const localSo = Boolean(flags & 4), localPo = Boolean(flags & 8);
       const expected = method === 'mbt_delivery' ? localSo && localPo
-        : method === 'yard_pickup' ? localPo && (localSo || netsuiteSo) : netsuiteSo && netsuitePo;
+        : method === 'yard_pickup' ? localPo && (localSo || netsuiteSo) : netsuiteSo || localSo;
       const transaction = await beginRollbackContext();
       try {
         await transaction.run(async () => {
@@ -243,16 +243,20 @@ test('yard pickup also accepts full local customer collection with a local PO ar
   assert.equal(detail.operationalCompletionSource, 'yard_pickup');
 });
 
-test('vendor pickup requires NetSuite receipt and fulfillment, excluding partial or cancelled native orders', async () => {
+test('vendor pickup completes on a fulfilled or billed SO without a PO receipt, excluding partial or cancelled SOs', async () => {
   let detail = await linkedFixture('vendor_pickup');
   await query("UPDATE sales_orders SET status_text='Sales Order : Pending Billing' WHERE netsuite_id=$1", [detail.salesOrderId]);
-  await query("UPDATE purchase_orders SET status_text='Purchase Order : Pending Bill' WHERE netsuite_id=$1", [detail.purchaseOrderId]);
   detail = await repository.getSpecialStockCase(detail.id);
   await assertProjections(detail, 'completed');
   assert.equal(detail.operationalCompletionSource, 'netsuite_order_completion');
   for (const status of ['Purchase Order : Pending Billing/Partially Received', 'Closed', 'Cancelled', 'Pending Receipt']) {
     await query('UPDATE purchase_orders SET status_text=$2 WHERE netsuite_id=$1', [detail.purchaseOrderId, status]);
-    assert.notEqual((await repository.getSpecialStockCase(detail.id)).stage, 'completed');
-    assert.notEqual(await sqlStage(detail.id), 'completed');
+    assert.equal((await repository.getSpecialStockCase(detail.id)).stage, 'completed', status);
+    assert.equal(await sqlStage(detail.id), 'completed', status);
+  }
+  for (const status of ['Sales Order : Partially Fulfilled', 'Sales Order : Pending Billing/Partially Fulfilled', 'Closed', 'Cancelled', 'Pending Fulfillment']) {
+    await query('UPDATE sales_orders SET status_text=$2 WHERE netsuite_id=$1', [detail.salesOrderId, status]);
+    assert.notEqual((await repository.getSpecialStockCase(detail.id)).stage, 'completed', status);
+    assert.notEqual(await sqlStage(detail.id), 'completed', status);
   }
 });

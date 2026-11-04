@@ -561,6 +561,8 @@ import {
   linkSpecialPurchaseOrder,
   markSpecialPurchaseOrderSentToVendor,
   linkSpecialSalesOrder,
+  replaceSpecialSalesOrder,
+  replaceSpecialPurchaseOrder,
   listSpecialDispatchHandoffs,
   listSpecialStockCases,
   registerSpecialStockMedia,
@@ -13045,6 +13047,15 @@ app.post("/api/sales/special-stock-requests/:id/sales-order/link", requirePrivat
   }
 });
 
+app.post("/api/sales/special-stock-requests/:id/sales-order/replace", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await replaceSpecialSalesOrder(req.params.id, req.body || {}, specialStockSalesContext(req));
+    emitSpecialStockUpdate("sales-order-replace", { requestId: detail.id, salesOrderId: detail.salesOrderId });
+    emitAppEvent('scm.schedule.updated', { source: 'special-so-replace' });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/sales/special-stock-requests/:id/sales-order/refresh", requirePrivateSalesRecordAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     await refreshSpecialOrderStatusCache([await getSpecialStockCase(req.params.id, {
@@ -13318,6 +13329,15 @@ app.post("/api/scm/special-stock-requests/:id/purchase-order/link", requireSmart
   } catch (error) {
     next(error);
   }
+});
+
+app.post("/api/scm/special-stock-requests/:id/purchase-order/replace", requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const detail = await replaceSpecialPurchaseOrder(req.params.id, req.body || {}, { operatorId: req.operator.id });
+    emitSpecialStockUpdate("purchase-order-replace", { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
+    emitAppEvent('scm.schedule.updated', { source: 'special-po-replace' });
+    res.json(detail);
+  } catch (error) { next(error); }
 });
 
 app.get("/api/dispatch/special-stock-handoffs", requireSpecialStockWorkflow, async (req, res, next) => {
@@ -25184,6 +25204,8 @@ async function scmReconciliationScheduledTick() {
       }
     }
     const aggregate = await aggregateReconciliationNightlyTick({ operationalSyncRunning: anyNetSuiteSyncRunning });
+    if (aggregate.specialVendorPickup?.error) console.error("Nightly Special vendor pickup refresh failed:", aggregate.specialVendorPickup.error);
+    if (aggregate.specialVendorPickup?.updated) emitSpecialStockUpdate("nightly-vendor-pickup-refresh", { requestIds: aggregate.specialVendorPickup.completedRequestIds });
     if (aggregate.started) { return; }
     await scmReconciliationNightlyTick({
       operationalSyncRunning: anyNetSuiteSyncRunning
