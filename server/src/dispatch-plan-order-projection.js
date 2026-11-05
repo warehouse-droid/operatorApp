@@ -352,8 +352,10 @@ function physicalRouteEvidence(load = {}) {
     location: text(stop.location),
     dropLocation: text(stop.dropLocation ?? stop.drop_location),
     dropAddress: text(stop.dropAddress ?? stop.drop_address),
-    dropoffKey: text(stop.dropoffKey ?? stop.dropoff_key),
-    dependencyTargetRefs: stop.dependencyTargetRefs || []
+    dropoffKey: text(stop.dropoffKey ?? stop.dropoff_key)
+    // dependencyTargetRefs is a projection annotation, not a place or visit.
+    // The Dispatch page keeps its own stops between autosaves, so counting it
+    // would clear the load timing on every save of a linked PO drop.
   }));
 }
 

@@ -783,3 +783,59 @@ test("Driver never displays an explicitly selected SO service fee as a physical 
     assert.deepEqual(detail.items.map((item) => item.sku), ["MBBS-Special Material"]);
   }
 });
+
+test("a planner PO drop keeps its vendor location so autosaves keep the load timing", async () => {
+  const { reconcileAuthoritativeDispatchOrderProjection } = await import("../../../src/dispatch-plan-order-projection.js");
+  const po = projectPurchaseOrderRouteResidual(productionPo(), productionAllocations());
+  const draft = planWithTarget(po);
+  draft.trucks[0].loads[0].stops.push({
+    id: "planner-po-drop",
+    type: "drop",
+    orderId: PO_REF,
+    location: "Ayr Yard - Unilock",
+    dropoffKey: "location:1",
+    dropLocation: "3445",
+    dropAddress: "3445 Kennedy Road, Toronto, ON"
+  });
+  // First save: the server adds the vendor pickup and its PO annotations.
+  const settled = reconcileAuthoritativeDispatchOrderProjection({
+    plan: draft,
+    projectedOrders: draft.orders,
+    comparisonOrders: draft.orders
+  }).plan;
+
+  // Later autosaves: the Dispatch page keeps its own stops, so it re-sends the
+  // PO drop with the vendor in `location` and without the server annotations.
+  const input = structuredClone(settled);
+  const load = input.trucks[0].loads[0];
+  Object.assign(load, { plannedStartMinute: 770, plannedFinishMinute: 940, timing: { start: 770, finish: 940 } });
+  delete load.routeProjectionRefreshRequired;
+  load.stops = load.stops.map((stop) => {
+    if (stop.id !== "planner-po-drop") {
+      return stop;
+    }
+    const pageStop = { ...stop };
+    for (const field of ["dependencyTargetRefs", "dependencySource", "dependencyResidualManaged", "dependencyResidualProjected"]) {
+      delete pageStop[field];
+    }
+    return pageStop;
+  });
+
+  const result = reconcileAuthoritativeDispatchOrderProjection({
+    plan: input,
+    projectedOrders: input.orders,
+    comparisonOrders: input.orders
+  });
+  const saved = result.plan.trucks[0].loads[0];
+  const drop = saved.stops.find((stop) => stop.id === "planner-po-drop");
+
+  assert.deepEqual(result.changedLoadIds, []);
+  assert.equal(drop.location, "Ayr Yard - Unilock");
+  assert.equal(drop.dropLocation, "3445");
+  assert.equal(drop.dependencyResidualProjected, true);
+  assert.deepEqual(drop.dependencyTargetRefs, [TARGET_REF]);
+  assert.equal(saved.routeProjectionRefreshRequired, undefined);
+  assert.equal(saved.plannedFinishMinute, 940);
+  assert.deepEqual(saved.timing, { start: 770, finish: 940 });
+  assert.equal(saved.stops.filter((stop) => stop.type === "drop" && stop.orderId === PO_REF).length, 1);
+});

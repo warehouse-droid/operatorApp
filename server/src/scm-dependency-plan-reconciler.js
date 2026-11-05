@@ -120,7 +120,10 @@ function projectedResidualStop(stop = {}, order = {}, dropoff = {}, { managed = 
     ...stop,
     type: "drop",
     orderId: text(order.id),
-    location: destinationYard || address,
+    // A planner-created PO drop keeps its vendor pickup reference in
+    // `location`; the destination is dropLocation/dropAddress. Rewriting it
+    // made every autosave look like a route change and cleared load timing.
+    location: text(stop.location) || destinationYard || address,
     dropoffKey: text(dropoff.key),
     dropLocation: destinationYard,
     dropAddress: address,
