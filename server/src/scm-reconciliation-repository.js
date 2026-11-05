@@ -6569,8 +6569,14 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     let match = Number(row.sourceId) > 0
       ? { state: direct.get(`${kind}:${Number(row.sourceId)}`), target: null }
       : null;
+    // A PO split takes reconciliation status only from its own target, as the
+    // PO/TO Schedule query and PO Split do. A family snapshot taken before the
+    // split existed has no target for it, and the parent's residual target is a
+    // different order: borrowing it showed the parent's Hold over the split's
+    // own Direct ship. Such a split stays unreconciled until the next run.
+    const exactTargetOnly = kind === "PO" && row.isScmSplit === true;
     match ||= byTarget.get(`${kind}:${text(row.orderRef).toLowerCase()}`)
-      || byTarget.get(`${kind}:${text(row.sourceRef).toLowerCase()}`);
+      || (exactTargetOnly ? null : byTarget.get(`${kind}:${text(row.sourceRef).toLowerCase()}`));
     if (!match && kind === "PO") {
       const members = groupMatches.get(text(row.orderRef).toLowerCase()) || [];
       if (members.length) {
