@@ -5252,7 +5252,7 @@ function renderStepper(unit, label, value) {
       <span>${label}</span>
       <div class="stepper" data-unit="${unit}">
         <button data-action="step-qty" data-unit="${unit}" data-delta="-1" type="button">-</button>
-        <input data-pack="${unit}" value="${value}" readonly />
+        <input data-pack="${unit}" value="${value}" readonly aria-haspopup="dialog" />
         <button data-action="step-qty" data-unit="${unit}" data-delta="1" type="button">+</button>
       </div>
     </label>
@@ -5678,7 +5678,7 @@ function renderConsolidationAllocation(allocation) {
               </div>
               <div class="stepper">
                 <button data-action="step-consolidation" data-order="${allocation.batchOrderId}" data-line="${escapeHtml(allocation.lineKey)}" data-unit="${unit.key}" data-delta="-1" type="button">-</button>
-                <input value="${displayQty(value)}" readonly />
+                <input value="${displayQty(value)}" readonly aria-haspopup="dialog" aria-label="${escapeHtml(displayUnit(unit.label))}" />
                 <button data-action="step-consolidation" data-order="${allocation.batchOrderId}" data-line="${escapeHtml(allocation.lineKey)}" data-unit="${unit.key}" data-delta="1" type="button">+</button>
               </div>
             </div>
@@ -6334,15 +6334,24 @@ async function startConsolidation() {
   }
 }
 
-function stepConsolidationAllocation(batchOrderId, lineKey, unit, delta) {
+function consolidationAllocationUnit(batchOrderId, lineKey, unit) {
   const allocation = (consolidationBatch?.items || []).flatMap((item) => item.allocations || [])
     .find((item) => String(item.batchOrderId) === String(batchOrderId) && String(item.lineKey) === String(lineKey));
-  if (!allocation) return;
-  const unitInfo = (allocation.units || []).find((item) => item.key === unit);
-  if (!unitInfo) return;
-  const draft = consolidationDraft(allocation);
-  draft[unit] = Math.max(0, Math.min(qty(unitInfo.required), qty(draft[unit]) + Number(delta || 0)));
+  const unitInfo = (allocation?.units || []).find((item) => item.key === unit);
+  return unitInfo ? { allocation, unitInfo } : null;
+}
+
+function setConsolidationAllocation(batchOrderId, lineKey, unit, value) {
+  const target = consolidationAllocationUnit(batchOrderId, lineKey, unit);
+  if (!target) return;
+  consolidationDraft(target.allocation)[unit] = Math.max(0, Math.min(qty(target.unitInfo.required), qty(value)));
   render();
+}
+
+function stepConsolidationAllocation(batchOrderId, lineKey, unit, delta) {
+  const target = consolidationAllocationUnit(batchOrderId, lineKey, unit);
+  if (!target) return;
+  setConsolidationAllocation(batchOrderId, lineKey, unit, qty(consolidationDraft(target.allocation)[unit]) + Number(delta || 0));
 }
 
 async function confirmConsolidationAllocation(batchOrderId, lineKey) {
@@ -9912,17 +9921,56 @@ async function submitCycleCount() {
   render();
 }
 
-function stepQty(unit, delta) {
-  const input = app.querySelector(`.selected-panel [data-pack="${unit}"]`);
-  if (!input) return;
+function packQtyLimit(unit) {
+  if (unit.startsWith("cycle-")) return Number.POSITIVE_INFINITY;
   const selectedLine = selectedOrder?.lines?.find((line) => String(line.id) === String(selectedLineId));
   const receivingLine = receivingSelectedOrder?.lines?.find((line) => String(line.id) === String(receivingSelectedLineId));
   const activeLine = currentModule === "receiving" ? receivingLine : selectedLine;
   const values = Object.fromEntries(["pallets", "layers", "sections", "pieces"].map(key =>
     [key, qty(app.querySelector(`.selected-panel [data-pack="${key}"]`)?.value)]));
-  const max = unit.startsWith("cycle-") ? Number.POSITIVE_INFINITY : activeLine ? panelLimit(activeLine, unit, values) : Number.POSITIVE_INFINITY;
-  input.value = Math.min(max, Math.max(0, qty(input.value) + Number(delta)));
+  return activeLine ? panelLimit(activeLine, unit, values) : Number.POSITIVE_INFINITY;
+}
+
+function setPackQty(unit, value) {
+  const input = app.querySelector(`.selected-panel [data-pack="${unit}"]`);
+  if (!input) return;
+  input.value = Math.min(packQtyLimit(unit), Math.max(0, qty(value)));
   if (unit.startsWith("cycle-")) updateCycleVariancePreview();
+}
+
+function stepQty(unit, delta) {
+  const input = app.querySelector(`.selected-panel [data-pack="${unit}"]`);
+  if (input) setPackQty(unit, qty(input.value) + Number(delta));
+}
+
+/** The number pad target for a tapped stepper quantity (operator-stepper-keypad.js). */
+function stepperKeypadTarget(input) {
+  const consolidation = input.closest(".stepper")?.querySelector('[data-action="step-consolidation"]');
+  if (consolidation) {
+    const { order, line, unit } = consolidation.dataset;
+    const target = consolidationAllocationUnit(order, line, unit);
+    if (!target) return null;
+    return {
+      label: displayUnit(target.unitInfo.label), value: qty(consolidationDraft(target.allocation)[unit]),
+      max: qty(target.unitInfo.required), decimals: !["PLT", "LYR", "SEC", "PCS"].includes(target.unitInfo.label),
+      apply: (value) => setConsolidationAllocation(order, line, unit, value)
+    };
+  }
+  const unit = input.dataset.pack;
+  const panel = input.closest(".selected-panel");
+  if (!unit || !panel) return null;
+  const module = currentModule;
+  const lineKey = panel.dataset.selectedLine ?? panel.dataset.receivingSelectedLine;
+  return {
+    label: input.closest(".stepper-field")?.querySelector(":scope > span")?.textContent.trim() || "",
+    value: qty(input.value), max: packQtyLimit(unit), decimals: unit === "sales",
+    apply: (value) => {
+      // A background refresh may have re-rendered the panel; only set the same line's quantity.
+      const current = app.querySelector(".selected-panel");
+      if (currentModule !== module || (current?.dataset.selectedLine ?? current?.dataset.receivingSelectedLine) !== lineKey) return;
+      setPackQty(unit, value);
+    }
+  };
 }
 
 function cycleUnitValue(unit) {
@@ -11042,6 +11090,7 @@ const operatorDisplaySettings = window.OperatorDisplaySettings.create({
   shell, onClose: () => { currentModule = "menu"; render(); }
 });
 window.OperatorOrderKeypad.install(app);
+window.OperatorStepperKeypad.install(app, stepperKeypadTarget);
 
 let operatorPhonePolicyRequest = 0;
 async function refreshOperatorPhonePolicy({ renderChanged = true } = {}) {

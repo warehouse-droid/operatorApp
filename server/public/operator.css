@@ -2273,6 +2273,127 @@ label span {
   font-weight: 900;
 }
 
+/* Tapping a stepper quantity opens the number pad (operator-stepper-keypad.js). */
+.stepper input[readonly] {
+  cursor: pointer;
+  caret-color: transparent;
+}
+
+.stepper input[readonly]:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
+.stepper-keypad-dialog {
+  width: min(380px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  box-sizing: border-box;
+  overflow: auto;
+  padding: 0;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  color: var(--ink);
+  background: #fff;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 30%);
+}
+
+.stepper-keypad-dialog::backdrop {
+  background: rgb(3 12 18 / 65%);
+}
+
+.stepper-keypad {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+}
+
+.stepper-keypad-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stepper-keypad-header h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.stepper-keypad-header span {
+  color: var(--muted);
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.stepper-keypad-display {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.stepper-keypad-display output {
+  min-height: 58px;
+  padding: 0 14px;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  border-radius: 8px;
+  font-size: 32px;
+  font-weight: 900;
+  line-height: 54px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.stepper-keypad-display output.fresh {
+  background: #e9f8f5;
+  color: var(--accent);
+}
+
+.stepper-keypad-clear {
+  min-height: 58px;
+  padding: 0 14px;
+}
+
+.stepper-keypad-error {
+  min-height: 18px;
+  margin: -4px 0 0;
+  color: var(--danger);
+  font-weight: 800;
+}
+
+.stepper-keypad-keys {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.stepper-keypad-keys button {
+  min-height: 58px;
+  background: #eef4f5;
+  font-size: 26px;
+}
+
+/* Without a decimal key, 0 spans two columns next to backspace. */
+.stepper-keypad-keys:not(.decimals) [data-stepper-key="0"] {
+  grid-column: span 2;
+}
+
+.stepper-keypad-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stepper-keypad-actions button {
+  min-height: 54px;
+  font-size: 18px;
+}
+
+.stepper-keypad-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .confirm-button,
 .selected-actions {
   margin-top: auto;
