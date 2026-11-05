@@ -78,3 +78,24 @@ test('stock return fallback retry keys remain compatible and exchanges have a se
   assert.equal(context.normalizedIdempotencyKey(input,'operator-1'),expected);
   assert.notEqual(context.normalizedIdempotencyKey({...input,returnMode:'exchange'},'operator-1'),expected);
 });
+
+test('a 2967 (SOA) order is looked up for exchange at 3445 while its stock return stays blocked',async()=>{
+  const bodies=[];
+  const page=vm.createContext({RETURN_ORDER_PREFIX_YARDS:{SOA:{locationId:28,yardCode:'2967'},SOB:{locationId:1,yardCode:'3445'},SOM:{locationId:26,yardCode:'150'}},
+    returnYardSettings:[{locationId:1,allowCrossYardReturns:false}],locationId:1,currentModule:'stock-exchange',returnMode:'stock',
+    returnBusy:false,returnLookupCode:'',returnLookupMessage:'',normalizedPickupCameraCode:value=>String(value).toUpperCase(),
+    t:(_key,value)=>value,tf:(_key,value,vars)=>value.replace('{yard}',vars.yard),render:()=>undefined,
+    stopReturnScannerCamera:()=>undefined,clearReturnCustomerSearch:()=>undefined,returnOrderNotFulfilledMessage:()=>'',returnYardName:()=>'',
+    api:async(_path,options)=>{bodies.push(JSON.parse(options.body));throw new Error('stop after request');}});
+  for(const name of ['returnOrderPrefixYard','currentReturnYardSetting','currentYardAllowsCrossYardReturns','returnLookupYardPreflight','lookupReturnOrder']){
+    vm.runInContext(extract(name),page);
+  }
+  assert.equal(page.returnLookupYardPreflight('SOA1001').blocked,false);
+  await page.lookupReturnOrder('SOA1001');
+  assert.deepEqual(bodies,[{code:'SOA1001',receivingLocationId:1,mode:'exchange'}]);
+  page.currentModule='stock-return';
+  assert.equal(page.returnLookupYardPreflight('SOA1001').blocked,true);
+  await page.lookupReturnOrder('SOA1001');
+  assert.equal(bodies.length,1);
+  assert.match(page.returnLookupMessage,/2967/);
+});

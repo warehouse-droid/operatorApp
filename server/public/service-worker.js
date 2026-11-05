@@ -1,4 +1,4 @@
-const CACHE_NAME = "mbbs-yard-operator-20261104-stepper-keypad-v1";
+const CACHE_NAME = "mbbs-yard-operator-20261105-exchange-any-yard-v1";
 const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
 const APP_SHELL = [
   "/operator",
@@ -23,7 +23,7 @@ const APP_SHELL = [
   "/operator-photo-outbox.js?v=20260917-background-photos-v1",
   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
   "/operator-popup-audit.js?v=20261026-popup-v1",
-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104",
+  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105",
   "/return-notifications.js?v=20261028-return-enhancements",
   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
   "/scm-special-alert.js?v=20260928-special-alert-v1",

@@ -38,6 +38,20 @@ test('exchange rejects normal returns, GD, unsupported yards and pallet mixtures
   await assert.rejects(submit({ ...input, lines: [] }), /exchange|stock|quantity/i);
 });
 
+test('an order placed at 2967 can be exchanged at 3445 while its stock return stays at 2967', async t => {
+  const { remoteLines } = await fixture(t, { enabled: false });
+  Object.assign(remoteLines[0], { tranid: 'SOA99091700', ordering_location_id: '28', line_location_id: 28 });
+  const prior = (await query('SELECT allow_cross_yard_returns FROM return_yard_settings WHERE location_id=1')).rows[0];
+  await query('UPDATE return_yard_settings SET allow_cross_yard_returns=false WHERE location_id=1');
+  t.after(() => query('UPDATE return_yard_settings SET allow_cross_yard_returns=$1 WHERE location_id=1', [prior.allow_cross_yard_returns]));
+  await assert.rejects(submit(await submitInput({ quantity: 1 })), error => error.code === 'CROSS_YARD_RETURN_BLOCKED');
+  const result = await submit(await exchangeInput(2));
+  assert.equal(result.stockExchange.recordType, 'exchange');
+  const batch = await query('SELECT receiving_location_id FROM return_batches WHERE id=$1', [result.stockExchange.batchId]);
+  assert.equal(Number(batch.rows[0].receiving_location_id), 1);
+  assert.equal((await localStockReserved([99091703])).get('99091703'), 2);
+});
+
 test('concurrent return and exchange admissions cannot spend the same remaining quantity', async t => {
   await fixture(t, { enabled: false });
   const results = await Promise.allSettled([submit(await exchangeInput(7)), submit(await submitInput({ quantity: 7 }))]);

@@ -1658,7 +1658,10 @@ export async function submitReturnBatch({
       includeStockReturns: hasStock,
       includeNetSuiteOrderLines: hasStock,
       includePalletBalance: hasPallet,
-      enforceYardRestriction: hasStock,
+      // Stock exchanges are not tied to the ordering yard: an order placed at
+      // 2967 may be exchanged at 3445 or 150 (assertStockExchange limits the
+      // receiving yard to the exchange yards).
+      enforceYardRestriction: hasStock && !exchange,
       forcePalletBalance: hasPallet
     });
     const admitted = await existingBatchByIdempotency(idempotencyKey, operator);

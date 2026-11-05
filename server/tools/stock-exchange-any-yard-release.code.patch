@@ -1,0 +1,90 @@
+diff --git a/server/src/server.js b/server/src/server.js
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -22338,7 +22338,9 @@
+       receivingLocationId: req.body?.receivingLocationId || req.body?.yardLocationId,
+       includeStockReturns: returnMode !== "pallet",
+       includeNetSuiteOrderLines: false,
+-      enforceYardRestriction: returnMode !== "pallet"
++      // PALLET returns are customer-level and stock exchanges may be received
++      // at any exchange yard, so only stock returns stay at the ordering yard.
++      enforceYardRestriction: returnMode !== "pallet" && returnMode !== "exchange"
+     })));
+   } catch (error) {
+     next(error);
+diff --git a/server/src/return-repository.js b/server/src/return-repository.js
+--- a/server/src/return-repository.js
++++ b/server/src/return-repository.js
+@@ -1660,7 +1660,10 @@
+       includeStockReturns: hasStock,
+       includeNetSuiteOrderLines: hasStock,
+       includePalletBalance: hasPallet,
+-      enforceYardRestriction: hasStock,
++      // Stock exchanges are not tied to the ordering yard: an order placed at
++      // 2967 may be exchanged at 3445 or 150 (assertStockExchange limits the
++      // receiving yard to the exchange yards).
++      enforceYardRestriction: hasStock && !exchange,
+       forcePalletBalance: hasPallet
+     });
+     const admitted = await existingBatchByIdempotency(idempotencyKey, operator);
+diff --git a/server/public/operator.js b/server/public/operator.js
+--- a/server/public/operator.js
++++ b/server/public/operator.js
+@@ -2977,7 +2977,9 @@
+ 
+ function returnLookupYardPreflight(orderRef) {
+   const requiredYard = returnOrderPrefixYard(orderRef);
++  // Stock exchanges may be received at any exchange yard, whatever yard took the order.
+   if (!requiredYard
++      || currentModule === "stock-exchange"
+       || Number(requiredYard.locationId) === Number(locationId)
+       || currentYardAllowsCrossYardReturns()) {
+     return { blocked: false, requiredYard };
+@@ -8948,7 +8950,7 @@
+   try {
+     const payload = await api("/api/returns/orders/lookup", {
+       method: "POST",
+-      body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: returnMode })
++      body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: currentModule === "stock-exchange" ? "exchange" : returnMode })
+     });
+     stopReturnScannerCamera();
+     const lookup = normalizeReturnLookup(payload);
+@@ -9157,7 +9159,7 @@
+   if (!lookup && returnLookupCode) {
+     lookup = await api("/api/returns/orders/lookup", {
+       method: "POST",
+-      body: JSON.stringify({ code: returnLookupCode, receivingLocationId: locationId, mode })
++      body: JSON.stringify({ code: returnLookupCode, receivingLocationId: locationId, mode: currentModule === "stock-exchange" ? "exchange" : mode })
+     });
+   }
+   if (!lookup && (draft.customerId || draft.customer_id)) {
+diff --git a/server/public/operator.html b/server/public/operator.html
+--- a/server/public/operator.html
++++ b/server/public/operator.html
+@@ -38,7 +38,7 @@
+     <script src="/operator-inventory.js?v=20261027-damage-reasons-zh-v1&damageCamera=20261102"></script>
+     <script src="/return-notifications.js?v=20261028-return-enhancements"></script>
+     <script src="/operator-popup-audit.js?v=20261026-popup-v1"></script>
+-    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104"></script>
++    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105"></script>
+     <script src="/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1"></script>
+     <script src="/scm-special-alert.js?v=20260928-special-alert-v1"></script>
+   </body>
+diff --git a/server/public/service-worker.js b/server/public/service-worker.js
+--- a/server/public/service-worker.js
++++ b/server/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20261105-photo-cleanup-v1";
++const CACHE_NAME = "mbbs-yard-operator-20261105-exchange-any-yard-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -23,7 +23,7 @@
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1&missingCleanup=20261105",
+   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+   "/operator-popup-audit.js?v=20261026-popup-v1",
+-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104",
++  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105",
+   "/return-notifications.js?v=20261028-return-enhancements",
+   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
+   "/scm-special-alert.js?v=20260928-special-alert-v1",

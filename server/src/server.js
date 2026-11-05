@@ -22263,7 +22263,9 @@ app.post("/api/returns/orders/lookup", requireOperator, requireOperatorAccess, r
       receivingLocationId: req.body?.receivingLocationId || req.body?.yardLocationId,
       includeStockReturns: returnMode !== "pallet",
       includeNetSuiteOrderLines: false,
-      enforceYardRestriction: returnMode !== "pallet"
+      // PALLET returns are customer-level and stock exchanges may be received
+      // at any exchange yard, so only stock returns stay at the ordering yard.
+      enforceYardRestriction: returnMode !== "pallet" && returnMode !== "exchange"
     })));
   } catch (error) {
     next(error);

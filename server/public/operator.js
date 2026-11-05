@@ -2977,7 +2977,9 @@ function currentYardAllowsCrossYardReturns() {
 
 function returnLookupYardPreflight(orderRef) {
   const requiredYard = returnOrderPrefixYard(orderRef);
+  // Stock exchanges may be received at any exchange yard, whatever yard took the order.
   if (!requiredYard
+      || currentModule === "stock-exchange"
       || Number(requiredYard.locationId) === Number(locationId)
       || currentYardAllowsCrossYardReturns()) {
     return { blocked: false, requiredYard };
@@ -8948,7 +8950,7 @@ async function lookupReturnOrder(code = returnLookupCode) {
   try {
     const payload = await api("/api/returns/orders/lookup", {
       method: "POST",
-      body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: returnMode })
+      body: JSON.stringify({ code: clean, receivingLocationId: locationId, mode: currentModule === "stock-exchange" ? "exchange" : returnMode })
     });
     stopReturnScannerCamera();
     const lookup = normalizeReturnLookup(payload);
@@ -9157,7 +9159,7 @@ async function resumeReturnDraft(draft, { renderAfter = true } = {}) {
   if (!lookup && returnLookupCode) {
     lookup = await api("/api/returns/orders/lookup", {
       method: "POST",
-      body: JSON.stringify({ code: returnLookupCode, receivingLocationId: locationId, mode })
+      body: JSON.stringify({ code: returnLookupCode, receivingLocationId: locationId, mode: currentModule === "stock-exchange" ? "exchange" : mode })
     });
   }
   if (!lookup && (draft.customerId || draft.customer_id)) {
