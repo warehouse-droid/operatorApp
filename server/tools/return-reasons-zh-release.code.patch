@@ -1,0 +1,134 @@
+diff --git a/server/public/operator.js b/server/public/operator.js
+--- a/server/public/operator.js
++++ b/server/public/operator.js
+@@ -2937,6 +2937,24 @@
+   return "";
+ }
+ 
++// NetSuite return reasons (R1–R5 quality, GD normal) shown in the operator's language.
++// Translated by reason ID so a NetSuite label wording change still shows Chinese;
++// the English label is still what is submitted and stored.
++const RETURN_REASON_I18N_KEYS = Object.freeze({
++  5: "operator.returnReasonR1",
++  6: "operator.returnReasonR2",
++  7: "operator.returnReasonR3",
++  8: "operator.returnReasonR4",
++  9: "operator.returnReasonR5",
++  10: "operator.returnReasonGD"
++});
++
++function returnReasonText(reason) {
++  const label = String(reason?.label || reason?.reasonLabel || reason?.reason_label || reason?.reasonCode || reason?.reason_code || "");
++  const key = RETURN_REASON_I18N_KEYS[Number(reason?.id ?? reason?.reasonId ?? reason?.reason_id)];
++  return key ? t(key, label) : localizeMessage(label);
++}
++
+ function normalizeReturnReason(reason, fallbackId = "") {
+   if (typeof reason === "string" || typeof reason === "number") {
+     return { id: String(fallbackId || reason), label: String(reason) };
+@@ -3122,7 +3140,7 @@
+           kind: "line",
+           lineId: String(values.clientRowKey || ""),
+           label: returnLineName(line),
+-          detail: reason?.label || tf("operator.returnReasonRow", "Return reason row {number}", { number: index + 1 })
++          detail: (reason && returnReasonText(reason)) || tf("operator.returnReasonRow", "Return reason row {number}", { number: index + 1 })
+         });
+       });
+     } else {
+@@ -3537,7 +3555,7 @@
+             <span>${t("operator.netsuiteReason", "NetSuite reason")}</span>
+             <select data-return-line-input="reasonId" data-line="${escapeHtml(rowKey)}">
+               <option value="">${t("operator.selectReason", "Select reason")}</option>
+-              ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(reason.label)}</option>`).join("")}
++              ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(returnReasonText(reason))}</option>`).join("")}
+             </select>
+           </label>
+         </div>
+@@ -3852,7 +3870,7 @@
+     <div class="return-review-line">
+       <div>
+         <strong>${escapeHtml(returnLineName(line))}</strong>
+-        <span class="return-review-reason">${escapeHtml(reason.label || "-")}</span>
++        <span class="return-review-reason">${escapeHtml(returnReasonText(reason) || "-")}</span>
+         ${values.note ? `<em>${escapeHtml(values.note)}</em>` : ""}
+       </div>
+       <b>${displayReturnQty(returnLineCalculatedSalesQty(line, values))} ${escapeHtml(returnLineSalesUom(line))}</b>
+@@ -4046,7 +4064,7 @@
+           <div class="return-review-line">
+             <div>
+               <strong>${escapeHtml(line.itemName || line.item_name || line.sku || "-")}</strong>
+-              <span>${escapeHtml(line.reasonLabel || line.reason_label || "")}</span>
++              <span>${escapeHtml(returnReasonText(line))}</span>
+               ${line.note ? `<em>${escapeHtml(line.note)}</em>` : ""}
+             </div>
+             <b>${displayReturnQty(line.returnedSalesQuantity ?? line.returned_sales_quantity ?? line.salesQuantity ?? line.sales_quantity)} ${escapeHtml(displayUnit(line.salesUom || line.sales_uom || ""))}</b>
+@@ -8688,7 +8706,7 @@
+             <strong>${escapeHtml(line.itemName || "")}</strong>
+             ${line.description ? `<span>${escapeHtml(line.description)}</span>` : ""}
+             ${line.reasonLabel || line.reasonCode
+-              ? `<span>${escapeHtml(line.reasonLabel || line.reasonCode)}</span>`
++              ? `<span>${escapeHtml(returnReasonText(line))}</span>`
+               : ""}
+             ${line.approvalStatus
+               ? `<em>${escapeHtml(localizeMessage(line.approvalStatus))}</em>`
+diff --git a/server/public/i18n.js b/server/public/i18n.js
+--- a/server/public/i18n.js
++++ b/server/public/i18n.js
+@@ -601,6 +601,12 @@
+     "operator.nonNegativeQuantity": "数量不能为负数。",
+     "operator.netsuiteReason": "NetSuite 原因",
+     "operator.selectReason": "选择原因",
++    "operator.returnReasonR1": "R1 - 色差",
++    "operator.returnReasonR2": "R2 - 泛碱 / 白华",
++    "operator.returnReasonR3": "R3 - 缺角 / 裂纹",
++    "operator.returnReasonR4": "R4 - 表面问题",
++    "operator.returnReasonR5": "R5 - 其他",
++    "operator.returnReasonGD": "GD - 状况良好",
+     "operator.qualityReasonRequired": "请选择质量问题原因。",
+     "operator.shortNoteOptional": "简短备注（可选）",
+     "operator.returnReasonRow": "退货原因行 {number}",
+diff --git a/server/public/operator.html b/server/public/operator.html
+--- a/server/public/operator.html
++++ b/server/public/operator.html
+@@ -25,7 +25,7 @@
+     <script src="/operator-phone.js?v=20261008-phone-keyboard-v1"></script>
+     <script src="/operator-viewport.js?v=20260930-android-bottom-bar-v1"></script>
+     <script src="/vendor/quagga2/quagga.min.js?v=1.12.1"></script>
+-    <script src="/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104"></script>
++    <script src="/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104&returnReasonsZh=20261105"></script>
+     <script src="/operator-load-summary.js?v=20260918-operator-display-settings-v1"></script>
+     <script src="/operator-netsuite-failures.js?v=20261030-netsuite-errors-v1"></script>
+     <script src="/operator-photo-outbox.js?v=20260917-background-photos-v1&missingCleanup=20261105"></script>
+@@ -38,7 +38,7 @@
+     <script src="/operator-inventory.js?v=20261027-damage-reasons-zh-v1&damageCamera=20261102"></script>
+     <script src="/return-notifications.js?v=20261028-return-enhancements"></script>
+     <script src="/operator-popup-audit.js?v=20261026-popup-v1"></script>
+-    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105"></script>
++    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105"></script>
+     <script src="/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1"></script>
+     <script src="/scm-special-alert.js?v=20260928-special-alert-v1"></script>
+   </body>
+diff --git a/server/public/service-worker.js b/server/public/service-worker.js
+--- a/server/public/service-worker.js
++++ b/server/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20261105-return-keypad-v1";
++const CACHE_NAME = "mbbs-yard-operator-20261105-return-reasons-zh-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -18,12 +18,12 @@
+   "/i18n.css?v=20260701-i18n-v2",
+   "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
+   "/vendor/quagga2/quagga.min.js?v=1.12.1",
+-  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104",
++  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104&returnReasonsZh=20261105",
+   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1&missingCleanup=20261105",
+   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+   "/operator-popup-audit.js?v=20261026-popup-v1",
+-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105",
++  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105",
+   "/return-notifications.js?v=20261028-return-enhancements",
+   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
+   "/scm-special-alert.js?v=20260928-special-alert-v1",

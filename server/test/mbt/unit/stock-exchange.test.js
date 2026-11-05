@@ -99,3 +99,31 @@ test('a 2967 (SOA) order is looked up for exchange at 3445 while its stock retur
   assert.equal(bodies.length,1);
   assert.match(page.returnLookupMessage,/2967/);
 });
+
+test('exchange and return reasons show in Chinese while the English NetSuite label is kept',()=>{
+  const storage=new Map([['mbbs.ui.language','zh-CN']]);
+  const page=vm.createContext({localStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)},
+    document:{documentElement:{},addEventListener(){}},CustomEvent:class{},dispatchEvent:()=>true,escapeHtml:String,returnType:'quality',
+    renderReturnUnitInputs:()=>'',returnReasons:{normalReason:{id:'10',label:'GD - Good Condition'},qualityReasons:[
+      {id:'5',label:'R1 - Color Variation'},{id:'6',label:'R2 - Efflorescence'},{id:'7',label:'R3 - Chipping / Crack'},
+      {id:'8',label:'R4 - Surface'},{id:'9',label:'R5 - Others'}]}});
+  vm.runInContext('window = globalThis',page);
+  vm.runInContext(fs.readFileSync('public/i18n.js','utf8'),page);
+  vm.runInContext(`const t=(key,fallback)=>window.MBBS_I18N?.t(key,fallback)||fallback;
+    const tf=(key,fallback,variables={})=>window.MBBS_I18N?.format(key,fallback,variables)||fallback;
+    const localizeMessage=message=>window.MBBS_I18N?.message(message)||String(message||'');`,page);
+  const constant=source.match(/const RETURN_REASON_I18N_KEYS = [\s\S]*?\}\);/)?.[0];assert.ok(constant);
+  vm.runInContext(constant,page);
+  for(const name of ['returnReasonText','renderReturnStockRow']){vm.runInContext(extract(name),page);}
+  const row=page.renderReturnStockRow({},{clientRowKey:'a',reasonId:'6'},0);
+  for(const label of ['R1 - 色差','R2 - 泛碱 / 白华','R3 - 缺角 / 裂纹','R4 - 表面问题','R5 - 其他']){assert.ok(row.includes(label),label);}
+  assert.doesNotMatch(row,/Color Variation|Efflorescence/);
+  assert.match(row,/value="6" selected>R2 - 泛碱 \/ 白华</);
+  // History lines carry the reason ID; a reworded NetSuite label still translates by ID.
+  assert.equal(page.returnReasonText({reasonId:7,reasonLabel:'R3 - Chipping/Cracks'}),'R3 - 缺角 / 裂纹');
+  assert.equal(page.returnReasonText({reasonId:10,reasonLabel:'GD - Good Condition'}),'GD - 状况良好');
+  assert.equal(page.returnReasonText({label:'R5 - Others'}),'R5 - 其他');
+  page.MBBS_I18N.setLanguage('en');
+  assert.equal(page.returnReasonText({id:'5',label:'R1 - Color Variation'}),'R1 - Color Variation');
+  assert.match(page.renderReturnStockRow({},{clientRowKey:'a',reasonId:''},0),/>R2 - Efflorescence</);
+});

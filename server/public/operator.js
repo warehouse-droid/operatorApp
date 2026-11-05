@@ -2937,6 +2937,24 @@ function renderReturnYardBanner() {
   return "";
 }
 
+// NetSuite return reasons (R1–R5 quality, GD normal) shown in the operator's language.
+// Translated by reason ID so a NetSuite label wording change still shows Chinese;
+// the English label is still what is submitted and stored.
+const RETURN_REASON_I18N_KEYS = Object.freeze({
+  5: "operator.returnReasonR1",
+  6: "operator.returnReasonR2",
+  7: "operator.returnReasonR3",
+  8: "operator.returnReasonR4",
+  9: "operator.returnReasonR5",
+  10: "operator.returnReasonGD"
+});
+
+function returnReasonText(reason) {
+  const label = String(reason?.label || reason?.reasonLabel || reason?.reason_label || reason?.reasonCode || reason?.reason_code || "");
+  const key = RETURN_REASON_I18N_KEYS[Number(reason?.id ?? reason?.reasonId ?? reason?.reason_id)];
+  return key ? t(key, label) : localizeMessage(label);
+}
+
 function normalizeReturnReason(reason, fallbackId = "") {
   if (typeof reason === "string" || typeof reason === "number") {
     return { id: String(fallbackId || reason), label: String(reason) };
@@ -3122,7 +3140,7 @@ function returnReviewPhotoTargets() {
           kind: "line",
           lineId: String(values.clientRowKey || ""),
           label: returnLineName(line),
-          detail: reason?.label || tf("operator.returnReasonRow", "Return reason row {number}", { number: index + 1 })
+          detail: (reason && returnReasonText(reason)) || tf("operator.returnReasonRow", "Return reason row {number}", { number: index + 1 })
         });
       });
     } else {
@@ -3537,7 +3555,7 @@ function renderReturnStockRow(line, values, rowIndex) {
             <span>${t("operator.netsuiteReason", "NetSuite reason")}</span>
             <select data-return-line-input="reasonId" data-line="${escapeHtml(rowKey)}">
               <option value="">${t("operator.selectReason", "Select reason")}</option>
-              ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(reason.label)}</option>`).join("")}
+              ${returnReasons.qualityReasons.map((reason) => `<option value="${escapeHtml(reason.id)}" ${String(values.reasonId) === String(reason.id) ? "selected" : ""}>${escapeHtml(returnReasonText(reason))}</option>`).join("")}
             </select>
           </label>
         </div>
@@ -3827,7 +3845,7 @@ function renderReturnReviewLine({ line, values }) {
     <div class="return-review-line">
       <div>
         <strong>${escapeHtml(returnLineName(line))}</strong>
-        <span class="return-review-reason">${escapeHtml(reason.label || "-")}</span>
+        <span class="return-review-reason">${escapeHtml(returnReasonText(reason) || "-")}</span>
         ${values.note ? `<em>${escapeHtml(values.note)}</em>` : ""}
       </div>
       <b>${displayReturnQty(returnLineCalculatedSalesQty(line, values))} ${escapeHtml(returnLineSalesUom(line))}</b>
@@ -4021,7 +4039,7 @@ function renderReturnHistoryDetails(record) {
           <div class="return-review-line">
             <div>
               <strong>${escapeHtml(line.itemName || line.item_name || line.sku || "-")}</strong>
-              <span>${escapeHtml(line.reasonLabel || line.reason_label || "")}</span>
+              <span>${escapeHtml(returnReasonText(line))}</span>
               ${line.note ? `<em>${escapeHtml(line.note)}</em>` : ""}
             </div>
             <b>${displayReturnQty(line.returnedSalesQuantity ?? line.returned_sales_quantity ?? line.salesQuantity ?? line.sales_quantity)} ${escapeHtml(displayUnit(line.salesUom || line.sales_uom || ""))}</b>
@@ -8663,7 +8681,7 @@ function renderHistoryLineDetails(record) {
             <strong>${escapeHtml(line.itemName || "")}</strong>
             ${line.description ? `<span>${escapeHtml(line.description)}</span>` : ""}
             ${line.reasonLabel || line.reasonCode
-              ? `<span>${escapeHtml(line.reasonLabel || line.reasonCode)}</span>`
+              ? `<span>${escapeHtml(returnReasonText(line))}</span>`
               : ""}
             ${line.approvalStatus
               ? `<em>${escapeHtml(localizeMessage(line.approvalStatus))}</em>`
