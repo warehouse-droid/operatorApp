@@ -118,6 +118,7 @@ export function staffPathAllowed(operator, pathname) {
   if (!isMbrOnly(operator)) {return true;}
   return pathname.startsWith('/api/mbr/')
     || pathname.startsWith('/api/repair/')
+    || pathname.startsWith('/api/account-applications/')
     || ['/api/auth/me', '/api/auth/logout'].includes(pathname);
 }
 

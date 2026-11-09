@@ -61,13 +61,20 @@ export async function persistSpecialOrderStatusObservation(observation) {
   if (!kind || !verifiedStatus({ id: observation.netsuiteOrderId, tranid: observation.tranid,
     status: observation.status, status_text: observation.statusText }, observation)) throw Error('Invalid Special order status observation.');
   return withTransaction(async () => {
-    const result = await query(`UPDATE ${kind.table} header
+    // The fence (synced_at) still applies; previous reads the locked row so an unchanged status is known.
+    const result = await query(`WITH previous AS (
+        SELECT netsuite_id, status AS previous_status, status_text AS previous_status_text FROM ${kind.table}
+        WHERE netsuite_id=$1 FOR UPDATE)
+      UPDATE ${kind.table} header
       SET status=$2, status_text=$3, synced_at=now(),
           status_updated_at=CASE WHEN status IS DISTINCT FROM $2 OR status_text IS DISTINCT FROM $3 THEN now() ELSE status_updated_at END
-      WHERE netsuite_id=$1 AND tranid=$5 AND synced_at IS NOT DISTINCT FROM $4::timestamptz
+      FROM previous
+      WHERE header.netsuite_id=previous.netsuite_id AND header.tranid=$5 AND header.synced_at IS NOT DISTINCT FROM $4::timestamptz
         AND EXISTS (SELECT 1 FROM sales_special_stock_cases special WHERE special.${kind.link}=header.netsuite_id)
-      RETURNING netsuite_id`, [observation.netsuiteOrderId, observation.status, observation.statusText, observation.syncedAt, observation.tranid]);
-    if (!result.rowCount) return false;
+      RETURNING header.netsuite_id, (previous.previous_status IS DISTINCT FROM $2 OR previous.previous_status_text IS DISTINCT FROM $3) AS changed`,
+    [observation.netsuiteOrderId, observation.status, observation.statusText, observation.syncedAt, observation.tranid]);
+    // An unchanged status only renews freshness: no audit row, mirror event or page reload.
+    if (!result.rowCount || result.rows[0].changed !== true) return false;
     await enqueueNetSuiteMirrorOrderEvent(kind.orderType, observation.netsuiteOrderId, { changeType: 'status' });
     await writeAudit({ actorType: 'system', source: 'special-stock-request', action: 'special.order_status.refreshed',
       orderId: /** @type {any} */ (observation.netsuiteOrderId), details: { orderType: kind.orderType, tranid: observation.tranid,
@@ -81,21 +88,38 @@ export async function persistSpecialOrderStatusObservation(observation) {
 export function createSpecialOrderStatusCache(dependencies = {}) {
   const { now = () => new Date(), fetchStatuses = fetchTransactionStatusesFromNetSuite,
     persist = persistSpecialOrderStatusObservation, logger = console } = dependencies;
+  // An order NetSuite did not answer for (deleted, malformed, or a failed call) is not asked again for
+  // MAX_AGE_MS unless forced, so a PO deleted in NetSuite is not re-read and logged on every list load.
+  /** @type {Map<string,number>} */
+  const retryAt = new Map();
+  /** @param {string} type @param {{netsuiteOrderId:number}} order @param {number} at */
+  const holdOff = (type, order, at) => {
+    if (retryAt.size >= 5000) for (const [key, until] of retryAt) if (until <= at) retryAt.delete(key);
+    retryAt.set(`${type}:${order.netsuiteOrderId}`, at + MAX_AGE_MS);
+  };
   /** @param {Record<string,any>[]} details @param {{force?:boolean}} options */
   return async (details, { force = false } = {}) => {
     const result = { attempted: 0, updated: 0, failed: 0 };
     for (const kind of kinds) {
-      const orders = staleOrders(details, kind.prefix, now(), force);
+      const current = now(), at = Number(current);
+      const orders = staleOrders(details, kind.prefix, current, force)
+        .filter(order => force || !((retryAt.get(`${kind.orderType}:${order.netsuiteOrderId}`) ?? 0) > at));
       if (!orders.length) continue;
       result.attempted += orders.length;
       let rows;
       try { rows = await fetchStatuses(orders.map(order => order.netsuiteOrderId), kind.recordType); }
-      catch (error) { result.failed += orders.length; logger.error('Special order status refresh failed', kind.orderType, String(error instanceof Error ? error.message : error)); continue; }
+      catch (error) {
+        result.failed += orders.length;
+        for (const order of orders) holdOff(kind.orderType, order, at);
+        logger.error('Special order status refresh failed', kind.orderType, String(error instanceof Error ? error.message : error)); continue;
+      }
       for (const order of orders) {
         const matches = Array.isArray(rows) ? rows.filter(row => identity(row?.id) === order.netsuiteOrderId) : [];
         if (matches.length !== 1 || !verifiedStatus(matches[0], order)) {
-          result.failed++; logger.error('Special order status response is missing or invalid', kind.orderType, order.netsuiteOrderId); continue;
+          result.failed++; holdOff(kind.orderType, order, at);
+          logger.error('Special order status response is missing or invalid', kind.orderType, order.netsuiteOrderId); continue;
         }
+        retryAt.delete(`${kind.orderType}:${order.netsuiteOrderId}`);
         try {
           if (await persist({ orderType: kind.orderType, ...order, status: matches[0].status, statusText: matches[0].status_text })) result.updated++;
         } catch (error) { result.failed++; logger.error('Special order status persistence failed', kind.orderType, String(error instanceof Error ? error.message : error)); }
@@ -109,4 +133,27 @@ const refresh = createSpecialOrderStatusCache();
 /** @param {Record<string,any>[]} details @param {{force?:boolean}} options */
 export function refreshSpecialOrderStatusCache(details, options = {}) {
   return config.netsuite?.directAccessEnabled ? refresh(details, options) : Promise.resolve({ attempted: 0, updated: 0, failed: 0 });
+}
+
+/** List pages answer from saved statuses; stale SO/PO statuses refresh afterwards, one batch at a time,
+ * and onUpdated (a page reload event) runs only when a status changed. A list load never waits for NetSuite.
+ * @param {{refresh?:(details:Record<string,any>[])=>Promise<{attempted:number,updated:number,failed:number}>,
+ *   onUpdated?:(result:{attempted:number,updated:number,failed:number})=>void,logger?:{error:(...args:any[])=>void}}} dependencies */
+export function createBackgroundSpecialStatusRefresh(dependencies = {}) {
+  const { refresh: refreshStatuses = refreshSpecialOrderStatusCache, onUpdated = () => {}, logger = console } = dependencies;
+  /** @type {Promise<{attempted:number,updated:number,failed:number}>|null} */
+  let running = null;
+  /** @param {Record<string,any>[]} details */
+  return details => {
+    // The batch in progress covers this load; anything still stale is picked up by the next load.
+    if (running) return running;
+    running = Promise.resolve().then(() => refreshStatuses(details))
+      .then(result => { if (result.updated) onUpdated(result); return result; })
+      .catch(error => {
+        logger.error('Special order status refresh failed', String(error instanceof Error ? error.message : error));
+        return { attempted: 0, updated: 0, failed: 0 };
+      })
+      .finally(() => { running = null; });
+    return running;
+  };
 }

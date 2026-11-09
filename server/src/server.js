@@ -67,9 +67,11 @@ import { createOperatorYardGuard, assertOperatorOrderYard, assertOperatorUploadY
 import { configureConsolidationLoadEvents, listConsolidationLoadOrders, createConsolidationLoadPreview, getConsolidatedLoad, listPendingConsolidatedLoads } from "./consolidation-load-repository.js";
 import { submitConsolidatedLoad, resumeConsolidatedLoad } from "./consolidation-load-service.js";
 import { assertOperatorYard, operatorYardLocationIds } from "./operator-yard-access.js";
+import { createOperatorPushRuntime, operatorPushPublicConfiguration, revokeOperatorPushSubscription, saveOperatorPushSubscription, sendOperatorPushTest } from "./operator-push.js";
 import express from "express";
 import { createFieldSalesRuntime } from "./field-sales/runtime.js";
 import { createMbrRuntime } from "./mbr/runtime.js";
+import { createAccountApplicationRuntime } from "./account-applications/runtime.js";
 import { createRepairRuntime } from "./repair/runtime.js";
 import { createStockCheckRuntime } from "./stock-check/runtime.js";
 import { isMbrOnly, staffPathAllowed } from "../public/mbr/domain.js";
@@ -279,6 +281,17 @@ import {
 } from "./dispatch-actual-arrival-repository.js";
 import { actualArrivalWorkerTick } from "./dispatch-actual-arrival-service.js";
 import { runWithAuditContext } from "./audit-context.js";
+import {
+  createClientErrorRouter,
+  createSystemAuditRequestMiddleware,
+  installSystemAuditConsoleCapture,
+  installSystemAuditProcessHooks,
+  noteRequestError,
+  requestDurationMs
+} from "./system-audit.js";
+import { listSystemResourceSamples, startSystemResourceMonitor } from "./system-resource-monitor.js";
+import { createRequestTimingRecorder } from "./request-timing.js";
+import { getPerformanceReport } from "./performance-stats.js";
 import { DispatchPlanDateMismatchError, StaleDispatchPlanSaveError, applyDispatchPlannedAssignment, confirmDispatchPlan, createDispatchPlan, dispatchPlannedOrderRefs, getCurrentDispatchPlan, getDispatchPlan, getDispatchPlanRevision, getDispatchPlanSnapshot, listDispatchPlanSnapshots, listDispatchPlans, reopenDispatchPlan, restoreDispatchPlanSnapshot, saveDispatchPlanRecoveryDraft, saveDispatchPlanSnapshot } from "./dispatch-plan-repository.js";
 import {
   advanceDispatchV2Followup,
@@ -589,7 +602,7 @@ import {
   refreshSpecialSalesOrder
 } from "./special-stock-request-service.js";
 import { updateSpecialFulfillment } from './special-stock-fulfillment.js';
-import { refreshSpecialOrderStatusCache } from './special-stock-status-refresh.js';
+import { refreshSpecialOrderStatusCache, createBackgroundSpecialStatusRefresh } from './special-stock-status-refresh.js';
 import { reviewSpecialQuantityChange } from './special-stock-quantity-service.js';
 import { reviewSpecialClosure, requestSpecialClosure as requestSpecialCaseClosure } from './special-stock-closure-service.js';
 import {
@@ -659,6 +672,14 @@ import {
   voidReturnRecord
 } from "./return-repository.js";
 const app = express();
+// Request ids, timing and failed/slow request records for the Admin audit log.
+app.use(createSystemAuditRequestMiddleware({
+  skip: isSystemAuditQuietRequest,
+  applicationAudited: isApplicationAuditedRequest
+}));
+// Load time of every page and API call for Admin -> Performance (src/request-timing.js).
+const requestTiming = createRequestTimingRecorder();
+app.use(requestTiming.middleware({ skip: isSystemAuditQuietRequest }));
 app.use(netSuiteFailureRequestContext);
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(dirname, "../public");
@@ -2369,6 +2390,17 @@ async function targetedScmPurchaseOrdersForResponse(orderRefs = [], operator = n
     }
   }
   return [...byRef.values()];
+}
+
+// The SCM PO catalog is keyed by visible ref, and the targeted refresh after a
+// rename only upserts the new ref. Drop the old key so a dead card (whose PO
+// Split lookups would fail) does not linger until the next full refresh.
+async function removeRenamedScmPurchaseOrderCatalogOrder(oldRef = "", newRef = "") {
+  const previous = String(oldRef || "").trim();
+  const current = String(newRef || "").trim();
+  if (!previous || !current || previous.toLowerCase() === current.toLowerCase()) return;
+  await removeScmPurchaseOrderCatalogOrder(previous)
+    .catch((error) => console.error("SCM PO catalog rename cleanup failed:", error.message));
 }
 
 async function scmPurchaseOrderMutationOrders(req, orderRefs = []) {
@@ -5260,6 +5292,11 @@ export function scmPurchaseOrderCatalogRefreshRequest(payload = {}) {
   };
 }
 
+// Events after which an open Operator page refreshes its Delivery Prep alerts.
+const OPERATOR_PUSH_EVENT_TYPES = new Set(["dispatch.plan.saved", "dispatch.plan.confirmed", "dispatch.plan.followups.completed",
+  "delivery.order.updated", "dispatch.orders.updated"]);
+const operatorPushRuntime = createOperatorPushRuntime();
+
 function emitAppEvent(type, payload = {}) {
   afterTransactionCommit(() => {
     if (
@@ -5298,6 +5335,8 @@ function emitAppEvent(type, payload = {}) {
         }).catch((error) => console.error("SCM PO catalog enqueue failed:", error.message));
       }
     }
+    // Operator Web Push: check soon after planning changes so sleeping devices are alerted quickly.
+    if (OPERATOR_PUSH_EVENT_TYPES.has(type)) operatorPushRuntime.nudge();
     const event = {
       id: ++eventSeq,
       type,
@@ -5489,7 +5528,8 @@ function auditRequestRoute(req) {
 }
 
 function auditRequestSource(req) {
-  return String(req.path || "").split("/").filter(Boolean)[1] || "application";
+  // originalUrl: inside a mounted router req.path no longer carries the /api/<area> prefix.
+  return String(req.originalUrl || req.path || "").split("?")[0].split("/").filter(Boolean)[1] || "application";
 }
 
 function auditRequestAction(req, route) {
@@ -5519,9 +5559,14 @@ function auditRequestReferences(req) {
   return references;
 }
 
-async function writeFallbackMutationAudit(req, statusCode, context) {
+async function writeFallbackMutationAudit(req, statusCode, context, res = null) {
   if (context.semanticAuditPromises?.length) await Promise.allSettled(context.semanticAuditPromises);
-  if (context.semanticAuditCount) return;
+  const aborted = statusCode === null;
+  const failed = aborted || statusCode >= 400;
+  // A semantic audit describes a successful change; a failure is still recorded because a
+  // semantic row written inside a rolled-back transaction does not survive.
+  if (context.semanticAuditCount && !failed) return;
+  const auditError = res?.locals?.auditError || null;
   const route = auditRequestRoute(req);
   const references = auditRequestReferences(req);
   const actorName = req.operator?.display_name || req.operator?.username || req.driver?.name || req.driver?.login || "";
@@ -5538,8 +5583,14 @@ async function writeFallbackMutationAudit(req, statusCode, context) {
       method: req.method,
       route,
       status: statusCode,
-      outcome: statusCode >= 400 ? "rejected" : "completed",
+      outcome: aborted ? "client_disconnected" : statusCode >= 400 ? "rejected" : "completed",
       actorName,
+      ...(res?.locals?.auditRequestId ? { auditRequestId: res.locals.auditRequestId } : {}),
+      ...(res ? { durationMs: requestDurationMs(res) } : {}),
+      ...(auditError?.message ? { errorMessage: auditError.message } : {}),
+      ...(auditError?.code ? { errorCode: auditError.code } : {}),
+      ...(auditError?.stack ? { stack: auditError.stack } : {}),
+      ...(context.semanticAuditCount ? { semanticAuditRows: context.semanticAuditCount } : {}),
       ...references,
       request: sanitizeAuditValue({ params: req.params || {}, query: req.query || {}, body: req.body || {} }),
       ip: req.ip || "",
@@ -8806,6 +8857,48 @@ export async function processNetSuiteOrderWebhook(payload = {}, {
   return { ok: true, orderId: payload.id, tranid: payload.tranid, recordType: type, results, stockRequestTransfer, specialStockRequest };
 }
 
+// Every change request (POST/PUT/PATCH/DELETE) is audited. Registered before the routers that
+// mount ahead of the general body parser; it only reads req.body once the response has finished.
+// Machine-to-machine paths are left out; their failures are still recorded by the system audit.
+const APPLICATION_AUDIT_EXCLUDED_PATHS = new Set(["/api/operator/netsuite-failures", "/api/client-errors"]);
+function isApplicationAuditedRequest(req) {
+  const requestPath = String(req.originalUrl || req.url || "").split("?")[0].replace(/\/+$/u, "");
+  return requestPath.startsWith("/api/")
+    && MUTATING_API_METHODS.has(req.method)
+    && !requestPath.startsWith("/api/internal/")
+    && !isHighFrequencyPollRequest({ path: requestPath })
+    && !APPLICATION_AUDIT_EXCLUDED_PATHS.has(requestPath)
+    && req.get("x-mbbs-rollback-test") !== "1";
+}
+
+app.use((req, res, next) => {
+  if (!isApplicationAuditedRequest(req)) return next();
+  const context = { semanticAuditCount: 0, semanticAuditPromises: [] };
+  let settled = false;
+  const settle = (aborted) => {
+    if (settled) return;
+    settled = true;
+    void writeFallbackMutationAudit(req, aborted ? null : res.statusCode, context, res).catch((error) => {
+      console.error("Fallback application audit failed:", error);
+    });
+  };
+  res.once("finish", () => settle(false));
+  res.once("close", () => settle(!res.writableFinished));
+  return runWithAuditContext(context, () => next());
+});
+
+// Browser errors (uncaught exceptions, rejected promises, failed scripts) from staff pages.
+app.use("/api/client-errors", createClientErrorRouter({
+  async resolveActor(req) {
+    const token = bearerToken(req);
+    if (!token) return null;
+    const viewer = await getOperatorByToken(token);
+    if (viewer) return { actorType: "operator", actorOperatorId: viewer.id, actorName: viewer.display_name || viewer.username };
+    const session = await getDriverSession(token);
+    return session ? { actorType: "driver", actorName: session.driverLogin } : null;
+  }
+}));
+
 // Customer webhooks authenticate and bound their payload before the general parser.
 app.use('/api/webhooks/netsuite/customer', createCustomerWebhookRouter());
 
@@ -8814,6 +8907,9 @@ const repairRuntime = createRepairRuntime({authenticate:requireOperator,authenti
 app.use('/api/repair',repairRuntime.router);
 // Bound contract inputs before the application-wide large photo parser.
 app.use('/api/mbr', mbrRuntime.router);
+// Customer account applications bound their own public/staff body limits.
+const accountApplicationRuntime = createAccountApplicationRuntime({ authenticate: requireOperator, config, dataDir });
+app.use('/api/account-applications', accountApplicationRuntime.router);
 
 const stockCheckRuntime = createStockCheckRuntime({ authenticate: requireOperator, dataDir });
 app.use('/api/scm/stock-check', stockCheckRuntime.router);
@@ -8917,29 +9013,18 @@ app.post("/api/internal/netsuite-sync/events", requireNetSuiteMirrorSignature, a
   }
 });
 
+// The event stream and print-agent polls stay open by design; they are not "slow requests".
+function isSystemAuditQuietRequest(req) {
+  const requestPath = String(req.originalUrl || req.url || "").split("?")[0].replace(/\/+$/u, "");
+  return requestPath === "/api/events" || isHighFrequencyPollRequest({ path: requestPath });
+}
+
 function isHighFrequencyPollRequest(req) {
   const requestPath = String(req.path || "").replace(/\/+$/u, "");
   return requestPath === "/api/webhooks/netsuite/order"
     || requestPath === "/api/scm/print-agent/lease"
     || /^\/api\/scm\/print-agent\/jobs\/[^/]+\/heartbeat$/u.test(requestPath);
 }
-
-app.use((req, res, next) => {
-  if (!req.path.startsWith("/api/")
-      || !MUTATING_API_METHODS.has(req.method)
-      || isHighFrequencyPollRequest(req)
-      || req.path.replace(/\/+$/u, '') === '/api/operator/netsuite-failures'
-      || req.get("x-mbbs-rollback-test") === "1") {
-    return next();
-  }
-  const context = { semanticAuditCount: 0, semanticAuditPromises: [] };
-  res.once("finish", () => {
-    void writeFallbackMutationAudit(req, res.statusCode, context).catch((error) => {
-      console.error("Fallback application audit failed:", error);
-    });
-  });
-  return runWithAuditContext(context, () => next());
-});
 
 app.post("/api/webhooks/netsuite/if-ir", async (req, res, next) => {
   try {
@@ -9111,6 +9196,14 @@ app.use((req, res, next) => {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   } else if (req.path === "/field-sales" || req.path.startsWith("/field-sales/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  } else if (req.path === "/account-application" || req.path === "/accounting" || req.path.startsWith("/accounting/")
+      || /^\/(?:sales|mbt|mbr)\/account-applications(?:\/|$)/u.test(req.path)) {
+    const vaultOrigin = accountApplicationRuntime.vault.publicOrigin();
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'${vaultOrigin ? ` ${vaultOrigin}` : ""}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`);
   } else if (req.path === "/mbr" || req.path.startsWith("/mbr/")) {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Referrer-Policy", "no-referrer");
@@ -9119,7 +9212,7 @@ app.use((req, res, next) => {
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   } else if (req.path === "/mbt" || req.path.startsWith("/mbt/")) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/return-automation", "/admin/sor-auto-returns", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/control/order-reopen", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
+  } else if (req.path.endsWith(".webmanifest") || ["/", "/operator", "/driver", "/control", "/control/returns", "/admin", "/admin/accounts", "/admin/sync", "/admin/maps-usage", "/admin/reconciliation", "/admin/printers", "/admin/photo-storage", "/admin/audit", "/admin/performance", "/admin/return-automation", "/admin/sor-auto-returns", "/admin/mbt-gates", "/dispatch", "/dispatch/custom-orders", "/dispatch/special-stock", "/dispatch/driver-pwa", "/dispatch/offline-review", "/sales", "/sales/planning", "/sales/schedule", "/sales/monitor", "/sales/printing", "/sales/in-outbound-record", "/sales/returns", "/sales/stock-requests", "/sales/delivery-instructions", "/dispatch/loaded-export", "/dispatch/in-outbound-record", "/control/in-outbound-record", "/control/order-reopen", "/dispatch/po-to-schedule", "/scm/custom-orders", "/scm/smart", "/scm/stock-requests", "/scm/to-printing", "/scm/dependency-management", "/scm/printers", "/scm/route-rules", "/scm/schedule-formatting", "/operator.html", "/driver.html", "/control.html", "/admin.html", "/dispatch-menu.html", "/dispatch-special-stock.html", "/dispatch-custom-orders.html", "/dispatch-offline-review.html", "/sales.html", "/sales-stock-requests.html", "/sales-delivery-instructions.html", "/sales-printing.html", "/dispatch-loaded-export.html", "/scm-smart.html", "/scm-stock-requests.html", "/scm/to-printing.html", "/scm/dependency-management.html", "/scm-dependency-management.js", "/scm-dependency-management.css", "/scm-printers.html", "/scm-route-rules.html", "/scm-schedule-formatting.html"].includes(req.path)) {
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   }
   next();
@@ -9131,6 +9224,11 @@ app.get('/mbr', (_req, res) => res.redirect(302, '/mbr/contracts'));
 app.get('/mbr/setup', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/contracts.html')));
 app.get(['/mbr/contracts', '/mbr/contracts/:id'], (_req, res) => res.sendFile(path.join(publicDir, 'mbr/contracts.html')));
 app.get('/mbr/sign', (_req, res) => res.sendFile(path.join(publicDir, 'mbr/sign.html')));
+app.get('/account-application', (_req, res) => res.sendFile(path.join(publicDir, 'account-applications/apply.html')));
+app.get(['/sales/account-applications', '/sales/account-applications/:id', '/mbt/account-applications', '/mbt/account-applications/:id',
+  '/mbr/account-applications', '/mbr/account-applications/:id'], (_req, res) => res.sendFile(path.join(publicDir, 'account-applications/staff.html')));
+app.get(['/accounting', '/accounting/account-applications', '/accounting/account-applications/:id', '/accounting/setup'],
+  (_req, res) => res.sendFile(path.join(publicDir, 'account-applications/accounting.html')));
 app.use(express.static(publicDir));
 app.get(['/operator/repair','/driver/repair'],(_req,res)=>res.sendFile(path.join(publicDir,'repair/requester.html')));
 app.get('/repair/office',(req,res)=>res.redirect(302,'/repair'+(req.originalUrl.includes('?')?req.originalUrl.slice(req.originalUrl.indexOf('?')):'')));
@@ -12748,9 +12846,14 @@ function emitSpecialStockUpdate(source, detail = {}) {
   emitAppEvent("special-stock-request.updated", { source, ...detail });
 }
 
-/** @param {()=>Promise<any>} read */
-async function readSpecialWithCurrentOrderStatuses(read) {
+// Special list pages answer from saved statuses and never wait for NetSuite; stale SO/PO statuses refresh
+// afterwards, one batch at a time, and only a changed status reloads open pages (2026-11-06 list stall).
+const refreshSpecialListStatuses = createBackgroundSpecialStatusRefresh({ onUpdated: () => emitSpecialStockUpdate('order-status-refresh') });
+
+/** @param {()=>Promise<any>} read @param {{background?:boolean}} [options] */
+async function readSpecialWithCurrentOrderStatuses(read, { background = false } = {}) {
   const saved = await read();
+  if (background) { void refreshSpecialListStatuses(Array.isArray(saved) ? saved : [saved]); return saved; }
   const result = await refreshSpecialOrderStatusCache(Array.isArray(saved) ? saved : [saved]);
   if (result.updated) emitSpecialStockUpdate('order-status-refresh');
   return result.attempted ? read() : saved;
@@ -12835,7 +12938,7 @@ app.get("/api/sales/special-stock-requests", requirePrivateSalesRecordAccess, re
         audience: "sales",
         requestedByOperatorId: req.query.mine === "1" ? req.operator.id : undefined,
         authorizedStoreLocationIds: operatorSalesYardLocationIds(req.operator)
-      }))
+      }), { background: true })
     });
   } catch (error) {
     next(error);
@@ -13196,7 +13299,7 @@ app.get("/api/scm/special-stock-requests/order-links", requireSpecialStockWorkfl
 app.get("/api/scm/special-stock-requests", requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     specialStockNoStore(res);
-    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined })) });
+    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined }), { background: true }) });
   } catch (error) {
     next(error);
   }
@@ -13304,6 +13407,16 @@ app.post("/api/scm/special-stock-requests/:id/purchase-order/create", requireSma
   }
 });
 
+// Save SCM's PO review, including PO-only items, without creating the PO in NetSuite.
+app.post('/api/scm/special-stock-requests/:id/purchase-order/draft', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const { saveSpecialPurchaseOrderDraft } = await import('./special-stock-request-service.js');
+    const detail = await saveSpecialPurchaseOrderDraft(req.params.id, req.body || {}, { operatorId: /** @type {any} */ (req).operator.id });
+    emitSpecialStockUpdate('purchase-order-draft-saved', { requestId: detail.id });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/scm/special-stock-requests/:id/purchase-order/skip', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
   try {
     const detail = await skipSpecialOrderCreation(req.params.id, { ...req.body, orderKind: 'purchase_order' }, { operatorId: req.operator?.id });
@@ -13336,6 +13449,35 @@ app.post("/api/scm/special-stock-requests/:id/purchase-order/replace", requireSm
     const detail = await replaceSpecialPurchaseOrder(req.params.id, req.body || {}, { operatorId: req.operator.id });
     emitSpecialStockUpdate("purchase-order-replace", { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
     emitAppEvent('scm.schedule.updated', { source: 'special-po-replace' });
+    res.json(detail);
+  } catch (error) { next(error); }
+});
+
+// SCM-added PO-only items after the PO exists. A PO created by this application is updated in
+// NetSuite; otherwise the item is recorded for SCM only. The SO and Sales are not involved.
+app.post('/api/scm/special-stock-requests/:id/purchase-order/items', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const { addSpecialPurchaseItem } = await import('./special-stock-po-items-service.js');
+    const detail = await addSpecialPurchaseItem(req.params.id, req.body || {}, { operatorId: /** @type {any} */ (req).operator.id });
+    emitSpecialStockUpdate('purchase-order-item-added', { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
+    res.status(201).json(detail);
+  } catch (error) { emitSpecialStockUpdate('purchase-order-item-added', { requestId: Number(req.params.id) }); next(error); }
+});
+
+app.post('/api/scm/special-stock-requests/:id/purchase-order/items/:lineId/retry', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const { retrySpecialPurchaseItem } = await import('./special-stock-po-items-service.js');
+    const detail = await retrySpecialPurchaseItem(req.params.id, req.params.lineId, req.body || {}, { operatorId: /** @type {any} */ (req).operator.id });
+    emitSpecialStockUpdate('purchase-order-item-synced', { requestId: detail.id, purchaseOrderId: detail.purchaseOrderId });
+    res.json(detail);
+  } catch (error) { emitSpecialStockUpdate('purchase-order-item-synced', { requestId: Number(req.params.id) }); next(error); }
+});
+
+app.post('/api/scm/special-stock-requests/:id/purchase-order/items/:lineId/resolve', requireSmartScmWriteAccess, requireSpecialStockWorkflow, async (req, res, next) => {
+  try {
+    const { resolveSpecialPurchaseOrderItem } = await import('./special-stock-request-repository.js');
+    const detail = await resolveSpecialPurchaseOrderItem(req.params.id, req.params.lineId, req.body || {}, { operatorId: /** @type {any} */ (req).operator.id });
+    emitSpecialStockUpdate('purchase-order-item-resolved', { requestId: detail.id });
     res.json(detail);
   } catch (error) { next(error); }
 });
@@ -17198,6 +17340,9 @@ app.post("/api/scm/schedule", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
+    if (updated.order_kind === "PO") {
+      await removeRenamedScmPurchaseOrderCatalogOrder(req.body?.orderRef || req.body?.order_ref, updated.order_ref);
+    }
     const omitSchedule = req.query.includeSchedule === "false";
     res.json({
       updated,
@@ -17277,6 +17422,9 @@ app.put("/api/scm/schedule/:id", async (req, res, next) => {
       after: updated
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-schedule", orderId: updated.order_ref });
+    if (updated.order_kind === "PO") {
+      await removeRenamedScmPurchaseOrderCatalogOrder(req.params.id, updated.order_ref);
+    }
     const omitSchedule = req.query.includeSchedule === "false";
     res.json({
       updated,
@@ -17780,6 +17928,7 @@ app.put("/api/dispatch/scm/purchase-orders/:ref/ref", async (req, res, next) => 
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-ref", type: "PO", orderId: updated.displayRef });
     emitAppEvent("receiving.order.updated", { source: "scm-po-ref", type: "PO", orderId: updated.poId });
+    await removeRenamedScmPurchaseOrderCatalogOrder(updated.oldDisplayRef, updated.displayRef);
     res.json({
       updated,
       orders: await scmPurchaseOrderMutationOrders(req, [updated.displayRef, updated.poRef])
@@ -17816,6 +17965,7 @@ app.put("/api/dispatch/scm/purchase-order-splits/:ref", async (req, res, next) =
       }
     }).catch(() => null);
     emitAppEvent("dispatch.orders.updated", { source: "scm-po-split-rename", type: "PO", orderId: updated.newPoRef });
+    await removeRenamedScmPurchaseOrderCatalogOrder(updated.oldPoRef, updated.newPoRef);
     res.json({
       updated,
       orders: await scmPurchaseOrderMutationOrders(req, [updated.newPoRef, updated.sourcePoRef])
@@ -18774,6 +18924,7 @@ app.get([
   "/admin/reconciliation",
   "/admin/photo-storage",
   "/admin/audit",
+  "/admin/performance",
   "/admin/return-automation", "/admin/sor-auto-returns"
 ], (req, res) => {
   res.sendFile(path.join(publicDir, "admin.html"));
@@ -19046,7 +19197,8 @@ app.post("/api/auth/login", async (req, res, next) => {
 });
 
 app.get("/api/auth/me", requireOperator, (req, res) => {
-  res.json({ operator: req.operator, mbrContractsEnabled: config.mbr.enabled });
+  res.json({ operator: req.operator, mbrContractsEnabled: config.mbr.enabled,
+    accountApplicationsEnabled: config.accountApplications.enabled });
 });
 
 app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
@@ -19066,6 +19218,20 @@ app.post("/api/auth/logout", requireOperator, async (req, res, next) => {
 
 // Account preferences and phone layout policy are independent of the selected yard.
 app.use("/api/operator/preferences", requireOperator, requireOperatorAccess, createOperatorPreferencesRouter());
+// Operator Web Push (background Delivery Prep alerts). Account-level: the yard is checked per request.
+app.get("/api/operator/push/config", requireOperator, requireOperatorAccess, (req, res) => res.json(operatorPushPublicConfiguration()));
+app.put("/api/operator/push/subscription", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try { res.json(await saveOperatorPushSubscription(req.operator, req.body || {}, { userAgent: req.get("user-agent") || "" })); }
+  catch (error) { next(error); }
+});
+app.delete("/api/operator/push/subscription", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try { res.json(await revokeOperatorPushSubscription(req.operator, req.body || {})); }
+  catch (error) { next(error); }
+});
+app.post("/api/operator/push/test", requireOperator, requireOperatorAccess, async (req, res, next) => {
+  try { res.json(await sendOperatorPushTest(req.operator, req.body || {})); }
+  catch (error) { next(error); }
+});
 app.use("/api/operator/phone-layout-policy", requireOperator, requireOperatorAccess, createOperatorPhonePolicyRouter());
 app.use('/api/operator/netsuite-failures', requireOperator, requireOperatorAccess, createOperatorNetSuiteFailureRouter());
 
@@ -23571,13 +23737,18 @@ app.get("/api/delivery/audit", requireOperator, requireAdmin, async (req, res, n
   try {
     res.json(await listAudit({
       limit: req.query.limit,
+      offset: req.query.offset,
       orderId: req.query.orderId,
       operatorId: req.query.operatorId,
       from: req.query.from,
       to: req.query.to,
       actor: req.query.actor,
       action: req.query.action,
-      tranid: req.query.tranid
+      tranid: req.query.tranid,
+      category: req.query.category,
+      severity: req.query.severity,
+      search: req.query.search,
+      requestId: req.query.requestId
     }));
   } catch (error) {
     next(error);
@@ -23589,8 +23760,27 @@ app.get("/api/delivery/audit/options", requireOperator, requireAdmin, async (req
     res.json(await listAuditOptions({
       from: req.query.from,
       to: req.query.to,
-      tranid: req.query.tranid
+      tranid: req.query.tranid,
+      category: req.query.category
     }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+// NetSuite posting time and page / API load time for Admin -> Performance (src/performance-stats.js).
+app.get("/api/admin/performance", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await getPerformanceReport({ range: req.query.range, from: req.query.from, to: req.query.to }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+// CPU, memory and database activity for the Audit Log chart (src/system-resource-monitor.js).
+app.get("/api/delivery/audit/resources", requireOperator, requireAdmin, async (req, res, next) => {
+  try {
+    res.json(await listSystemResourceSamples({ from: req.query.from, to: req.query.to }));
   } catch (error) {
     next(error);
   }
@@ -23769,7 +23959,8 @@ app.post("/api/admin/operator-netsuite-posting/:id/resume", requireOperator, req
       });
     }
     const command = await withTransaction(async () => {
-      const resumed = await resumePublicOperatorNetSuitePostingCommand(req.params.id);
+      // Admin authorization: if NetSuite proves no transaction exists, post the saved evidence again.
+      const resumed = await resumePublicOperatorNetSuitePostingCommand(req.params.id, { authorizeRepost: true });
       await writeAudit({
         actorOperatorId: operatorId(req),
         source: "admin",
@@ -25097,6 +25288,7 @@ app.post("/api/cycle-count/submit", async (req, res, next) => {
 });
 
 app.use((error, req, res, next) => {
+  noteRequestError(res, error);
   console.error(error);
   if (error instanceof DispatchPlanEditLeaseError) {
     return sendDispatchPlanEditLeaseError(res, error);
@@ -25597,6 +25789,8 @@ export async function startServer() {
   }
   return app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
+    startSystemResourceMonitor({ processName: "app" });
+    requestTiming.start();
     startNetSuiteMirrorWorkers();
     startStockRequestSalesOrderRefresh({operationalSyncRunning:anyNetSuiteSyncRunning,emit:(/** @type {Record<string,any>} */ detail)=>{emitStockRequestUpdate('hourly-so-refresh',detail);emitSpecialStockUpdate('hourly-so-refresh',detail);}});
     setTimeout(() => void sorReturnTick(), 7000);
@@ -25606,7 +25800,9 @@ export async function startServer() {
     waitlistRuntime.start();
     fieldSalesRuntime.start();
     mbrRuntime.start();
+    accountApplicationRuntime.start();
     repairRuntime.start();
+    operatorPushRuntime.start();
     stockCheckRuntime.start();
     startOperatorNetSuitePostingRuntime();
     deliveryOperationRuntime.start();
@@ -25671,5 +25867,7 @@ export async function startServer() {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  installSystemAuditProcessHooks({ processName: "app" });
+  installSystemAuditConsoleCapture({ processName: "app" });
   await startServer();
 }

@@ -666,6 +666,48 @@ export function matchSpecialOrderCoverage(expectedLines = [], canonicalLines = [
   return mappings;
 }
 
+/**
+ * Best-effort PO line identities. A PO is independent of its reviewed draft once created
+ * (SCM may edit it or add lines, such as a split fee, in NetSuite), so a difference never
+ * blocks the request: unmatched lines simply stay unmapped. Matches, in order of confidence:
+ * the saved identity, a unique exact item/quantity/UOM/description tuple, then the only
+ * remaining line of the same item.
+ */
+export function mapSpecialPurchaseOrderLines(expectedLines = [], canonicalLines = []) {
+  const candidates = (Array.isArray(canonicalLines) ? canonicalLines : [])
+    .filter((line) => line?.active !== false && Number.isSafeInteger(Number(line?.id)) && Number(line.id) > 0
+      && Number.isSafeInteger(Number(line?.lineId)) && Number(line.lineId) > 0)
+    .map((line) => ({ ...line, used: false }))
+    .sort((left, right) => Number(left.id) - Number(right.id));
+  const pending = (Array.isArray(expectedLines) ? expectedLines : []).map((line) => ({ ...line, done: false }))
+    .sort((left, right) => Number(left.id) - Number(right.id));
+  const mappings = [];
+  const take = (expected, candidate) => {
+    candidate.used = true; expected.done = true;
+    mappings.push({ expectedLineId: Number(expected.id), canonicalLineId: Number(candidate.id), remoteLineId: Number(candidate.lineId) });
+  };
+  const sameItem = (expected, candidate) => !candidate.used && Number(candidate.itemId) === Number(expected.itemId);
+  for (const expected of pending) {
+    if (!expected.remoteLineId) continue;
+    const candidate = candidates.find((line) => sameItem(expected, line) && Number(line.lineId) === Number(expected.remoteLineId));
+    if (candidate) take(expected, candidate);
+  }
+  for (const expected of pending.filter((line) => !line.done)) {
+    const description = normalizedOrderDescription(expected.description, expected.itemName);
+    const matches = candidates.filter((candidate) => sameItem(expected, candidate)
+      && Math.abs(Number(candidate.quantity) - Number(expected.quantity)) <= 0.000001
+      && (!normalizedOrderText(expected.uom) || normalizedOrderText(expected.uom) === normalizedOrderText(candidate.uom))
+      && (!description || description === normalizedOrderDescription(candidate.description, candidate.itemName)));
+    if (matches.length === 1) take(expected, matches[0]);
+  }
+  for (const expected of pending.filter((line) => !line.done)) {
+    const others = pending.filter((line) => !line.done && Number(line.itemId) === Number(expected.itemId));
+    const matches = candidates.filter((candidate) => sameItem(expected, candidate));
+    if (others.length === 1 && matches.length === 1) take(expected, matches[0]);
+  }
+  return mappings;
+}
+
 function marker(caseId, type) {
   const id = positiveId(caseId, "Special case ID", "SPECIAL_CASE_ID_INVALID");
   return `MBBS-SPECIAL-${type}:${id}`;

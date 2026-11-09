@@ -33,7 +33,7 @@ const loadedState = {
     inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"].includes(localStorage.getItem("mbbs.dispatch.loaded.inboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.inboundType")
       : "purchase_order",
-    outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order", "custom_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
+    outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"].includes(localStorage.getItem("mbbs.dispatch.loaded.outboundType"))
       ? localStorage.getItem("mbbs.dispatch.loaded.outboundType")
       : "sales_order"
   },
@@ -102,11 +102,25 @@ function loadedAllowedYards() {
 
 const DISPATCH_YARD_TYPES = {
   inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"],
-  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order", "custom_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order", "custom_order"]
 };
+// The SO tab also lists SOR rental deliveries; their cards keep the SOR badge.
+const MOVEMENT_TAB_ORDER_TYPES = { sales_order: ["sales_order", "sor_order"] };
 
 function selectedMovementType() {
   return loadedState.typeByDirection[loadedState.direction];
+}
+
+function movementTabOrderTypes(orderType) {
+  return MOVEMENT_TAB_ORDER_TYPES[orderType] || [orderType];
+}
+
+function movementTabCode(orderType) {
+  return movementTabOrderTypes(orderType).map(movementTypeCode).join(" + ");
+}
+
+function movementTabLabel(orderType) {
+  return movementTabOrderTypes(orderType).map(movementTypeLabel).join(" + ");
 }
 
 function movementTypeCode(orderType) {
@@ -206,7 +220,7 @@ function loadedFilterQuery() {
     yard: loadedState.filters.yard || "all",
     driver: loadedState.filters.driver || "all",
     direction: loadedState.direction,
-    orderType: selectedMovementType()
+    orderType: movementTabOrderTypes(selectedMovementType()).join(",")
   });
 }
 
@@ -378,6 +392,12 @@ function loadedDocumentLabel(order) {
   return (order.documents || []).map((document) => `${document.type}: ${document.ref}`).join(" · ");
 }
 
+// Driver deliveries of SO splits that have no sales order of their own.
+function loadedSplitLabel(order) {
+  const refs = Array.isArray(order.split_refs) ? order.split_refs.filter(Boolean) : [];
+  return refs.length ? `${loadedT("yard.splitDeliveries", "Split")}: ${refs.join(", ")}` : "";
+}
+
 function loadedMovementStatus(order, driverOnly) {
   return order.waitingForDriverCompletion ? "waiting for driver completion"
     : order.movement_status || (driverOnly ? loadedT("yard.driverComplete", "Driver complete") : loadedT("yard.processed", "Processed"));
@@ -386,7 +406,7 @@ function loadedMovementStatus(order, driverOnly) {
 function renderLoadedList() {
   const orders = visibleLoadedOrders();
   return `
-    <div class="dispatch-loaded-list-head"><strong>${orders.length}</strong><span>${loadedSearchActive() ? loadedT("yard.globalResults", "results across all directions and order types") : `${movementTypeCode(selectedMovementType())} · ${loadedT("yard.processed", "processed")}`}</span></div>
+    <div class="dispatch-loaded-list-head"><strong>${orders.length}</strong><span>${loadedSearchActive() ? loadedT("yard.globalResults", "results across all directions and order types") : `${movementTabCode(selectedMovementType())} · ${loadedT("yard.processed", "processed")}`}</span></div>
     ${loadedState.searchLoading ? `<div class="dispatch-loaded-notice">${loadedT("control.searching", "Searching...")} ${loadedT("yard.searchingHelp", "Checking all processed yard movements across every direction, type, yard, and date.")}</div>` : ""}
     ${orders.map((order) => {
       const driverOnly = loadedBoolean(order, "driver_only", "driverOnly");
@@ -399,6 +419,7 @@ function renderLoadedList() {
       return `<button class="dispatch-loaded-order ${loadedOrderKey(order) === loadedState.selectedKey ? "active" : ""}" data-action="select-loaded-order" data-key="${loadedEscape(loadedOrderKey(order))}" type="button">
         <div class="dispatch-movement-card-head"><strong>${loadedEscape(order.tranid || order.order_id)}</strong><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
         <span>${loadedEscape(order.yard_location || loadedT("common.yard", "Yard"))} | ${loadedEscape(loadedMovementStatus(order, driverOnly))}</span>
+        ${loadedSplitLabel(order) ? `<span class="movement-documents movement-split-refs">${loadedEscape(loadedSplitLabel(order))}</span>` : ""}
         ${loadedDocumentLabel(order) ? `<span class="movement-documents">${loadedEscape(loadedDocumentLabel(order))}</span>` : ""}
         <em>${deliveryAt ? `${loadedT("yard.deliveryTime", "Delivered")} ${loadedFormatDate(deliveryAt)}` : loadedFormatDate(lastActivityAt)} | ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities} | ${yardPhotos + driverPhotos} ${loadedT("common.photos", "photos")}</em>
         ${order.party ? `<small>${loadedEscape(order.party)}</small>` : ""}
@@ -526,7 +547,7 @@ function renderLoadedDetail() {
   const route = [order.source_location, order.destination_location].filter(Boolean).join(" → ");
   return `
     <div class="dispatch-loaded-detail-head">
-      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(loadedMovementStatus(order, driverOnly))}</p>${loadedDocumentLabel(order) ? `<p class="movement-documents"><strong>${loadedEscape(loadedDocumentLabel(order))}</strong></p>` : ""}${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}${deliveryAt ? `<p><strong>${loadedT("yard.deliveryTime", "Delivered")}:</strong> ${loadedFormatDate(deliveryAt)}</p>` : ""}${activityRange ? `<p>${loadedT("yard.activityRange", "Activity")}: ${activityRange}</p>` : ""}</div>
+      <div><div class="dispatch-movement-detail-title"><h2>${loadedEscape(order.tranid || order.order_id)}</h2><span class="dispatch-movement-badges"><i class="dispatch-movement-badge ${loadedEscape(order.direction)}">${loadedT(`yard.${order.direction}`, order.direction)}</i><i class="dispatch-movement-badge type">${movementTypeCode(order.order_type)}</i>${driverOnly ? `<i class="dispatch-movement-badge type">${loadedT("yard.driverOnly", "Driver only")}</i>` : ""}</span></div><p>${loadedEscape(movementTypeLabel(order.order_type))} | ${loadedEscape(order.yard_location || "")} | ${loadedEscape(loadedMovementStatus(order, driverOnly))}</p>${loadedSplitLabel(order) ? `<p class="movement-documents movement-split-refs"><strong>${loadedEscape(loadedSplitLabel(order))}</strong></p>` : ""}${loadedDocumentLabel(order) ? `<p class="movement-documents"><strong>${loadedEscape(loadedDocumentLabel(order))}</strong></p>` : ""}${route ? `<p>${loadedEscape(route)}</p>` : ""}${order.party ? `<p>${loadedEscape(order.party)}</p>` : ""}${deliveryAt ? `<p><strong>${loadedT("yard.deliveryTime", "Delivered")}:</strong> ${loadedFormatDate(deliveryAt)}</p>` : ""}${activityRange ? `<p>${loadedT("yard.activityRange", "Activity")}: ${activityRange}</p>` : ""}</div>
       <strong>${lines.length} ${loadedT("control.lines", "line(s)")} · ${loadedT("yard.yardActivities", "Yard")} ${yardActivities} · ${loadedT("yard.driverActivities", "Driver")} ${driverActivities}</strong>
     </div>
     <div class="dispatch-loaded-lines">${lines.map((line) => `<div class="dispatch-loaded-line">
@@ -565,7 +586,7 @@ function renderDispatchLoaded() {
         <div class="dispatch-loaded-searches"><label><span>${loadedT("control.orderSearch", "Order Search")}</span><input id="dispatchLoadedSearch" placeholder="${loadedT("yard.orderSearchPlaceholder", "Order / party / location")}" value="${loadedEscape(loadedState.search)}" /></label><label><span>${loadedT("yard.itemSearch", "Item Search")}</span><input id="dispatchLoadedItemSearch" placeholder="${loadedT("yard.itemSearchPlaceholder", "SKU / item / description")}" value="${loadedEscape(loadedState.itemSearch)}" /></label></div>
         <div class="dispatch-yard-tabs">
           <div class="dispatch-yard-direction-tabs" role="tablist" aria-label="${loadedT("yard.direction", "Direction")}">${["inbound", "outbound"].map((direction) => `<button class="${loadedState.direction === direction && !loadedSearchActive() ? "active" : ""}" data-action="yard-direction" data-direction="${direction}" type="button">${loadedT(`yard.${direction}`, direction === "inbound" ? "Inbound" : "Outbound")}</button>`).join("")}</div>
-          <div class="dispatch-yard-type-tabs" role="tablist" aria-label="${loadedT("yard.orderType", "Order Type")}">${typeTabs.map((orderType) => `<button class="${selectedMovementType() === orderType && !loadedSearchActive() ? "active" : ""}" data-action="yard-type" data-order-type="${orderType}" aria-label="${loadedEscape(movementTypeLabel(orderType))}" title="${loadedEscape(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>`).join("")}</div>
+          <div class="dispatch-yard-type-tabs" role="tablist" aria-label="${loadedT("yard.orderType", "Order Type")}">${typeTabs.map((orderType) => `<button class="${selectedMovementType() === orderType && !loadedSearchActive() ? "active" : ""}" data-action="yard-type" data-order-type="${orderType}" aria-label="${loadedEscape(movementTypeLabel(orderType))}" title="${loadedEscape(movementTabLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>`).join("")}</div>
         </div>
         <div class="dispatch-loaded-list" id="dispatchLoadedList">${renderLoadedList()}</div>
       </aside>

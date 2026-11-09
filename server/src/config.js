@@ -71,6 +71,11 @@ function buildConfig(env) {
     databaseUrl: env.DATABASE_URL,
     mbr: { enabled: booleanValue(env.MBR_CONTRACTS_ENABLED, false) },
     repair: { enabled: booleanValue(env.REPAIR_ENABLED, false), postingEnabled: booleanValue(env.REPAIR_NETSUITE_POSTING_ENABLED, false) },
+    accountApplications: {
+      enabled: booleanValue(env.ACCOUNT_APPLICATIONS_ENABLED, false),
+      vaultUrl: String(env.ACCOUNT_VAULT_URL || "").trim().replace(/\/+$/u, ""),
+      vaultTokenSecret: String(env.ACCOUNT_VAULT_TOKEN_SECRET || "")
+    },
     googleMapsApiKey: googleMapsServerApiKey,
     googleMaps: {
       serverApiKey: googleMapsServerApiKey,

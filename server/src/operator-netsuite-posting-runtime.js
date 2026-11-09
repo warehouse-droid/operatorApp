@@ -5,12 +5,16 @@ import {
   completeOperatorNetSuitePostingCommand,
   failOperatorNetSuitePostingCommand,
   getOperatorNetSuitePostingCommand,
+  listOperatorNetSuitePostingAttentionCommands,
   listRunnableOperatorNetSuitePostingCommandIds,
+  markOperatorNetSuitePostingAttemptRemote,
   markOperatorNetSuitePostingCommandAttention,
+  operatorNetSuitePostingBaselineTransactionId,
   recordOperatorNetSuitePostingStepFailure,
   recordOperatorNetSuitePostingStepSuccess,
   renewOperatorNetSuitePostingLease,
   resumeDueOperatorNetSuitePostingAutoRetries,
+  resumeOperatorNetSuitePostingCommand,
   scheduleOperatorNetSuitePostingAutoRetry,
   startOperatorNetSuitePostingAttempt
 } from "./operator-netsuite-posting-repository.js";
@@ -20,6 +24,7 @@ import { POSTING_AUTO_RETRY_LIMIT } from "./posting-auto-retry-policy.js";
 import { operatorNetSuitePostingAdapter } from "./operator-netsuite-posting-netsuite-adapter.js";
 import { finalizeOperatorNetSuitePosting, lockOperatorNetSuitePostingFinalization } from "./operator-netsuite-posting-finalizer.js";
 import { createOperatorNetSuitePostingProcessor } from "./operator-netsuite-posting-service.js";
+import { createOperatorAttentionReconciler, throttled } from "./netsuite-attention-reconciliation.js";
 
 /**
  * @param {object} dependencies
@@ -27,8 +32,10 @@ import { createOperatorNetSuitePostingProcessor } from "./operator-netsuite-post
  * @param {() => Promise<string[]>} dependencies.listRunnable
  * @param {(error: Error, commandId: string) => void} dependencies.logError
  * @param {() => Promise<unknown>} [dependencies.resumeDueAutoRetries]
+ * @param {() => Promise<unknown>} [dependencies.reconcileAttention] throttled; runs in the background
  */
-export function createOperatorNetSuitePostingRuntime({ process: processCommand, listRunnable, logError, resumeDueAutoRetries }) {
+export function createOperatorNetSuitePostingRuntime({ process: processCommand, listRunnable, logError, resumeDueAutoRetries,
+  reconcileAttention }) {
   const inFlight = new Map();
 
   function enqueue(/** @type {unknown} */ value) {
@@ -52,6 +59,11 @@ export function createOperatorNetSuitePostingRuntime({ process: processCommand, 
     if (resumeDueAutoRetries) {
       try {await resumeDueAutoRetries();} catch (error) {logError(/** @type {Error} */ (error), "automatic-retry");}
     }
+    if (reconcileAttention) {
+      // Never delays posting; a re-queued command is picked up by a later tick.
+      void Promise.resolve().then(reconcileAttention)
+        .catch((error) => logError(/** @type {Error} */ (error), "attention-reconciliation"));
+    }
     const commandIds = await listRunnable();
     await Promise.all(commandIds.map((commandId) => enqueue(commandId)));
     return { discovered: commandIds.length };
@@ -65,6 +77,7 @@ const repository = {
   claim: claimOperatorNetSuitePostingCommand,
   renew: renewOperatorNetSuitePostingLease,
   startAttempt: startOperatorNetSuitePostingAttempt,
+  markAttemptRemote: markOperatorNetSuitePostingAttemptRemote,
   success: recordOperatorNetSuitePostingStepSuccess,
   failure: recordOperatorNetSuitePostingStepFailure,
   attention: markOperatorNetSuitePostingCommandAttention,
@@ -90,6 +103,29 @@ async function resumeDueAutoRetriesWithAudit() {
   });
 }
 
+/**
+ * NetSuite shows this attention posting complete: re-queue it for verification (no re-post
+ * authorization). The processor re-checks under its lease, then completes and finalizes it.
+ * @param {string} commandId @param {Record<string, any>} evidence
+ */
+export async function requeueReconciledAttention(commandId, evidence) {
+  return withTransaction(async () => {
+    const resumed = await resumeOperatorNetSuitePostingCommand(commandId);
+    await writeAudit({ actorType: "system", source: "admin", action: "operator_netsuite_posting.command.reconcile_resumed",
+      details: { commandId, ...evidence } });
+    return resumed;
+  });
+}
+
+const attentionReconciler = createOperatorAttentionReconciler({
+  listAttention: () => listOperatorNetSuitePostingAttentionCommands({ limit: 50 }),
+  baselineFor: operatorNetSuitePostingBaselineTransactionId,
+  findByExternalId: (step, direct) => operatorNetSuitePostingAdapter.findByExternalId(step, direct),
+  linkedTransactionsAfter: (step, baseline) => operatorNetSuitePostingAdapter.linkedTransactionsAfter(step, baseline),
+  sourceFulfillment: (step) => operatorNetSuitePostingAdapter.sourceFulfillment(step),
+  requeue: requeueReconciledAttention
+});
+
 const processor = createOperatorNetSuitePostingProcessor({
   repository,
   adapter: operatorNetSuitePostingAdapter,
@@ -102,6 +138,10 @@ export const operatorNetSuitePostingRuntime = createOperatorNetSuitePostingRunti
   process: processor.process,
   listRunnable: () => listRunnableOperatorNetSuitePostingCommandIds({ limit: 25 }),
   resumeDueAutoRetries: resumeDueAutoRetriesWithAudit,
+  reconcileAttention: throttled(() => attentionReconciler.run({
+    log: (error, commandId) => console.error(`Operator NetSuite attention reconciliation for ${commandId} failed:`,
+      error instanceof Error ? error.message : String(error))
+  })),
   logError: (error, commandId) => {
     console.error(`Operator NetSuite posting command ${commandId} worker failed:`, error.message);
   }

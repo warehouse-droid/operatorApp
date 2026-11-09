@@ -6558,6 +6558,26 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     });
   }
 
+  // A planned split keeps its own Planned status over the family's
+  // reconciliation status. Callers that build rows from order lists (SCM PO
+  // responses, Dispatch orders) do not say whether the split is planned, so
+  // look it up the same way the SCM PO catalog does instead of assuming not.
+  const unstatedPlanSplitRefs = [...new Set(sourceRows
+    .filter((row) => text(row.orderKind).toUpperCase() === "PO"
+      && row.isScmSplit === true
+      && typeof row.dispatchPlanned !== "boolean")
+    .map((row) => text(row.orderRef).toLowerCase())
+    .filter(Boolean))];
+  const activelyPlannedSplitRefs = new Set(unstatedPlanSplitRefs.length
+    ? (await query(
+      `SELECT DISTINCT lower(assignment.order_ref) AS order_ref
+         FROM dispatch_plan_order_assignments assignment
+         JOIN dispatch_plans plan ON plan.id = assignment.plan_id
+        WHERE plan.status <> 'cancelled'
+          AND lower(assignment.order_ref) = ANY($1::text[])`,
+      [unstatedPlanSplitRefs]
+    )).rows.map((planned) => planned.order_ref)
+    : []);
   const completedView = text(view).toLowerCase() === "completed";
   const enriched = [];
   for (const row of sourceRows) {
@@ -6566,6 +6586,8 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
       if (!reviewOnly) enriched.push(row);
       continue;
     }
+    const hasActivePlan = row.dispatchPlanned === true
+      || activelyPlannedSplitRefs.has(text(row.orderRef).toLowerCase());
     let match = Number(row.sourceId) > 0
       ? { state: direct.get(`${kind}:${Number(row.sourceId)}`), target: null }
       : null;
@@ -6661,7 +6683,7 @@ export async function enrichScmScheduleWithReconciliation(rows = [], {
     const preserveManualSplitOperationalStatus = kind === "PO"
       && row.isScmSplit === true
       && scmManualSplitHasOperationalStatusAuthority(row.status, {
-        hasActivePlan: row.dispatchPlanned === true,
+        hasActivePlan,
         derivedStatus: row.calculatedStatus
       });
     const scheduleReviewBlocked = !preserveManualSplitOperationalStatus

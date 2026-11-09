@@ -1,4 +1,4 @@
-import { hasActiveTransaction, query } from "./db.js";
+import { hasActiveTransaction, query, withTransaction } from "./db.js";
 import { enrichYardMovementEvidence } from "./movement-record-evidence.js";
 import { salesStoreLocationIdSql } from "./sales-store.js";
 import {
@@ -25,6 +25,13 @@ const SALES_ORDER_MOVEMENT_TYPES = new Set(["sales_order", "sor_order"]);
 const SOR_DELIVERY_REF_SQL = "'^SOR[0-9]+(-S[0-9]+)?$'";
 const SOR_TRANSPORT_REF_SQL = "'^SOR[0-9]+(-S[0-9]+)?(-Return)?$'";
 const SOR_RETURN_KIND_SQL = "'sor_rental_return'";
+// Match priority of a Driver reference to a dispatch SO split (e.g. SOA10724-S1)
+// that was never materialized as its own sales order: it belongs to the parent.
+const SPLIT_PARENT_MATCH_PRIORITY = 15;
+const UNMATERIALIZED_SO_SPLIT_SQL = (splitRefExpression) => `NOT EXISTS (
+  SELECT 1 FROM sales_orders own
+   WHERE LOWER(BTRIM(own.tranid)) = LOWER(BTRIM(${splitRefExpression}))
+)`;
 
 function salesOrderTypeSql(tranidExpression) {
   return `CASE
@@ -270,7 +277,15 @@ function selectedOrderReferencesSql() {
     ['custom_order', 'dispatch_custom_orders', 'id', 'ref_number'],
     ['sor_return', 'dispatch_custom_orders', 'id', 'ref_number']
   ].map(([type, table, id, reference]) => `SELECT LOWER(BTRIM(${reference})) FROM ${table}
-    WHERE $2::text = '${type}' AND ${id} = $3::bigint`).join('\nUNION ALL\n');
+    WHERE $2::text = '${type}' AND ${id} = $3::bigint`).concat(`SELECT LOWER(BTRIM(split.split_ref))
+      FROM sales_orders parent
+      JOIN dispatch_global_order_splits split
+        ON split.order_type = 'SO'
+       AND split.definition_kind = 'split'
+       AND LOWER(BTRIM(split.parent_order_ref)) = LOWER(BTRIM(parent.tranid))
+     WHERE $2::text IN ('sales_order', 'sor_order')
+       AND parent.netsuite_id = $3::bigint
+       AND ${UNMATERIALIZED_SO_SPLIT_SQL("split.split_ref")}`).join('\nUNION ALL\n');
 }
 
 function driverOrderCtes({ fromParam = null, toParam = null, selectedOrder = false } = {}) {
@@ -337,6 +352,28 @@ function driverOrderCtes({ fromParam = null, toParam = null, selectedOrder = fal
         FROM driver_record_refs refs
         JOIN sales_orders o
           ON LOWER(BTRIM(o.tranid)) = LOWER(BTRIM(refs.order_ref))
+      UNION ALL
+      -- A Driver delivering an SO split that has no sales order of its own
+      -- (the yard loaded the parent) is shown on the parent order's record.
+      SELECT refs.*,
+             'outbound'::text,
+             ${salesOrderTypeSql("o.tranid")},
+             o.netsuite_id,
+             o.tranid,
+             o.customer,
+             ${salesOrderYardLocationIdSql("o")},
+             ${salesOrderYardLocationSql("o")},
+             NULL::text,
+             o.outbound_location,
+             ${SPLIT_PARENT_MATCH_PRIORITY}
+        FROM driver_record_refs refs
+        JOIN dispatch_global_order_splits split
+          ON split.order_type = 'SO'
+         AND split.definition_kind = 'split'
+         AND LOWER(BTRIM(split.split_ref)) = LOWER(BTRIM(refs.order_ref))
+        JOIN sales_orders o
+          ON LOWER(BTRIM(o.tranid)) = LOWER(BTRIM(split.parent_order_ref))
+       WHERE ${UNMATERIALIZED_SO_SPLIT_SQL("refs.order_ref")}
       UNION ALL
       SELECT refs.*,
              'inbound', 'purchase_order', o.netsuite_id,
@@ -445,7 +482,8 @@ function recordEventsSql() {
            NULL::text AS driver_name,
            NULL::text AS driver_login,
            NULL::text AS truck_plate,
-           NULL::text AS stop_type
+           NULL::text AS stop_type,
+           NULL::text AS split_ref
       FROM movement_records movement
     UNION ALL
     SELECT event.direction,
@@ -481,7 +519,9 @@ function recordEventsSql() {
            event.driver_name,
            event.driver_login,
            event.truck_plate,
-           event.stop_type
+           event.stop_type,
+           CASE WHEN event.match_priority = ${SPLIT_PARENT_MATCH_PRIORITY}
+             THEN BTRIM(event.order_ref) END
       FROM driver_order_events event
   `;
 }
@@ -736,10 +776,17 @@ function movementFilterParams({
     params.push(normalizedDirection);
     clauses.push(`movement.direction = $${params.length}`);
   }
-  const normalizedType = String(orderType || "").trim().toLowerCase();
-  if (VALID_ORDER_TYPES.has(normalizedType)) {
-    params.push(normalizedType);
+  // One type per tab; the SO tab asks for "sales_order,sor_order" so SOR rental
+  // deliveries are listed with the other sales orders.
+  const normalizedTypes = [...new Set(String(orderType || "").split(",")
+    .map((type) => type.trim().toLowerCase())
+    .filter((type) => VALID_ORDER_TYPES.has(type)))];
+  if (normalizedTypes.length === 1) {
+    params.push(normalizedTypes[0]);
     clauses.push(`movement.order_type = $${params.length}`);
+  } else if (normalizedTypes.length > 1) {
+    params.push(normalizedTypes);
+    clauses.push(`movement.order_type = ANY($${params.length}::text[])`);
   }
   const salesStoreScoped = Array.isArray(allowedSalesStoreLocationIds);
   const locationIdSql = salesStoreScoped
@@ -773,8 +820,20 @@ function movementFilterParams({
   const orderTerm = String(search || "").trim();
   if (orderTerm) {
     params.push(`%${orderTerm}%`);
+    const term = `$${params.length}`;
+    // Split and group references are written with and without the hyphen
+    // (SOA10724-S1 / SOA10724S1 in GOA-10724S1-10878S1).
+    const compact = (expression) => `REPLACE(${expression}, '-', '')`;
+    const groupMemberRefs = `SELECT LOWER(BTRIM(member.order_ref))
+          FROM dispatch_plan_order_assignments member
+         WHERE NULLIF(BTRIM(member.planned_order_ref), '') IS NOT NULL
+           AND ${compact("member.planned_order_ref")} ILIKE ${compact(term)}`;
     clauses.push(`(
-      movement.tranid ILIKE $${params.length}
+      movement.tranid ILIKE ${term}
+      OR ${compact("movement.tranid")} ILIKE ${compact(term)}
+      OR ${compact("COALESCE(movement.split_ref, '')")} ILIKE ${compact(term)}
+      OR LOWER(BTRIM(movement.tranid)) IN (${groupMemberRefs})
+      OR LOWER(BTRIM(COALESCE(movement.split_ref, ''))) IN (${groupMemberRefs})
       OR COALESCE(movement.party, '') ILIKE $${params.length}
       OR movement.order_id::text ILIKE $${params.length}
       OR COALESCE(movement.source_location, '') ILIKE $${params.length}
@@ -803,29 +862,25 @@ function movementFilterParams({
       ))
     )`);
   }
+  // Item search is a condition on movement_lines, applied by listYardMovements as a set
+  // intersection (see there), not a per-movement EXISTS.
+  let itemWhere = null;
   const itemTerm = String(itemSearch || "").trim();
   if (itemTerm) {
     params.push(`%${itemTerm}%`);
-    clauses.push(`EXISTS (
-      SELECT 1
-        FROM movement_lines line
-       WHERE line.direction = movement.direction
-         AND line.order_type = movement.order_type
-         AND line.order_id = movement.order_id
-         AND (
+    itemWhere = `(
            COALESCE(line.item_name, '') ILIKE $${params.length}
            OR COALESCE(line.sku, '') ILIKE $${params.length}
            OR COALESCE(line.item_description, '') ILIKE $${params.length}
            OR line.item_id::text ILIKE $${params.length}
-         )
-    )`);
+         )`;
   }
   const driverLogin = String(driver || "").trim();
   if (driverLogin && driverLogin.toLowerCase() !== "all") {
     params.push(driverLogin);
     clauses.push(`LOWER(BTRIM(COALESCE(movement.driver_login, ''))) = LOWER(BTRIM($${params.length}))`);
   }
-  return { params, where: clauses.join("\n       AND "), fromDate, toDate };
+  return { params, where: clauses.join("\n       AND "), itemWhere, fromDate, toDate };
 }
 
 function movementSummaryColumns(alias = "movement") {
@@ -834,6 +889,11 @@ function movementSummaryColumns(alias = "movement") {
     ${alias}.order_type,
     ${alias}.order_id,
     ARRAY_AGG(DISTINCT ${alias}.event_key) AS record_keys,
+    COALESCE(
+      ARRAY_AGG(DISTINCT ${alias}.split_ref ORDER BY ${alias}.split_ref)
+        FILTER (WHERE ${alias}.split_ref IS NOT NULL),
+      ARRAY[]::text[]
+    ) AS split_refs,
     (ARRAY_AGG(${alias}.tranid ORDER BY ${alias}.activity_at DESC))[1] AS tranid,
     (ARRAY_AGG(${alias}.party ORDER BY ${alias}.activity_at DESC))[1] AS party,
     (ARRAY_AGG(${alias}.yard_location_id ORDER BY ${alias}.activity_at DESC))[1] AS yard_location_id,
@@ -871,14 +931,44 @@ function movementSummaryColumns(alias = "movement") {
   `;
 }
 
+const MOVEMENT_LIST_STATEMENT_TIMEOUT = "30s";
+
+// A runaway list query must not hold database CPU for minutes (2026-11-05: three
+// item searches ran 8 minutes and slowed every page); fail it with a clear message.
+async function runMovementListQuery(sql, params) {
+  if (hasActiveTransaction()) return query(sql, params);
+  try {
+    return await withTransaction(async () => {
+      await query(`SET LOCAL statement_timeout = '${MOVEMENT_LIST_STATEMENT_TIMEOUT}'`);
+      return query(sql, params);
+    });
+  } catch (error) {
+    if (error?.code === "57014") {
+      throw Object.assign(new Error("The In/Outbound search took too long. Narrow the dates or the search, then try again."), {
+        status: 400,
+        code: "MOVEMENT_QUERY_TIMEOUT"
+      });
+    }
+    throw error;
+  }
+}
+
 export async function listYardMovements(filters = {}) {
-  const { params, where } = movementFilterParams(filters);
-  const result = await query(
-    `${movementCtes({ fromParam: 1, toParam: 2 })},
+  const { params, where, itemWhere } = movementFilterParams(filters);
+  // record_events has no statistics, so the planner expects one row after any
+  // filter. A correlated EXISTS over movement_lines was therefore re-run (whole
+  // line union, parallel workers) for every movement; an all-dates item search
+  // took minutes. Intersecting two order-key sets computes each side once.
+  const result = await runMovementListQuery(
+    `${movementCtes({ fromParam: 1, toParam: 2, lines: Boolean(itemWhere) })},
      matching_orders AS (
-       SELECT DISTINCT movement.direction, movement.order_type, movement.order_id
+       SELECT ${itemWhere ? "" : "DISTINCT "}movement.direction, movement.order_type, movement.order_id
          FROM record_events movement
         WHERE ${where}
+       ${itemWhere ? `INTERSECT
+       SELECT line.direction, line.order_type, line.order_id
+         FROM movement_lines line
+        WHERE ${itemWhere}` : ""}
      )
      SELECT ${movementSummaryColumns()}
        FROM record_events movement

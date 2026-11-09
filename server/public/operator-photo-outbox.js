@@ -1,7 +1,7 @@
 (function operatorPhotoOutbox(/** @type {Window & {OperatorPhotoOutbox?: any}} */ global) {
   "use strict";
   /** @typedef {{id: string, sha256: string, byteSize: number, mimeType: string}} PhotoManifest */
-  /** @typedef {PhotoManifest & {blob: Blob, actorId: string, actionId: string, attempt: number, nextAttemptAt: number, leaseUntil: number, leaseToken?: string}} QueuedPhoto */
+  /** @typedef {PhotoManifest & {blob: Blob, actorId: string, actionId: string, attempt: number, nextAttemptAt: number, leaseUntil: number, leaseToken?: string, missingSince?: number}} QueuedPhoto */
   /** @typedef {{actorId: () => string | null, request: (path: string, options?: RequestInit) => Promise<any>, status?: (state: {count: number, retrying: boolean}) => void}} Configuration */
   /** @type {Promise<IDBDatabase> | undefined} */
   let database;
@@ -10,6 +10,12 @@
   let running = false, resumeQueued = false;
   /** @type {number | undefined} */
   let timer;
+  // Photos are stored before their confirmation is sent. When the server answers that the confirmation does
+  // not exist (it was rejected, or the operator left before it was sent), the photos belong to nothing. They
+  // are kept for a day, because a slow or re-sent confirmation with the same request id still attaches them,
+  // and then discarded so the device stops retrying and the "photos waiting" notice clears.
+  const MISSING_CONFIRMATION_GRACE_MS = 24 * 60 * 60 * 1000;
+  const MISSING_CONFIRMATION_RETRY_MS = 10 * 60 * 1000;
 
   function open() {
     if (database) return database;
@@ -100,16 +106,38 @@
     });
   }
 
-  /** @param {QueuedPhoto} photo @param {boolean} succeeded */
-  async function finish(photo, succeeded) {
-    await transaction(["photos"], "readwrite", tx => {
+  /** @param {IDBTransaction} tx @param {QueuedPhoto} photo */
+  function discard(tx, photo) {
+    const photos = tx.objectStore("photos");
+    photos.delete(photo.id);
+    let remaining = false;
+    const cursor = photos.openCursor();
+    cursor.onsuccess = () => {
+      const row = cursor.result;
+      if (!row) {
+        if (!remaining) tx.objectStore("actions").delete(photo.actionId);
+        return;
+      }
+      if (row.value.actionId === photo.actionId && row.value.id !== photo.id) remaining = true;
+      row.continue();
+    };
+  }
+
+  /** @param {QueuedPhoto} photo @param {boolean} succeeded @param {boolean} [missing] */
+  async function finish(photo, succeeded, missing = false) {
+    await transaction(["photos", "actions"], "readwrite", tx => {
       const store = tx.objectStore("photos"), request = store.get(photo.id);
       request.onsuccess = () => {
         const current = request.result;
         if (!current || current.leaseToken !== photo.leaseToken) return;
         if (succeeded) { store.delete(photo.id); return; }
+        const now = Date.now();
+        if (missing) {
+          if (!current.missingSince) current.missingSince = now;
+          if (now - current.missingSince >= MISSING_CONFIRMATION_GRACE_MS) { discard(tx, current); return; }
+        }
         current.attempt += 1; current.leaseUntil = 0;
-        current.nextAttemptAt = Date.now() + Math.min(60000, 2000 * 2 ** Math.min(current.attempt, 5));
+        current.nextAttemptAt = now + (missing ? MISSING_CONFIRMATION_RETRY_MS : Math.min(60000, 2000 * 2 ** Math.min(current.attempt, 5)));
         store.put(current);
       };
     });
@@ -119,8 +147,15 @@
   async function transfer(photo) {
     if (!configuration) throw new Error("Operator photo queue is not ready.");
     const action = await read("actions", photo.actionId);
+    if (!action) throw Object.assign(new Error("Photo confirmation is missing on this device."), { missingConfirmation: true });
     if (!action.accepted) {
-      const accepted = await configuration.request(`/api/operator/photo-actions/${photo.actionId}`);
+      let accepted;
+      try { accepted = await configuration.request(`/api/operator/photo-actions/${photo.actionId}`); }
+      catch (error) {
+        // 404: the server has no confirmation with this id for this operator (never saved).
+        if (/** @type {any} */ (error)?.status === 404) throw Object.assign(new Error("Photo confirmation was never saved."), { missingConfirmation: true });
+        throw error;
+      }
       const acceptedPhotos = /** @type {PhotoManifest[]} */ (accepted.photos);
       if (!acceptedPhotos.some(row => row.id === photo.id && row.sha256 === photo.sha256)) throw new Error("Photo identity changed.");
       action.accepted = true;
@@ -145,9 +180,10 @@
       for (let index = 0; index < 20 && configuration.actorId() === actorId; index += 1) {
         const photo = await claim(actorId);
         if (!photo) break;
-        let succeeded = false;
-        try { await transfer(photo); succeeded = true; } catch { /* Keep bytes for a later attempt. */ }
-        await finish(photo, succeeded);
+        let succeeded = false, missing = false;
+        try { await transfer(photo); succeeded = true; }
+        catch (error) { missing = /** @type {any} */ (error)?.missingConfirmation === true; /* Otherwise keep bytes for a later attempt. */ }
+        await finish(photo, succeeded, missing);
         await updateStatus();
       }
     } finally {

@@ -1,0 +1,163 @@
+diff --git a/server/public/control.js b/server/public/control.js
+--- a/server/public/control.js
++++ b/server/public/control.js
+@@ -242,6 +242,8 @@
+   if (activeSection === "count-sheets") { void controlCountSheets.load(); return; }
+   if (activeSection === "damage-stock") { void controlDamage.load(); return; }
+   render();
++  // An Admin tab loads its own data when it is opened.
++  if (IS_ADMIN_PAGE && operator) void loadControlData().catch((error) => console.warn(error));
+ }
+ 
+ let token = readStaffToken();
+@@ -410,6 +412,8 @@
+ let auditResourceFocus = -1;
+ // The From/To to return to after a click on the resources chart narrowed them.
+ let auditResourcesZoomFrom = null;
++// The Audit Log searches only when Apply / Refresh (or a drill-down) is clicked, never on opening a page.
++let auditSearched = false;
+ let syncMaxRunMinutesDraft = null;
+ 
+ async function request(path, options = {}) {
+@@ -1945,8 +1949,8 @@
+         </button>
+         <button class="metric-card" data-action="control-section" data-section="audit" type="button">
+           <span>${t("control.auditLog", "Audit Log")}</span>
+-          <strong>${audit.length}</strong>
+-          <em>user, NetSuite, system and error records loaded</em>
++          <strong>${t("control.auditSearch", "Search")}</strong>
++          <em>user, NetSuite, system and error records (loads on Apply)</em>
+         </button>
+       </div>
+       <section class="panel">
+@@ -4793,7 +4797,7 @@
+       <div class="section-heading">
+         <div>
+           <h2>${t("control.auditLog", "Audit Log")}</h2>
+-          <p class="muted">${t("control.latest", "Latest")} ${audit.length} ${t("control.records", "records")} · ${t("control.auditScope", "user actions, NetSuite postings, reconciliation, background jobs, failed requests and browser errors")}</p>
++          <p class="muted">${auditSearched ? `${t("control.latest", "Latest")} ${audit.length} ${t("control.records", "records")} · ` : ""}${t("control.auditScope", "user actions, NetSuite postings, reconciliation, background jobs, failed requests and browser errors")}</p>
+         </div>
+         <button data-action="load-audit">${t("common.refresh", "Refresh")}</button>
+       </div>
+@@ -4862,8 +4866,9 @@
+         ` : ""}
+       </div>
+       ${auditLoadError ? `<div class="notice warning">${escapeHtml(auditLoadError)}</div>` : ""}
+-      ${renderAuditResources()}
+-      ${renderAudit()}
++      ${auditSearched ? `${renderAuditResources()}${renderAudit()}` : `
++        <p class="muted audit-not-loaded">${t("control.auditNotLoaded", "Choose filters and click Apply to load the Audit Log.")}</p>
++      `}
+       ${auditHasMore ? `
+         <div class="audit-load-more">
+           <button data-action="load-more-audit" type="button" ${auditLoadingMore ? "disabled" : ""}>${auditLoadingMore ? t("common.loading", "Loading…") : t("control.auditLoadOlder", "Load older records")}</button>
+@@ -5066,6 +5071,7 @@
+ }
+ 
+ async function loadAudit() {
++  auditSearched = true;
+   const resources = loadAuditResources();
+   try {
+     audit = await request(auditQueryString());
+@@ -5893,6 +5899,39 @@
+   }
+ }
+ 
++// Admin tabs load the data they show when they are opened, not every tab's data on every page.
++// The Audit Log runs no search until Apply / Refresh; the SOR auto-returns panel loads itself.
++const ADMIN_SECTION_DATA = {
++  dashboard: ["operators", "syncSettings", "photoArchive", "mapsUsage", "returnSettings"],
++  operators: ["operators", "aggregateAccess", "publicSales"],
++  sync: ["syncSettings", "m2m", "envSettings", "mirror"],
++  "maps-usage": ["mapsUsage"],
++  reconciliation: ["reconciliation"],
++  "return-automation": ["returnSettings", "returnNotifications"],
++  storage: ["photoArchive"],
++  performance: ["performance"],
++  audit: [],
++  "sor-auto-returns": []
++};
++const ADMIN_DATA_LOADERS = {
++  operators: async () => { operators = await request("/api/operators"); },
++  aggregateAccess: async () => { aggregateAccess = await request("/api/admin/aggregate-request-access"); },
++  publicSales: async () => { publicSalesSettings = await request("/api/admin/public-sales"); },
++  syncSettings: async () => { syncSettings = await request("/api/control/sync-settings"); },
++  m2m: async () => { netsuiteM2mStatus = await request("/api/admin/netsuite-m2m"); },
++  envSettings: async () => { envSettings = await request("/api/control/env-settings"); },
++  mirror: async () => { mirrorStatus = await request("/api/admin/netsuite-mirror"); },
++  photoArchive: async () => { photoArchiveSettings = await request("/api/admin/photo-archive"); },
++  mapsUsage: async () => {
++    mapsUsage = await request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message }));
++  },
++  returnSettings: () => loadAdminReturnSettings(),
++  returnNotifications: () => loadReturnNotificationSettings(),
++  reconciliation: () => loadScmReconciliationControl(),
++  // The report can take seconds; the tab shows "Loading…" and renders when it arrives, as before.
++  performance: async () => { void loadPerformance().then(() => render()); }
++};
++
+ async function loadControlData() {
+   if (!IS_ADMIN_PAGE && activeSection === "reopen") return controlOrderReopen.load();
+   if (!IS_ADMIN_PAGE && activeSection === "count-sheets") return controlCountSheets.load();
+@@ -5904,47 +5943,9 @@
+     return render();
+   }
+   if (IS_ADMIN_PAGE) {
+-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage, nextAggregateAccess] = await Promise.all([
+-      request("/api/operators"),
+-      // Filter options aggregate 30 days of audit rows; they load after the page instead of delaying it.
+-      Promise.resolve(auditOptions),
+-      request(auditQueryString()).catch((error) => {
+-        auditLoadError = error.message;
+-        return [];
+-      }),
+-      request("/api/control/sync-settings"),
+-      request("/api/admin/netsuite-m2m"),
+-      request("/api/control/env-settings"),
+-      request("/api/admin/photo-archive"),
+-      request("/api/admin/netsuite-mirror"),
+-      request("/api/admin/public-sales"),
+-      request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message })),
+-      request("/api/admin/aggregate-request-access")
+-    ]);
+-    operators = nextOperators;
+-    aggregateAccess = nextAggregateAccess;
+-    auditOptions = nextAuditOptions;
+-    audit = nextAudit;
+-    auditHasMore = audit.length >= Number(auditFilters.limit || 200);
+-    void loadAuditOptions().then(() => {
+-      if (activeSection === "audit") render();
+-    });
+-    void loadAuditResources().then(() => {
+-      if (activeSection === "audit") render();
+-    });
+-    if (activeSection === "performance") void loadPerformance().then(() => render());
+-    syncSettings = nextSyncSettings;
+-    netsuiteM2mStatus = nextM2mStatus;
+-    envSettings = nextEnvSettings;
+-    photoArchiveSettings = nextPhotoArchiveSettings;
+-    mirrorStatus = nextMirrorStatus;
+-    publicSalesSettings = nextPublicSalesSettings;
+-    mapsUsage = nextMapsUsage;
+-    await Promise.all([
+-      loadAdminReturnSettings(),
+-      loadReturnNotificationSettings(),
+-      loadScmReconciliationControl()
+-    ]);
++    // Only the open tab's data (2026-11-06: every tab waited ~30 s for a remembered Audit Log search).
++    const keys = ADMIN_SECTION_DATA[activeSection] ?? ADMIN_SECTION_DATA.dashboard;
++    await Promise.all(keys.map((key) => ADMIN_DATA_LOADERS[key]()));
+   } else {
+     classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
+     cycleRecords = await request("/api/cycle-count/records?limit=50");
+diff --git a/server/public/admin.html b/server/public/admin.html
+--- a/server/public/admin.html
++++ b/server/public/admin.html
+@@ -19,6 +19,6 @@
+     <script src="/sor-admin.js?v=20260924-sor-gate-v1"></script>
+     <script src="/admin-dispatch-editors.js?v=20261015-editor-controls"></script>
+     <script src="/yard-movement-requests.js?v=20261022-yard-speed-v1"></script>
+-    <script src="/control.js?v=20261022-aggregate-nightly-labels-v1&returnNotifications=1&returnCmOnly=1&stockExchange=20261029&sorRecords=20261103-2&auditLog=20261105-1&resources=20261105-1&perf=20261106-1"></script>
++    <script src="/control.js?v=20261022-aggregate-nightly-labels-v1&returnNotifications=1&returnCmOnly=1&stockExchange=20261029&sorRecords=20261103-2&auditLog=20261105-1&resources=20261105-1&perf=20261106-1&adminLazy=20261106-1"></script>
+   </body>
+ </html>

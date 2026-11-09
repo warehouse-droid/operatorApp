@@ -3806,6 +3806,17 @@ html[data-operator-phone="true"] #app[data-module="pallet-return"] .topbar :is(b
   white-space: nowrap;
 }
 
+/* Tapping a return quantity opens the number pad (operator-stepper-keypad.js). */
+.return-quantity-stepper [data-return-quantity-value] {
+  cursor: pointer;
+  caret-color: transparent;
+}
+
+.return-quantity-stepper [data-return-quantity-value]:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+}
+
 .return-photo-button {
   min-height: 42px;
   padding: 5px 10px;

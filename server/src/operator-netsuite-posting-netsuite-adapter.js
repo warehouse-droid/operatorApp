@@ -5,6 +5,7 @@ import {
   fetchItemReceiptFromNetSuite,
   fetchPurchaseOrderHistorySnapshotFromNetSuite,
   fetchSalesOrderFulfillmentStateFromNetSuite,
+  findLinkedPostingTransactionsAfter,
   findOperatorNetSuitePostingTransactionByExternalId,
   postIfirViaNetSuiteRestlet,
   transformPurchaseOrderToItemReceipt,
@@ -85,6 +86,7 @@ async function recheckKitSource(step, readSource) {
  * @param {Function} [dependencies.fetchSalesOrderFulfillmentSource]
  * @param {Function} [dependencies.checkTransferPosting]
  * @param {Function|null} [dependencies.postIfirRestlet]
+ * @param {Function} [dependencies.findLinkedTransactionsAfter]
  */
 export function createOperatorNetSuitePostingAdapter({
   findTransactionByExternalId,
@@ -100,7 +102,8 @@ export function createOperatorNetSuitePostingAdapter({
   fetchDispatchFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
   fetchSalesOrderFulfillmentSource = (/** @type {number} */ id) => fetchSalesOrderFulfillmentStateFromNetSuite(id, { includeAllSourceLines: true }),
   checkTransferPosting = async () => {},
-  postIfirRestlet = null
+  postIfirRestlet = null,
+  findLinkedTransactionsAfter = findLinkedPostingTransactionsAfter
 }) {
   const endpointTypes = new WeakMap();
   // Source proof comes from our authenticated read or the validated RESTlet envelope.
@@ -135,6 +138,16 @@ export function createOperatorNetSuitePostingAdapter({
   }
 
   return {
+    /** IF/IR linked to the step's source order created after a baseline transaction ID. */
+    async linkedTransactionsAfter(/** @type {Record<string, any>} */ step, /** @type {number} */ afterTransactionId) {
+      return operatorNetSuiteRequestPool.run(() => findLinkedTransactionsAfter(
+        step.sourceNetSuiteId, step.transactionType, afterTransactionId));
+    },
+    /** Live line fulfillment of an SO:IF step's order (reconciliation only; null for other sources). */
+    async sourceFulfillment(/** @type {Record<string, any>} */ step) {
+      if (step.sourceOrderKind !== "SO" || step.transactionType !== "IF") {return null;}
+      return operatorNetSuiteRequestPool.run(() => fetchSalesOrderFulfillmentSource(step.sourceNetSuiteId));
+    },
     async findByExternalId(/** @type {Record<string, any>} */ step, direct = false) {
       const found = await operatorNetSuiteRequestPool.run(() => findTransactionByExternalId(
         step.externalId,

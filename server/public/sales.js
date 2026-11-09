@@ -333,6 +333,9 @@ function renderSalesMenu() {
           <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/returns'" type="button">
             <strong>Return Records</strong><span>Review your store's submitted stock and PALLET returns, photos, approval status, and estimated or actual credits.</span>
           </button>
+          <button class="dispatch-menu-card primary-card" onclick="location.href='/sales/account-applications'" type="button">
+            <strong>Account Applications</strong><span>Send a new customer an account application link, then follow it until Accounting approves the account.</span>
+          </button>
         `}
         <button class="dispatch-menu-card ${operator.publicSales ? "primary-card" : ""}" onclick="location.href='/sales/planning'" type="button">
           <strong>Dispatch Planning</strong><span>Review daily loads, routes, trucks, orders, and stops in permanent view-only mode.</span>

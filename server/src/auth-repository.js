@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { normalizeAccountEmail } from "./account-email.js";
 import { promisify } from "node:util";
 import { query, withTransaction } from "./db.js";
-import { trackSemanticAudit } from "./audit-context.js";
+import { trackSemanticAudit, withAuditRequestId } from "./audit-context.js";
 
 const scrypt = promisify(crypto.scrypt);
 const SESSION_DAYS = 14;
@@ -20,7 +20,8 @@ export const OPERATOR_ROLES = Object.freeze([
   "repair_office",
   "mbt_frontdesk",
   "mbt_billing",
-  "boss"
+  "boss",
+  "accounting"
 ]);
 export const SALES_YARD_LOCATION_IDS = Object.freeze([1, 28, 15, 26]);
 
@@ -62,6 +63,7 @@ export function operatorHomeRoute(value) {
   if (role === "mbr_sales") return "/mbr/contracts";
   if (role === "repair_technician") return "/repair/workshop";
   if (role === "repair_office") return "/repair";
+  if (role === "accounting") return "/accounting";
   if (role === "operator" && roles.has("mbt_frontdesk")) return "/mbt/frontdesk";
   if (role === "operator" && roles.has("mbt_billing")) return "/mbt/billing";
   if (role === "operator") return "/operator";
@@ -270,84 +272,113 @@ export async function writeAudit({
       action,
       orderId || null,
       lineId || null,
-      JSON.stringify(details || {})
+      JSON.stringify(withAuditRequestId(details || {}))
     ]
   ));
 }
 
-const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
-  SELECT
-    a.id::text AS id,
-    a.id AS legacy_sort_id,
-    'delivery'::text AS audit_stream,
-    a.actor_type,
-    a.actor_operator_id,
-    NULL::text AS actor_name,
-    a.source,
-    a.action,
-    a.order_id::text AS order_id,
-    a.order_id AS numeric_order_id,
-    a.line_id,
-    NULL::text AS entity_type,
-    NULL::text AS entity_id,
-    NULL::text AS load_id,
-    NULL::text AS truck_id,
-    NULL::text AS session_id,
-    NULL::bigint AS plan_id,
-    NULL::date AS plan_date,
-    NULL::jsonb AS before_state,
-    NULL::jsonb AS after_state,
-    a.details,
-    a.created_at
-  FROM delivery_audit_log a
-  UNION ALL
-  SELECT
-    a.id::text AS id,
-    a.id AS legacy_sort_id,
-    'dispatch'::text AS audit_stream,
-    COALESCE(NULLIF(a.operator_name, ''), 'operator') AS actor_type,
-    a.operator_id AS actor_operator_id,
-    a.operator_name AS actor_name,
-    a.source,
-    a.action,
-    a.order_id,
-    CASE WHEN a.order_id ~ '^[0-9]+$' THEN a.order_id::bigint ELSE NULL END AS numeric_order_id,
-    NULL::bigint AS line_id,
-    a.entity_type,
-    a.entity_id,
-    a.load_id,
-    a.truck_id,
-    a.session_id,
-    a.plan_id,
-    a.plan_date,
-    a.before_state,
-    a.after_state,
-    COALESCE(a.details, '{}'::jsonb) AS details,
-    a.created_at
-  FROM dispatch_audit_log a
-  UNION ALL
-  SELECT
-    a.audit_event_id::text AS id,
-    NULL::bigint AS legacy_sort_id,
-    'mbt'::text AS audit_stream,
-    a.actor_type,
-    a.actor_operator_id,
-    a.actor_operator_id AS actor_name,
-    a.source,
-    a.action,
-    NULL::text AS order_id,
-    NULL::bigint AS numeric_order_id,
-    NULL::bigint AS line_id,
-    a.entity_type,
-    a.entity_id,
-    NULL::text AS load_id,
-    NULL::text AS truck_id,
-    NULL::text AS session_id,
-    NULL::bigint AS plan_id,
-    NULL::date AS plan_date,
-    a.before_state,
-    a.after_state,
-    jsonb_strip_nulls(jsonb_build_object(
+// Columns every audit stream projects, in order. Streams fill the ones they have and NULL the rest.
+const AUDIT_COLUMNS = [
+  "id", "legacy_sort_id", "audit_stream", "category", "severity", "actor_type", "actor_operator_id",
+  "actor_name", "source", "action", "message", "request_id", "order_id", "numeric_order_id", "line_id",
+  "entity_type", "entity_id", "load_id", "truck_id", "session_id", "plan_id", "plan_date",
+  "before_state", "after_state", "details", "created_at"
+];
+const AUDIT_COLUMN_TYPES = {
+  id: "text", legacy_sort_id: "bigint", audit_stream: "text", category: "text", severity: "text",
+  actor_type: "text", actor_operator_id: "text", actor_name: "text", source: "text", action: "text",
+  message: "text", request_id: "text", order_id: "text", numeric_order_id: "bigint", line_id: "bigint",
+  entity_type: "text", entity_id: "text", load_id: "text", truck_id: "text", session_id: "text",
+  plan_id: "bigint", plan_date: "date", before_state: "jsonb", after_state: "jsonb", details: "jsonb",
+  created_at: "timestamptz"
+};
+
+function auditStreamSelect(columns, from) {
+  const unknown = Object.keys(columns).filter((column) => !AUDIT_COLUMNS.includes(column));
+  if (unknown.length) throw new Error(`Unknown audit columns: ${unknown.join(", ")}`);
+  const projected = AUDIT_COLUMNS.map((column) => (
+    columns[column] === undefined ? `NULL::${AUDIT_COLUMN_TYPES[column]} AS ${column}` : `${columns[column]} AS ${column}`
+  ));
+  return `SELECT\n    ${projected.join(",\n    ")}\n  ${from}`;
+}
+
+// Severity of application rows: HTTP 5xx and failed actions are errors; rejections are warnings.
+const DELIVERY_SEVERITY = `CASE
+      WHEN a.action ~* '(fail|error|crash)'
+        OR a.details->>'outcome' IN ('failed', 'error')
+        OR a.details->>'status' ~ '^5[0-9]{2}$' THEN 'error'
+      WHEN a.details->>'outcome' IN ('rejected', 'client_disconnected', 'uncertain')
+        OR a.details->>'status' ~ '^4[0-9]{2}$'
+        OR a.action ~* '(reject|warn|conflict|missing|timeout|expired)' THEN 'warning'
+      ELSE 'info'
+    END`;
+
+const AUDIT_STREAMS = [
+  auditStreamSelect({
+    id: "a.id::text",
+    legacy_sort_id: "a.id",
+    audit_stream: "'delivery'::text",
+    category: `CASE
+      WHEN a.source ILIKE 'netsuite%' OR a.action LIKE 'netsuite.%' OR a.action LIKE 'returns.netsuite.%' THEN 'netsuite'
+      WHEN a.actor_type IN ('operator', 'driver', 'anonymous') OR a.actor_operator_id IS NOT NULL THEN 'user'
+      ELSE 'system'
+    END`,
+    severity: DELIVERY_SEVERITY,
+    actor_type: "a.actor_type",
+    actor_operator_id: "a.actor_operator_id",
+    source: "a.source",
+    action: "a.action",
+    message: "COALESCE(a.details->>'errorMessage', a.details->>'error', a.details->>'message', a.details->>'reason')",
+    request_id: "a.details->>'auditRequestId'",
+    order_id: "a.order_id::text",
+    numeric_order_id: "a.order_id",
+    line_id: "a.line_id",
+    details: "a.details",
+    created_at: "a.created_at"
+  }, "FROM delivery_audit_log a"),
+  auditStreamSelect({
+    id: "a.id::text",
+    legacy_sort_id: "a.id",
+    audit_stream: "'dispatch'::text",
+    category: "CASE WHEN a.operator_id IS NOT NULL OR NULLIF(a.operator_name, '') IS NOT NULL THEN 'user' ELSE 'system' END",
+    severity: "CASE WHEN a.action ~* '(fail|error)' THEN 'error' WHEN a.action ~* '(reject|conflict|warn)' THEN 'warning' ELSE 'info' END",
+    actor_type: "COALESCE(NULLIF(a.operator_name, ''), 'operator')",
+    actor_operator_id: "a.operator_id",
+    actor_name: "a.operator_name",
+    source: "a.source",
+    action: "a.action",
+    message: "COALESCE(a.details->>'error', a.details->>'reason')",
+    request_id: "a.details->>'auditRequestId'",
+    order_id: "a.order_id",
+    numeric_order_id: "CASE WHEN a.order_id ~ '^[0-9]+$' THEN a.order_id::bigint ELSE NULL END",
+    entity_type: "a.entity_type",
+    entity_id: "a.entity_id",
+    load_id: "a.load_id",
+    truck_id: "a.truck_id",
+    session_id: "a.session_id",
+    plan_id: "a.plan_id",
+    plan_date: "a.plan_date",
+    before_state: "a.before_state",
+    after_state: "a.after_state",
+    details: "COALESCE(a.details, '{}'::jsonb)",
+    created_at: "a.created_at"
+  }, "FROM dispatch_audit_log a"),
+  auditStreamSelect({
+    id: "a.audit_event_id::text",
+    audit_stream: "'mbt'::text",
+    category: "CASE WHEN a.actor_operator_id IS NOT NULL THEN 'user' ELSE 'system' END",
+    severity: "'info'::text",
+    actor_type: "a.actor_type",
+    actor_operator_id: "a.actor_operator_id",
+    actor_name: "a.actor_operator_id",
+    source: "a.source",
+    action: "a.action",
+    message: "a.reason",
+    entity_type: "a.entity_type",
+    entity_id: "a.entity_id",
+    before_state: "a.before_state",
+    after_state: "a.after_state",
+    details: `jsonb_strip_nulls(jsonb_build_object(
       'auditEventId', a.audit_event_id,
       'actorRoles', a.actor_roles,
       'reason', a.reason,
@@ -356,37 +387,177 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
       'correlationId', a.correlation_id,
       'requestId', a.request_id,
       'idempotencyKey', a.idempotency_key
-    )) AS details,
-    a.occurred_at AS created_at
-  FROM mbt_audit_events a
-  UNION ALL
-  SELECT
-    'boss:' || e.id::text AS id,
-    e.id AS legacy_sort_id,
-    'boss_approval'::text AS audit_stream,
-    CASE WHEN e.actor_id IS NULL THEN 'system' ELSE 'operator' END AS actor_type,
-    e.actor_id AS actor_operator_id,
-    COALESCE(e.actor_name, 'NetSuite') AS actor_name,
-    'boss_approvals'::text AS source,
-    'boss.approval.' || e.kind AS action,
-    r.order_id::text AS order_id,
-    r.order_id AS numeric_order_id,
-    NULL::bigint AS line_id,
-    'boss_approval_request'::text AS entity_type,
-    r.id::text AS entity_id,
-    NULL::text AS load_id,
-    NULL::text AS truck_id,
-    NULL::text AS session_id,
-    NULL::bigint AS plan_id,
-    NULL::date AS plan_date,
-    NULL::jsonb AS before_state,
-    NULL::jsonb AS after_state,
-    jsonb_build_object('requestId', r.id, 'cycle', r.cycle,
+    ))`,
+    created_at: "a.occurred_at"
+  }, "FROM mbt_audit_events a"),
+  auditStreamSelect({
+    id: "'boss:' || e.id::text",
+    legacy_sort_id: "e.id",
+    audit_stream: "'boss_approval'::text",
+    category: "CASE WHEN e.actor_id IS NULL THEN 'system' ELSE 'user' END",
+    severity: "'info'::text",
+    actor_type: "CASE WHEN e.actor_id IS NULL THEN 'system' ELSE 'operator' END",
+    actor_operator_id: "e.actor_id",
+    actor_name: "COALESCE(e.actor_name, 'NetSuite')",
+    source: "'boss_approvals'::text",
+    action: "'boss.approval.' || e.kind",
+    order_id: "r.order_id::text",
+    numeric_order_id: "r.order_id",
+    entity_type: "'boss_approval_request'::text",
+    entity_id: "r.id::text",
+    details: `jsonb_build_object('requestId', r.id, 'cycle', r.cycle,
       'tranid', e.snapshot->>'tranid', 'decision', e.kind,
-      'snapshotCapturedAt', e.snapshot->>'refreshedAt', 'snapshot', e.snapshot) AS details,
-    e.created_at
-  FROM boss_approval_events e
-  JOIN boss_approval_requests r ON r.id=e.request_id
+      'snapshotCapturedAt', e.snapshot->>'refreshedAt', 'snapshot', e.snapshot)`,
+    created_at: "e.created_at"
+  }, `FROM boss_approval_events e
+  JOIN boss_approval_requests r ON r.id=e.request_id`),
+  // Failed and slow requests, process logs, crashes, NetSuite postings and browser errors.
+  auditStreamSelect({
+    id: "'sys:' || a.id::text",
+    legacy_sort_id: "a.id",
+    audit_stream: "'system'::text",
+    category: "a.category",
+    severity: "a.severity",
+    actor_type: "a.actor_type",
+    actor_operator_id: "a.actor_operator_id",
+    actor_name: "a.actor_name",
+    source: "a.source",
+    action: "a.action",
+    message: "a.message",
+    request_id: "a.request_id",
+    details: `jsonb_strip_nulls(jsonb_build_object(
+      'outcome', a.outcome,
+      'process', a.process_name,
+      'method', a.http_method,
+      'route', a.route,
+      'status', a.status_code,
+      'durationMs', a.duration_ms,
+      'errorCode', a.error_code,
+      'orderRef', a.order_ref,
+      'repeatCount', NULLIF(a.repeat_count, 1)
+    )) || a.details`,
+    created_at: "a.occurred_at"
+  }, "FROM system_audit_events a"),
+  // Every operator IF/IR posting attempt (receiving, customer pickup, delivery prep, TO and direct PO jobs).
+  auditStreamSelect({
+    id: "'post:' || t.id::text",
+    legacy_sort_id: "t.id",
+    audit_stream: "'netsuite_posting'::text",
+    category: "'netsuite'::text",
+    severity: "CASE t.outcome WHEN 'failed' THEN 'error' WHEN 'uncertain' THEN 'warning' ELSE 'info' END",
+    actor_type: "'operator'::text",
+    actor_operator_id: "c.actor_operator_id",
+    source: "'netsuite-posting'::text",
+    action: "'netsuite.posting.' || lower(s.transaction_type) || '.' || t.outcome",
+    message: `COALESCE(t.error, s.transaction_type || ' ' || t.outcome || ' for ' || s.source_order_kind || ' '
+      || COALESCE(NULLIF(s.source_order_ref, ''), s.source_netsuite_id::text) || ' (attempt ' || t.attempt_number || ')')`,
+    order_id: "s.source_netsuite_id::text",
+    numeric_order_id: "s.source_netsuite_id",
+    entity_type: "'operator_netsuite_posting_step'::text",
+    entity_id: "s.external_id",
+    details: `jsonb_strip_nulls(jsonb_build_object(
+      'commandId', c.id,
+      'commandRequestId', c.request_id,
+      'commandStatus', c.status,
+      'functionKey', c.function_key,
+      'transactionType', s.transaction_type,
+      'yard', c.yard_code,
+      'locationId', c.canonical_location_id,
+      'stepIndex', s.step_index,
+      'attempt', t.attempt_number,
+      'outcome', t.outcome,
+      'sourceOrderKind', s.source_order_kind,
+      'sourceOrderRef', NULLIF(s.source_order_ref, ''),
+      'externalId', s.external_id,
+      'startedAt', t.started_at,
+      'finishedAt', t.finished_at,
+      'error', t.error
+    )) || t.details`,
+    created_at: "t.started_at"
+  }, `FROM operator_netsuite_posting_attempts t
+  JOIN operator_netsuite_posting_steps s ON s.id = t.step_id
+  JOIN operator_netsuite_posting_commands c ON c.id = s.command_id`),
+  // Sales order Item Fulfillment automation (Dispatch completion -> NetSuite IF).
+  auditStreamSelect({
+    id: "'soif:' || e.id::text",
+    legacy_sort_id: "e.id",
+    audit_stream: "'so_fulfillment'::text",
+    category: "'netsuite'::text",
+    severity: "CASE WHEN e.action ~* '(fail|error)' THEN 'error' WHEN e.action ~* '(attention|reject|block|uncertain|mismatch)' THEN 'warning' ELSE 'info' END",
+    actor_type: "CASE WHEN NULLIF(e.actor_id, '') IS NULL THEN 'system' ELSE 'operator' END",
+    actor_operator_id: "NULLIF(e.actor_id, '')",
+    actor_name: "NULLIF(e.actor_id, '')",
+    source: "'so-fulfillment'::text",
+    action: "'so_fulfillment.' || e.action",
+    message: "NULLIF(e.reason, '')",
+    order_id: "c.source_sales_order_id::text",
+    numeric_order_id: "c.source_sales_order_id",
+    entity_type: "'dispatch_sales_order_if_candidate'::text",
+    entity_id: "c.id::text",
+    details: `jsonb_strip_nulls(jsonb_build_object(
+      'candidateId', c.id,
+      'dispatchOrderRef', c.dispatch_order_ref,
+      'sourceOrderRef', c.source_sales_order_ref,
+      'externalId', c.external_id,
+      'reason', NULLIF(e.reason, '')
+    )) || e.details`,
+    created_at: "e.created_at"
+  }, `FROM dispatch_sales_order_if_audit_events e
+  JOIN dispatch_sales_order_if_candidates c ON c.id = e.candidate_id`),
+  // SO / PO / TO reconciliation (webhook, nightly, manual and backfill runs).
+  auditStreamSelect({
+    id: "'recon:' || r.id::text",
+    legacy_sort_id: "r.id",
+    audit_stream: "'reconciliation'::text",
+    category: "'reconciliation'::text",
+    severity: "CASE WHEN r.action ~* '(fail|error)' THEN 'error' WHEN r.validation_status = 'rejected' THEN 'warning' ELSE 'info' END",
+    actor_type: "CASE WHEN r.source = 'manual' THEN 'operator' ELSE 'system' END",
+    actor_operator_id: "NULLIF(r.actor, '')",
+    actor_name: "NULLIF(r.actor, '')",
+    source: "'reconciliation-' || r.source",
+    action: "'reconciliation.' || lower(r.record_type) || '.' || r.action",
+    message: "CASE WHEN r.validation_status = 'rejected' THEN 'Rejected by validation' END",
+    order_id: "r.parent_order_netsuite_id::text",
+    numeric_order_id: "r.parent_order_netsuite_id",
+    entity_type: "lower(r.record_type)",
+    entity_id: "r.netsuite_transaction_id::text",
+    details: `jsonb_strip_nulls(jsonb_build_object(
+      'runId', r.run_id,
+      'eventType', r.event_type,
+      'recordType', r.record_type,
+      'validation', r.validation_status,
+      'transactionRef', r.transaction_ref,
+      'parentOrderKind', r.parent_order_kind,
+      'parentOrderRef', r.parent_order_ref,
+      'netsuiteLineKey', r.netsuite_line_key,
+      'occurredAt', r.occurred_at,
+      'payload', r.payload
+    ))`,
+    created_at: "r.created_at"
+  }, "FROM scm_reconciliation_audit_events r")
+];
+
+// What each stream above (same order) can produce. A Category or request-id filter leaves out streams
+// that cannot match, so e.g. "Failed / slow requests" never scans the large application audit table.
+const AUDIT_STREAM_SCOPES = [
+  { stream: "delivery", categories: ["user", "netsuite", "system"], requestIds: true },
+  { stream: "dispatch", categories: ["user", "system"], requestIds: true },
+  { stream: "mbt", categories: ["user", "system"], requestIds: false },
+  { stream: "boss_approval", categories: ["user", "system"], requestIds: false },
+  { stream: "system", categories: ["request", "netsuite", "system", "client"], requestIds: true },
+  { stream: "netsuite_posting", categories: ["netsuite"], requestIds: false },
+  { stream: "so_fulfillment", categories: ["netsuite"], requestIds: false },
+  { stream: "reconciliation", categories: ["reconciliation"], requestIds: false }
+];
+if (AUDIT_STREAM_SCOPES.length !== AUDIT_STREAMS.length) throw new Error("Every audit stream needs a scope.");
+
+function unifiedAuditCte({ category = "", requestId = "" } = {}) {
+  const streams = AUDIT_STREAMS.filter((_, index) => {
+    const scope = AUDIT_STREAM_SCOPES[index];
+    return (!category || scope.categories.includes(category)) && (!requestId || scope.requestIds);
+  });
+  return `WITH unified_audit AS (
+  ${streams.join("\n  UNION ALL\n  ")}
 ), resolved_audit AS (
   SELECT
     a.*,
@@ -404,6 +575,8 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
       a.details->>'vrmaRef',
       a.details->>'sourceOrderRef',
       a.details->>'orderRef',
+      a.details->>'parentOrderRef',
+      a.details->>'transactionRef',
       a.details->>'receivingOrderId',
       a.details->>'deliveryOrderId',
       NULLIF(a.order_id, ''),
@@ -416,17 +589,23 @@ const UNIFIED_AUDIT_CTE = `WITH unified_audit AS (
   LEFT JOIN purchase_orders po ON po.netsuite_id = a.numeric_order_id
   LEFT JOIN local_co_orders co ON co.delivery_order_id = a.numeric_order_id
 )`;
+}
 
-export async function listAudit({
-  limit = 100,
-  orderId = null,
-  operatorId = null,
-  from = null,
-  to = null,
-  actor = "",
-  action = "",
-  tranid = ""
-} = {}) {
+export const AUDIT_CATEGORIES = Object.freeze(["user", "netsuite", "reconciliation", "system", "request", "client"]);
+const AUDIT_SEVERITY_FILTERS = Object.freeze({
+  errors: ["error", "critical"],
+  problems: ["warning", "error", "critical"],
+  info: ["info"],
+  warning: ["warning"],
+  error: ["error"],
+  critical: ["critical"]
+});
+const AUDIT_STATEMENT_TIMEOUT = "30s";
+// Free-text search reads each row's own text (not joined names), so it filters inside every stream
+// before the joins; without a From date it covers this many days.
+export const AUDIT_SEARCH_DEFAULT_DAYS = 30;
+
+function auditFilterClauses({ orderId, operatorId, from, to, actor, action, tranid, category, severity, search, requestId }) {
   const params = [];
   const clauses = [];
   if (orderId) {
@@ -463,24 +642,104 @@ export async function listAudit({
     params.push(`%${String(tranid).trim()}%`);
     clauses.push(`COALESCE(a.tranid, '') ILIKE $${params.length}`);
   }
-  params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
+  const categoryValue = String(category || "").trim().toLowerCase();
+  if (categoryValue) {
+    if (!AUDIT_CATEGORIES.includes(categoryValue)) {
+      throw Object.assign(new Error(`Unknown audit category: ${categoryValue}`), { status: 400 });
+    }
+    params.push(categoryValue);
+    clauses.push(`a.category = $${params.length}`);
+  }
+  const severityValue = String(severity || "").trim().toLowerCase();
+  if (severityValue) {
+    const severities = AUDIT_SEVERITY_FILTERS[severityValue];
+    if (!severities) throw Object.assign(new Error(`Unknown audit severity filter: ${severityValue}`), { status: 400 });
+    params.push(severities);
+    clauses.push(`a.severity = ANY($${params.length}::text[])`);
+  }
+  const requestIdValue = String(requestId || "").trim();
+  if (requestIdValue) {
+    params.push(requestIdValue);
+    clauses.push(`a.request_id = $${params.length}`);
+  }
+  const searchValue = String(search || "").trim();
+  if (searchValue) {
+    params.push(`%${searchValue.replace(/[\\%_]/g, (match) => `\\${match}`)}%`);
+    clauses.push(`(
+      a.action ILIKE $${params.length}
+      OR COALESCE(a.source, '') ILIKE $${params.length}
+      OR COALESCE(a.message, '') ILIKE $${params.length}
+      OR COALESCE(a.order_id, '') ILIKE $${params.length}
+      OR COALESCE(a.entity_id, '') ILIKE $${params.length}
+      OR COALESCE(a.actor_name, '') ILIKE $${params.length}
+      OR a.details::text ILIKE $${params.length}
+    )`);
+  }
+  return { params, clauses };
+}
 
-  const result = await query(
-    `${UNIFIED_AUDIT_CTE}, limited_audit AS MATERIALIZED (
+async function runAuditQuery(sql, params) {
+  try {
+    return await withTransaction(async () => {
+      await query(`SET LOCAL statement_timeout = '${AUDIT_STATEMENT_TIMEOUT}'`);
+      return query(sql, params);
+    });
+  } catch (error) {
+    if (error?.code === "57014") {
+      throw Object.assign(new Error("The audit search took too long. Narrow the From/To range or add a filter, then try again."), {
+        status: 400,
+        code: "AUDIT_QUERY_TIMEOUT"
+      });
+    }
+    throw error;
+  }
+}
+
+export async function listAudit({
+  limit = 100,
+  offset = 0,
+  orderId = null,
+  operatorId = null,
+  from = null,
+  to = null,
+  actor = "",
+  action = "",
+  tranid = "",
+  category = "",
+  severity = "",
+  search = "",
+  requestId = ""
+} = {}) {
+  const searching = Boolean(String(search || "").trim());
+  const effectiveFrom = from || (searching ? new Date(Date.now() - AUDIT_SEARCH_DEFAULT_DAYS * 86_400_000).toISOString() : null);
+  const { params, clauses } = auditFilterClauses({
+    orderId, operatorId, from: effectiveFrom, to, actor, action, tranid, category, severity, search, requestId
+  });
+  params.push(Math.min(Math.max(Number(limit) || 100, 1), 500));
+  const limitParam = params.length;
+  params.push(Math.min(Math.max(Math.trunc(Number(offset) || 0), 0), 10000));
+  const offsetParam = params.length;
+
+  const result = await runAuditQuery(
+    `${unifiedAuditCte({ category: String(category || "").trim().toLowerCase(), requestId: String(requestId || "").trim() })}, limited_audit AS MATERIALIZED (
        SELECT a.*
        FROM resolved_audit a
        ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
        ORDER BY a.created_at DESC, a.legacy_sort_id DESC NULLS LAST, a.id DESC
-       LIMIT $${params.length}
+       LIMIT $${limitParam} OFFSET $${offsetParam}
      )
      SELECT
        a.id,
        a.audit_stream,
+       a.category,
+       a.severity,
        a.actor_type,
        a.actor_operator_id,
        a.actor_name,
        a.source,
        a.action,
+       a.message,
+       a.request_id,
        a.order_id,
        a.numeric_order_id,
        a.line_id,
@@ -508,28 +767,20 @@ export async function listAudit({
   return result.rows;
 }
 
+// Without a From date the filter options cover the last 30 days, which keeps the page fast.
+const AUDIT_OPTIONS_DEFAULT_DAYS = 30;
+
 export async function listAuditOptions({
   from = null,
   to = null,
-  tranid = ""
+  tranid = "",
+  category = ""
 } = {}) {
-  const params = [];
-  const clauses = [];
-  if (from) {
-    params.push(from);
-    clauses.push(`a.created_at >= $${params.length}::timestamptz`);
-  }
-  if (to) {
-    params.push(to);
-    clauses.push(`a.created_at <= $${params.length}::timestamptz`);
-  }
-  if (tranid) {
-    params.push(`%${String(tranid).trim()}%`);
-    clauses.push(`COALESCE(a.tranid, '') ILIKE $${params.length}`);
-  }
+  const effectiveFrom = from || new Date(Date.now() - AUDIT_OPTIONS_DEFAULT_DAYS * 86_400_000).toISOString();
+  const { params, clauses } = auditFilterClauses({ from: effectiveFrom, to, tranid, category });
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  const result = await query(
-    `${UNIFIED_AUDIT_CTE}, filtered AS (
+  const result = await runAuditQuery(
+    `${unifiedAuditCte({ category: String(category || "").trim().toLowerCase() })}, filtered AS (
        SELECT a.action,
               NULLIF(COALESCE(a.display_name, a.username, a.actor_name, a.actor_type, a.actor_operator_id), '') AS actor
        FROM resolved_audit a
@@ -543,7 +794,9 @@ export async function listAuditOptions({
   );
   return {
     actors: result.rows[0]?.actors || [],
-    actions: result.rows[0]?.actions || []
+    actions: result.rows[0]?.actions || [],
+    categories: AUDIT_CATEGORIES,
+    optionsFrom: effectiveFrom
   };
 }
 

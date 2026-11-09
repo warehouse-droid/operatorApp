@@ -7,6 +7,7 @@ const ACCOUNT_ROLE_OPTIONS = [
   { value: "repair_technician", labelKey: "control.roleRepairTechnician", label: "Repair Technician" },
   { value: "repair_office", labelKey: "control.roleRepairOffice", label: "Repair Office" },
   { value: "boss", labelKey: "control.roleBoss", label: "BOSS" },
+  { value: "accounting", labelKey: "control.roleAccounting", label: "Accounting" },
   { value: "operator", labelKey: "control.roleOperator", label: "Operator" },
   { value: "dispatcher", labelKey: "control.roleDispatcher", label: "Dispatcher" },
   { value: "scm", labelKey: "control.roleScm", label: "SCM Staff" },
@@ -29,7 +30,7 @@ let returnNotificationSettings = {};
 const SECTION_STORAGE_KEY = IS_ADMIN_PAGE ? "mbbs.admin.section" : "mbbs.control.section";
 const ACCOUNT_SELECTION_KEY = "mbbs.admin.selectedAccount";
 const SCM_RECONCILIATION_SELECTED_RUN_KEY = "mbbs.admin.reconciliation.selectedRun";
-const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "sor-auto-returns", "storage", "audit"]);
+const ADMIN_SECTIONS = new Set(["dashboard", "operators", "sync", "maps-usage", "reconciliation", "return-automation", "sor-auto-returns", "storage", "audit", "performance"]);
 const CONTROL_SECTIONS = new Set(["dashboard", "returns", "locks", "reopen", "classification", "vendor-mapping", "warnings", "loaded-export", "cycle-count", "count-sheets", "damage-stock", "fulfillment"]);
 const CONTROL_SECTION_ROUTES = {
   dashboard: "/control",
@@ -54,7 +55,8 @@ const ADMIN_SECTION_ROUTES = {
   "return-automation": "/admin/return-automation",
   "sor-auto-returns": "/admin/sor-auto-returns",
   storage: "/admin/photo-storage",
-  audit: "/admin/audit"
+  audit: "/admin/audit",
+  performance: "/admin/performance"
 };
 const CONTROL_ROUTE_SECTIONS = Object.fromEntries(
   Object.entries(CONTROL_SECTION_ROUTES).map(([section, route]) => [route, section])
@@ -240,6 +242,8 @@ function setActiveSection(section, { updateRoute = true } = {}) {
   if (activeSection === "count-sheets") { void controlCountSheets.load(); return; }
   if (activeSection === "damage-stock") { void controlDamage.load(); return; }
   render();
+  // An Admin tab loads its own data when it is opened.
+  if (IS_ADMIN_PAGE && operator) void loadControlData().catch((error) => console.warn(error));
 }
 
 let token = readStaffToken();
@@ -383,21 +387,33 @@ const loadedTypeByDirection = {
   inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"].includes(localStorage.getItem("mbbs.control.loaded.inboundType"))
     ? localStorage.getItem("mbbs.control.loaded.inboundType")
     : "purchase_order",
-  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"].includes(localStorage.getItem("mbbs.control.loaded.outboundType"))
     ? localStorage.getItem("mbbs.control.loaded.outboundType")
     : "sales_order"
 };
 let loadedSearchTimer = null;
 let loadedSearchLoading = false;
-let auditFilters = {
-  from: localStorage.getItem("mbbs.control.audit.from") || "",
-  to: localStorage.getItem("mbbs.control.audit.to") || "",
-  actor: localStorage.getItem("mbbs.control.audit.actor") || "",
-  action: localStorage.getItem("mbbs.control.audit.action") || "",
-  tranid: localStorage.getItem("mbbs.control.audit.tranid") || "",
-  limit: localStorage.getItem("mbbs.control.audit.limit") || "200"
-};
+const AUDIT_FILTER_DEFAULTS = Object.freeze({
+  from: "", to: "", category: "", severity: "", search: "", actor: "", action: "", tranid: "", requestId: "", limit: "200"
+});
+// requestId is a one-off drill-down ("Same request") and is not remembered between visits.
+const AUDIT_TRANSIENT_FILTERS = new Set(["requestId"]);
+let auditFilters = Object.fromEntries(Object.entries(AUDIT_FILTER_DEFAULTS).map(([key, fallback]) => [
+  key,
+  AUDIT_TRANSIENT_FILTERS.has(key) ? fallback : (localStorage.getItem(`mbbs.control.audit.${key}`) || fallback)
+]));
 let auditOptions = { actors: [], actions: [] };
+let auditLoadError = "";
+let auditFiltersBeforeRequest = null;
+let auditHasMore = false;
+let auditLoadingMore = false;
+let auditResources = null;
+let auditResourcesError = "";
+let auditResourceFocus = -1;
+// The From/To to return to after a click on the resources chart narrowed them.
+let auditResourcesZoomFrom = null;
+// The Audit Log searches only when Apply / Refresh (or a drill-down) is clicked, never on opening a page.
+let auditSearched = false;
 let syncMaxRunMinutesDraft = null;
 
 async function request(path, options = {}) {
@@ -584,24 +600,60 @@ function hydrateSecurePhotoImages(root = app) {
 
 function saveAuditFilters() {
   for (const [key, value] of Object.entries(auditFilters)) {
+    if (AUDIT_TRANSIENT_FILTERS.has(key)) continue;
     localStorage.setItem(`mbbs.control.audit.${key}`, value || "");
   }
 }
 
-function auditQueryString() {
+// The page shows every time in Toronto time (MBBS_I18N.displayDateTime), so From/To are Toronto wall time too,
+// whatever zone the browser is in.
+const AUDIT_TIME_ZONE = "America/Toronto";
+
+function auditZoneParts(date) {
+  return Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+    timeZone: AUDIT_TIME_ZONE, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+}
+
+function auditZoneOffsetMs(instant) {
+  const parts = auditZoneParts(new Date(instant));
+  const wall = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour) % 24,
+    Number(parts.minute), Number(parts.second));
+  return wall - Math.floor(instant / 1000) * 1000;
+}
+
+function auditDatetimeLocal(date) {
+  const parts = auditZoneParts(date);
+  return `${parts.year}-${parts.month}-${parts.day}T${String(Number(parts.hour) % 24).padStart(2, "0")}:${parts.minute}`;
+}
+
+function auditFilterTimestamp(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/u);
+  if (!match) return text;
+  const wall = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]));
+  // Two passes settle the offset across daylight-saving changes.
+  let instant = wall - auditZoneOffsetMs(wall);
+  instant = wall - auditZoneOffsetMs(instant);
+  return new Date(instant).toISOString();
+}
+
+function auditQueryString({ offset = 0 } = {}) {
   const url = new URL("/api/delivery/audit", window.location.origin);
   for (const [key, value] of Object.entries(auditFilters)) {
-    const text = String(value || "").trim();
+    const text = ["from", "to"].includes(key) ? auditFilterTimestamp(value) : String(value || "").trim();
     if (text) url.searchParams.set(key, text);
   }
   if (!url.searchParams.has("limit")) url.searchParams.set("limit", "200");
+  if (offset) url.searchParams.set("offset", String(offset));
   return url.pathname + url.search;
 }
 
 function auditOptionsQueryString() {
   const url = new URL("/api/delivery/audit/options", window.location.origin);
-  for (const key of ["from", "to", "tranid"]) {
-    const text = String(auditFilters[key] || "").trim();
+  for (const key of ["from", "to", "tranid", "category"]) {
+    const text = ["from", "to"].includes(key) ? auditFilterTimestamp(auditFilters[key]) : String(auditFilters[key] || "").trim();
     if (text) url.searchParams.set(key, text);
   }
   return url.pathname + url.search;
@@ -1720,6 +1772,7 @@ function renderActiveSection() {
   if (activeSection === "damage-stock") return controlDamage.render();
   if (activeSection === "fulfillment") return renderFulfillmentSection();
   if (activeSection === "audit") return renderAuditSection();
+  if (activeSection === "performance") return renderPerformanceSection();
   return renderDashboardSection();
 }
 
@@ -1896,8 +1949,8 @@ function renderDashboardSection() {
         </button>
         <button class="metric-card" data-action="control-section" data-section="audit" type="button">
           <span>${t("control.auditLog", "Audit Log")}</span>
-          <strong>${audit.length}</strong>
-          <em>login and application records loaded</em>
+          <strong>${t("control.auditSearch", "Search")}</strong>
+          <em>user, NetSuite, system and error records (loads on Apply)</em>
         </button>
       </div>
       <section class="panel">
@@ -2750,11 +2803,25 @@ function loadedOrderKey(order) {
 
 const YARD_MOVEMENT_TYPES = {
   inbound: ["purchase_order", "transfer_order", "co_order", "sor_return"],
-  outbound: ["sales_order", "sor_order", "transfer_order", "co_order", "vrma_order"]
+  outbound: ["sales_order", "transfer_order", "co_order", "vrma_order"]
 };
+// The SO tab also lists SOR rental deliveries; their cards keep the SOR badge.
+const MOVEMENT_TAB_ORDER_TYPES = { sales_order: ["sales_order", "sor_order"] };
 
 function selectedLoadedOrderType() {
   return loadedTypeByDirection[loadedDirection];
+}
+
+function movementTabOrderTypes(orderType) {
+  return MOVEMENT_TAB_ORDER_TYPES[orderType] || [orderType];
+}
+
+function movementTabCode(orderType) {
+  return movementTabOrderTypes(orderType).map(movementTypeCode).join(" + ");
+}
+
+function movementTabLabel(orderType) {
+  return movementTabOrderTypes(orderType).map(movementTypeLabel).join(" + ");
 }
 
 function movementTypeCode(orderType) {
@@ -2854,7 +2921,7 @@ function loadedOrdersQuery() {
   params.set("yard", loadedFilters.yard || "all");
   params.set("driver", loadedFilters.driver || "all");
   params.set("direction", loadedDirection);
-  params.set("orderType", selectedLoadedOrderType());
+  params.set("orderType", movementTabOrderTypes(selectedLoadedOrderType()).join(","));
   return params;
 }
 
@@ -3017,6 +3084,12 @@ function loadedDocumentLabel(order) {
   return (order.documents || []).map((document) => `${document.type}: ${document.ref}`).join(" · ");
 }
 
+// Driver deliveries of SO splits that have no sales order of their own.
+function loadedSplitLabel(order) {
+  const refs = Array.isArray(order.split_refs) ? order.split_refs.filter(Boolean) : [];
+  return refs.length ? `${t("yard.splitDeliveries", "Split")}: ${refs.join(", ")}` : "";
+}
+
 function loadedMovementStatus(order) {
   return order.waitingForDriverCompletion ? "waiting for driver completion"
     : order.movement_status || t("yard.processed", "Processed");
@@ -3028,7 +3101,7 @@ function renderLoadedOrderList() {
   return `
     <div class="loaded-list-head">
       <strong>${orders.length}</strong>
-      <span>${searchActive ? t("yard.globalResults", "results across all directions and order types") : `${movementTypeCode(selectedLoadedOrderType())} · ${t("yard.processed", "processed")}`}</span>
+      <span>${searchActive ? t("yard.globalResults", "results across all directions and order types") : `${movementTabCode(selectedLoadedOrderType())} · ${t("yard.processed", "processed")}`}</span>
     </div>
     ${loadedSearchLoading ? `<div class="notice"><strong>${t("control.searching", "Searching...")}</strong><span>${t("yard.searchingHelp", "Checking all processed yard movements across every direction, type, yard, and date.")}</span></div>` : ""}
     ${orders.map((order) => `
@@ -3038,6 +3111,7 @@ function renderLoadedOrderList() {
           <span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span>
         </div>
         <span>${escapeHtml(order.yard_location || t("common.yard", "Yard"))} | ${escapeHtml(loadedMovementStatus(order))}</span>
+        ${loadedSplitLabel(order) ? `<span class="movement-documents movement-split-refs">${escapeHtml(loadedSplitLabel(order))}</span>` : ""}
         ${loadedDocumentLabel(order) ? `<span class="movement-documents">${escapeHtml(loadedDocumentLabel(order))}</span>` : ""}
         <em>${formatDate(order.last_activity_at || order.last_processed_at)} | ${t("yard.yardActivities", "Yard")} ${order.yard_activity_count || order.process_count || 0} | ${t("yard.driverActivities", "Driver")} ${order.driver_activity_count || 0} | ${order.photo_count || 0} ${t("common.photos", "photos")}</em>
         ${order.party ? `<small>${escapeHtml(order.party)}</small>` : ""}
@@ -3075,7 +3149,7 @@ function renderLoadedExportSection() {
               ${["inbound", "outbound"].map((direction) => `<button class="${loadedDirection === direction && !searchActive ? "active" : ""}" data-action="yard-direction" data-direction="${direction}" type="button">${t(`yard.${direction}`, direction === "inbound" ? "Inbound" : "Outbound")}</button>`).join("")}
             </div>
             <div class="yard-type-tabs" role="tablist" aria-label="${t("yard.orderType", "Order Type")}">
-              ${typeTabs.map((orderType) => `<button class="${selectedLoadedOrderType() === orderType && !searchActive ? "active" : ""}" data-action="yard-type" data-order-type="${orderType}" aria-label="${escapeHtml(movementTypeLabel(orderType))}" title="${escapeHtml(movementTypeLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>`).join("")}
+              ${typeTabs.map((orderType) => `<button class="${selectedLoadedOrderType() === orderType && !searchActive ? "active" : ""}" data-action="yard-type" data-order-type="${orderType}" aria-label="${escapeHtml(movementTypeLabel(orderType))}" title="${escapeHtml(movementTabLabel(orderType))}" type="button">${movementTypeCode(orderType)}</button>`).join("")}
             </div>
           </div>
           <div class="loaded-order-list" id="loadedOrderList">
@@ -3177,6 +3251,7 @@ function renderLoadedOrderDetail() {
       <div>
         <div class="movement-detail-title"><h3>${escapeHtml(order.tranid || order.order_id)}</h3><span class="movement-badges"><i class="movement-badge ${escapeHtml(order.direction)}">${t(`yard.${order.direction}`, order.direction)}</i><i class="movement-badge type">${movementTypeCode(order.order_type)}</i>${order.driver_only ? `<i class="movement-badge type">${t("yard.driverOnly", "Driver only")}</i>` : ""}</span></div>
         <p class="muted">${escapeHtml(movementTypeLabel(order.order_type))} | ${escapeHtml(order.yard_location || "")} | ${escapeHtml(loadedMovementStatus(order))}</p>
+        ${loadedSplitLabel(order) ? `<p class="movement-documents movement-split-refs"><strong>${escapeHtml(loadedSplitLabel(order))}</strong></p>` : ""}
         ${loadedDocumentLabel(order) ? `<p class="movement-documents"><strong>${escapeHtml(loadedDocumentLabel(order))}</strong></p>` : ""}
         ${route ? `<p class="muted">${escapeHtml(route)}</p>` : ""}
         ${order.party ? `<p class="muted">${escapeHtml(order.party)}</p>` : ""}
@@ -4689,25 +4764,75 @@ function renderClassificationSection() {
   `;
 }
 
+function auditCategoryLabel(category) {
+  return {
+    user: t("control.auditCategoryUser", "User actions"),
+    netsuite: t("control.auditCategoryNetSuite", "NetSuite postings"),
+    reconciliation: t("control.auditCategoryReconciliation", "SO / PO / TO reconciliation"),
+    system: t("control.auditCategorySystem", "System & background jobs"),
+    request: t("control.auditCategoryRequest", "Failed / slow requests"),
+    client: t("control.auditCategoryClient", "Browser errors")
+  }[category] || category || "";
+}
+
+function auditSeverityLabel(severity) {
+  return {
+    info: t("control.auditSeverityInfo", "Info"),
+    warning: t("control.auditSeverityWarning", "Warning"),
+    error: t("control.auditSeverityError", "Error"),
+    critical: t("control.auditSeverityCritical", "Critical")
+  }[severity] || severity || "";
+}
+
 function renderAuditSection() {
+  const categoryOptions = ["user", "netsuite", "reconciliation", "system", "request", "client"];
+  const severityOptions = [
+    ["", t("control.auditAllLevels", "All levels")],
+    ["errors", t("control.auditErrorsOnly", "Errors only")],
+    ["problems", t("control.auditWarningsAndErrors", "Warnings & errors")],
+    ["info", t("control.auditInfoOnly", "Info only")]
+  ];
   return `
     <section class="panel">
       <div class="section-heading">
         <div>
           <h2>${t("control.auditLog", "Audit Log")}</h2>
-          <p class="muted">${t("control.latest", "Latest")} ${audit.length} ${t("control.records", "records")}</p>
+          <p class="muted">${auditSearched ? `${t("control.latest", "Latest")} ${audit.length} ${t("control.records", "records")} · ` : ""}${t("control.auditScope", "user actions, NetSuite postings, reconciliation, background jobs, failed requests and browser errors")}</p>
         </div>
         <button data-action="load-audit">${t("common.refresh", "Refresh")}</button>
       </div>
       <div class="audit-filter-card">
         <div class="audit-filter-row">
           <label>
-            <span>${t("control.from", "From")}</span>
+            <span>${t("control.from", "From")} <small class="muted">${t("control.auditTorontoTime", "Toronto time")}</small></span>
             <input data-audit-filter="from" type="datetime-local" value="${escapeHtml(auditFilters.from)}" />
           </label>
           <label>
-            <span>${t("control.to", "To")}</span>
+            <span>${t("control.to", "To")} <small class="muted">${t("control.auditTorontoTime", "Toronto time")}</small></span>
             <input data-audit-filter="to" type="datetime-local" value="${escapeHtml(auditFilters.to)}" />
+          </label>
+          <label>
+            <span>${t("control.auditCategory", "Category")}</span>
+            <select data-audit-filter="category">
+              <option value="">${t("control.auditAllCategories", "All categories")}</option>
+              ${categoryOptions.map((value) => `<option value="${value}" ${auditFilters.category === value ? "selected" : ""}>${escapeHtml(auditCategoryLabel(value))}</option>`).join("")}
+            </select>
+          </label>
+          <label>
+            <span>${t("control.auditLevel", "Level")}</span>
+            <select data-audit-filter="severity">
+              ${severityOptions.map(([value, label]) => `<option value="${value}" ${auditFilters.severity === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="audit-filter-search">
+            <span>${t("control.auditSearch", "Search")}</span>
+            <input data-audit-filter="search" type="search" placeholder="${escapeHtml(t("control.auditSearchPlaceholder", "Message, error, item, customer…"))}" value="${escapeHtml(auditFilters.search)}" />
+          </label>
+          <label>
+            <span>${t("control.limit", "Limit")}</span>
+            <select data-audit-filter="limit">
+              ${["100", "200", "300", "500"].map((value) => `<option value="${value}" ${String(auditFilters.limit) === value ? "selected" : ""}>${value}</option>`).join("")}
+            </select>
           </label>
           <label>
             <span>${t("control.actor", "Actor")}</span>
@@ -4725,19 +4850,30 @@ function renderAuditSection() {
             <span>${t("control.tranid", "TranID")}</span>
             <input data-audit-filter="tranid" placeholder="SO / TO / PO / CO" value="${escapeHtml(auditFilters.tranid)}" />
           </label>
-          <label>
-            <span>${t("control.limit", "Limit")}</span>
-            <select data-audit-filter="limit">
-              ${["100", "200", "300", "500"].map((value) => `<option value="${value}" ${String(auditFilters.limit) === value ? "selected" : ""}>${value}</option>`).join("")}
-            </select>
-          </label>
           <div class="audit-filter-actions">
             <button class="primary" data-action="apply-audit-filters" type="button">${t("common.apply", "Apply")}</button>
             <button data-action="reset-audit-filters" type="button">${t("common.reset", "Reset")}</button>
           </div>
         </div>
+        ${auditFilters.search && !auditFilters.from ? `
+          <p class="muted audit-search-note">${t("control.auditSearchWindow", "Search covers the last 30 days unless From is set.")}</p>
+        ` : ""}
+        ${auditFilters.requestId ? `
+          <div class="audit-request-filter">
+            <span>${t("control.auditShowingRequest", "Showing every record from request")} <code>${escapeHtml(auditFilters.requestId)}</code></span>
+            <button data-action="audit-clear-request" type="button">${t("control.auditShowAll", "Show all records")}</button>
+          </div>
+        ` : ""}
       </div>
-      ${renderAudit()}
+      ${auditLoadError ? `<div class="notice warning">${escapeHtml(auditLoadError)}</div>` : ""}
+      ${auditSearched ? `${renderAuditResources()}${renderAudit()}` : `
+        <p class="muted audit-not-loaded">${t("control.auditNotLoaded", "Choose filters and click Apply to load the Audit Log.")}</p>
+      `}
+      ${auditHasMore ? `
+        <div class="audit-load-more">
+          <button data-action="load-more-audit" type="button" ${auditLoadingMore ? "disabled" : ""}>${auditLoadingMore ? t("common.loading", "Loading…") : t("control.auditLoadOlder", "Load older records")}</button>
+        </div>
+      ` : ""}
     </section>
   `;
 }
@@ -4879,35 +5015,789 @@ function renderClassifications() {
   `;
 }
 
+function auditRowSummary(row) {
+  const details = row.details || {};
+  const parts = [];
+  if (details.method && details.route) parts.push(`${details.method} ${details.route}`);
+  if (details.status) parts.push(`HTTP ${details.status}`);
+  if (Number.isFinite(Number(details.durationMs)) && details.durationMs !== null) {
+    const ms = Number(details.durationMs);
+    parts.push(ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
+  }
+  if (details.process && details.process !== "app") parts.push(details.process);
+  if (Number(details.repeatCount) > 1) parts.push(`×${details.repeatCount}`);
+  return parts.join(" · ");
+}
+
 function renderAudit() {
   return `
-    <table>
-      <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.actor", "Actor")}</th><th>${t("control.action", "Action")}</th><th>${t("control.tranid", "TranID")}</th><th>${t("common.order", "Order")}</th><th>${t("control.details", "Details")}</th></tr></thead>
+    <table class="audit-table">
+      <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.auditLevel", "Level")}</th><th>${t("control.actor", "Actor")}</th><th>${t("control.action", "Action")}</th><th>${t("control.tranid", "TranID")}</th><th>${t("control.details", "Details")}</th></tr></thead>
       <tbody>
-        ${audit.map((row) => `
-          <tr>
+        ${audit.map((row) => {
+          const severity = ["info", "warning", "error", "critical"].includes(row.severity) ? row.severity : "info";
+          const summary = auditRowSummary(row);
+          return `
+          <tr class="audit-row audit-row-${severity}">
             <td>${formatDate(row.created_at)}</td>
-            <td>${escapeHtml(row.display_name || row.actor_type)}</td>
-            <td><strong>${escapeHtml(row.action)}</strong><br><span class="muted">${escapeHtml(row.source)}</span></td>
-            <td><strong>${escapeHtml(row.tranid || "")}</strong></td>
-            <td>${row.order_id || ""}${row.line_id ? `<br><span class="muted">${t("control.line", "Line")} ${row.line_id}</span>` : ""}</td>
-            <td><pre>${escapeHtml(JSON.stringify(row.details || {}, null, 2))}</pre></td>
+            <td>
+              <span class="audit-severity ${severity}">${escapeHtml(auditSeverityLabel(severity))}</span>
+              <br><span class="muted">${escapeHtml(auditCategoryLabel(row.category))}</span>
+            </td>
+            <td>${escapeHtml(row.display_name || row.actor_name || row.actor_type || "")}</td>
+            <td>
+              <strong>${escapeHtml(row.action)}</strong><br><span class="muted">${escapeHtml(row.source || "")}</span>
+              ${row.message ? `<div class="audit-message ${severity}">${escapeHtml(String(row.message).slice(0, 600))}</div>` : ""}
+              ${summary ? `<div class="muted audit-summary">${escapeHtml(summary)}</div>` : ""}
+            </td>
+            <td>
+              <strong>${escapeHtml(row.tranid || "")}</strong>
+              ${row.order_id && row.order_id !== row.tranid ? `<br><span class="muted">${escapeHtml(row.order_id)}</span>` : ""}
+              ${row.line_id ? `<br><span class="muted">${t("control.line", "Line")} ${escapeHtml(row.line_id)}</span>` : ""}
+            </td>
+            <td class="audit-details-cell">
+              <details class="audit-details">
+                <summary>${t("control.auditShowDetails", "Show details")}</summary>
+                <pre>${escapeHtml(JSON.stringify(row.details || {}, null, 2))}</pre>
+              </details>
+              ${row.request_id ? `<button class="link-button audit-request-link" data-action="audit-same-request" data-request-id="${escapeHtml(row.request_id)}" data-created-at="${escapeHtml(row.created_at || "")}" type="button">${t("control.auditSameRequest", "Same request")}</button>` : ""}
+            </td>
           </tr>
-        `).join("") || `<tr><td colspan="6" class="muted">${t("control.noAuditRows", "No audit rows match the filters.")}</td></tr>`}
+        `;
+        }).join("") || `<tr><td colspan="6" class="muted">${t("control.noAuditRows", "No audit rows match the filters.")}</td></tr>`}
       </tbody>
     </table>
   `;
 }
 
 async function loadAudit() {
-  audit = await request(auditQueryString());
+  auditSearched = true;
+  const resources = loadAuditResources();
+  try {
+    audit = await request(auditQueryString());
+    auditLoadError = "";
+  } catch (error) {
+    audit = [];
+    auditLoadError = error.message;
+  }
+  auditHasMore = audit.length >= Number(auditFilters.limit || 200);
+  await resources;
+  return audit;
+}
+
+async function loadMoreAudit() {
+  const page = await request(auditQueryString({ offset: audit.length }));
+  const seen = new Set(audit.map((row) => `${row.audit_stream}:${row.id}`));
+  audit = audit.concat(page.filter((row) => !seen.has(`${row.audit_stream}:${row.id}`)));
+  auditHasMore = page.length >= Number(auditFilters.limit || 200);
   return audit;
 }
 
 async function loadAuditOptions() {
-  auditOptions = await request(auditOptionsQueryString());
+  auditOptions = await request(auditOptionsQueryString()).catch(() => auditOptions);
   return auditOptions;
 }
+
+// Server resources chart above the Audit Log (GET /api/delivery/audit/resources): host and app CPU,
+// memory and database activity for the same From/To, one panel per unit on a shared time axis.
+// Each point is the peak of its time bucket. Hover or arrow keys read every value at a time; a click
+// (or Enter) shows the audit events around that time.
+const RESOURCE_CHART = Object.freeze({ width: 960, left: 46, right: 70, top: 26, panel: 72, gap: 38, axis: 26 });
+const RESOURCE_PANELS = Object.freeze([
+  { key: "cpu", title: () => t("control.resourceCpu", "CPU (% of the server)"), max: () => 100, unit: "%",
+    series: [{ key: "hostCpuPercent", css: "host" }, { key: "appCpuPercent", css: "app" }], threshold: 85 },
+  { key: "memory", title: () => t("control.resourceMemory", "Memory used (% of the server)"), max: () => 100, unit: "%",
+    series: [{ key: "hostMemoryUsedPercent", css: "host" }, { key: "appMemoryPercent", css: "app" }] },
+  { key: "db", title: () => t("control.resourceDb", "Database: active queries"), unit: "",
+    max: (samples) => Math.max(10, Math.ceil(Math.max(0, ...samples.map((s) => Number(s.dbActiveQueries) || 0)) / 10) * 10),
+    series: [{ key: "dbActiveQueries", css: "db" }] }
+]);
+
+function auditResourcesQueryString() {
+  const url = new URL("/api/delivery/audit/resources", window.location.origin);
+  for (const key of ["from", "to"]) {
+    const text = auditFilterTimestamp(auditFilters[key]);
+    if (text) url.searchParams.set(key, text);
+  }
+  return url.pathname + url.search;
+}
+
+async function loadAuditResources() {
+  try {
+    const payload = await request(auditResourcesQueryString());
+    for (const sample of payload.samples || []) {
+      sample.appMemoryPercent = sample.hostMemoryTotalMb
+        ? Math.round((Number(sample.appMemoryMb) / Number(sample.hostMemoryTotalMb)) * 1000) / 10 : null;
+    }
+    auditResources = payload;
+    auditResourcesError = "";
+  } catch (error) {
+    auditResourcesError = error.message;
+  }
+  auditResourceFocus = -1;
+  return auditResources;
+}
+
+function resourceTimeLabel(value, { withDate = false, withSeconds = false } = {}) {
+  const parts = auditZoneParts(new Date(value));
+  const time = `${String(Number(parts.hour) % 24).padStart(2, "0")}:${parts.minute}${withSeconds ? `:${parts.second}` : ""}`;
+  return withDate ? `${parts.month}-${parts.day} ${time}` : time;
+}
+
+function resourceDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0));
+  if (value < 60) return `${value} s`;
+  const minutes = Math.floor(value / 60);
+  return minutes < 60 ? `${minutes} min ${String(value % 60).padStart(2, "0")} s` : `${Math.floor(minutes / 60)} h ${String(minutes % 60).padStart(2, "0")} min`;
+}
+
+function resourceGeometry() {
+  const { width, left, right, top, panel, gap, axis } = RESOURCE_CHART;
+  const panels = RESOURCE_PANELS.map((definition, index) => ({ ...definition, y: top + index * (panel + gap), height: panel }));
+  const bottom = panels[panels.length - 1].y + panel;
+  return { width, left, right, plotWidth: width - left - right, panels, bottom, height: bottom + axis };
+}
+
+function resourceXScale(geometry) {
+  const from = Date.parse(auditResources.from);
+  const to = Date.parse(auditResources.to);
+  const span = Math.max(1, to - from);
+  return (value) => geometry.left + ((Date.parse(value) - from) / span) * geometry.plotWidth;
+}
+
+// Tick times on Toronto wall-clock boundaries.
+function resourceTimeTicks() {
+  const from = Date.parse(auditResources.from);
+  const to = Date.parse(auditResources.to);
+  const minute = 60_000;
+  const steps = [5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880].map((value) => value * minute);
+  const step = steps.find((value) => (to - from) / value <= 7) || steps[steps.length - 1];
+  const ticks = [];
+  const offset = auditZoneOffsetMs(from);
+  for (let wall = Math.ceil((from + offset) / step) * step; wall - offset <= to && ticks.length < 12; wall += step) {
+    ticks.push(new Date(wall - auditZoneOffsetMs(wall - offset)).toISOString());
+  }
+  return { ticks, withDate: to - from > 20 * 3_600_000 };
+}
+
+function resourcePath(samples, key, x, y, gapMs) {
+  let path = "";
+  let previous = null;
+  for (const sample of samples) {
+    const value = sample[key];
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+      previous = null;
+      continue;
+    }
+    const at = Date.parse(sample.at);
+    const command = previous !== null && at - previous <= gapMs ? "L" : "M";
+    path += `${command}${x(sample.at).toFixed(1)},${y(Number(value)).toFixed(1)}`;
+    previous = at;
+  }
+  return path;
+}
+
+function renderAuditResources() {
+  const samples = auditResources?.samples || [];
+  const head = `
+    <div class="resource-monitor-head">
+      <div>
+        <h3>${t("control.resourceTitle", "Server resources")}</h3>
+        <p class="muted">${t("control.resourceHint", "CPU, memory and database activity for the same From / To (Toronto time). Each point is the peak of its interval. Click the chart to show the events around that time.")}</p>
+      </div>
+      <div class="resource-legend" aria-hidden="true">
+        <span><i class="resource-key host"></i>${t("control.resourceHost", "Whole server")}</span>
+        <span><i class="resource-key app"></i>${t("control.resourceApp", "MBBS app")}</span>
+        <span><i class="resource-key db"></i>${t("control.resourceDbShort", "Database")}</span>
+        ${auditResourcesZoomFrom ? `<button class="link-button" data-action="audit-resource-unzoom" type="button">${t("control.resourceBack", "Back to the previous range")}</button>` : ""}
+      </div>
+    </div>`;
+  if (auditResourcesError && !auditResources) {
+    return `<div class="resource-monitor">${head}<div class="notice warning">${escapeHtml(auditResourcesError)}</div></div>`;
+  }
+  if (!samples.length) {
+    const since = auditResources?.firstSampledAt
+      ? `${t("control.resourceRecordingSince", "Recording since")} ${escapeHtml(formatDate(auditResources.firstSampledAt))}.`
+      : t("control.resourceNotYet", "The monitor has not recorded a sample yet; it records every 30 seconds.");
+    return `<div class="resource-monitor">${head}<p class="muted resource-empty">${t("control.resourceNoSamples", "No resource samples in this range.")} ${since}</p></div>`;
+  }
+  const geometry = resourceGeometry();
+  const x = resourceXScale(geometry);
+  const gapMs = Math.max(2.5 * auditResources.bucketSeconds * 1000, 95_000);
+  const { ticks, withDate } = resourceTimeTicks();
+  const peak = (key) => Math.max(...samples.map((sample) => Number(sample[key]) || 0));
+  const panels = geometry.panels.map((panel) => {
+    const max = panel.max(samples);
+    const y = (value) => panel.y + panel.height - (Math.min(max, Math.max(0, value)) / max) * panel.height;
+    const last = samples[samples.length - 1];
+    const labels = [];
+    for (const series of panel.series) {
+      const value = Number(last[series.key]);
+      if (!Number.isFinite(value) || last[series.key] === null) continue;
+      const labelY = y(value) + 4;
+      // Converging end labels are not stacked: the legend and tooltip carry the second one.
+      if (labels.some((existing) => Math.abs(existing.y - labelY) < 12)) continue;
+      labels.push({ y: labelY, text: `${Math.round(value * 10) / 10}${panel.unit}` });
+    }
+    return `
+      <g class="resource-panel" data-panel="${panel.key}">
+        <text class="resource-panel-title" x="${geometry.left}" y="${panel.y - 10}">${escapeHtml(panel.title())}</text>
+        <line class="resource-grid" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${panel.y}" y2="${panel.y}" />
+        <line class="resource-grid" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${panel.y + panel.height / 2}" y2="${panel.y + panel.height / 2}" />
+        <line class="resource-baseline" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${panel.y + panel.height}" y2="${panel.y + panel.height}" />
+        <text class="resource-tick" x="${geometry.left - 6}" y="${panel.y + 4}" text-anchor="end">${max}${panel.unit}</text>
+        <text class="resource-tick" x="${geometry.left - 6}" y="${panel.y + panel.height / 2 + 4}" text-anchor="end">${max / 2}${panel.unit}</text>
+        <text class="resource-tick" x="${geometry.left - 6}" y="${panel.y + panel.height + 4}" text-anchor="end">0</text>
+        ${panel.threshold ? `
+          <line class="resource-threshold" x1="${geometry.left}" x2="${geometry.width - geometry.right}" y1="${y(panel.threshold)}" y2="${y(panel.threshold)}" />
+          <text class="resource-tick" x="${geometry.width - geometry.right - 4}" y="${y(panel.threshold) - 4}" text-anchor="end">${t("control.resourceAlertLine", "warning")} ${panel.threshold}%</text>` : ""}
+        ${panel.series.map((series) => `<path class="resource-line ${series.css}" d="${resourcePath(samples, series.key, x, y, gapMs)}" />`).join("")}
+        ${labels.map((label) => `<text class="resource-end" x="${geometry.width - geometry.right + 8}" y="${label.y}">${escapeHtml(label.text)}</text>`).join("")}
+        ${panel.series.map((series) => `<circle class="resource-dot ${series.css}" data-series="${series.key}" r="4" cx="-20" cy="-20" />`).join("")}
+      </g>`;
+  }).join("");
+  const axisY = geometry.bottom + 18;
+  const summary = `${t("control.resourceTitle", "Server resources")}: ${resourceTimeLabel(auditResources.from, { withDate: true })} – ${resourceTimeLabel(auditResources.to, { withDate: true })}. `
+    + `${t("control.resourcePeakCpu", "Peak CPU")} ${peak("hostCpuPercent")}%, ${t("control.resourcePeakMemory", "peak memory used")} ${peak("hostMemoryUsedPercent")}%, `
+    + `${t("control.resourcePeakDb", "peak active database queries")} ${peak("dbActiveQueries")}.`;
+  return `
+    <div class="resource-monitor${auditResourcesError ? " is-stale" : ""}">
+      ${head}
+      ${auditResourcesError ? `<div class="notice warning">${escapeHtml(auditResourcesError)}</div>` : ""}
+      <div class="resource-chart-wrap">
+        <svg class="resource-chart" data-resource-plot viewBox="0 0 ${geometry.width} ${geometry.height}" role="img" tabindex="0" aria-label="${escapeHtml(summary)}">
+          ${panels}
+          ${ticks.map((tick) => `<text class="resource-tick" x="${x(tick).toFixed(1)}" y="${axisY}" text-anchor="middle">${escapeHtml(resourceTimeLabel(tick, { withDate }))}</text>`).join("")}
+          <line class="resource-crosshair" x1="-20" x2="-20" y1="${geometry.panels[0].y}" y2="${geometry.bottom}" />
+          <rect class="resource-hit" x="${geometry.left}" y="0" width="${geometry.plotWidth}" height="${geometry.height}" />
+        </svg>
+        <div class="resource-tooltip" role="status" hidden></div>
+      </div>
+      <details class="resource-table">
+        <summary>${t("control.resourceTable", "Show as table")}</summary>
+        <div class="resource-table-scroll">
+          <table class="audit-table">
+            <thead><tr>
+              <th>${t("control.time", "Time")}</th><th>${t("control.resourceHostCpu", "Server CPU")}</th><th>${t("control.resourceAppCpu", "App CPU")}</th>
+              <th>${t("control.resourceMemoryUsed", "Memory used")}</th><th>${t("control.resourceAppMemory", "App memory")}</th>
+              <th>${t("control.resourceDbActive", "DB active queries")}</th><th>${t("control.resourceLongest", "Longest DB query")}</th>
+            </tr></thead>
+            <tbody>
+              ${[...samples].reverse().map((sample) => `
+                <tr>
+                  <td>${escapeHtml(resourceTimeLabel(sample.at, { withDate: true, withSeconds: true }))}</td>
+                  <td>${sample.hostCpuPercent ?? "—"}%</td><td>${sample.appCpuPercent ?? "—"}%</td>
+                  <td>${sample.hostMemoryUsedPercent ?? "—"}%</td><td>${sample.appMemoryMb ?? "—"} MB</td>
+                  <td>${sample.dbActiveQueries ?? "—"}</td>
+                  <td>${sample.dbLongestQuerySeconds ? escapeHtml(resourceDuration(sample.dbLongestQuerySeconds)) : "—"}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </div>`;
+}
+
+function resourceTooltipRows(sample) {
+  const percent = (value) => (value === null || value === undefined ? "—" : `${value}%`);
+  const rows = [
+    ["host", percent(sample.hostCpuPercent), t("control.resourceHostCpu", "Server CPU")],
+    ["app", percent(sample.appCpuPercent), t("control.resourceAppCpu", "App CPU")],
+    ["host", percent(sample.hostMemoryUsedPercent), `${t("control.resourceMemoryUsed", "Memory used")}${sample.hostMemoryAvailableMb ? ` · ${(sample.hostMemoryAvailableMb / 1024).toFixed(1)} GB ${t("control.resourceFree", "free")}` : ""}`],
+    ["app", sample.appMemoryMb === null ? "—" : `${sample.appMemoryMb} MB`, `${t("control.resourceAppMemory", "App memory")}${sample.appHeapMb ? ` · heap ${sample.appHeapMb} MB` : ""}`],
+    ["db", sample.dbActiveQueries ?? "—", t("control.resourceDbActive", "DB active queries")],
+    ["", sample.dbLongestQuerySeconds ? resourceDuration(sample.dbLongestQuerySeconds) : "—", t("control.resourceLongest", "Longest DB query")],
+    ["", sample.eventLoopMaxMs === null ? "—" : `${Math.round(sample.eventLoopMaxMs)} ms`, t("control.resourceLag", "App event-loop lag")]
+  ];
+  return rows;
+}
+
+function showResourcePoint(svg, index) {
+  const samples = auditResources?.samples || [];
+  const sample = samples[index];
+  const wrap = svg.closest(".resource-chart-wrap");
+  const tooltip = wrap?.querySelector(".resource-tooltip");
+  if (!sample || !tooltip) return;
+  auditResourceFocus = index;
+  const geometry = resourceGeometry();
+  const x = resourceXScale(geometry)(sample.at);
+  const crosshair = svg.querySelector(".resource-crosshair");
+  crosshair.setAttribute("x1", x);
+  crosshair.setAttribute("x2", x);
+  for (const panel of geometry.panels) {
+    const max = panel.max(samples);
+    for (const series of panel.series) {
+      const dot = svg.querySelector(`[data-panel="${panel.key}"] .resource-dot[data-series="${series.key}"]`);
+      const value = Number(sample[series.key]);
+      const visible = sample[series.key] !== null && sample[series.key] !== undefined && Number.isFinite(value);
+      dot.setAttribute("cx", visible ? x : -20);
+      dot.setAttribute("cy", visible ? panel.y + panel.height - (Math.min(max, Math.max(0, value)) / max) * panel.height : -20);
+    }
+  }
+  // Values come from the server and query text from the database: textContent only.
+  tooltip.replaceChildren();
+  const title = document.createElement("div");
+  title.className = "resource-tooltip-title";
+  const bucket = Number(auditResources.bucketSeconds) || 30;
+  title.textContent = `${resourceTimeLabel(sample.at, { withDate: true, withSeconds: true })}${bucket > 30 ? ` · ${t("control.resourcePeakOf", "peak of")} ${resourceDuration(bucket)}` : ""}`;
+  tooltip.append(title);
+  for (const [css, value, label] of resourceTooltipRows(sample)) {
+    const row = document.createElement("div");
+    row.className = "resource-tooltip-row";
+    const key = document.createElement("i");
+    key.className = `resource-key ${css}`;
+    const strong = document.createElement("strong");
+    strong.textContent = String(value);
+    const span = document.createElement("span");
+    span.textContent = label;
+    row.append(key, strong, span);
+    tooltip.append(row);
+  }
+  const queryText = sample.longestQuery?.query;
+  if (queryText && Number(sample.dbLongestQuerySeconds) >= 10) {
+    const code = document.createElement("code");
+    code.textContent = String(queryText).slice(0, 220);
+    tooltip.append(code);
+  }
+  const hint = document.createElement("div");
+  hint.className = "resource-tooltip-hint";
+  hint.textContent = t("control.resourceClickHint", "Click to show the events around this time");
+  tooltip.append(hint);
+  tooltip.hidden = false;
+  const box = svg.getBoundingClientRect();
+  const left = (x / geometry.width) * box.width;
+  const width = tooltip.offsetWidth || 260;
+  tooltip.style.left = `${Math.min(Math.max(0, left + 14 + width > box.width ? left - width - 14 : left + 14), Math.max(0, box.width - width))}px`;
+  tooltip.style.top = "8px";
+}
+
+function hideResourcePoint(svg) {
+  const tooltip = svg.closest(".resource-chart-wrap")?.querySelector(".resource-tooltip");
+  if (tooltip) tooltip.hidden = true;
+  svg.querySelector(".resource-crosshair")?.setAttribute("x1", -20);
+  svg.querySelector(".resource-crosshair")?.setAttribute("x2", -20);
+  svg.querySelectorAll(".resource-dot").forEach((dot) => { dot.setAttribute("cx", -20); dot.setAttribute("cy", -20); });
+}
+
+function nearestResourceIndex(svg, clientX) {
+  const samples = auditResources?.samples || [];
+  if (!samples.length) return -1;
+  const geometry = resourceGeometry();
+  const box = svg.getBoundingClientRect();
+  const viewX = ((clientX - box.left) / box.width) * geometry.width;
+  const x = resourceXScale(geometry);
+  let best = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    if (Math.abs(x(samples[index].at) - viewX) < Math.abs(x(samples[best].at) - viewX)) best = index;
+  }
+  return best;
+}
+
+async function zoomAuditToResource(index) {
+  const sample = auditResources?.samples?.[index];
+  if (!sample) return;
+  const at = Date.parse(sample.at);
+  const half = Math.max(5 * 60_000, (Number(auditResources.bucketSeconds) || 30) * 1000);
+  auditResourcesZoomFrom ||= { ...auditFilters };
+  auditFilters = { ...auditFilters, requestId: "", from: auditDatetimeLocal(new Date(at - half)), to: auditDatetimeLocal(new Date(at + half)) };
+  saveAuditFilters();
+  await loadAuditOptions();
+  await loadAudit();
+  render();
+}
+
+app.addEventListener("pointermove", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (!svg) return;
+  const index = nearestResourceIndex(svg, event.clientX);
+  if (index >= 0) showResourcePoint(svg, index);
+});
+
+app.addEventListener("pointerout", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (svg && !svg.contains(event.relatedTarget)) hideResourcePoint(svg);
+});
+
+app.addEventListener("focusin", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (svg) showResourcePoint(svg, auditResourceFocus >= 0 ? auditResourceFocus : (auditResources?.samples?.length || 0) - 1);
+});
+
+app.addEventListener("focusout", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (svg) hideResourcePoint(svg);
+});
+
+app.addEventListener("keydown", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (!svg) return;
+  const count = auditResources?.samples?.length || 0;
+  const current = auditResourceFocus >= 0 ? auditResourceFocus : count - 1;
+  const moves = { ArrowLeft: current - 1, ArrowRight: current + 1, Home: 0, End: count - 1 };
+  if (event.key in moves) {
+    event.preventDefault();
+    showResourcePoint(svg, Math.min(count - 1, Math.max(0, moves[event.key])));
+  } else if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    void zoomAuditToResource(current).catch((error) => alert(error.message));
+  } else if (event.key === "Escape") {
+    hideResourcePoint(svg);
+  }
+});
+
+app.addEventListener("click", (event) => {
+  const svg = event.target.closest?.("[data-resource-plot]");
+  if (svg) {
+    const index = nearestResourceIndex(svg, event.clientX);
+    if (index >= 0) void zoomAuditToResource(index).catch((error) => alert(error.message));
+    return;
+  }
+  const back = event.target.closest?.('[data-action="audit-resource-unzoom"]');
+  if (!back || !auditResourcesZoomFrom) return;
+  auditFilters = { ...auditResourcesZoomFrom };
+  auditResourcesZoomFrom = null;
+  saveAuditFilters();
+  void loadAuditOptions().then(() => loadAudit()).then(() => render()).catch((error) => alert(error.message));
+});
+
+// Admin -> Performance (GET /api/admin/performance): NetSuite posting time for IF / IR / CM and the
+// server-side load time of each page's API calls, for one of four preset ranges.
+const PERFORMANCE_RANGES = Object.freeze([
+  ["today", "Today"], ["24h", "24 hours"], ["7d", "7 days"], ["30d", "30 days"]
+]);
+let performanceReport = null;
+let performanceError = "";
+let performanceLoading = false;
+let performanceRangeKey = PERFORMANCE_RANGES.some(([key]) => key === localStorage.getItem("mbbs.admin.performance.range"))
+  ? localStorage.getItem("mbbs.admin.performance.range") : "7d";
+
+async function loadPerformance() {
+  performanceLoading = true;
+  try {
+    performanceReport = await request(`/api/admin/performance?range=${encodeURIComponent(performanceRangeKey)}`);
+    performanceError = "";
+  } catch (error) {
+    performanceError = error.message;
+  } finally {
+    performanceLoading = false;
+  }
+  return performanceReport;
+}
+
+function perfDuration(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const ms = Math.max(0, Math.round(Number(value)));
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)} s`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ${String(seconds % 60).padStart(2, "0")} s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ${String(minutes % 60).padStart(2, "0")} min`;
+  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
+}
+
+function perfCount(value) {
+  return Number(value || 0).toLocaleString("en-CA");
+}
+
+function perfSlotLabel(value) {
+  const parts = auditZoneParts(new Date(value));
+  return Number(performanceReport?.slotSeconds) <= 3600
+    ? `${parts.month}-${parts.day} ${String(Number(parts.hour) % 24).padStart(2, "0")}:00`
+    : `${parts.month}-${parts.day}`;
+}
+
+// One-series trend line; native per-point tooltips, the table cells carry the exact numbers.
+function perfSparkline(points, key, label) {
+  const values = (points || []).filter((point) => Number.isFinite(Number(point[key])));
+  if (values.length < 2) return `<span class="muted">${values.length ? perfDuration(values[0][key]) : "—"}</span>`;
+  const width = 112;
+  const height = 28;
+  const max = Math.max(...values.map((point) => Number(point[key]))) || 1;
+  const x = (index) => 4 + (index / (values.length - 1)) * (width - 8);
+  const y = (value) => height - 4 - (Number(value) / max) * (height - 8);
+  const path = values.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point[key]).toFixed(1)}`).join("");
+  const last = values[values.length - 1];
+  const summary = `${label}: ${values.map((point) => `${perfSlotLabel(point.at)} ${perfDuration(point[key])}`).join(", ")}`;
+  return `
+    <svg class="perf-spark" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${escapeHtml(summary)}">
+      <path class="perf-spark-line" d="${path}" />
+      <circle class="perf-spark-end" cx="${x(values.length - 1).toFixed(1)}" cy="${y(last[key]).toFixed(1)}" r="4" />
+      ${values.map((point, index) => `<circle class="perf-spark-hit" cx="${x(index).toFixed(1)}" cy="${y(point[key]).toFixed(1)}" r="8"><title>${escapeHtml(`${perfSlotLabel(point.at)} · ${perfDuration(point[key])} · ${perfCount(point.count)} ${t("control.perfCalls", "done")}`)}</title></circle>`).join("")}
+    </svg>`;
+}
+
+function perfTimes(p50, p90, max) {
+  return `<span class="perf-times"><strong>${perfDuration(p50)}</strong><span>${perfDuration(p90)}</span><span class="muted">${perfDuration(max)}</span></span>`;
+}
+
+// Text, linked when the server gave an in-app path for it.
+function perfLink(text, href) {
+  const label = escapeHtml(text || "—");
+  return typeof href === "string" && href.startsWith("/") && !href.startsWith("//") ? `<a href="${escapeHtml(href)}">${label}</a>` : label;
+}
+
+function renderPerformancePostings() {
+  const postings = performanceReport?.postings || { rows: [], slowest: [], failures: [] };
+  const rows = postings.rows.length ? postings.rows.map((row) => `
+      <tr>
+        <td><span class="perf-type perf-type-${escapeHtml(String(row.type).toLowerCase())}">${escapeHtml(row.type)}</span> ${escapeHtml(row.label)}
+          ${row.source ? `<small class="muted perf-source">${row.link ? perfLink(row.source, row.link) : escapeHtml(row.source)}</small>` : ""}</td>
+        <td class="perf-num">${perfCount(row.posted)}</td>
+        <td class="perf-num">${row.failed ? `<span class="perf-failed">${perfCount(row.failed)}</span>` : "0"}${row.retried ? ` <small class="muted">${perfCount(row.retried)} ${t("control.perfRetried", "retried")}</small>` : ""}</td>
+        <td>${perfTimes(row.nsP50Ms, row.nsP90Ms, row.nsMaxMs)}</td>
+        <td>${perfTimes(row.totalP50Ms, row.totalP90Ms, row.totalMaxMs)}</td>
+        <td>${perfSparkline(row.trend, "p50Ms", `${row.type} ${row.label} ${t("control.perfMedianTotal", "median total time")}`)}</td>
+      </tr>`).join("") : `<tr><td colspan="6" class="muted">${t("control.perfNoPostings", "No postings in this range.")}</td></tr>`;
+  const slowest = postings.slowest.map((item) => `
+      <tr>
+        <td>${escapeHtml(formatDate(item.at))}</td>
+        <td><span class="perf-type perf-type-${escapeHtml(String(item.type).toLowerCase())}">${escapeHtml(item.type)}</span> ${escapeHtml(item.label)}</td>
+        <td>${perfLink(item.orderRef, item.link)}${item.recordRef ? ` → ${escapeHtml(item.recordRef)}` : ""}</td>
+        <td>${escapeHtml(item.actor || "—")}</td>
+        <td class="perf-num"><strong>${perfDuration(item.totalMs)}</strong></td>
+        <td class="perf-num">${perfDuration(item.nsMs)}</td>
+        <td class="perf-num">${item.attempts === null || item.attempts === undefined ? "—" : perfCount(item.attempts)}</td>
+      </tr>`).join("");
+  const failures = postings.failures.map((item) => `
+      <tr>
+        <td>${escapeHtml(formatDate(item.at))}</td>
+        <td><span class="perf-type perf-type-${escapeHtml(String(item.type).toLowerCase())}">${escapeHtml(item.type)}</span> ${escapeHtml(item.label)}</td>
+        <td>${perfLink(item.orderRef, item.link)}</td>
+        <td><span class="audit-severity ${item.outcome === "uncertain" ? "warning" : "error"}">${escapeHtml(item.outcome === "uncertain" ? t("control.perfUncertain", "Not confirmed") : t("control.perfFailedLabel", "Failed"))}</span></td>
+        <td class="perf-error">${escapeHtml(item.error || "—")}</td>
+      </tr>`).join("");
+  return `
+    <div class="perf-block" id="perf-postings">
+      <h3>${t("control.perfPostingTitle", "NetSuite posting time")}</h3>
+      <p class="muted perf-note">${t("control.perfPostingNote", "Each time column shows median · 90% · slowest. NetSuite = the posting call itself (duplicate check, create, read-back and any wait for a free NetSuite slot). Total = from the submit (or the automatic start) until NetSuite confirmed the record. Failed = attempts that failed or could not be confirmed and were retried. PO: NetSuite = all purchase-order writes of one action added up; Total = the time the MBBS request took (recorded since this page went live).")}</p>
+      <div class="perf-scroll">
+        <table class="audit-table perf-table">
+          <thead><tr>
+            <th>${t("control.perfPosting", "Posting")}</th><th class="perf-num">${t("control.perfDone", "Done")}</th><th class="perf-num">${t("control.perfFailed", "Failed")}</th>
+            <th>${t("control.perfNetSuite", "NetSuite time")}<br><small class="muted">${t("control.perfTimesLegend", "median · 90% · slowest")}</small></th>
+            <th>${t("control.perfTotal", "Total time")}<br><small class="muted">${t("control.perfTimesLegend", "median · 90% · slowest")}</small></th>
+            <th>${Number(performanceReport?.slotSeconds) <= 3600 ? t("control.perfTrendHour", "Median total per hour") : t("control.perfTrendDay", "Median total per day")}</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p class="muted perf-note">${t("control.perfPostingSince", "Credit memo and PO times, and the NetSuite time of SO auto-fulfillment, are recorded from 2026-11-05.")}</p>
+      <div class="perf-split">
+        <div>
+          <h4>${t("control.perfSlowest", "Slowest postings")}</h4>
+          <div class="perf-scroll"><table class="audit-table perf-table">
+            <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.perfPosting", "Posting")}</th><th>${t("control.perfOrder", "Order → record")}</th><th>${t("control.actor", "Actor")}</th><th class="perf-num">${t("control.perfTotal", "Total time")}</th><th class="perf-num">${t("control.perfNetSuite", "NetSuite time")}</th><th class="perf-num">${t("control.perfAttempts", "Attempts")}</th></tr></thead>
+            <tbody>${slowest || `<tr><td colspan="7" class="muted">—</td></tr>`}</tbody>
+          </table></div>
+        </div>
+        <div>
+          <h4>${t("control.perfFailures", "Recent failed attempts")}</h4>
+          <div class="perf-scroll"><table class="audit-table perf-table">
+            <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.perfPosting", "Posting")}</th><th>${t("control.perfOrderOnly", "Order")}</th><th>${t("control.perfResult", "Result")}</th><th>${t("control.perfError", "Error")}</th></tr></thead>
+            <tbody>${failures || `<tr><td colspan="5" class="muted">${t("control.perfNoFailures", "No failed attempts in this range.")}</td></tr>`}</tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+const PERF_CARD_LABELS = Object.freeze({
+  IF: "Item fulfillment", IR: "Item receipt", PO: "Purchase orders", CM: "Credit memos", Driver: "Driver completion"
+});
+
+// One card per type: done / failed in the range, the slowest 90% time, and what is waiting right now.
+function renderPerformanceSummary() {
+  const cards = performanceReport?.summary || [];
+  if (!cards.length) return "";
+  return `
+    <div class="perf-summary">
+      ${cards.map((card) => {
+        const items = card.attentionItems || [];
+        return `
+        <div class="perf-card${card.failed || card.attention ? " is-bad" : ""}" data-perf-card="${escapeHtml(card.type)}">
+          <button type="button" class="perf-card-head" data-action="performance-scroll" data-target="${card.type === "Driver" ? "perf-driver" : "perf-postings"}">
+            <span class="perf-type">${escapeHtml(card.type)}</span> ${escapeHtml(t(`control.perfCard.${card.type}`, PERF_CARD_LABELS[card.type] || card.type))}
+          </button>
+          <div class="perf-card-stats">
+            <span><strong>${perfCount(card.done)}</strong> ${t("control.perfDoneLower", "done")}</span>
+            <span${card.failed ? ` class="perf-failed"` : ""}><strong>${perfCount(card.failed)}</strong> ${t("control.perfFailedLower", "failed")}</span>
+          </div>
+          <div class="perf-card-time muted">${card.slowest ? `90%: <strong>${perfDuration(card.slowest.p90Ms)}</strong> · ${escapeHtml(card.slowest.label)}` : "—"}</div>
+          <div class="perf-card-attention">
+            ${card.attention ? `<strong class="perf-failed">${t("control.perfNeedsAttention", "Needs attention now")}: ${perfCount(card.attention)}</strong>
+              <ul>${items.map((item) => `<li>${perfLink(`${item.label}: ${perfCount(item.count)}`, item.link)}</li>`).join("")}</ul>`
+              : `<span class="muted">${t("control.perfNothingWaiting", "Nothing waiting")}</span>`}
+          </div>
+        </div>`;
+      }).join("")}
+    </div>
+    <p class="muted perf-note">${t("control.perfSummaryNote", "Done and failed are for the selected range; “Needs attention now” is what is waiting today, whatever the range. 90% = the slowest posting type's 90% time.")}</p>`;
+}
+
+const PERF_DRIVER_PROBLEMS = Object.freeze({
+  completion_failed: ["Completion failed", "error"],
+  connection_closed: ["Phone lost the reply", "warning"],
+  photo_upload: ["Photo upload failed", "error"],
+  offline_review_required: ["Offline sync: needs review", "error"],
+  offline_blocked: ["Offline sync: blocked", "error"],
+  offline_resolution_pending: ["Offline sync: being resolved", "warning"],
+  offline_rejected: ["Offline sync: rejected", "error"]
+});
+const PERF_PHOTO_STAGES = Object.freeze({
+  authorizing: "Getting upload ticket", uploading: "Uploading", confirming: "Confirming upload", saving: "Saving",
+  reconciling: "Checking after reconnect", signature: "Signature"
+});
+
+function renderPerformanceDriver() {
+  const driver = performanceReport?.driver;
+  if (!driver) return "";
+  const { online, offline, photos } = driver;
+  const steps = (online.steps || []).map((step) => `${escapeHtml(t(`control.perfStep.${step.key}`, step.label))} ${perfDuration(step.p50Ms)}`).join(" · ");
+  const trendHead = Number(performanceReport?.slotSeconds) <= 3600 ? t("control.perfTrendHour", "Median total per hour") : t("control.perfTrendDay", "Median total per day");
+  const failedCell = (count, extras) => `${count ? `<span class="perf-failed">${perfCount(count)}</span>` : "0"}${extras.filter(([value]) => value).map(([value, label]) => ` <small class="muted">${perfCount(value)} ${label}</small>`).join("")}`;
+  const uploadFailures = photos.uploadFailures || [];
+  const recent = (driver.recent || []).map((item) => {
+    const [label, severity] = PERF_DRIVER_PROBLEMS[item.kind] || [item.kind, "error"];
+    const stage = item.kind === "photo_upload" ? PERF_PHOTO_STAGES[item.code] || item.code : item.code;
+    return `
+      <tr>
+        <td>${escapeHtml(formatDate(item.at))}</td>
+        <td>${escapeHtml(item.driver || "—")}</td>
+        <td>${escapeHtml(item.jobId || "—")}</td>
+        <td><span class="audit-severity ${severity}">${escapeHtml(t(`control.perfDriverProblem.${item.kind}`, label))}</span>${stage ? ` <small class="muted">${escapeHtml(stage)}</small>` : ""}</td>
+        <td class="perf-error">${escapeHtml(item.error || "—")}</td>
+      </tr>`;
+  }).join("");
+  return `
+    <div class="perf-block" id="perf-driver">
+      <h3>${t("control.perfDriverTitle", "Driver completion")}</h3>
+      <p class="muted perf-note">${t("control.perfDriverNote", "Online = the completion request on the server (from arrival until the reply is sent; phone upload and network time are not included). Offline = from the tap on the phone until the server applied it: reaching the server, then waiting for photos and applying. Each time column shows median · 90% · slowest. A direct PO receipt posted after a drop is shown above as “Direct PO receipt”.")}</p>
+      <div class="perf-scroll">
+        <table class="audit-table perf-table">
+          <thead><tr>
+            <th>${t("control.perfCompletion", "Completion")}</th><th class="perf-num">${t("control.perfDone", "Done")}</th><th class="perf-num">${t("control.perfFailed", "Failed")}</th>
+            <th>${t("control.perfTotal", "Total time")}<br><small class="muted">${t("control.perfTimesLegend", "median · 90% · slowest")}</small></th>
+            <th>${t("control.perfDriverParts", "Parts (median)")}</th><th>${trendHead}</th>
+          </tr></thead>
+          <tbody>
+            <tr data-perf-driver="online">
+              <td>${t("control.perfDriverOnline", "Online completion")}<small class="muted perf-source">${t("control.perfDriverOnlineSource", "Driver PWA → server")}</small></td>
+              <td class="perf-num">${perfCount(online.done)}</td>
+              <td class="perf-num">${failedCell(online.failed, [[online.rejected, t("control.perfRejected", "rejected")], [online.lostConnection, t("control.perfLostReply", "lost reply")]])}</td>
+              <td>${perfTimes(online.p50Ms, online.p90Ms, online.maxMs)}</td>
+              <td><small>${steps || "—"}</small></td>
+              <td>${perfSparkline(online.trend, "p50Ms", t("control.perfDriverOnline", "Online completion"))}</td>
+            </tr>
+            <tr data-perf-driver="offline">
+              <td>${t("control.perfDriverOffline", "Offline completion")}<small class="muted perf-source">${perfLink(t("control.perfDriverOfflineSource", "tap on phone → applied"), "/dispatch-offline-review.html")}</small></td>
+              <td class="perf-num">${perfCount(offline.applied)}</td>
+              <td class="perf-num">${failedCell(offline.review + offline.rejected, [[offline.waiting, t("control.perfStillSyncing", "still syncing")], [offline.evidenceOnly, t("control.perfEvidenceOnly", "kept as evidence")]])}</td>
+              <td>${perfTimes(offline.totalP50Ms, offline.totalP90Ms, offline.totalMaxMs)}</td>
+              <td><small>${t("control.perfReachServer", "Reach server")} ${perfDuration(offline.uploadP50Ms)} · ${t("control.perfApply", "Photos + apply")} ${perfDuration(offline.applyP50Ms)}${offline.invalidDeviceTime ? ` · ${perfCount(offline.invalidDeviceTime)} ${t("control.perfBadPhoneClock", "with a wrong phone clock (not timed)")}` : ""}</small></td>
+              <td>${perfSparkline(offline.trend, "p50Ms", t("control.perfDriverOffline", "Offline completion"))}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="perf-split">
+        <div>
+          <h4>${t("control.perfPhotoUploads", "Photo uploads")}</h4>
+          <p class="muted perf-note">${t("control.perfOfflinePhotos", "Offline photos")}: ${perfCount(photos.offline.photos)} ${t("control.perfReceived", "received")}, ${perfCount(photos.offline.durable)} ${t("control.perfVerified", "verified")} (${t("control.perfMedian", "Median")} ${perfDuration(photos.offline.durableP50Ms)}, 90% ${perfDuration(photos.offline.durableP90Ms)})${photos.offline.rejected ? ` · <span class="perf-failed">${perfCount(photos.offline.rejected)} ${t("control.perfRejected", "rejected")}</span>` : ""}${photos.offline.verificationErrors ? ` · <span class="perf-failed">${perfCount(photos.offline.verificationErrors)} ${t("control.perfVerifyErrors", "not verified yet (error)")}</span>` : ""}</p>
+          <div class="perf-scroll"><table class="audit-table perf-table">
+            <thead><tr><th>${t("control.perfUploadStage", "Failed at")}</th><th class="perf-num">${t("control.perfFailed", "Failed")}</th><th class="perf-num">${t("control.perfRecovered", "Recovered later")}</th></tr></thead>
+            <tbody>${uploadFailures.length ? uploadFailures.map((item) => `
+              <tr><td>${escapeHtml(t(`control.perfPhotoStage.${item.stage}`, PERF_PHOTO_STAGES[item.stage] || item.stage || "—"))}</td>
+                <td class="perf-num">${item.failed ? `<span class="perf-failed">${perfCount(item.failed)}</span>` : "0"}</td>
+                <td class="perf-num">${perfCount(item.recovered)}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">${t("control.perfNoUploadFailures", "No photo upload failures in this range.")}</td></tr>`}</tbody>
+          </table></div>
+        </div>
+        <div>
+          <h4>${t("control.perfDriverRecent", "Recent driver problems")} <small class="muted">${perfLink(t("control.perfOpenOfflineReview", "Open Driver PWA review"), "/dispatch-offline-review.html")}</small></h4>
+          <div class="perf-scroll"><table class="audit-table perf-table">
+            <thead><tr><th>${t("control.time", "Time")}</th><th>${t("control.perfDriver", "Driver")}</th><th>${t("control.perfJob", "Job")}</th><th>${t("control.perfProblem", "Problem")}</th><th>${t("control.perfError", "Error")}</th></tr></thead>
+            <tbody>${recent || `<tr><td colspan="5" class="muted">${t("control.perfNoDriverProblems", "No driver problems in this range.")}</td></tr>`}</tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderPerformanceEndpointRows(endpoints) {
+  return endpoints.map((item) => `
+      <tr class="${item.background ? "perf-background" : ""}">
+        <td>
+          ${item.label ? `<strong>${escapeHtml(item.label)}</strong><br>` : ""}
+          <code>${escapeHtml(item.method)} ${escapeHtml(item.route)}</code>
+          ${item.background ? `<small class="muted"> · ${t("control.perfBackground", "automatic refresh")}</small>` : ""}
+        </td>
+        <td class="perf-num">${perfCount(item.count)}</td>
+        <td class="perf-num"><strong>${perfDuration(item.p50Ms)}</strong></td>
+        <td class="perf-num">${perfDuration(item.p90Ms)}</td>
+        <td class="perf-num muted">${perfDuration(item.maxMs)}</td>
+        <td class="perf-num">${item.errors ? `<span class="perf-failed">${perfCount(item.errors)}</span>` : "0"}</td>
+        <td>${item.key ? perfSparkline(item.trend, "p90Ms", `${item.label} 90%`) : ""}</td>
+      </tr>`).join("");
+}
+
+function renderPerformancePages() {
+  const groups = performanceReport?.pages || [];
+  const head = `<thead><tr><th>${t("control.perfCall", "Page or call")}</th><th class="perf-num">${t("control.perfCalls", "Calls")}</th><th class="perf-num">${t("control.perfMedian", "Median")}</th><th class="perf-num">90%</th><th class="perf-num">${t("control.perfSlowestShort", "Slowest")}</th><th class="perf-num">${t("control.perfErrors", "Errors")}</th><th>${Number(performanceReport?.slotSeconds) <= 3600 ? t("control.perfTrend90Hour", "90% per hour") : t("control.perfTrend90Day", "90% per day")}</th></tr></thead>`;
+  return `
+    <div class="perf-block">
+      <h3>${t("control.perfPagesTitle", "Page and API load time")}</h3>
+      <p class="muted perf-note">${t("control.perfPagesNote", "Measured on the server: from the request arriving until the last byte is sent (uploads include the transfer time). Phone network time and drawing the screen come on top. Errors = server errors and calls the browser abandoned.")}
+        ${performanceReport?.pagesRecordedSince ? ` ${t("control.perfRecordingSince", "Recording since")} ${escapeHtml(formatDate(performanceReport.pagesRecordedSince))}.` : ` ${t("control.perfNotRecorded", "Nothing recorded yet.")}`}</p>
+      ${groups.map((group) => {
+        const shown = group.endpoints.filter((item, index) => item.key || item.page || index < 8);
+        const rest = group.endpoints.filter((item) => !shown.includes(item));
+        return `
+        <div class="perf-group" data-perf-group="${escapeHtml(group.key)}">
+          <h4>${escapeHtml(group.label)} <small class="muted">${perfCount(group.calls)} ${t("control.perfCallsLower", "calls")}${group.slowest ? ` · ${t("control.perfSlowestCall", "slowest 90%")}: ${escapeHtml(group.slowest.label || group.slowest.route)} ${perfDuration(group.slowest.p90Ms)}` : ""}</small></h4>
+          ${group.endpoints.length ? `
+            <div class="perf-scroll"><table class="audit-table perf-table">${head}<tbody>${renderPerformanceEndpointRows(shown)}</tbody></table></div>
+            ${rest.length ? `<details class="perf-more"><summary>${t("control.perfShowAll", "Show all calls")} (${rest.length} ${t("control.perfMore", "more")})</summary>
+              <div class="perf-scroll"><table class="audit-table perf-table">${head}<tbody>${renderPerformanceEndpointRows(rest)}</tbody></table></div></details>` : ""}
+          ` : `<p class="muted">${t("control.perfNoCalls", "No calls in this range.")}</p>`}
+        </div>`;
+      }).join("")}
+    </div>`;
+}
+
+function renderPerformanceSection() {
+  return `
+    <section class="panel perf-page${performanceLoading && performanceReport ? " is-loading" : ""}">
+      <div class="section-heading">
+        <div>
+          <h2>${t("control.performance", "Performance")}</h2>
+          <p class="muted">${performanceReport ? `${escapeHtml(formatDate(performanceReport.from))} – ${escapeHtml(formatDate(performanceReport.to))} · ${t("control.auditTorontoTime", "Toronto time")}` : t("common.loading", "Loading…")}</p>
+        </div>
+        <div class="perf-range" role="group" aria-label="${t("control.perfRange", "Range")}">
+          ${PERFORMANCE_RANGES.map(([key, label]) => `<button type="button" data-action="performance-range" data-range="${key}" class="${key === performanceRangeKey ? "active" : ""}" aria-pressed="${key === performanceRangeKey}">${escapeHtml(t(`control.perfRange.${key}`, label))}</button>`).join("")}
+          <button type="button" data-action="performance-refresh">${t("common.refresh", "Refresh")}</button>
+        </div>
+      </div>
+      ${performanceError ? `<div class="notice warning">${escapeHtml(performanceError)}</div>` : ""}
+      ${performanceReport ? `${renderPerformanceSummary()}${renderPerformancePostings()}${renderPerformanceDriver()}${renderPerformancePages()}` : ""}
+    </section>`;
+}
+
+app.addEventListener("click", (event) => {
+  const button = event.target.closest?.('[data-action="performance-range"], [data-action="performance-refresh"], [data-action="performance-scroll"]');
+  if (!button) return;
+  if (button.dataset.action === "performance-scroll") {
+    document.getElementById(button.dataset.target || "")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  if (button.dataset.action === "performance-range") {
+    performanceRangeKey = button.dataset.range || "7d";
+    localStorage.setItem("mbbs.admin.performance.range", performanceRangeKey);
+  }
+  render();
+  void loadPerformance().then(() => render());
+});
 
 async function loadReturnDetail(id = selectedReturnId) {
   if (!id) {
@@ -5009,6 +5899,39 @@ async function loadAdminReturnSettings() {
   }
 }
 
+// Admin tabs load the data they show when they are opened, not every tab's data on every page.
+// The Audit Log runs no search until Apply / Refresh; the SOR auto-returns panel loads itself.
+const ADMIN_SECTION_DATA = {
+  dashboard: ["operators", "syncSettings", "photoArchive", "mapsUsage", "returnSettings"],
+  operators: ["operators", "aggregateAccess", "publicSales"],
+  sync: ["syncSettings", "m2m", "envSettings", "mirror"],
+  "maps-usage": ["mapsUsage"],
+  reconciliation: ["reconciliation"],
+  "return-automation": ["returnSettings", "returnNotifications"],
+  storage: ["photoArchive"],
+  performance: ["performance"],
+  audit: [],
+  "sor-auto-returns": []
+};
+const ADMIN_DATA_LOADERS = {
+  operators: async () => { operators = await request("/api/operators"); },
+  aggregateAccess: async () => { aggregateAccess = await request("/api/admin/aggregate-request-access"); },
+  publicSales: async () => { publicSalesSettings = await request("/api/admin/public-sales"); },
+  syncSettings: async () => { syncSettings = await request("/api/control/sync-settings"); },
+  m2m: async () => { netsuiteM2mStatus = await request("/api/admin/netsuite-m2m"); },
+  envSettings: async () => { envSettings = await request("/api/control/env-settings"); },
+  mirror: async () => { mirrorStatus = await request("/api/admin/netsuite-mirror"); },
+  photoArchive: async () => { photoArchiveSettings = await request("/api/admin/photo-archive"); },
+  mapsUsage: async () => {
+    mapsUsage = await request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message }));
+  },
+  returnSettings: () => loadAdminReturnSettings(),
+  returnNotifications: () => loadReturnNotificationSettings(),
+  reconciliation: () => loadScmReconciliationControl(),
+  // The report can take seconds; the tab shows "Loading…" and renders when it arrives, as before.
+  performance: async () => { void loadPerformance().then(() => render()); }
+};
+
 async function loadControlData() {
   if (!IS_ADMIN_PAGE && activeSection === "reopen") return controlOrderReopen.load();
   if (!IS_ADMIN_PAGE && activeSection === "count-sheets") return controlCountSheets.load();
@@ -5020,35 +5943,9 @@ async function loadControlData() {
     return render();
   }
   if (IS_ADMIN_PAGE) {
-    const [nextOperators, nextAuditOptions, nextAudit, nextSyncSettings, nextM2mStatus, nextEnvSettings, nextPhotoArchiveSettings, nextMirrorStatus, nextPublicSalesSettings, nextMapsUsage, nextAggregateAccess] = await Promise.all([
-      request("/api/operators"),
-      request(auditOptionsQueryString()),
-      request(auditQueryString()),
-      request("/api/control/sync-settings"),
-      request("/api/admin/netsuite-m2m"),
-      request("/api/control/env-settings"),
-      request("/api/admin/photo-archive"),
-      request("/api/admin/netsuite-mirror"),
-      request("/api/admin/public-sales"),
-      request("/api/admin/maps-usage").catch((error) => ({ ...mapsUsage, error: error.message })),
-      request("/api/admin/aggregate-request-access")
-    ]);
-    operators = nextOperators;
-    aggregateAccess = nextAggregateAccess;
-    auditOptions = nextAuditOptions;
-    audit = nextAudit;
-    syncSettings = nextSyncSettings;
-    netsuiteM2mStatus = nextM2mStatus;
-    envSettings = nextEnvSettings;
-    photoArchiveSettings = nextPhotoArchiveSettings;
-    mirrorStatus = nextMirrorStatus;
-    publicSalesSettings = nextPublicSalesSettings;
-    mapsUsage = nextMapsUsage;
-    await Promise.all([
-      loadAdminReturnSettings(),
-      loadReturnNotificationSettings(),
-      loadScmReconciliationControl()
-    ]);
+    // Only the open tab's data (2026-11-06: every tab waited ~30 s for a remembered Audit Log search).
+    const keys = ADMIN_SECTION_DATA[activeSection] ?? ADMIN_SECTION_DATA.dashboard;
+    await Promise.all(keys.map((key) => ADMIN_DATA_LOADERS[key]()));
   } else {
     classifications = await request(`/api/inventory/classifications?limit=300${classificationSearch ? `&search=${encodeURIComponent(classificationSearch)}` : ""}`);
     cycleRecords = await request("/api/cycle-count/records?limit=50");
@@ -5441,6 +6338,7 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "apply-audit-filters") {
+      auditResourcesZoomFrom = null;
       app.querySelectorAll("[data-audit-filter]").forEach((input) => {
         auditFilters[input.dataset.auditFilter] = input.value || "";
       });
@@ -5450,10 +6348,45 @@ app.addEventListener("click", async (event) => {
       return render();
     }
     if (button.dataset.action === "reset-audit-filters") {
-      auditFilters = { from: "", to: "", actor: "", action: "", tranid: "", limit: "200" };
+      auditFiltersBeforeRequest = null;
+      auditResourcesZoomFrom = null;
+      auditFilters = { ...AUDIT_FILTER_DEFAULTS };
       saveAuditFilters();
       await loadAuditOptions();
       await loadAudit();
+      return render();
+    }
+    if (button.dataset.action === "audit-same-request") {
+      // A request and the postings it triggers finish within minutes; the window keeps the search fast.
+      const createdAt = new Date(button.dataset.createdAt || Date.now());
+      const anchor = Number.isNaN(createdAt.getTime()) ? new Date() : createdAt;
+      auditFiltersBeforeRequest ||= { ...auditFilters };
+      auditFilters = {
+        ...AUDIT_FILTER_DEFAULTS,
+        limit: auditFilters.limit,
+        requestId: button.dataset.requestId || "",
+        from: auditDatetimeLocal(new Date(anchor.getTime() - 15 * 60_000)),
+        to: auditDatetimeLocal(new Date(anchor.getTime() + 3 * 3_600_000))
+      };
+      await loadAudit();
+      return render();
+    }
+    if (button.dataset.action === "audit-clear-request") {
+      auditFilters = auditFiltersBeforeRequest ? { ...auditFiltersBeforeRequest, requestId: "" } : { ...auditFilters, requestId: "" };
+      auditFiltersBeforeRequest = null;
+      await loadAudit();
+      return render();
+    }
+    if (button.dataset.action === "load-more-audit") {
+      auditLoadingMore = true;
+      render();
+      try {
+        await loadMoreAudit();
+      } catch (error) {
+        auditLoadError = error.message;
+      } finally {
+        auditLoadingMore = false;
+      }
       return render();
     }
     if (button.dataset.action === "open-photo-lightbox") {

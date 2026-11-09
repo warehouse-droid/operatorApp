@@ -4,6 +4,38 @@ import { pickupExistingFulfillmentTransactions } from './operator-pickup-existin
 import { operatorPostingTelemetry as telemetry } from "./operator-netsuite-posting-telemetry.js";
 import { operatorStepHasKits } from './operator-netsuite-posting-kits.js';
 import { POSTING_AUTO_RETRY_DELAYS_MINUTES, isPostingTimeoutOrConnectionFailure } from './posting-auto-retry-policy.js';
+import { sourceCompletionForStep } from './netsuite-attention-reconciliation.js';
+
+/** An Admin re-post waits this long after anything was last sent to NetSuite, so
+ * a slow earlier request has finished (RESTlets stop after 5 minutes). */
+export const ADMIN_REPOST_QUIET_SECONDS = 10 * 60;
+
+/** @param {string} message */
+function refusedRepost(message) {
+  return Object.assign(new Error(message), { code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED", ambiguous: true });
+}
+
+/**
+ * The synchronous Admin re-post conditions: a current authorization, the quiet
+ * period, and a baseline to compare the source order against.
+ * @param {any} repost evidence from startAttempt @param {boolean} ready the boundary supports a re-post
+ * @returns {number} the baseline transaction ID
+ */
+export function assertAdminRepostReady(repost, ready) {
+  if (repost?.authorized !== true || !ready) {
+    throw refusedRepost("The previous NetSuite attempt is not yet verified. Recovery must finish before another posting.");
+  }
+  const since = repost.secondsSinceRemoteAttempt;
+  if (since !== null && !(Number(since) >= ADMIN_REPOST_QUIET_SECONDS)) {
+    const minutes = Math.max(1, Math.ceil((ADMIN_REPOST_QUIET_SECONDS - Math.max(0, Number(since) || 0)) / 60));
+    throw refusedRepost(`NetSuite has no record of the earlier attempt yet. Resume verification again in ${minutes} minute${minutes === 1 ? "" : "s"} to post the saved evidence.`);
+  }
+  const baseline = Number(repost.baselineTransactionId);
+  if (!Number.isSafeInteger(baseline) || baseline <= 0) {
+    throw refusedRepost("There is no earlier posting to compare this order against, so it cannot be posted again automatically.");
+  }
+  return baseline;
+}
 
 /** @param {unknown} error */
 function failureDetails(error) {
@@ -59,8 +91,8 @@ function safeRemoteEvidence(record) {
 
 /**
  * @param {object} dependencies
- * @param {{get: Function, claim: Function, renew: Function, startAttempt: Function, success: Function, failure: Function, attention: Function, fail: Function, complete: Function}} dependencies.repository
- * @param {{findByExternalId: Function, verify: Function, transform: Function, fetchById: Function}} dependencies.adapter
+ * @param {{get: Function, claim: Function, renew: Function, startAttempt: Function, success: Function, failure: Function, attention: Function, fail: Function, complete: Function, markAttemptRemote?: Function, scheduleAutoRetry?: Function}} dependencies.repository
+ * @param {{findByExternalId: Function, verify: Function, transform: Function, fetchById: Function, hasSplitPlan?: Function, linkedTransactionsAfter?: Function}} dependencies.adapter
  * @param {(command: Record<string, any>) => Promise<unknown>} dependencies.finalize
  * @param {string} dependencies.workerId
  * @param {(command: Record<string, any>) => Promise<unknown>} [dependencies.lockFinalization]
@@ -113,6 +145,72 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     }
   }
 
+  /**
+   * Outcome for a direct step whose earlier attempt has no verified result, after the
+   * external-ID read proved NetSuite holds no transaction for it.
+   *  1. Reconciliation: if an IF/IR was posted against the source order since the request and
+   *     NetSuite shows this step's lines fully fulfilled, that transaction completes the step.
+   *     If something was posted but quantity remains, a person decides (throws).
+   *  2. Admin re-post: with nothing posted since, only a fresh Admin "Resume verification"
+   *     (one attempt), after a quiet period, may send the saved payload again.
+   * Otherwise it throws and nothing is sent.
+   * @param {Record<string, any>} step @param {Record<string, any>} attempt
+   * @returns {Promise<{ record?: Record<string, any>, verified?: Record<string, any>, reconciliation?: Record<string, any>,
+   *   repostEvidence?: Record<string, any> }>}
+   */
+  async function unverifiedStepOutcome(step, attempt) {
+    const repost = attempt.adminRepost;
+    const baseline = Number(repost?.baselineTransactionId);
+    /** @type {any[]|null} */ let later = null;
+    if (typeof adapter.linkedTransactionsAfter === "function" && Number.isSafeInteger(baseline) && baseline > 0) {
+      later = await uncheckedAsUnverified(step, "list the transactions posted against", () => telemetry.context({ stage: "repost_check" },
+        () => telemetry.time({ operation: "posting.repost_check" }, () => /** @type {Function} */ (adapter.linkedTransactionsAfter)(step, baseline))));
+      if (!Array.isArray(later)) {throw refusedRepost("NetSuite did not list the transactions for this order. Nothing was posted again.");}
+      if (later.length) {return reconcileFromSource(step, later, baseline);}
+    }
+    assertAdminRepostReady(repost, later !== null && typeof repository.markAttemptRemote === "function");
+    return { repostEvidence: { adminRepost: { authorizedAt: repost.authorizedAt, secondsSinceRemoteAttempt: repost.secondsSinceRemoteAttempt,
+      baselineTransactionId: baseline, laterLinkedTransactions: 0, externalIdAbsent: true } } };
+  }
+
+  /**
+   * A reconciliation read that fails proves nothing: the step stays "not yet verified" (so
+   * automatic verification continues) and nothing is sent.
+   * @param {Record<string, any>} step @param {string} action @param {() => Promise<any>} read
+   */
+  async function uncheckedAsUnverified(step, action, read) {
+    try { return await read(); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw refusedRepost(`NetSuite could not ${action} ${step.sourceOrderRef || "this order"} (${message}). Nothing was posted again.`);
+    }
+  }
+
+  /**
+   * @param {Record<string, any>} step @param {any[]} later IF/IR posted against the order since the request
+   * @param {number} baseline
+   */
+  async function reconcileFromSource(step, later, baseline) {
+    const order = step.sourceOrderRef || "This order";
+    const refs = later.map((/** @type {any} */ item) => item.tranId || item.id).join(", ");
+    if (typeof adapter.sourceFulfillment !== "function" || step.sourceOrderKind !== "SO" || step.transactionType !== "IF") {
+      throw refusedRepost(`${order} already has ${refs} posted after this request. Check it in NetSuite; nothing was posted again.`);
+    }
+    const live = await uncheckedAsUnverified(step, "read the fulfillment of", () => telemetry.context({ stage: "reconciliation" },
+      () => telemetry.time({ operation: "posting.reconciliation" }, () => /** @type {Function} */ (adapter.sourceFulfillment)(step))));
+    const completion = sourceCompletionForStep(step, live);
+    if (!completion.complete) {
+      throw refusedRepost(`${order} already has ${refs} posted after this request, but NetSuite does not show this posting's quantity as fulfilled. Check it in NetSuite; nothing was posted again.`);
+    }
+    const latest = later[later.length - 1];
+    const id = Number(latest.id);
+    if (!Number.isSafeInteger(id) || id <= 0) {throw refusedRepost(`${order}: NetSuite returned an unreadable transaction ID. Nothing was posted again.`);}
+    const tranId = String(latest.tranId || id);
+    return { record: { id, tranId, externalId: "" }, verified: { id, transactionRef: tranId },
+      reconciliation: { reconciledFromSource: true, baselineTransactionId: baseline, transactions: later,
+        reason: completion.reason, status: completion.status, lines: completion.lines } };
+  }
+
   async function verifiedExternalRecord(/** @type {Record<string, any>} */ step, stage = "duplicate_check", direct = false) {
     const record = await telemetry.context({ stage }, () => telemetry.time({ operation: `posting.${stage}` }, () => adapter.findByExternalId(step, direct)));
     if (!record) {return null;}
@@ -121,7 +219,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
   }
 
   // The branches mirror one remote transform/recovery state machine; splitting
-  // them would obscure the no-second-transform invariant.
+  // them would obscure the no-second-transform invariant. Its one exception is an
+  // Admin re-post, allowed only by adminRepostEvidence after NetSuite proves absence.
   // eslint-disable-next-line complexity
   async function postStep(/** @type {Record<string, any>} */ command, /** @type {Record<string, any>} */ step) {
     const attempt = await repository.startAttempt({
@@ -137,6 +236,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
     const mayTransform = !direct || attempt.fresh === true || backgroundRetry || await adapter.hasSplitPlan?.(step) === true;
     let recoveryAttempted = direct && !mayTransform;
     let remoteMayExist = direct && !mayTransform;
+    /** @type {Record<string, any>|undefined} */ let reconciliation;
+    /** @type {Record<string, any>} */ let outcome = { repostEvidence: {} };
     try {
       const existing = direct && mayTransform && !backgroundRetry && !operatorStepHasKits(step) ? null
         : await verifiedExternalRecord(step, direct ? "recovery" : "duplicate_check", direct);
@@ -144,11 +245,18 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
         ({ record, verified } = existing);
         recovered = true;
       } else {
-        if (!mayTransform) {
-          throw Object.assign(new Error("The previous NetSuite attempt is not yet verified. Recovery must finish before another posting."), {
-            code: "OPERATOR_NETSUITE_POSTING_RESULT_UNVERIFIED", ambiguous: true
-          });
+        // The external-ID read above found nothing. An unverified step is either completed
+        // by reconciliation or, only by Admin re-post, sent again with its saved payload.
+        if (!mayTransform) {outcome = await unverifiedStepOutcome(step, attempt);}
+        if (outcome.record) {
+          ({ record, verified, reconciliation } = outcome);
+          recovered = true;
         }
+      }
+      if (!recovered) {
+        if (!mayTransform) {recoveryAttempted = false;}
+        await repository.markAttemptRemote?.({ commandId: command.id, leaseToken: command.leaseToken,
+          stepId: step.id, attemptNumber: attempt.attemptNumber, details: outcome.repostEvidence });
         const transformed = await telemetry.context({ stage: "transform" }, () => telemetry.time({ operation: "posting.transform" }, () => adapter.transform(step)));
         remoteMayExist = true;
         const transactionId = Number(transformed?.id);
@@ -212,7 +320,8 @@ export function createOperatorNetSuitePostingProcessor({ repository, adapter, fi
       transactionRef: verified.transactionRef,
       response: { ...safeRemoteEvidence(record),
         ...(verified.quantityAdjustments?.length ? { quantityAdjustments: verified.quantityAdjustments } : {}),
-        ...(verified.additionalPurchaseCharges?.length ? { additionalPurchaseCharges: verified.additionalPurchaseCharges } : {}) },
+        ...(verified.additionalPurchaseCharges?.length ? { additionalPurchaseCharges: verified.additionalPurchaseCharges } : {}),
+        ...(reconciliation ? { reconciliation } : {}) },
       recovered
     });
     replaceStep(command, updated);

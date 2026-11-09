@@ -34,10 +34,11 @@ export const netSuiteFailureAudit = createNetSuiteFailureAudit({ persist: persis
 export function closeNetSuiteFailureAudit() { return auditPool.end(); }
 
 /** @type {import('express').RequestHandler} */
-export function netSuiteFailureRequestContext(req, _res, next) {
+export function netSuiteFailureRequestContext(req, res, next) {
   const requestId = crypto.randomUUID();
   return netSuiteFailureAudit.context({ requestContext: () => ({
     actorOperatorId: (/** @type {any} */ (req)).operator?.id,
+    auditRequestId: res.locals?.auditRequestId,
     requestId: req.body?.requestId || requestId,
     orderId: req.params?.id || req.body?.orderId || req.originalUrl.match(/\/orders\/([^/?]+)/u)?.[1],
     locationId: req.body?.destinationLocationId ?? req.body?.locationId,

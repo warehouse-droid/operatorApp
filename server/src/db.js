@@ -6,8 +6,13 @@ const { Pool } = pg;
 const transactionStorage = new AsyncLocalStorage();
 let savepointSeq = 0;
 
+// node-postgres defaults to 10 connections. On 2026-11-06 a few transactions held connections while
+// waiting on other work and every page queued behind them; PostgreSQL allows 100 (about 22 in use).
+export const DATABASE_POOL_MAX = Math.min(50, Math.max(1, Number.parseInt(process.env.DATABASE_POOL_MAX || "", 10) || 30));
+
 export const pool = new Pool({
   connectionString: config.databaseUrl,
+  max: DATABASE_POOL_MAX,
   options: "-c jit=off"
 });
 

@@ -524,34 +524,36 @@ function isPhysicalItem(line) {
     || type.includes("non-inventory");
 }
 
-export function assertReturnOrderFullyFulfilled(order = {}) {
+/**
+ * Order-level gate, checked before any return history call. Returns are limited per line: each
+ * line can return at most its own fulfilled quantity, less what is already returned or reserved
+ * (returnBalance), so a partly fulfilled or closed order can return what was fulfilled. The whole
+ * order is blocked only when nothing on it can be returned: pending approval, cancelled, or (while
+ * not fully fulfilled) no physical line fulfilled yet.
+ */
+export function assertReturnOrderFulfilled(order = {}) {
   const statusText = String(order.statusText || order.status_text || "").trim();
   const status = String(order.status || "").trim();
   const normalized = `${status} ${statusText}`.replace(/\s+/g, " ").trim().toUpperCase();
   const rawCode = status.toUpperCase().match(/(?:^|:)([A-Z])$/)?.[1] || "";
-  const blockedCode = ["A", "B", "C", "D", "E", "Y"].includes(rawCode);
-  const blockedText = [
-    "PENDING APPROVAL",
-    "PENDING FULFILLMENT",
-    "PARTIALLY FULFILLED",
-    "CANCELLED",
-    "CANCELED",
-    "UNDEFINED"
-  ].some((value) => normalized.includes(value));
-  const closed = rawCode === "H" || normalized.includes("CLOSED");
-  const incompleteClosedLine = closed && (order.lines || [])
-    .filter((line) => isPhysicalItem(line))
-    .some((line) => Number(line.fulfilledQuantity || 0) + QUANTITY_EPSILON
-      < Number(line.salesQuantity || 0));
-  if (!blockedCode && !blockedText && !incompleteClosedLine) {
+  const notReturnable = ["A", "C", "Y"].includes(rawCode)
+    || ["PENDING APPROVAL", "CANCELLED", "CANCELED", "UNDEFINED"].some((value) => normalized.includes(value));
+  const notFullyFulfilled = ["B", "D", "E", "H"].includes(rawCode)
+    || ["PENDING FULFILLMENT", "PARTIALLY FULFILLED", "CLOSED"].some((value) => normalized.includes(value));
+  const anyLineFulfilled = (order.lines || [])
+    .some((line) => isPhysicalItem(line) && Number(line.fulfilledQuantity || 0) > QUANTITY_EPSILON);
+  if (!notReturnable && (!notFullyFulfilled || anyLineFulfilled)) {
     return;
   }
-  const displayedStatus = statusText || status || "not fully fulfilled";
+  const orderRef = order.tranid || order.id || "";
+  const displayedStatus = statusText || status || "not fulfilled";
   throw httpError(
     409,
-    `Sales Order ${order.tranid || order.id || ""} is ${displayedStatus}. Only fully fulfilled Sales Orders can be returned.`,
+    notReturnable
+      ? `Sales Order ${orderRef} is ${displayedStatus} and cannot be returned.`
+      : `Nothing on Sales Order ${orderRef} has been fulfilled yet (${displayedStatus}). Only fulfilled quantities can be returned.`,
     {
-      code: "ORDER_NOT_FULLY_FULFILLED",
+      code: "ORDER_NOT_FULFILLED",
       orderStatus: status,
       orderStatusText: statusText
     }
@@ -588,7 +590,7 @@ export async function lookupReturnSalesOrder({
   if (!order) throw httpError(404, "Sales Order was not found in NetSuite.");
   // The first SO-lines response already contains the authoritative header
   // status. Fail here before PALLET/stock history or REST line expansion.
-  assertReturnOrderFullyFulfilled(order);
+  assertReturnOrderFulfilled(order);
   if (!order.orderingLocationId) {
     const prefix = String(order.tranid || "").toUpperCase();
     const fallback = prefix.startsWith("SOA")

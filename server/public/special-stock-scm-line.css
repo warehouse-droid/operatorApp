@@ -66,3 +66,31 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* PO-only items (vendor fees such as a split fee, or other items) after the PO exists. */
+.special-stock-page .special-po-items {
+  display: grid;
+  gap: 0.6rem;
+  margin-top: 1rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid #e5e7eb;
+}
+
+.special-stock-page .special-po-items h4,
+.special-stock-page .special-po-items p {
+  margin: 0;
+}
+
+.special-stock-page .special-po-item form {
+  margin-top: 0.4rem;
+}
+
+/* The PO-only item suggestions open directly under the search field (SPREQ-000187). */
+.special-stock-page .special-po-item-search {
+  display: block;
+}
+
+.special-stock-page .special-po-item-search > input {
+  width: 100%;
+  box-sizing: border-box;
+}

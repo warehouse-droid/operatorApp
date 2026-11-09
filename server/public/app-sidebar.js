@@ -12,10 +12,12 @@
   let sidebarOperator = null;
   let mbrContractsEnabled = false;
   let repairEnabled = false;
+  let accountApplicationsEnabled = false;
+  let accountApprovalCount = 0;
   const repairPage = path === "/repair" || path.startsWith("/repair/");
   const repairParams = new URLSearchParams(window.location.search);
   if (repairPage && (repairParams.has("embedded") || repairParams.get("mode") === "driver")) return;
-  if (!path.startsWith("/repair") && !path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbr") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests")) return;
+  if (!path.startsWith("/repair") && !path.startsWith("/admin") && !path.startsWith("/control") && !path.startsWith("/dispatch") && !path.startsWith("/scm") && !path.startsWith("/sales") && !path.startsWith("/mbr") && !path.startsWith("/mbt") && !path.startsWith("/aggregate-requests") && !path.startsWith("/accounting")) return;
 
   function t(key, fallback) {
     return window.MBBS_I18N?.t?.(key, fallback) || fallback;
@@ -65,6 +67,7 @@
     { label: "Field Sales", href: "/field-sales/", icon: "FS", authorities: ["admin", "field_sales"] },
     { label: "MBR", href: "/mbr", icon: "MR", authorities: ["admin", "mbr_sales"] },
     { label: "MBT", href: "/mbt", icon: "MB", authorities: ["admin", "dispatcher", "mbt_frontdesk", "mbt_billing"] },
+    { label: "Accounting", href: "/accounting", icon: "AC", authorities: ["accounting", "admin"], accountApplications: true },
     { label: "Aggregate Requests", href: "/aggregate-requests", icon: "AG", staffOnly: true, authorities: ["admin", "sales", "operator", "yard_manager"] },
     { label: "Operator", href: "/operator", icon: "OP", authorities: ["admin", "operator", "yard_manager"] }
   ];
@@ -114,7 +117,8 @@
     { label: "PO/TO Schedule", href: "/sales/schedule", icon: "PT" },
     { label: "Truck Monitor", href: "/sales/monitor", icon: "MO" },
     { label: "SO Printing", href: "/sales/printing", icon: "PR" },
-    { label: "In/Outbound Record", href: "/sales/in-outbound-record", icon: "IR", staffOnly: true }
+    { label: "In/Outbound Record", href: "/sales/in-outbound-record", icon: "IR", staffOnly: true },
+    { label: "Account Applications", href: "/sales/account-applications", icon: "AA", staffOnly: true, accountApplications: true }
   ];
 
   const controlItems = [
@@ -145,12 +149,21 @@
     { label: "Yard Printers", href: "/admin/printers", icon: "PR" },
     { label: "Photo Storage", href: "/admin/photo-storage", controlSection: "storage", icon: "PS" },
     { label: "Feature Gates", href: "/admin/mbt-gates", icon: "FG" },
-    { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" }
+    { label: "Audit", href: "/admin/audit", controlSection: "audit", icon: "AU" },
+    { label: "Performance", href: "/admin/performance", controlSection: "performance", icon: "PF" },
+    { label: "Application Setup", href: "/accounting/setup", icon: "AS", accountApplications: true }
   ];
 
   const mbrItems = [
     { label: "Contract", href: "/mbr/contracts", icon: "CT" },
-    { label: "MBR Setup", href: "/mbr/setup", icon: "SE" }
+    { label: "MBR Setup", href: "/mbr/setup", icon: "SE" },
+    { label: "Account Applications", href: "/mbr/account-applications", icon: "AA", accountApplications: true }
+  ];
+
+  const accountingItems = [
+    { label: "Accounting Menu", href: "/accounting", icon: "AM", authorities: ["accounting", "admin"] },
+    { label: "Account Approvals", href: "/accounting/account-applications", icon: "AP", authorities: ["accounting"], badge: "account-approvals" },
+    { label: "Application Setup", href: "/accounting/setup", icon: "SE", authorities: ["accounting", "admin"] }
   ];
 
   const mbtItems = [
@@ -158,7 +171,8 @@
     { label: "Front Desk", href: "/mbt/frontdesk", icon: "FD", mbtRole: "mbt_frontdesk" },
     { label: "Billing", href: "/mbt/billing", icon: "BL", mbtRole: "mbt_billing" },
     { label: "Assets", href: "/mbt/assets", icon: "BA", mbtRoles: ["admin", "dispatcher"] },
-    { label: "Configuration", href: "/mbt/config", icon: "CF", mbtRoles: ["admin", "dispatcher"] }
+    { label: "Configuration", href: "/mbt/config", icon: "CF", mbtRoles: ["admin", "dispatcher"] },
+    { label: "Account Applications", href: "/mbt/account-applications", icon: "AA", mbtRoles: ["admin", "mbt_frontdesk"], accountApplications: true }
   ];
 
   function staffRoleSet() {
@@ -201,6 +215,7 @@
     return mainItems.filter((item) => (!item.staffOnly || !operator?.publicSales)
       && (item.href !== "/mbr" || mbrContractsEnabled)
       && (item.href !== "/repair" || repairEnabled)
+      && (!item.accountApplications || accountApplicationsEnabled)
       && (item.href !== "/aggregate-requests" || aggregateAccess) && itemAllowedByAuthority(item, roles));
   }
 
@@ -219,12 +234,13 @@
       {label:"Repair portal",href:"/repair",icon:"RP"},
       {label:"Repair Team",href:"/repair/workshop",icon:"RT",authorities:["admin","repair_technician"]}
     ].filter(item=>itemAllowedByAuthority(item))};
-    if (path.startsWith("/mbr")) return { title: "MBR", items: mbrItems };
+    if (path.startsWith("/mbr")) return { title: "MBR", items: mbrItems.filter((item) => !item.accountApplications || accountApplicationsEnabled) };
+    if (path === "/accounting" || path.startsWith("/accounting/")) return { title: "Accounting", items: accountingItems.filter((item) => itemAllowedByAuthority(item)) };
     if (path.startsWith("/aggregate-requests")) return {
       title: "Aggregate Requests", items: [{ label: "Requests", href: "/aggregate-requests", icon: "AG" }]
     };
-    if (path.startsWith("/mbt")) return { title: "MBT Bin Operations", items: visibleMbtItems() };
-    if (path.startsWith("/admin")) return { title: "Admin", items: adminItems };
+    if (path.startsWith("/mbt")) return { title: "MBT Bin Operations", items: visibleMbtItems().filter((item) => !item.accountApplications || accountApplicationsEnabled) };
+    if (path.startsWith("/admin")) return { title: "Admin", items: adminItems.filter((item) => !item.accountApplications || accountApplicationsEnabled) };
     if (path.startsWith("/dispatch")) return { title: "Dispatch", items: dispatchItems };
     if (path.startsWith("/scm")) return {
       title: "SCM",
@@ -236,7 +252,8 @@
       const operator = window.MBBS_DISPATCH_OPERATOR || sidebarOperator;
       return {
         title: "Sales",
-        items: salesItems.filter((item) => !item.staffOnly || (operator && !operator.publicSales))
+        items: salesItems.filter((item) => (!item.staffOnly || (operator && !operator.publicSales))
+          && (!item.accountApplications || accountApplicationsEnabled))
       };
     }
     return { title: "Control", items: controlItems };
@@ -582,6 +599,7 @@
         <span class="app-sidebar-icon">${escapeHtml(icon)}</span>
         <span class="app-sidebar-text">${escapeHtml(label)}</span>
         ${item.badge === "offline-review" ? `<span class="app-sidebar-badge" data-sidebar-offline-review-badge hidden aria-live="polite"></span>` : ""}
+        ${item.badge === "account-approvals" ? `<span class="app-sidebar-badge" data-sidebar-account-approvals-badge ${accountApprovalCount > 0 ? "" : "hidden"} aria-label="${accountApprovalCount} applications waiting">${accountApprovalCount > 99 ? "99+" : accountApprovalCount || ""}</span>` : ""}
       </a>
     `;
   }
@@ -750,7 +768,17 @@
       const payload = await response.json();
       sidebarOperator = payload.operator || null;
       mbrContractsEnabled = payload.mbrContractsEnabled === true;
+      accountApplicationsEnabled = payload.accountApplicationsEnabled === true;
       render();
+      if (accountApplicationsEnabled && path.startsWith("/accounting") && staffRoleSet().has("accounting")) {
+        const summary = await fetch("/api/account-applications/review/summary", {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, cache: "no-store"
+        }).then((result) => (result.ok ? result.json() : null)).catch(() => null);
+        if (summary && Number.isFinite(Number(summary.submitted))) {
+          accountApprovalCount = Math.max(0, Math.floor(Number(summary.submitted)));
+          render();
+        }
+      }
     } catch {
       // Retain the stored authority view while the live session check is temporarily unavailable.
     }

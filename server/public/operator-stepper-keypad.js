@@ -114,7 +114,9 @@
       if (!field) return;
       void open(field).then((value) => { if (value !== null) field.apply(value); });
     };
-    const stepperInput = (element) => element?.closest?.(".stepper input[readonly]");
+    // Stepper quantities: Pack / Receive / Consolidation inputs, and Pallet / Stock Return and
+    // Stock Exchange quantities (a read-only input or an <output>).
+    const stepperInput = (element) => element?.closest?.(".stepper input[readonly], .return-quantity-stepper [data-return-quantity-value]");
     app.addEventListener("click", (event) => start(stepperInput(event.target)));
     app.addEventListener("keydown", (event) => {
       const input = stepperInput(event.target);

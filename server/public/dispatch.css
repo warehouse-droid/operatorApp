@@ -9798,6 +9798,9 @@ button[data-action="enter-edit-mode"]:disabled:hover {
 .dispatch-loaded-list {
   flex: 1 1 auto;
   grid-template-columns: minmax(0, 1fr);
+  /* Cards keep their full height; a long list scrolls instead of squeezing
+     each card to its min-height and clipping the order number. */
+  grid-auto-rows: max-content;
 }
 
 .dispatch-loaded-list-head {
@@ -9822,7 +9825,7 @@ button[data-action="enter-edit-mode"]:disabled:hover {
   min-height: 92px;
   padding: 10px;
   display: grid;
-  align-content: center;
+  align-content: start;
   gap: 4px;
   text-align: left;
   overflow: hidden;

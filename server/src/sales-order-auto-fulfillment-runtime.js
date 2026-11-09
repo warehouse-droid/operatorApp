@@ -11,14 +11,17 @@ import {
   failSalesOrderAutoFulfillmentCandidate,
   getSalesOrderAutoFulfillmentCandidate,
   listRunnableSalesOrderAutoFulfillmentCandidateIds,
+  listSalesOrderAutoFulfillmentAttentionCandidates,
   markSalesOrderAutoFulfillmentAttention,
   markSalesOrderAutoFulfillmentClosed,
   markSalesOrderAutoFulfillmentReconciled,
   prepareSalesOrderAutoFulfillmentCandidate,
+  reconcileSalesOrderAutoFulfillmentAttention,
   renewSalesOrderAutoFulfillmentCandidateLease,
   startSalesOrderAutoFulfillmentAttempt
 } from "./sales-order-auto-fulfillment-repository.js";
 import { createSalesOrderAutoFulfillmentProcessor } from "./sales-order-auto-fulfillment-service.js";
+import { createDeliveryAttentionReconciler, throttled } from "./netsuite-attention-reconciliation.js";
 
 const repository = {
   get: getSalesOrderAutoFulfillmentCandidate,
@@ -39,6 +42,14 @@ const processor = createSalesOrderAutoFulfillmentProcessor({
   adapter: salesOrderAutoFulfillmentNetSuiteAdapter,
   workerId: `dispatch-so-if-${process.pid}`
 });
+
+// Attention items NetSuite already shows fulfilled (or closed) are cleared; nothing is posted.
+const reconcileDeliveryAttention = throttled(() => createDeliveryAttentionReconciler({
+  listAttention: () => listSalesOrderAutoFulfillmentAttentionCandidates({ limit: 50 }),
+  fetchLiveOrder: fetchLiveSalesOrderAutoFulfillmentState,
+  resolve: reconcileSalesOrderAutoFulfillmentAttention
+}).run({ log: (error, candidateId) => console.error(`Dispatch SO fulfillment attention reconciliation for ${candidateId} failed:`,
+  error instanceof Error ? error.message : String(error)) }));
 
 /** @type {Map<string, Promise<any>>} */
 const inFlight = new Map();
@@ -65,6 +76,8 @@ export function enqueueSalesOrderAutoFulfillmentCandidate(candidateId) {
 
 export async function salesOrderAutoFulfillmentTick() {
   if (config.netsuite?.directAccessEnabled !== true) {return { disabled: true, discovered: 0 };}
+  void reconcileDeliveryAttention().catch((error) => console.error("Dispatch SO fulfillment attention reconciliation failed:",
+    error instanceof Error ? error.message : String(error)));
   await directPoAutoReceiptTick();
   await transferPostingTick({enqueue:(/** @type {string} */ id)=>operatorNetSuitePostingRuntime.enqueue(id)});
   const ids = await listRunnableSalesOrderAutoFulfillmentCandidateIds({ limit: 25 });

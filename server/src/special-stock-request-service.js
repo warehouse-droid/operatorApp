@@ -404,7 +404,24 @@ export function createSpecialStockRequestService(dependencies = {}) {
     }, context);
   }
 
-  return { createSalesOrder, createPurchaseOrder, refreshSalesOrder };
+  /** Save SCM's PO review (materials, PO-only items, PALLET) without creating the PO in NetSuite.
+   * Uses the same validation as PO creation; the SO and the Sales process are not involved. */
+  async function savePurchaseOrderDraft(caseId, input = {}, context = {}) {
+    const before = await deps.getCase(caseId, { audience: 'scm' });
+    if (before.purchaseOrderId || before.purchaseOrderSkipped || before.purchaseOrderSubmissionStartedAt) {
+      throw serviceError('The PO has already been submitted. Its draft can no longer be changed.', 'SPECIAL_PO_ALREADY_LINKED', 409);
+    }
+    if (!Array.isArray(input.lines) || !Array.isArray(input.extraLines ?? []) || (input.extraLines || []).length > 100 || input.lines.length > 100) {
+      throw serviceError('Review at most 100 materials and 100 added PO items.', 'SPECIAL_PO_LINES_INVALID', 400);
+    }
+    const resolved = await deps.resolvePurchaseUnits([
+      ...input.lines.map(line => ({...line,itemId:2055})), ...(input.extraLines || [])
+    ]);
+    const { operationId: _operationId, ...draft } = input;
+    return deps.preparePurchaseOrder(caseId, {...draft,lines:resolved.slice(0,input.lines.length),extraLines:resolved.slice(input.lines.length)}, context);
+  }
+
+  return { createSalesOrder, createPurchaseOrder, savePurchaseOrderDraft, refreshSalesOrder };
 }
 
 let defaultService = createSpecialStockRequestService();
@@ -417,4 +434,5 @@ export function configureSpecialStockReviewBoundary(dependencies) {
 
 export const createSpecialSalesOrder = (...args) => defaultService.createSalesOrder(...args);
 export const createSpecialPurchaseOrder = (...args) => defaultService.createPurchaseOrder(...args);
+export const saveSpecialPurchaseOrderDraft = (...args) => defaultService.savePurchaseOrderDraft(...args);
 export const refreshSpecialSalesOrder = (...args) => defaultService.refreshSalesOrder(...args);

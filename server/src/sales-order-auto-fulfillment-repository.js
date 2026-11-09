@@ -817,6 +817,40 @@ export const markSalesOrderAutoFulfillmentClosed = (/** @type {LooseRecord} */ i
   details: { issues: input.issues, liveOrder: input.liveOrder },
   error: "The NetSuite Sales Order is closed."
 });
+/** Candidates waiting for Admin attention, oldest first (reconciliation sweep). */
+export async function listSalesOrderAutoFulfillmentAttentionCandidates({ limit = 50 } = {}) {
+  const result = await query(
+    `SELECT id FROM dispatch_sales_order_if_candidates
+      WHERE status = 'attention' AND lease_token IS NULL
+      ORDER BY updated_at ASC, id ASC LIMIT $1`,
+    [Math.min(Math.max(Number(limit) || 50, 1), 200)]
+  );
+  const candidates = [];
+  for (const row of result.rows) {
+    const candidate = publicCandidate(await candidateRow(row.id));
+    if (candidate) {candidates.push(candidate);}
+  }
+  return candidates;
+}
+
+/**
+ * Reconciliation found the order already fulfilled (or closed) in NetSuite: clear the attention
+ * item. Only a candidate still in attention and unleased changes; nothing is posted.
+ * @param {{candidateId: unknown, outcome: string, liveOrder?: any}} input
+ */
+export async function reconcileSalesOrderAutoFulfillmentAttention({ candidateId, outcome, liveOrder }) {
+  if (!["reconciled", "closed"].includes(outcome)) {
+    throw failure("SALES_ORDER_IF_RECONCILE_OUTCOME_INVALID", "Reconciliation can only mark a candidate reconciled or closed.", 400);
+  }
+  return withTransaction(async () => {
+    const row = await candidateRow(candidateId, { lock: true });
+    if (!row || row.status !== "attention" || row.lease_token) {return row ? publicCandidate(row) : null;}
+    return setTerminalState({ candidateId, status: outcome, action: "attention_reconciled",
+      details: { liveOrder: liveOrder || null, previousError: row.last_error || null },
+      error: outcome === "closed" ? "The NetSuite Sales Order is closed." : null });
+  });
+}
+
 export const markSalesOrderAutoFulfillmentReconciled = (/** @type {LooseRecord} */ input) => setTerminalState({
   candidateId: input.candidateId,
   status: "reconciled",

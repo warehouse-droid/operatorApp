@@ -4,6 +4,7 @@ import { sumSpecialAmounts } from './special-stock-discount-total.js';
 import { specialRestUnitId } from './special-stock-netsuite-adapter.js';
 import { prepareSpecialAdjustmentPlan, specialAdjustmentMatches } from './special-stock-adjustment-adapter.js';
 import { specialLineSubtotal, specialQuantity, specialPalletQuantity } from '../public/special-stock-pricing.js';
+import { buildSpecialPurchaseLinePayload } from './special-stock-request-netsuite.js';
 
 /**
  * @typedef {Record<string, any>} Raw NetSuite JSON, validated at the boundary.
@@ -170,7 +171,8 @@ function assertAllowedChange(order) {
       const rate=Number(line.rate),gross=sumSpecialAmounts(target.lines.filter(l=>l.itemId===2055).map(l=>specialLineSubtotal(l.quantity,l.rate)));
       if (!line.remoteLineId || line.quantity!==1 || !Number.isFinite(rate) || rate>0 || rate!==Number(rate.toFixed(2)) || -rate>gross
         || line.createdPoId || line.createPo || !/^Vendor discount \| MBBS-SPECIAL-PO:\d+$/.test(line.description)
-        || target.lines.filter(l=>l.itemId===4981).length!==1 || index!==target.lines.length-1) throw conflict('The vendor discount must remain one final purchase discount within the gross total.');
+        // SCM-added PO items are appended after it; keyed REST updates keep its existing position.
+        || target.lines.filter(l=>l.itemId===4981).length!==1) throw conflict('The vendor discount must remain one purchase discount within the gross total.');
     } else {
       specialQuantity(line.quantity);
       if (line.itemId === 1784) specialPalletQuantity(line.quantity);
@@ -262,4 +264,86 @@ export async function verifySpecialRestSalesOrder(orderId, payload, transport) {
         || actual.itemId !== itemId || actual.rate !== String(line.rate)
         || (itemId !== 10716 && (actual.quantity !== line.quantity || actual.unitId !== (unit == null ? null : Number(unit)) || actual.description !== line.description));
     })) throw Object.assign(Error('The existing SO does not match the reviewed items, quantities, UOM, prices and discount amounts.'), { status: 409, code: 'SPECIAL_SO_PRICE_CONFLICT' });
+}
+
+/**
+ * Appending an SCM-added item to a PO this application created for the request.
+ * The PATCH merges one new row into the item sublist; existing rows are never sent,
+ * so they cannot be removed or rewritten. The baseline snapshot makes retries idempotent.
+ * @typedef {{itemId:number,quantity:number,unitId:number|null,rate:number,description:string,pack?:Record<string,number>}} AppendedLine
+ * @typedef {{version:1,kind:'purchase_item_append',purchaseOrderId:number,caseId:number,baseline:Snapshot,line:AppendedLine,payload:Raw}} PurchaseItemAppendPlan
+ */
+/** @param {string} message */
+const appendConflict = message => Object.assign(Error(message), { status: 409, code: 'SPECIAL_PO_ITEM_CONFLICT' });
+const APPEND_HEADER_FIELDS = ['entity', 'location', 'subsidiary', 'currency', 'memo'];
+/** @type {(keyof SnapshotLine)[]} */
+const APPEND_LINE_FIELDS = ['remoteLineId', 'itemId', 'quantity', 'unitId', 'rate', 'description', 'locationId', 'taxCode', 'createdPoId', 'createPo'];
+/** @param {SnapshotLine} before @param {SnapshotLine|undefined} after */
+function appendLineUnchanged(before, after) {
+  return Boolean(after) && APPEND_LINE_FIELDS.every(field => before[field] === after?.[field])
+    && Object.keys(SPECIAL_PACK_FIELDS).every(field => Number(before.pack?.[field] ?? 0) === Number(after?.pack?.[field] ?? 0));
+}
+/** @param {AppendedLine} expected @param {SnapshotLine|undefined} actual */
+function appendedLineMatches(expected, actual) {
+  return Boolean(actual) && actual?.itemId === expected.itemId && actual.quantity === expected.quantity
+    && Number(actual.rate) === expected.rate && actual.description === expected.description
+    && (expected.unitId === null || actual.unitId === expected.unitId)
+    && Object.entries(expected.pack || {}).every(([field, value]) => Number(actual.pack?.[field] ?? 0) === Number(value ?? 0));
+}
+/** @param {PurchaseItemAppendPlan} plan @param {Snapshot} current @returns {'baseline'|'applied'|'changed'} */
+export function specialPurchaseItemAppendState(plan, current) {
+  if (APPEND_HEADER_FIELDS.some(field => plan.baseline.header[field] !== current.header[field])) return 'changed';
+  if (!plan.baseline.lines.every((line, index) => appendLineUnchanged(line, current.lines[index]))) return 'changed';
+  if (current.lines.length === plan.baseline.lines.length) return 'baseline';
+  if (current.lines.length === plan.baseline.lines.length + 1 && appendedLineMatches(plan.line, current.lines.at(-1))) return 'applied';
+  return 'changed';
+}
+/** @param {unknown} error */
+function friendlyReadError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Only pending, unfulfilled, unreceived, unbilled and open orders/.test(message)
+    ? appendConflict('NetSuite PO lines can be added only while the PO is pending approval or pending receipt, with nothing received or billed. Add the item in NetSuite, or keep it as a record only.')
+    : error;
+}
+/** @param {{purchaseOrderId:number,caseId:number,line:Record<string,any>}} input @param {Transport} transport @returns {Promise<PurchaseItemAppendPlan>} */
+export async function prepareSpecialPurchaseItemAppend({ purchaseOrderId, caseId, line }, transport) {
+  let read;
+  try { read = await readSpecialRestOrder({ id: id(purchaseOrderId), kind: 'purchase_order' }, transport); }
+  catch (error) { throw friendlyReadError(error); }
+  const { record, snapshot } = read;
+  const marker = `MBBS-SPECIAL-PO:${id(caseId)}`;
+  const markers = String(record.memo || '').match(/MBBS-SPECIAL-PO:\d+\b/g) || [];
+  if (!markers.includes(marker) || markers.some(found => found !== marker)) {
+    throw appendConflict('Only a PO created by this application for this request can be updated. Add the item in NetSuite instead.');
+  }
+  const location = snapshot.header.location;
+  if (!location) throw appendConflict('The NetSuite PO location is required to add an item.');
+  const itemId = id(line.itemId), unitId = line.unitId ? id(line.unitId) : null;
+  const quantity = specialQuantity(line.quantity), rate = Number(line.unitPurchaseCost);
+  if ([1784, 4981, 10716].includes(itemId) || !Number.isFinite(rate) || rate < 0) throw appendConflict('A valid PO item and unit cost are required.');
+  const description = String(line.description || '').trim();
+  /** @type {Record<string,number>} */
+  const pack = {};
+  for (const field of Object.keys(SPECIAL_PACK_FIELDS)) if (line[field] != null) pack[field] = Number(line[field]);
+  const payload = buildSpecialPurchaseLinePayload({ ...line, itemId, unitId, quantity, unitPurchaseCost: rate, description }, location);
+  return { version: 1, kind: 'purchase_item_append', purchaseOrderId: id(purchaseOrderId), caseId: id(caseId), baseline: snapshot,
+    line: { itemId, quantity, unitId, rate, description, ...(itemId === 2055 && Object.keys(pack).length ? { pack } : {}) }, payload };
+}
+/** @param {PurchaseItemAppendPlan} plan @param {Transport} transport @returns {Promise<{remoteLineId:number}>} */
+export async function applySpecialPurchaseItemAppend(plan, transport) {
+  if (plan?.version !== 1 || plan.kind !== 'purchase_item_append' || !plan.baseline || !plan.payload) throw appendConflict('A saved PO update plan is required.');
+  const order = { id: id(plan.purchaseOrderId), kind: 'purchase_order' };
+  const read = async () => {
+    try { return (await readSpecialRestOrder(order, transport)).snapshot; }
+    catch (error) { throw friendlyReadError(error); }
+  };
+  let current = await read(), state = specialPurchaseItemAppendState(plan, current);
+  if (state === 'baseline') {
+    await transport.rest(recordPath(order), { method: 'PATCH', body: { item: { items: [plan.payload] } } });
+    current = await read();
+    state = specialPurchaseItemAppendState(plan, current);
+  }
+  if (state === 'baseline') throw appendConflict('NetSuite did not add the item to the PO. Retry the NetSuite update.');
+  if (state !== 'applied') throw appendConflict('The NetSuite PO changed after this item was prepared. Check the PO in NetSuite, then retry or keep the item as a record only.');
+  return { remoteLineId: id(current.lines.at(-1)?.remoteLineId) };
 }

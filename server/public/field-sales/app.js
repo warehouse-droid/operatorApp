@@ -121,7 +121,7 @@ async function reviewQueue() {
   on('#export-work','click',()=>download(new Blob([JSON.stringify({operatorId:state.operator.id,pending},null,2)],{type:'application/json'}),'field-sales-pending.json'),el);
 }
 function shell() {
-  const nav=[['prospects','⌖','Prospects'],['routes','↝','Routes'],['today','◉','Visiting'],['followups','↻','Follow-ups'],['quotes','▤','Quotes'],['customers','♙','Customers'],...(isAdmin(state.operator)?[['settings','⚙','Settings']]:[])];
+  const nav=[['prospects','⌖','Prospects'],['routes','↝','Routes'],['today','◉','Visiting'],['followups','↻','Follow-ups'],['quotes','▤','Quotes'],['customers','♙','Customers'],['applications','✍','Account apps'],...(isAdmin(state.operator)?[['settings','⚙','Settings']]:[])];
   $('#app').innerHTML=`<div class="shell"><aside class="rail"><div class="brand"><img src="/field-sales/icon.svg" alt=""><div>Field Sales<small>MBBS · MBR · MBT</small></div></div><nav class="nav">${nav.map(([id,icon,label])=>`<a href="#${id}" data-page="${id}" class="${id==='settings'?'settings-nav':''}"><span class="symbol">${icon}</span>${label}</a>`).join('')}</nav><div class="rail-footer"><span class="user-label">${escape(state.operator.display_name)}</span><a href="${escape(state.operator.homeRoute==='/field-sales/'?'/':state.operator.homeRoute||'/')}">Operations ↗</a><button id="logout">Sign out</button></div></aside><main class="workspace"><header class="topbar"><span class="eyebrow">Toronto · Field operations</span><button id="sync" class="quiet sync">Checking saved work…</button></header><div id="view" class="page"></div></main></div>`;
   on('#sync','click',reviewQueue);on('#logout','click',async()=>{await api('/api/auth/logout',{}).catch(()=>{});await state.workspace.close();state.workspace=null;token='';for(const key of [TOKEN,SESSION,'mbbs.dispatch.token','mbbs.control.token','mbbs.operator.token','mbbs.staff.role','mbbs.staff.roles']){localStorage.removeItem(key);}login();});
 }
@@ -132,9 +132,9 @@ async function renderPage() {
   document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===state.page));
   const view=$('#view');if(!view){return;}view.innerHTML='<div class="loading">Loading…</div>';
   try {
-    if(!state.settings.enabled&&state.page!=='settings'){view.innerHTML=`<div class="panel panel-pad stack"><h1>Field Sales</h1><p>An administrator can enable the module and set up City imports in Settings.</p>${isAdmin(state.operator)?'<a class="button primary" href="#settings">Open settings</a>':''}</div>`;return;}
+    if(!state.settings.enabled&&state.page!=='settings'&&state.page!=='applications'){view.innerHTML=`<div class="panel panel-pad stack"><h1>Field Sales</h1><p>An administrator can enable the module and set up City imports in Settings.</p>${isAdmin(state.operator)?'<a class="button primary" href="#settings">Open settings</a>':''}</div>`;return;}
     const page=state.page;
-    const module=await import(page==='quotes'?'./quotes.js':page==='customers'?'./customers.js':page==='today'||page==='followups'?'./visiting.js':page==='settings'?'./settings.js':'./planner.js');
+    const module=await import(page==='quotes'?'./quotes.js':page==='customers'?'./customers.js':page==='today'||page==='followups'?'./visiting.js':page==='settings'?'./settings.js':page==='applications'?'./applications.js':'./planner.js');
     if(state.page===page){await module.render(ctx,view,page);}
   }catch(error){view.innerHTML=`<div class="banner warning">${escape(error.message)}</div>`;}
 }

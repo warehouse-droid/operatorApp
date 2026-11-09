@@ -45,8 +45,11 @@
   let purchasePalletLine;
   /** @type {typeof import('./special-stock-purchase-pricing.js').specialLineSubtotal} */
   let purchaseSubtotal;
-  const poEditorReady = import('/special-stock-po-editor.js?v=20261029');
+  const poEditorReady = import('/special-stock-po-editor.js?v=20261105-po-items-search');
   let poEditor, poUomField, poPackFields;
+  const poItemsReady = import('/special-stock-po-items.js?v=20261105');
+  /** @type {typeof import('./special-stock-po-items.js')|null} */
+  let poItems = null;
   const purchasePricingReady = import('/special-stock-purchase-pricing.js' + '?v=20260930-pallet-routing-v1');
   purchasePricingReady.then(module => { vendorDiscountReview = module.specialVendorLineDiscountReview; purchasePalletLine = module.specialPurchasePalletLine; purchaseSubtotal = module.specialLineSubtotal; });
   /** @type {typeof import('./special-stock-po-routing.js').specialPoRoutingHtml} */
@@ -84,6 +87,7 @@
   const state = {
     operator: null,
     replaceOrderOpen: false,
+    addPurchaseItemOpen: false,
     enabled: null,
     storeLocationIds: [],
     vendorNames: [],
@@ -255,6 +259,50 @@
     return '<form data-special-po-sent-form><button type="submit">PO Sent to Vendor</button></form>';
   }
 
+  /** One PO-only item (vendor fee, split fee or other item); never an SO line. @param {any} detail @param {any} line */
+  function purchaseItemCard(detail, line) {
+    const ref = escapeHtml(detail.purchaseOrderRef || 'the PO');
+    const status = ({
+      synced: ['accepted', 'Added to PO', `Added to NetSuite PO ${ref}`],
+      pending: ['pending', 'Updating NetSuite PO', `Being added to NetSuite PO ${ref}`],
+      attention: ['attention', 'NetSuite update failed', `Not confirmed on NetSuite PO ${ref}`],
+      local: ['declined', 'Recorded only', 'Not on the NetSuite PO. Add it in NetSuite if the vendor should supply it.']
+    })[line.poSyncStatus] || ['accepted', 'On PO', detail.purchaseOrderSkipped ? 'Reviewed with the skipped PO step' : `Sent with PO ${ref}`];
+    const total = line.unitPurchaseCost == null ? '' : ` · Line total ${money(purchaseSubtotal?.(line.quantity, line.unitPurchaseCost) ?? 0)}`;
+    const pack = ['palletQty','layerQty','sectionQty','pieceQty'].some(field => line[field] != null)
+      ? `<p>PLT ${line.palletQty ?? '—'} · LYR ${line.layerQty ?? '—'} · SEC ${line.sectionQty ?? '—'} · PCS ${line.pieceQty ?? '—'}</p>` : '';
+    const actions = [
+      ...(line.poSyncStatus === 'attention' || line.poSyncStatus === 'pending' ? ['<button type="submit" value="retry">Retry NetSuite update</button>'] : []),
+      ...(line.poSyncStatus === 'attention' ? ['<button type="submit" value="record_only">Keep as record only</button>'] : []),
+      ...(line.poSyncStatus === 'local' ? ['<button class="danger" type="submit" value="remove">Remove</button>'] : [])
+    ];
+    return `<article class="stock-request-line special-po-item" data-special-po-item="${line.id}"><header><div><strong>PO-only item · ${escapeHtml(line.itemName || line.itemId)}</strong><p class="special-scm-item-description">${escapeHtml(line.description)}</p><small>${number(line.quantity)} ${escapeHtml(line.uom || '')}${line.unitPurchaseCost == null ? '' : ` · Unit cost ${rateLabel(line.unitPurchaseCost)}`}${total}</small></div><span class="stock-request-pill ${status[0]}">${status[1]}</span></header>
+      <p class="stock-request-muted">${status[2]}${line.addedAt ? ` · Added by ${escapeHtml(line.addedByName || 'SCM')} · ${escapeHtml(displayDate(line.addedAt))}` : ''}</p>${pack}
+      ${line.poSyncStatus === 'attention' && line.poSyncError ? `<p class="stock-request-error">${escapeHtml(line.poSyncError)}</p>` : ''}
+      ${actions.length ? `<form data-special-po-item-form data-line-id="${line.id}"><div class="stock-request-actions">${actions.join('')}</div></form>` : ''}</article>`;
+  }
+
+  /** PO-only items after the PO exists, with Add item. Before then, the PO review owns them. @param {any} detail */
+  function purchaseItemsView(detail) {
+    if (!poItems || detail.workflowKind === 'backorder' || (!detail.purchaseOrderId && !detail.purchaseOrderSkipped)) return '';
+    const items = poItems.specialPurchaseOnlyItems(detail);
+    const blocker = poItems.specialAddedPurchaseItemBlocker(detail);
+    const netsuite = poItems.specialAddedPurchaseItemMode(detail) === 'netsuite';
+    const ref = escapeHtml(detail.purchaseOrderRef || 'the PO');
+    const intro = netsuite ? `Add item adds the item to NetSuite PO ${ref}, which this application created. The SO and Sales are not changed.`
+      : detail.purchaseOrderSkipped ? 'The PO step was skipped (test). Added items are recorded for SCM only.'
+        : `${ref} was not created by this application, so added items are recorded for SCM only and the NetSuite PO is not changed.`;
+    const open = state.addPurchaseItemOpen && !blocker;
+    const form = open ? `<form class="stock-request-form special-po-add-form" data-special-po-add-form>${poEditor.extrasHtml(detail, {mode: 'add'})}
+      <div class="stock-request-actions"><button class="primary" type="submit">${netsuite ? `Add to PO ${ref}` : 'Save item'}</button><button type="button" data-special-scm-action="cancel-po-item">Cancel</button></div></form>` : '';
+    const showAdd = !open && !blocker;
+    if (!items.length && !showAdd && !open) return '';
+    return `<div class="special-po-items" data-special-po-items><h4>PO-only items</h4><p class="stock-request-muted">${intro}</p>
+      ${items.map(line => purchaseItemCard(detail, line)).join('') || '<p class="stock-request-muted">No PO-only items.</p>'}${form}
+      ${showAdd ? '<div class="stock-request-actions"><button type="button" class="special-add-item-button" data-special-scm-action="add-po-item">Add item</button></div>' : ''}
+      ${blocker && !['This request is closed or completed.'].includes(blocker) && items.length ? `<small class="stock-request-muted">${escapeHtml(blocker)}</small>` : ''}</div>`;
+  }
+
   function orderControls(detail) {
     const waitingForStock = detail.lines.some(line => line.salesDecision === 'accepted' && !specialStockAvailable(line.supplyStatus));
     const manualControls = manualPurchaseLinkControls(detail);
@@ -277,7 +325,7 @@
       })) : [...detail.purchaseOrderLines];
     const pallet = purchaseLines.find(line => line.itemId === 1784);
     const palletQuantity = pallet?.quantity ?? detail.vendorDiscountReview?.pallet?.quantity ?? detail.palletTotal ?? 0;
-    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : 'Review the items, quantities and vendor costs to create an independent NetSuite PO. These changes and added items apply only to the PO; the SO stays unchanged.'}</p>
+    return `<section class="stock-request-section"><h3>Review and create Purchase Order</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped for testing. Use Skip PO Creation to continue the test.' : 'Review the items, quantities and vendor costs to create an independent NetSuite PO. These changes and added items apply only to the PO; the SO stays unchanged. Save PO draft keeps this review and its added items without creating the PO.'}</p>
       <form data-special-po-form><fieldset ${retry ? 'disabled' : ''} style="border:0;padding:0">
       ${purchaseLines.filter(line => !line.ancillary).map(line => `<article class="stock-request-line" data-special-po-line="${line.caseLineId}"><strong>MBBS-Special</strong><div class="stock-request-line-fields">
         <label class="stock-request-wide"><span>Order description *</span><input name="description" required value="${escapeHtml(line.description)}" /></label>
@@ -294,7 +342,8 @@
         <label><span>PALLET purchase cost ($ / EACH)</span><input name="purchasePalletCost" type="number" min="0" max="1000000000" step="0.000001" ${Number(palletQuantity) > 0 ? 'required' : ''} value="${escapeHtml(pallet?.unitPurchaseCost ?? detail.vendorDiscountReview?.pallet?.unitPurchaseCost ?? '')}" /><small>Review the vendor cost separately from the SO selling price.</small></label>
       </div></article>
       <p data-special-purchase-totals role="status"></p></fieldset>
-      <div class="stock-request-actions">${!detail.salesOrderSkipped ? `<button class="primary" type="submit">${retry ? 'Recover PO operation' : 'Create PO in NetSuite'}</button>` : ''}${manualControls}${state.testSkipOrdersEnabled && !retry && detail.purchaseOrderOperationStatus !== 'creating' ? '<button type="submit" data-special-skip-po>Skip PO Creation</button>' : ''}</div></form></section>`;
+      ${detail.vendorDiscountReview?.confirmedAt && !retry ? `<p class="stock-request-muted" data-special-po-draft-saved>PO draft saved · ${escapeHtml(displayDate(detail.vendorDiscountReview.confirmedAt))}</p>` : ''}
+      <div class="stock-request-actions">${!detail.salesOrderSkipped ? `<button class="primary" type="submit">${retry ? 'Recover PO operation' : 'Create PO in NetSuite'}</button>` : ''}${!retry && detail.purchaseOrderOperationStatus !== 'creating' ? '<button type="submit" data-special-save-po-draft>Save PO draft</button>' : ''}${manualControls}${state.testSkipOrdersEnabled && !retry && detail.purchaseOrderOperationStatus !== 'creating' ? '<button type="submit" data-special-skip-po>Skip PO Creation</button>' : ''}</div></form></section>`;
   }
 
   function quantityReviewView(detail) {
@@ -314,7 +363,7 @@
   function detail() {
     const detail = state.detail;
     if (!detail) return `<div class="stock-request-empty"><strong>Select a case</strong><span>Review the stock checks and save them together.</span></div>`;
-    return `<div class="stock-request-heading"><div><h2>${escapeHtml(detail.requestRef)}</h2><p>${escapeHtml(detail.customerName)} · ${escapeHtml(detail.customerPhone || "No phone")}</p></div>${pill(detail.stage)}</div><div class="stock-request-summary"><span><small>Vendor</small><strong>${escapeHtml(detail.vendorName)}</strong></span><span><small>Store</small><strong>${escapeHtml(detail.storeName)}</strong></span><span><small>Delivery method</small><strong>${escapeHtml(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span><span><small>Case inquiry date</small><strong>${escapeHtml(detail.inquiryDate)}</strong></span><span><small>Sales Rep</small><strong>${escapeHtml(detail.netsuiteSalesRepName || detail.requestedByName || "—")}</strong></span><span><small>Expiry</small><strong>${escapeHtml(detail.expiresOn || "—")}</strong></span>${detail.netsuiteCustomerName ? `<span><small>NetSuite customer account</small><strong>${escapeHtml(detail.netsuiteCustomerName)}</strong></span>` : ""}<span><small>Revision</small><strong>${detail.revision}</strong></span></div>${detail.fulfillmentMethod === 'mbt_delivery' ? `<p class="stock-request-notice">${escapeHtml([detail.deliveryAddress,detail.deliveryContactName,detail.deliveryContactPhone,detail.deliveryDate].filter(Boolean).join(' · '))}</p>` : ''}${detail.attention ? `<div class="stock-request-notice stock-request-error">${escapeHtml(detail.attentionReason)}</div>` : ''}${specialPlanningStatus(detail)}${specialClosureStatus(detail, "scm")}${quantityReviewView(detail)}${detail.closeStatus === "closed" && detail.closureReason ? `<div class="stock-request-notice">Closed: ${escapeHtml(detail.closureReason)}</div>` : ''}${detail.remarks ? `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escapeHtml(detail.remarks)}</div></div>` : ""}${detail.postPoChangePending ? `<div class="stock-request-notice stock-request-error">A post-PO vendor change is waiting for Sales to record customer acknowledgement. The existing SO, PO, and Dispatch handoff were not silently changed.</div>` : ""}${poRoutingHtml(detail, state.poRouting)}${specialInformationPanel(detail, 'scm')}<section class="stock-request-section" data-scm-line-visibility="${detail.id}">${window.SCMStockCheckLines?.header(detail) || '<h3>Line responses</h3>'}${window.SCMRequestLineVisibility?.controls(detail) || ""}<form data-special-stock-check-form><div class="stock-request-lines" id="scm-request-lines-${detail.id}">${detail.lines.map(lineCard).join("")}${specialRequestPalletLine(detail)}</div>${detail.lines.some(canCheckStock) ? '<div class="stock-request-actions"><button class="primary" type="submit" data-scm-line-save>Save stock check</button></div>' : ''}</form></section>${orderControls(detail)}${purchaseOrderReplacement(detail)}<section class="stock-request-section"><h3>Audit trail</h3>${detail.events.slice(0, 20).map((event) => `<div class="stock-request-event"><strong>${escapeHtml(event.eventType.replaceAll("_", " "))}</strong><small>${escapeHtml(event.actorName)} · ${displayDate(event.createdAt)}</small></div>`).join("")}</section>${specialDocumentActions(detail)}`;
+    return `<div class="stock-request-heading"><div><h2>${escapeHtml(detail.requestRef)}</h2><p>${escapeHtml(detail.customerName)} · ${escapeHtml(detail.customerPhone || "No phone")}</p></div>${pill(detail.stage)}</div><div class="stock-request-summary"><span><small>Vendor</small><strong>${escapeHtml(detail.vendorName)}</strong></span><span><small>Store</small><strong>${escapeHtml(detail.storeName)}</strong></span><span><small>Delivery method</small><strong>${escapeHtml(specialFulfillmentLabel(detail.fulfillmentMethod))}</strong></span><span><small>Case inquiry date</small><strong>${escapeHtml(detail.inquiryDate)}</strong></span><span><small>Sales Rep</small><strong>${escapeHtml(detail.netsuiteSalesRepName || detail.requestedByName || "—")}</strong></span><span><small>Expiry</small><strong>${escapeHtml(detail.expiresOn || "—")}</strong></span>${detail.netsuiteCustomerName ? `<span><small>NetSuite customer account</small><strong>${escapeHtml(detail.netsuiteCustomerName)}</strong></span>` : ""}<span><small>Revision</small><strong>${detail.revision}</strong></span></div>${detail.fulfillmentMethod === 'mbt_delivery' ? `<p class="stock-request-notice">${escapeHtml([detail.deliveryAddress,detail.deliveryContactName,detail.deliveryContactPhone,detail.deliveryDate].filter(Boolean).join(' · '))}</p>` : ''}${detail.attention ? `<div class="stock-request-notice stock-request-error">${escapeHtml(detail.attentionReason)}</div>` : ''}${specialPlanningStatus(detail)}${specialClosureStatus(detail, "scm")}${quantityReviewView(detail)}${detail.closeStatus === "closed" && detail.closureReason ? `<div class="stock-request-notice">Closed: ${escapeHtml(detail.closureReason)}</div>` : ''}${detail.remarks ? `<div class="stock-request-notice"><small>Note</small><div class="special-header-note-content">${escapeHtml(detail.remarks)}</div></div>` : ""}${detail.postPoChangePending ? `<div class="stock-request-notice stock-request-error">A post-PO vendor change is waiting for Sales to record customer acknowledgement. The existing SO, PO, and Dispatch handoff were not silently changed.</div>` : ""}${poRoutingHtml(detail, state.poRouting)}${specialInformationPanel(detail, 'scm')}<section class="stock-request-section" data-scm-line-visibility="${detail.id}">${window.SCMStockCheckLines?.header(detail) || '<h3>Line responses</h3>'}${window.SCMRequestLineVisibility?.controls(detail) || ""}<form data-special-stock-check-form><div class="stock-request-lines" id="scm-request-lines-${detail.id}">${detail.lines.map(lineCard).join("")}${specialRequestPalletLine(detail)}</div>${detail.lines.some(canCheckStock) ? '<div class="stock-request-actions"><button class="primary" type="submit" data-scm-line-save>Save stock check</button></div>' : ''}</form>${purchaseItemsView(detail)}</section>${orderControls(detail)}${purchaseOrderReplacement(detail)}<section class="stock-request-section"><h3>Audit trail</h3>${detail.events.slice(0, 20).map((event) => `<div class="stock-request-event"><strong>${escapeHtml(event.eventType.replaceAll("_", " "))}</strong><small>${escapeHtml(event.actorName)} · ${displayDate(event.createdAt)}</small></div>`).join("")}</section>${specialDocumentActions(detail)}`;
   }
 
   function render({detailOnly=false} = {}) {
@@ -425,7 +474,7 @@
     state.formDrafts.clear(); state.dirty = false; poEditor?.reset();
     state.revisingDeclinedLineIds.clear();
     state.editingStockLineIds.clear();
-    state.poRouting = null; state.replaceOrderOpen = false;
+    state.poRouting = null; state.replaceOrderOpen = false; state.addPurchaseItemOpen = false; poEditor?.discard(`add:${detail.id}`);
     state.detail = detail; state.error = ''; state.notice = '';
     render({detailOnly:true});
   }
@@ -470,7 +519,7 @@
       const review = vendorDiscountReview(purchaseReviewLines(form));
       const pallet = purchasePalletLine(palletInput);
       const palletTotal = pallet ? purchaseSubtotal(pallet.quantity,pallet.unitPurchaseCost) : 0;
-      const extraTotal = poEditor?.totals() || 0;
+      const extraTotal = poEditor?.totals(form) || 0;
       for (const line of review.lines) form.querySelector(`[data-special-po-line="${line.caseLineId}"] [data-special-vendor-line-total]`).textContent = `Vendor discount: ${money(line.discountAmount)} · Net line total: ${money(line.netTotal)}`;
       display.textContent = `Gross purchase total: ${money(review.grossTotal + palletTotal + extraTotal)} · Vendor discount: ${money(review.amount)} · Net purchase total: ${money(review.netTotal + palletTotal + extraTotal)}${pallet ? ` · PALLET: ${money(palletTotal)}` : ''}${extraTotal ? ` · Added items: ${money(extraTotal)}` : ''}`;
     } catch (error) {
@@ -489,6 +538,8 @@
   mount.addEventListener("input", (event) => {
     if (!active()) return;
     if (event.target.closest("[data-special-po-form]")) updatePurchaseTotals();
+    const addForm = event.target.closest('[data-special-po-add-form]');
+    if (addForm) { try { poEditor?.totals(addForm); } catch { /* the row shows its own validation */ } }
     if (event.target.closest("form")) state.dirty = true;
     if (event.target.matches("[data-special-scm-vendor-search]")) {
       const lineId = Number(event.target.dataset.lineId);
@@ -556,7 +607,9 @@
 
   mount.addEventListener('submit', async event => {
     const form = /** @type {HTMLFormElement} */ (event.target);
-    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-split-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-sent-form], [data-special-po-replace-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
+    if (!form.matches('[data-special-information-request-form], [data-special-stock-check-form], [data-special-po-split-form], [data-special-po-routing-form], [data-special-po-form], [data-special-po-add-form], [data-special-po-item-form], [data-special-po-sent-form], [data-special-po-replace-form], [data-special-scm-close-form], [data-special-quantity-review-form], [data-special-closure-review-form]')) return;
+    if (form.matches('[data-special-po-item-form]') && event.submitter?.value === 'remove'
+      && !window.confirm('Remove this recorded PO-only item? The NetSuite PO is not changed.')) { event.preventDefault(); return; }
     event.preventDefault();
     if (state.busy) return;
     state.busy = true; state.error = '';
@@ -593,6 +646,15 @@
         path = 'purchase-order/link';
         payload.purchaseOrderSplitId = values.purchaseOrderSplitId || null;
         state.poRouting = null;
+      } else if (form.matches('[data-special-po-add-form]')) {
+        path = 'purchase-order/items';
+        const [line] = poEditor.extraLines(form);
+        if (!line) throw new Error('Enter the PO item.');
+        payload.line = line;
+      } else if (form.matches('[data-special-po-item-form]')) {
+        const action = event.submitter?.value;
+        path = action === 'retry' ? `purchase-order/items/${Number(form.dataset.lineId)}/retry` : `purchase-order/items/${Number(form.dataset.lineId)}/resolve`;
+        if (action !== 'retry') payload.action = action;
       } else if (form.matches('[data-special-po-sent-form]')) {
         path = 'purchase-order/sent-to-vendor';
       } else if (form.matches('[data-special-po-replace-form]')) {
@@ -619,11 +681,12 @@
         if (!payload.purchaseOrderRef) throw new Error('Enter an existing PO number to link.');
         payload.customLinkage = true;
       } else {
-        path = event.submitter?.matches('[data-special-skip-po]') ? 'purchase-order/skip' : 'purchase-order/create';
-        payload.operationId = state.detail.purchaseOrderOperationId || crypto.randomUUID();
+        const saveDraft = Boolean(event.submitter?.matches('[data-special-save-po-draft]'));
+        path = saveDraft ? 'purchase-order/draft' : event.submitter?.matches('[data-special-skip-po]') ? 'purchase-order/skip' : 'purchase-order/create';
+        if (!saveDraft) payload.operationId = state.detail.purchaseOrderOperationId || crypto.randomUUID();
         if (!state.detail.purchaseOrderSubmissionStartedAt) {
           payload.lines = purchaseReviewLines(form);
-          payload.extraLines = poEditor.extraLines();
+          payload.extraLines = poEditor.extraLines(form);
           payload.pallet = purchasePalletReview(form);
           await purchasePricingReady;
           vendorDiscountReview(payload.lines);
@@ -649,7 +712,13 @@
       }
       state.formDrafts.delete(specialFormKey(form));
       if (path === 'stock-check') { state.revisingDeclinedLineIds.clear(); state.editingStockLineIds.clear(); }
-      state.dirty = state.formDrafts.size > 0; state.notice = path === 'purchase-order/skip' ? 'PO creation skipped for testing.' : path === 'purchase-order/replace' ? `Purchase Order replaced with ${state.detail.purchaseOrderRef}.` : 'Saved.';
+      if (path === 'purchase-order/items') { state.addPurchaseItemOpen = false; poEditor.discard(`add:${state.detail.id}`); }
+      // The saved review, including its PO-only items, is now the form's source.
+      if (path === 'purchase-order/draft') poEditor.discard(String(state.detail.id));
+      state.dirty = state.formDrafts.size > 0; state.notice = path === 'purchase-order/skip' ? 'PO creation skipped for testing.' : path === 'purchase-order/replace' ? `Purchase Order replaced with ${state.detail.purchaseOrderRef}.`
+        : path === 'purchase-order/draft' ? 'PO draft saved. The PO has not been created in NetSuite yet.'
+        : path === 'purchase-order/items' ? (poItems?.specialAddedPurchaseItemMode(state.detail) === 'netsuite' ? `Item added to NetSuite PO ${state.detail.purchaseOrderRef}.` : 'Item recorded for SCM. The NetSuite PO was not changed.')
+          : /\/retry$/.test(path) ? `NetSuite PO ${state.detail.purchaseOrderRef} updated.` : 'Saved.';
       if (path === 'purchase-order/replace') state.replaceOrderOpen = false;
       if (stockCheckRefreshError) state.notice = `Stock check saved. The latest status could not be reloaded: ${stockCheckRefreshError} Use Refresh to try again.`;
       const index = state.requests.findIndex(request => request.id === state.detail.id);
@@ -694,6 +763,13 @@
       if (line?.salesDecision !== 'declined' || !canEditSpecialCaseLines(state.detail) || !canCheckStock({ ...line, salesDecision: 'pending' })) return;
       state.revisingDeclinedLineIds.add(line.id);
       state.dirty = true;
+      render({detailOnly:true});
+      return;
+    }
+    if (action === 'add-po-item' || action === 'cancel-po-item') {
+      state.addPurchaseItemOpen = action === 'add-po-item';
+      if (!state.addPurchaseItemOpen) { poEditor?.discard(`add:${state.detail.id}`); state.formDrafts.delete('data-special-po-add-form:'); }
+      state.dirty = state.addPurchaseItemOpen || state.formDrafts.size > 0;
       render({detailOnly:true});
       return;
     }
@@ -751,6 +827,7 @@
       ({ specialLineFields, specialLineFieldValues, specialAdjustmentFieldSummary } = await lineFieldsReady);
       ({ canEditSpecialCaseLines } = await caseEditsReady);
       ({ specialRequestPalletLine } = await palletDisplayReady);
+      poItems = await poItemsReady;
       ({ specialFormKey, rememberSpecialForm, restoreSpecialForms, preserveSpecialScroll } = await formsReady);
       const editorModule = await poEditorReady;
       poUomField = editorModule.specialPurchaseUomField; poPackFields = editorModule.specialPurchasePackFields;

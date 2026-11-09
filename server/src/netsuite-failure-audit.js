@@ -18,7 +18,7 @@ export function sanitizeNetSuiteFailureText(value, limit = 4000) {
     .slice(0, limit);
 }
 
-const textFields = ['actorOperatorId', 'requestId', 'commandId', 'orderId', 'orderRef', 'orderType', 'functionKey',
+const textFields = ['actorOperatorId', 'auditRequestId', 'requestId', 'commandId', 'orderId', 'orderRef', 'orderType', 'functionKey',
   'transactionType', 'sourceOrderKind', 'sourceNetSuiteId', 'stage', 'operation', 'clientVersion', 'errorName', 'requestPath'];
 const uuid = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/iu;
 
@@ -103,5 +103,12 @@ export function createNetSuiteFailureAudit({ persist, fallback = async row => co
       message: data?.message || data?.error?.message || data?.error || first?.detail || `NetSuite HTTP ${result.response.status}: ${result.text}` };
     await record(error, { ...details, httpStatus: result.response.status, ...(data?.stage ? { stage: data.stage } : {}) });
   }
-  return { context, record, capture, response };
+  /** The merged diagnostic context of the current operation (actor, request, order, command). */
+  function snapshot() {
+    const current = storage.getStore();
+    if (!current) { return {}; }
+    const { requestContext, ...details } = current;
+    return { ...(typeof requestContext === 'function' ? requestContext() : {}), ...details };
+  }
+  return { context, record, capture, response, snapshot };
 }

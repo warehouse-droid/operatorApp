@@ -12,18 +12,18 @@ const APP_SHELL = [
   "/operator-display-settings.css?v=20261008-input-font25-v1&palletEntry=20261026",
   "/operator-display-settings.js?v=20261028-return-enhancements&returnExchangeLayout=20261029",
   "/operator-order-keypad.js?v=20261008-phone-keyboard-v1",
-  "/operator-stepper-keypad.js?v=20261104-stepper-keypad-v1",
-  "/operator.css?v=20261029-pallet-search&returnExchangeLayout=20261029&palletBottom=20261029&stepperKeypad=20261104",
+  "/operator-stepper-keypad.js?v=20261104-stepper-keypad-v1&returnKeypad=20261105",
+  "/operator.css?v=20261029-pallet-search&returnExchangeLayout=20261029&palletBottom=20261029&stepperKeypad=20261104&returnKeypad=20261105",
   "/operator-viewport.js?v=20260930-android-bottom-bar-v1",
   "/i18n.css?v=20260701-i18n-v2",
   "/operator-receiving-confirmation.css?v=20260917-receiving-followup-v1",
   "/vendor/quagga2/quagga.min.js?v=1.12.1",
-  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104&returnReasonsZh=20261105",
+  "/i18n.js?v=20261027-damage-reasons-zh-v1&stockExchange=20261029&returnExchangeLayout=20261029&repairLanguage=20261030&damageCamera=20261102&stepperKeypad=20261104&returnReasonsZh=20261105&operatorPush=20261105",
   "/operator-load-summary.js?v=20260918-operator-display-settings-v1",
-  "/operator-photo-outbox.js?v=20260917-background-photos-v1",
+  "/operator-photo-outbox.js?v=20260917-background-photos-v1&missingCleanup=20261105",
   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
   "/operator-popup-audit.js?v=20261026-popup-v1",
-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnReasonsZh=20261105&proofPhotoSize=20261106",
+  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105&operatorPush=20261105&brokenPalletLayer=20261106&proofPhotoSize=20261106",
   "/return-notifications.js?v=20261028-return-enhancements",
   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
   "/scm-special-alert.js?v=20260928-special-alert-v1",
@@ -59,6 +59,35 @@ self.addEventListener("message", (event) => {
       event.data.options || {}
     ));
   }
+});
+
+// Operator Web Push: urgent Delivery Prep alerts while MBBS Yard is closed or the device sleeps.
+// The tag matches the page's own notification for the same order, so they replace each other.
+self.addEventListener("push", (event) => {
+  let data = {};
+  try { data = event.data?.json() || {}; } catch { data = {}; }
+  if (!["operator_delivery_prep", "operator_push_test"].includes(data.type)) return;
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const operatorWindows = windows.filter((client) => {
+      try { return new URL(client.url).pathname === "/operator"; } catch { return false; }
+    });
+    // An Operator page in view plays its own bell and banner; keep the system notification quiet.
+    const visible = operatorWindows.some((client) => client.visibilityState === "visible");
+    for (const client of operatorWindows) client.postMessage({ type: "OPERATOR_PUSH", notice: data.type, locationId: data.locationId });
+    await self.registration.showNotification(data.title || "MBBS Yard", {
+      body: data.body || "",
+      tag: data.tag || "operator-push",
+      renotify: true,
+      requireInteraction: data.type === "operator_delivery_prep",
+      silent: visible,
+      vibrate: visible ? undefined : [300, 150, 300, 150, 600],
+      icon: "/icons/mbbs-yard-192.png",
+      badge: "/icons/mbbs-yard-192.png",
+      timestamp: Date.now(),
+      data: { url: data.url || "/operator", notice: data.type === "operator_push_test" ? "push-test" : "delivery-prep", locationId: data.locationId }
+    });
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {

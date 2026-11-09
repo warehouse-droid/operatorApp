@@ -206,8 +206,10 @@ assert.match(operator, /if \(requirePhotos && palletQty > 0/);
 assert.match(operator, /if \(requirePhotos && returnType === "quality"/);
 assert.match(operator, /if \(requirePhotos && returnMode === "stock" && returnType === "normal"/);
 assert.match(operator, /returnStage = "review";\s*return render\(\);/);
-assert.match(operator, /ORDER_NOT_FULLY_FULFILLED/);
-assert.match(operator, /NetSuite status must show fully fulfilled before recording a return/);
+assert.match(operator, /ORDER_NOT_FULFILLED/);
+assert.doesNotMatch(operator, /ORDER_NOT_FULLY_FULFILLED|NetSuite status must show fully fulfilled/,
+  "stock returns are limited per line by fulfilled quantity, not by whole-order status");
+assert.match(operator, /Only fulfilled quantities can be returned/);
 assert.doesNotMatch(operator, /Item Receipts/, "fulfillment error copy must not tell the operator to wait for Item Receipts");
 assert.equal(returnUi.includes("return-review-aside"), false, "return checklist must not be rendered");
 assert.equal(returnUi.includes("operator.returnChecklist"), false, "return checklist copy must not be rendered");
@@ -216,7 +218,7 @@ assert.match(css, /\.sync-alert\[hidden\]\s*\{[^}]*display:\s*none\s*!important;
 const lookupStart = operator.indexOf("async function lookupReturnOrder");
 const lookupEnd = operator.indexOf("async function searchReturnCustomers", lookupStart);
 const lookupBody = operator.slice(lookupStart, lookupEnd);
-assert.match(lookupBody, /ORDER_NOT_FULLY_FULFILLED/);
+assert.match(lookupBody, /ORDER_NOT_FULFILLED/);
 assert.ok(lookupBody.indexOf("returnLookupYardPreflight(clean)") >= 0, "return lookup must run the local yard preflight");
 assert.match(
   lookupBody,
@@ -282,7 +284,7 @@ for (const key of [
   "operator.increaseQuantity",
   "operator.selectedReturnItem",
   "operator.requiredBeforeConfirm",
-  "operator.orderNotFullyFulfilled",
+  "operator.orderNotFulfilled",
   "operator.finalValidationHelp",
   "operator.addAnotherReason",
   "operator.evidenceTargets",

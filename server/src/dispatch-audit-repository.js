@@ -1,5 +1,5 @@
 import { query } from "./db.js";
-import { trackSemanticAudit } from "./audit-context.js";
+import { trackSemanticAudit, withAuditRequestId } from "./audit-context.js";
 
 function cleanText(value) {
   const text = String(value ?? "").trim();
@@ -59,7 +59,7 @@ export async function writeDispatchAudit(entry = {}) {
       cleanText(entry.planDate || entry.plan_date),
       JSON.stringify(cleanJson(entry.before, null)),
       JSON.stringify(cleanJson(entry.after, null)),
-      JSON.stringify(cleanJson(entry.details, {}))
+      JSON.stringify(withAuditRequestId(cleanJson(entry.details, {})))
     ]
   ));
   return auditRow(result.rows[0]);

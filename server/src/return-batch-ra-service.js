@@ -10,9 +10,24 @@ import { assertStagedReturnBatch, finalizeStagedReturnBatch } from "./return-sub
 import { prepareReturnAccounting } from './return-accounting.js';
 import { queueReturnAutomaticNotification } from './return-automatic-notifications.js';
 import { returnCreditMemoReconciliationIntent } from './return-credit-memo-adjustment.js';
+import { operatorPostingTelemetry } from './operator-netsuite-posting-telemetry.js';
 
 function error(message, code = "RETURN_BATCH_RA_BLOCKED") {
   return Object.assign(new Error(message), { status: 409, code });
+}
+
+/** Records how long a step took (shared-queue wait + NetSuite), including when it fails. */
+async function timed(timings, key, work) {
+  const started = performance.now();
+  try { return await work(); } finally { timings[key] = Math.round(performance.now() - started); }
+}
+
+function logReturnPostingTiming(batch, outcome, timings, problem = null) {
+  try {
+    console.info(JSON.stringify({ event: "return_posting_timing", at: new Date().toISOString(),
+      batchId: Number(batch.batch_id), externalId: batch.external_id, transactionType: returnBatchTransactionType(batch),
+      outcome, ...(problem ? { errorCode: String(problem.code || "REQUEST_FAILED").slice(0, 80) } : {}), timingsMs: timings }));
+  } catch { /* Diagnostics must never change a posting result. */ }
 }
 
 export function returnBatchTransactionType(batch) {
@@ -65,7 +80,7 @@ function transactionStatusOf(snapshot) {
 
 function transactionRefOf(snapshot) { return snapshot?.tranId || snapshot?.tranid || null; }
 
-async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null, errorCode = null } = {}) {
+async function setState(batchId, status, { message = null, snapshot = null, resetAttempt = false, actorOperatorId = null, transactionStatus = null, errorCode = null, timings = null } = {}) {
   const reference = transactionRefOf(snapshot);
   const remoteStatus = transactionStatus || transactionStatusOf(snapshot);
   await checkpoint(async q => {
@@ -85,7 +100,7 @@ async function setState(batchId, status, { message = null, snapshot = null, rese
       SELECT r.id,'batch_' || COALESCE(a.intent_snapshot->>'transactionType','return_authorization'),$2,
         jsonb_build_object('batchId',$1::bigint),$3::jsonb,$4,$5
       FROM return_records r JOIN return_batch_authorizations a ON a.batch_id=r.batch_id
-      WHERE r.batch_id=$1`, [batchId, status, JSON.stringify({ reference }), message, actorOperatorId]);
+      WHERE r.batch_id=$1`, [batchId, status, JSON.stringify({ reference, ...(timings ? { timingsMs: timings } : {}) }), message, actorOperatorId]);
   });
 }
 
@@ -122,20 +137,20 @@ function definiteRejection(problem) {
     && !(problem.netsuiteErrorCodes || []).some(code => /DUP|EXIST/i.test(code));
 }
 
-async function postOrRecover(batch) {
+async function postOrRecover(batch, timings) {
   const intent = batch.intent_snapshot;
   const transactionType = returnBatchTransactionType(batch);
   let found = batch.netsuite_transaction_id;
-  if (!found) {found = (await findReturnTransactionByExternalId(batch.external_id, transactionType))?.id;}
+  if (!found) {found = (await timed(timings, "lookupMs", () => findReturnTransactionByExternalId(batch.external_id, transactionType)))?.id;}
   if (!found) {
     if (batch.attempted_at) {throw uncertainCreation(batch);}
     await markAttempt(batch);
     try {
       const payload = buildReturnBatchPayload(intent);
-      const created = transactionType === "credit_memo"
-        ? await createOrUpdateCreditMemoInNetSuite({ payload }) : intent.sourceSalesOrderId
-        ? await createOrUpdateReturnAuthorizationInNetSuite({ salesOrderId: intent.sourceSalesOrderId, payload })
-        : await createStandaloneReturnAuthorizationInNetSuite(payload);
+      const created = await timed(timings, "createMs", () => transactionType === "credit_memo"
+        ? createOrUpdateCreditMemoInNetSuite({ payload }) : intent.sourceSalesOrderId
+        ? createOrUpdateReturnAuthorizationInNetSuite({ salesOrderId: intent.sourceSalesOrderId, payload })
+        : createStandaloneReturnAuthorizationInNetSuite(payload));
       found = created.id || (await findReturnTransactionByExternalId(batch.external_id, transactionType))?.id;
     } catch (problem) {
       problem.returnRaCreationRejected = definiteRejection(problem);
@@ -143,7 +158,7 @@ async function postOrRecover(batch) {
     }
   }
   const transactionId = await identify(batch, found);
-  const snapshot = await readBatchSnapshot(batch, transactionId);
+  const snapshot = await timed(timings, "readbackMs", () => readBatchSnapshot(batch, transactionId));
   return { transactionId, snapshot };
 }
 
@@ -182,11 +197,11 @@ async function activeMembers(batch) {
   }
 }
 
-async function verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) {
+async function verifyManualCandidate(batch, manualTransactionId, manualTransactionRef, timings) {
   if (batch.netsuite_transaction_id && Number(batch.netsuite_transaction_id) !== Number(manualTransactionId)) {
     throw error(`This return batch already has a different ${transactionLabel(batch)}.`);
   }
-  const candidate = await readBatchSnapshot(batch, manualTransactionId);
+  const candidate = await timed(timings, "readbackMs", () => readBatchSnapshot(batch, manualTransactionId));
   verifyReturnBatchSnapshot({ ...batch.intent_snapshot, netSuiteTransactionId: manualTransactionId }, candidate);
   if (manualTransactionRef && String(transactionRefOf(candidate)).toUpperCase() !== String(manualTransactionRef).trim().toUpperCase()) {
     throw error(`NetSuite ${transactionLabel(batch)} number does not match.`);
@@ -199,7 +214,7 @@ function allowInactiveBatch(batch, reconcile) {
   return !batch.draft_id && (reconcile || Boolean(batch.netsuite_transaction_id));
 }
 
-async function recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId }) {
+async function recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId, timings = null }) {
   if (!manualTransactionId && problem.code === "RETURN_CM_DELETED") {
     await recordDeletedCreditMemo(batch, actorOperatorId);
     return true;
@@ -208,7 +223,7 @@ async function recordSynchronizationFailure(batch, problem, { manualTransactionI
   // transaction or remove it from the reconciliation queue.
   if (manualTransactionId && ["succeeded", "manual_linked", "cancelled"].includes(batch.sync_status)) { return; }
   await setState(batch.batch_id, "failed", { message: String(problem.message || problem).slice(0, 4000),
-    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId, errorCode: problem.code || null });
+    resetAttempt: problem.returnRaCreationRejected === true, actorOperatorId, errorCode: problem.code || null, timings });
 }
 
 function alreadyDeletedCreditMemo(batch, manualTransactionId) {
@@ -271,18 +286,25 @@ export async function synchronizeReturnBatchAuthorization({ recordId, batchId = 
       return {};
     }
     if (batch.posting_policy.effective !== true) {return { error: error("This return was saved locally and was not admitted for NetSuite posting.") };}
+    const timings = {};
+    const started = performance.now();
     try {
       await activeMembers(batch);
-      const { transactionId, snapshot } = await withNetSuiteOperationalWork(
+      const netSuiteWork = () => withNetSuiteOperationalWork(
         reconcile ? "returns.reconcile" : "returns.pending", () => manualTransactionId
-          ? verifyManualCandidate(batch, manualTransactionId, manualTransactionRef) : postOrRecover(batch));
+          ? verifyManualCandidate(batch, manualTransactionId, manualTransactionRef, timings) : postOrRecover(batch, timings));
+      // Operator-facing postings also log every NetSuite call and shared-queue wait (operator_posting_timing).
+      const { transactionId, snapshot } = reconcile ? await netSuiteWork()
+        : await operatorPostingTelemetry.context({ commandId: batch.external_id, stage: "return_posting",
+          transactionType: returnBatchTransactionType(batch) === "credit_memo" ? "CM" : "RA" }, netSuiteWork);
+      timings.totalMs = Math.round(performance.now() - started);
       const verificationIntent = !manualTransactionId && hasVerifiedCreditMemo(batch)
         ? await returnCreditMemoReconciliationIntent(batch) : batch.intent_snapshot;
       verifyReturnBatchSnapshot({ ...verificationIntent, netSuiteTransactionId: transactionId }, snapshot,
         { allowInactive: allowInactiveBatch(batch, reconcile),
           allowAccountingAdjustments: !manualTransactionId && hasVerifiedCreditMemo(batch) });
       const inactive = /cancel|void|reject/i.test(transactionStatusOf(snapshot));
-      await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId });
+      await setState(batch.batch_id, inactive ? "cancelled" : manualTransactionId ? "manual_linked" : "succeeded", { snapshot, actorOperatorId, timings });
       await finalizeStagedReturnBatch(batch);
       await queueReturnAutomaticNotification(batch);
       await writeAudit({ actorOperatorId, source: "returns",
@@ -290,10 +312,14 @@ export async function synchronizeReturnBatchAuthorization({ recordId, batchId = 
         orderId: batch.intent_snapshot.sourceSalesOrderId,
         details: { batchId: Number(batch.batch_id), recordIds: batch.intent_snapshot.recordIds, transactionId,
           transactionType: returnBatchTransactionType(batch),
-          transactionRef: transactionRefOf(snapshot), receivingLocationId: batch.intent_snapshot.receivingLocationId } });
+          transactionRef: transactionRefOf(snapshot), receivingLocationId: batch.intent_snapshot.receivingLocationId,
+          timingsMs: timings } });
+      if (!reconcile) { logReturnPostingTiming(batch, "succeeded", timings); }
       return {};
     } catch (problem) {
-      const retired = await recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId });
+      timings.totalMs ??= Math.round(performance.now() - started);
+      if (!reconcile) { logReturnPostingTiming(batch, "failed", timings, problem); }
+      const retired = await recordSynchronizationFailure(batch, problem, { manualTransactionId, actorOperatorId, timings });
       return retired ? {} : { error: problem };
     }
   });

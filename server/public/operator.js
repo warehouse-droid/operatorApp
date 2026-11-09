@@ -1573,6 +1573,93 @@ function playDeliveryDing() {
   }
 }
 
+// Operator Web Push: this device's subscription, so urgent Delivery Prep alerts arrive while
+// MBBS Yard is closed or asleep. Synced once per account, yard and language; the server keeps
+// the yard and sends the alerts (src/operator-push.js).
+let operatorPushState = { key: "", endpoint: "", locationId: "", pending: null, retryAt: 0 };
+
+function operatorPushSupported() {
+  return window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function operatorPushKeyBytes(base64) {
+  const text = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`.replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+}
+
+function operatorPushSameKey(current, publicKey) {
+  if (!current) return false;
+  const bytes = new Uint8Array(current);
+  const wanted = operatorPushKeyBytes(publicKey);
+  return bytes.length === wanted.length && bytes.every((value, index) => value === wanted[index]);
+}
+
+/** True when this device receives background alerts for the selected yard. */
+function operatorPushActive() {
+  return Boolean(operatorPushState.endpoint) && operatorPushState.locationId === String(locationId || "");
+}
+
+async function syncOperatorPush({ force = false, test = false } = {}) {
+  if (!operator || !authToken || !locationId || !operatorPushSupported() || Notification.permission !== "granted") return false;
+  const language = window.MBBS_I18N?.language?.() || "en";
+  const key = `${operator.id}:${locationId}:${language}`;
+  if (operatorPushState.pending) return operatorPushState.pending;
+  if (!force && (operatorPushState.key === key || Date.now() < operatorPushState.retryAt)) return operatorPushActive();
+  operatorPushState.key = key;
+  const requestedLocation = String(locationId);
+  const run = (async () => {
+    try {
+      const config = await api("/api/operator/push/config");
+      if (!config?.enabled || !config.publicKey) {
+        operatorPushState.endpoint = "";
+        return false;
+      }
+      // A service worker that never activates must not leave the sync waiting forever.
+      const registration = await Promise.race([navigator.serviceWorker.ready,
+        new Promise((_resolve, reject) => setTimeout(() => reject(new Error("The service worker is not ready.")), 10000))]);
+      let subscription = await registration.pushManager.getSubscription();
+      if (subscription && !operatorPushSameKey(subscription.options?.applicationServerKey, config.publicKey)) {
+        await subscription.unsubscribe().catch(() => false);
+        subscription = null;
+      }
+      subscription ||= await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: operatorPushKeyBytes(config.publicKey) });
+      await api("/api/operator/push/subscription", {
+        method: "PUT",
+        body: JSON.stringify({ subscription: subscription.toJSON(), locationId: requestedLocation, language })
+      });
+      operatorPushState.endpoint = subscription.endpoint;
+      operatorPushState.locationId = requestedLocation;
+      operatorPushState.retryAt = 0;
+      if (test) {
+        await api("/api/operator/push/test", { method: "POST", body: JSON.stringify({ endpoint: subscription.endpoint }) }).catch(() => null);
+      }
+      return true;
+    } catch (error) {
+      // Retry later (e.g. the push service is unreachable); in-app alerts keep working meanwhile.
+      operatorPushState.key = "";
+      operatorPushState.endpoint = "";
+      operatorPushState.retryAt = error?.message === "Operator session changed." ? 0 : Date.now() + 5 * 60 * 1000;
+      console.warn("Background alerts are unavailable:", error?.message || error);
+      return false;
+    } finally {
+      operatorPushState.pending = null;
+    }
+  })();
+  operatorPushState.pending = run;
+  return run;
+}
+
+/** Logout: stop background alerts for this account on this device. */
+async function stopOperatorPush(reason = "logout") {
+  operatorPushState = { key: "", endpoint: "", locationId: "", pending: null, retryAt: 0 };
+  if (!operatorPushSupported()) return;
+  const registration = await navigator.serviceWorker.getRegistration().catch(() => null);
+  const subscription = await registration?.pushManager?.getSubscription().catch(() => null);
+  if (!subscription) return;
+  await api("/api/operator/push/subscription", { method: "DELETE", body: JSON.stringify({ endpoint: subscription.endpoint, reason }) }).catch(() => null);
+  await subscription.unsubscribe().catch(() => false);
+}
+
 async function showBrowserDeliveryNotification(items) {
   if (!("Notification" in window) || !items.length) return;
   if (Notification.permission !== "granted") return;
@@ -1632,7 +1719,8 @@ function showUrgentDeliveryAlert(items) {
     });
   } else {
     playDeliveryDing();
-    if (document.visibilityState !== "visible") {
+    // With background alerts on, the server's push shows the system notification (same tag).
+    if (document.visibilityState !== "visible" && !operatorPushActive()) {
       showBrowserDeliveryNotification(items).catch(() => {});
     }
   }
@@ -1871,11 +1959,37 @@ function operatorLoadedUnitCount(loaded, consumed, required, conversion, unit) {
     && upperSales === operatorRoundedSalesQuantity(loaded, unit) ? upper : lower;
 }
 
-function operatorPackUnitCapacity(required, consumed, conversion, unit) {
+function operatorPackUnitCapacity(required, consumed, conversion, unit, conversionGap = 0) {
   if (![required, consumed, conversion].every(Number.isFinite) || conversion <= 0
       || operatorRoundedSalesQuantity(required, unit) <= operatorRoundedSalesQuantity(consumed, unit)) return 0;
-  return operatorLoadedUnitCount(required, consumed,
+  const count = operatorLoadedUnitCount(required, consumed,
     Math.ceil(Math.max(0, required - consumed) / conversion), conversion, unit);
+  // One more package may finish a balance it overshoots by no more than the line's
+  // conversion gap: the last layer of a broken pallet.
+  const short = operatorRoundedSalesQuantity(consumed + count * conversion, unit)
+    < operatorRoundedSalesQuantity(required, unit);
+  return conversionGap > 0 && short && consumed + (count + 1) * conversion - required <= conversionGap + 0.000001
+    ? count + 1 : count;
+}
+
+/** NetSuite rounds package conversions, so a pallet taken as loose layers can hold more
+ * than its own conversion (95.6 SQFT/PLT, but 9 x 10.63 = 95.67 SQFT of layers). This is
+ * the most the whole larger packages of a line can differ from the smaller packages they
+ * hold. Only packages within 1% of a whole multiple count; unrelated conversions add 0.
+ */
+function operatorPackConversionGap(required, conversions) {
+  const sizes = conversions.filter(value => Number.isFinite(value) && value > 0);
+  if (!Number.isFinite(required) || required <= 0) return 0;
+  const packageGap = larger => Math.max(0, ...sizes.map(smaller => {
+    const count = Math.round(larger / smaller), gap = Math.abs(larger - count * smaller);
+    return count > 1 && gap <= larger * 0.01 ? gap : 0;
+  }));
+  return sizes.reduce((total, larger) => total + Math.floor(required / larger + 0.000001) * packageGap(larger), 0);
+}
+
+function packConversionGap(line) {
+  return operatorPackConversionGap(lineRequiredSalesQty(line),
+    ["pallets", "layers", "sections", "pieces"].map(unit => unitConversion(line, unit)));
 }
 
 function wholeUnitsFromSalesQty(salesQuantity, conversion, unit) {
@@ -1948,7 +2062,7 @@ function convertedRemainingPack(line) {
   const add = (unit, requested) => {
     const conversion = unitConversion(line, unit);
     const count = Math.min(requested,
-      operatorPackUnitCapacity(lineRequiredSalesQty(line), consumed, conversion, line.unit));
+      operatorPackUnitCapacity(lineRequiredSalesQty(line), consumed, conversion, line.unit, packConversionGap(line)));
     result[unit] += count;
     consumed += count * conversion;
   };
@@ -2192,7 +2306,7 @@ function panelLimit(line, unit, values = null) {
     const saved = absolute ? 0 : units.reduce((sum, key) => sum + packedValue(line, key) * unitConversion(line, key), 0);
     const others = units.reduce((sum, key) => sum + (key === unit ? 0 : qty(values?.[key] ?? panelValue(line, key))) * unitConversion(line, key), 0);
     return operatorPackUnitCapacity(lineRequiredSalesQty(line), packingLoadedSalesQty(line) + saved + others,
-      unitConversion(line, unit), line.unit);
+      unitConversion(line, unit), line.unit, packConversionGap(line));
   }
   if (isCustomerPickupMode()) return Math.max(0, requiredValue(line, unit) - pickupLoadedValue(line, unit));
   if (isActiveDraftPackedLine(line)) return activeDraftLimit(line, unit);
@@ -3009,10 +3123,10 @@ function returnLookupYardPreflight(orderRef) {
   return { blocked: true, requiredYard };
 }
 
-function returnOrderNotFullyFulfilledMessage() {
+function returnOrderNotFulfilledMessage() {
   return t(
-    "operator.orderNotFullyFulfilled",
-    "This Sales Order is not fully fulfilled. NetSuite status must show fully fulfilled before recording a return."
+    "operator.orderNotFulfilled",
+    "Nothing on this Sales Order can be returned yet. Only fulfilled quantities can be returned."
   );
 }
 
@@ -3506,8 +3620,8 @@ function renderReturnQuantityStepper({
     <div class="return-quantity-stepper" role="group" aria-label="${escapeHtml(label)}">
       <button data-action="return-step-quantity" data-delta="-1" ${shared} ${numericValue <= 0 ? "disabled" : ""} type="button" aria-label="${t("operator.decreaseQuantity", "Decrease quantity")}">−</button>
       ${editable
-        ? `<input type="number" inputmode="numeric" min="0" step="${escapeHtml(step)}" value="${numericValue}" ${shared} data-return-quantity-value aria-label="${escapeHtml(label)}" />`
-        : `<output data-return-quantity-value aria-live="polite">${displayReturnQty(numericValue)}</output>`}
+        ? `<input type="number" inputmode="numeric" min="0" step="${escapeHtml(step)}" value="${numericValue}" ${shared} data-return-quantity-value aria-label="${escapeHtml(label)}" readonly aria-haspopup="dialog" />`
+        : `<output data-return-quantity-value aria-live="polite" role="button" tabindex="0" aria-haspopup="dialog">${displayReturnQty(numericValue)}</output>`}
       <button data-action="return-step-quantity" data-delta="1" ${shared} type="button" aria-label="${t("operator.increaseQuantity", "Increase quantity")}">+</button>
     </div>
   `;
@@ -3677,35 +3791,60 @@ function updateReturnPhotoRequirement(kind, lineId, required) {
   }
 }
 
+/** The quantity a return stepper control (its +/- button) edits, or null. */
+function returnQuantityState(control) {
+  const kind = String(control?.dataset?.returnQuantityKind || "");
+  const field = String(control?.dataset?.returnQuantityField || "");
+  if (!field) return null;
+  if (kind === "pallet" && field === "palletQuantity") return { kind, field, values: null, current: Number(returnPalletQuantity) || 0 };
+  const values = returnLineValues[String(control.dataset.line || "")];
+  if (!values || !["pallets", "layers", "sections", "pieces", "salesQuantity"].includes(field)) return null;
+  return { kind, field, values, current: Number(values[field]) || 0 };
+}
+
 function stepReturnQuantity(button) {
-  const kind = String(button?.dataset?.returnQuantityKind || "");
-  const field = String(button?.dataset?.returnQuantityField || "");
   const delta = Number(button?.dataset?.delta || 0);
   const step = Math.max(0, Number(button?.dataset?.returnQuantityStep || 1)) || 1;
-  if (!delta || !field) return;
+  const state = delta ? returnQuantityState(button) : null;
+  if (state) setReturnQuantity(button, state.current + (delta * step));
+}
 
-  let currentValue = 0;
-  let values = null;
-  if (kind === "pallet" && field === "palletQuantity") {
-    currentValue = Number(returnPalletQuantity) || 0;
-  } else {
-    values = returnLineValues[String(button.dataset.line || "")];
-    if (!values || !["pallets", "layers", "sections", "pieces", "salesQuantity"].includes(field)) return;
-    currentValue = Number(values[field]) || 0;
-  }
+/** The number pad target for a tapped return quantity (operator-stepper-keypad.js). */
+function returnQuantityKeypadTarget(stepper) {
+  const control = stepper.querySelector('[data-action="return-step-quantity"][data-delta="1"]');
+  const state = returnQuantityState(control);
+  if (!state) return null;
+  const { kind, field } = state;
+  const line = String(control.dataset.line || "");
+  const balance = kind === "pallet" ? currentPalletBalance() : null;
+  return {
+    label: stepper.getAttribute("aria-label") || "", value: state.current,
+    max: balance ? returnBalanceAvailable(balance) : Number.POSITIVE_INFINITY, decimals: field === "salesQuantity",
+    apply: (value) => {
+      // A re-render may have replaced the stepper; set the same quantity only if it is still shown.
+      const current = control.isConnected ? control : [...app.querySelectorAll('[data-action="return-step-quantity"][data-delta="1"]')]
+        .find((button) => button.dataset.returnQuantityKind === kind && button.dataset.returnQuantityField === field
+          && String(button.dataset.line || "") === line);
+      if (current) setReturnQuantity(current, value);
+    }
+  };
+}
 
-  const nextValue = Math.max(0, Math.round((currentValue + (delta * step)) * 1_000_000) / 1_000_000);
-  if (kind === "pallet") returnPalletQuantity = nextValue;
-  else values[field] = nextValue;
+function setReturnQuantity(control, value) {
+  const state = returnQuantityState(control);
+  if (!state) return;
+  const nextValue = Math.max(0, Math.round((Number(value) || 0) * 1_000_000) / 1_000_000);
+  if (state.values) state.values[state.field] = nextValue;
+  else returnPalletQuantity = nextValue;
   returnDirty = true;
 
-  const stepper = button.closest(".return-quantity-stepper");
+  const stepper = control.closest(".return-quantity-stepper");
   const output = stepper?.querySelector("[data-return-quantity-value]");
   if (output instanceof HTMLInputElement) output.value = String(nextValue);
   else if (output) output.textContent = displayReturnQty(nextValue);
   const decrease = stepper?.querySelector('[data-action="return-step-quantity"][data-delta="-1"]');
   if (decrease) decrease.disabled = nextValue <= 0;
-  refreshReturnQuantityFeedback(button);
+  refreshReturnQuantityFeedback(control);
 }
 
 function refreshReturnQuantityFeedback(target) {
@@ -6561,6 +6700,7 @@ function applyDeliveryNotifications(nextNotifications, options = {}) {
   if (alertItems.length) {
     showUrgentDeliveryAlert(alertItems);
   }
+  void syncOperatorPush();
   return deliveryNotifications;
 }
 
@@ -9003,8 +9143,8 @@ async function lookupReturnOrder(code = returnLookupCode) {
     const code = String(error.payload?.code || "");
     returnLookupMessage = code === "CROSS_YARD_RETURN_BLOCKED"
       ? tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardName(error.payload.requiredReturnLocation) || "-" })
-      : code === "ORDER_NOT_FULLY_FULFILLED"
-        ? returnOrderNotFullyFulfilledMessage()
+      : code === "ORDER_NOT_FULFILLED"
+        ? returnOrderNotFulfilledMessage()
         : error.message;
   } finally {
     returnBusy = false;
@@ -9784,8 +9924,8 @@ async function submitReturn() {
     }
     returnValidationMessage = code === "CROSS_YARD_RETURN_BLOCKED"
       ? tf("operator.returnMustBeProcessedAt", "This return must be processed at {yard}.", { yard: returnYardName(error.payload.requiredReturnLocation) || "-" })
-      : code === "ORDER_NOT_FULLY_FULFILLED"
-        ? returnOrderNotFullyFulfilledMessage()
+      : code === "ORDER_NOT_FULFILLED"
+        ? returnOrderNotFulfilledMessage()
         : error.message;
     returnStage = "form";
     showToast(returnValidationMessage);
@@ -9975,6 +10115,8 @@ function stepQty(unit, delta) {
 
 /** The number pad target for a tapped stepper quantity (operator-stepper-keypad.js). */
 function stepperKeypadTarget(input) {
+  const returnStepper = input.closest(".return-quantity-stepper");
+  if (returnStepper) return returnQuantityKeypadTarget(returnStepper);
   const consolidation = input.closest(".stepper")?.querySelector('[data-action="step-consolidation"]');
   if (consolidation) {
     const { order, line, unit } = consolidation.dataset;
@@ -10104,6 +10246,7 @@ app.addEventListener("click", async (event) => {
     if (button.dataset.action === "logout") {
       stopReturnCamera();
       stopReturnScannerCamera();
+      await stopOperatorPush("logout").catch(() => {});
       await api("/api/auth/logout", { method: "POST" }).catch(() => ({}));
       operator = null;
       clearOperatorSession();
@@ -10338,7 +10481,10 @@ app.addEventListener("click", async (event) => {
         return render();
       }
       const permission = await Notification.requestPermission().catch(() => "default");
-      if (permission === "granted") {
+      if (permission === "granted" && await syncOperatorPush({ force: true, test: true })) {
+        playDeliveryDing();
+        showToast(t("operator.backgroundAlertsOn", "Background alerts are on for this device"));
+      } else if (permission === "granted") {
         playDeliveryDing();
         const registration = await navigator.serviceWorker?.ready?.catch(() => null);
         await registration?.showNotification?.(t("operator.notificationsEnabled", "MBBS notifications enabled"), {
@@ -11243,6 +11389,9 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.addEventListener("message", (event) => {
     if (event.data?.type === "OPEN_URGENT_DELIVERY_ALERT") {
       openUrgentDeliveryAlert().catch((error) => showToast(error.message));
+    }
+    if (event.data?.type === "OPERATOR_PUSH" && event.data.notice === "operator_delivery_prep") {
+      loadDeliveryNotifications().catch(() => {});
     }
   });
 }

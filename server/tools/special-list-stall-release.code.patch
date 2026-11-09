@@ -1,0 +1,287 @@
+diff --git a/server/src/special-stock-status-refresh.js b/server/src/special-stock-status-refresh.js
+--- a/server/src/special-stock-status-refresh.js
++++ b/server/src/special-stock-status-refresh.js
+@@ -61,13 +61,20 @@
+   if (!kind || !verifiedStatus({ id: observation.netsuiteOrderId, tranid: observation.tranid,
+     status: observation.status, status_text: observation.statusText }, observation)) throw Error('Invalid Special order status observation.');
+   return withTransaction(async () => {
+-    const result = await query(`UPDATE ${kind.table} header
++    // The fence (synced_at) still applies; previous reads the locked row so an unchanged status is known.
++    const result = await query(`WITH previous AS (
++        SELECT netsuite_id, status AS previous_status, status_text AS previous_status_text FROM ${kind.table}
++        WHERE netsuite_id=$1 FOR UPDATE)
++      UPDATE ${kind.table} header
+       SET status=$2, status_text=$3, synced_at=now(),
+           status_updated_at=CASE WHEN status IS DISTINCT FROM $2 OR status_text IS DISTINCT FROM $3 THEN now() ELSE status_updated_at END
+-      WHERE netsuite_id=$1 AND tranid=$5 AND synced_at IS NOT DISTINCT FROM $4::timestamptz
++      FROM previous
++      WHERE header.netsuite_id=previous.netsuite_id AND header.tranid=$5 AND header.synced_at IS NOT DISTINCT FROM $4::timestamptz
+         AND EXISTS (SELECT 1 FROM sales_special_stock_cases special WHERE special.${kind.link}=header.netsuite_id)
+-      RETURNING netsuite_id`, [observation.netsuiteOrderId, observation.status, observation.statusText, observation.syncedAt, observation.tranid]);
+-    if (!result.rowCount) return false;
++      RETURNING header.netsuite_id, (previous.previous_status IS DISTINCT FROM $2 OR previous.previous_status_text IS DISTINCT FROM $3) AS changed`,
++    [observation.netsuiteOrderId, observation.status, observation.statusText, observation.syncedAt, observation.tranid]);
++    // An unchanged status only renews freshness: no audit row, mirror event or page reload.
++    if (!result.rowCount || result.rows[0].changed !== true) return false;
+     await enqueueNetSuiteMirrorOrderEvent(kind.orderType, observation.netsuiteOrderId, { changeType: 'status' });
+     await writeAudit({ actorType: 'system', source: 'special-stock-request', action: 'special.order_status.refreshed',
+       orderId: /** @type {any} */ (observation.netsuiteOrderId), details: { orderType: kind.orderType, tranid: observation.tranid,
+@@ -81,21 +88,38 @@
+ export function createSpecialOrderStatusCache(dependencies = {}) {
+   const { now = () => new Date(), fetchStatuses = fetchTransactionStatusesFromNetSuite,
+     persist = persistSpecialOrderStatusObservation, logger = console } = dependencies;
++  // An order NetSuite did not answer for (deleted, malformed, or a failed call) is not asked again for
++  // MAX_AGE_MS unless forced, so a PO deleted in NetSuite is not re-read and logged on every list load.
++  /** @type {Map<string,number>} */
++  const retryAt = new Map();
++  /** @param {string} type @param {{netsuiteOrderId:number}} order @param {number} at */
++  const holdOff = (type, order, at) => {
++    if (retryAt.size >= 5000) for (const [key, until] of retryAt) if (until <= at) retryAt.delete(key);
++    retryAt.set(`${type}:${order.netsuiteOrderId}`, at + MAX_AGE_MS);
++  };
+   /** @param {Record<string,any>[]} details @param {{force?:boolean}} options */
+   return async (details, { force = false } = {}) => {
+     const result = { attempted: 0, updated: 0, failed: 0 };
+     for (const kind of kinds) {
+-      const orders = staleOrders(details, kind.prefix, now(), force);
++      const current = now(), at = Number(current);
++      const orders = staleOrders(details, kind.prefix, current, force)
++        .filter(order => force || !((retryAt.get(`${kind.orderType}:${order.netsuiteOrderId}`) ?? 0) > at));
+       if (!orders.length) continue;
+       result.attempted += orders.length;
+       let rows;
+       try { rows = await fetchStatuses(orders.map(order => order.netsuiteOrderId), kind.recordType); }
+-      catch (error) { result.failed += orders.length; logger.error('Special order status refresh failed', kind.orderType, String(error instanceof Error ? error.message : error)); continue; }
++      catch (error) {
++        result.failed += orders.length;
++        for (const order of orders) holdOff(kind.orderType, order, at);
++        logger.error('Special order status refresh failed', kind.orderType, String(error instanceof Error ? error.message : error)); continue;
++      }
+       for (const order of orders) {
+         const matches = Array.isArray(rows) ? rows.filter(row => identity(row?.id) === order.netsuiteOrderId) : [];
+         if (matches.length !== 1 || !verifiedStatus(matches[0], order)) {
+-          result.failed++; logger.error('Special order status response is missing or invalid', kind.orderType, order.netsuiteOrderId); continue;
++          result.failed++; holdOff(kind.orderType, order, at);
++          logger.error('Special order status response is missing or invalid', kind.orderType, order.netsuiteOrderId); continue;
+         }
++        retryAt.delete(`${kind.orderType}:${order.netsuiteOrderId}`);
+         try {
+           if (await persist({ orderType: kind.orderType, ...order, status: matches[0].status, statusText: matches[0].status_text })) result.updated++;
+         } catch (error) { result.failed++; logger.error('Special order status persistence failed', kind.orderType, String(error instanceof Error ? error.message : error)); }
+@@ -110,3 +134,26 @@
+ export function refreshSpecialOrderStatusCache(details, options = {}) {
+   return config.netsuite?.directAccessEnabled ? refresh(details, options) : Promise.resolve({ attempted: 0, updated: 0, failed: 0 });
+ }
++
++/** List pages answer from saved statuses; stale SO/PO statuses refresh afterwards, one batch at a time,
++ * and onUpdated (a page reload event) runs only when a status changed. A list load never waits for NetSuite.
++ * @param {{refresh?:(details:Record<string,any>[])=>Promise<{attempted:number,updated:number,failed:number}>,
++ *   onUpdated?:(result:{attempted:number,updated:number,failed:number})=>void,logger?:{error:(...args:any[])=>void}}} dependencies */
++export function createBackgroundSpecialStatusRefresh(dependencies = {}) {
++  const { refresh: refreshStatuses = refreshSpecialOrderStatusCache, onUpdated = () => {}, logger = console } = dependencies;
++  /** @type {Promise<{attempted:number,updated:number,failed:number}>|null} */
++  let running = null;
++  /** @param {Record<string,any>[]} details */
++  return details => {
++    // The batch in progress covers this load; anything still stale is picked up by the next load.
++    if (running) return running;
++    running = Promise.resolve().then(() => refreshStatuses(details))
++      .then(result => { if (result.updated) onUpdated(result); return result; })
++      .catch(error => {
++        logger.error('Special order status refresh failed', String(error instanceof Error ? error.message : error));
++        return { attempted: 0, updated: 0, failed: 0 };
++      })
++      .finally(() => { running = null; });
++    return running;
++  };
++}
+diff --git a/server/src/server.js b/server/src/server.js
+--- a/server/src/server.js
++++ b/server/src/server.js
+@@ -602,7 +602,7 @@
+   refreshSpecialSalesOrder
+ } from "./special-stock-request-service.js";
+ import { updateSpecialFulfillment } from './special-stock-fulfillment.js';
+-import { refreshSpecialOrderStatusCache } from './special-stock-status-refresh.js';
++import { refreshSpecialOrderStatusCache, createBackgroundSpecialStatusRefresh } from './special-stock-status-refresh.js';
+ import { reviewSpecialQuantityChange } from './special-stock-quantity-service.js';
+ import { reviewSpecialClosure, requestSpecialClosure as requestSpecialCaseClosure } from './special-stock-closure-service.js';
+ import {
+@@ -12846,9 +12846,14 @@
+   emitAppEvent("special-stock-request.updated", { source, ...detail });
+ }
+ 
+-/** @param {()=>Promise<any>} read */
+-async function readSpecialWithCurrentOrderStatuses(read) {
++// Special list pages answer from saved statuses and never wait for NetSuite; stale SO/PO statuses refresh
++// afterwards, one batch at a time, and only a changed status reloads open pages (2026-11-06 list stall).
++const refreshSpecialListStatuses = createBackgroundSpecialStatusRefresh({ onUpdated: () => emitSpecialStockUpdate('order-status-refresh') });
++
++/** @param {()=>Promise<any>} read @param {{background?:boolean}} [options] */
++async function readSpecialWithCurrentOrderStatuses(read, { background = false } = {}) {
+   const saved = await read();
++  if (background) { void refreshSpecialListStatuses(Array.isArray(saved) ? saved : [saved]); return saved; }
+   const result = await refreshSpecialOrderStatusCache(Array.isArray(saved) ? saved : [saved]);
+   if (result.updated) emitSpecialStockUpdate('order-status-refresh');
+   return result.attempted ? read() : saved;
+@@ -12933,7 +12938,7 @@
+         audience: "sales",
+         requestedByOperatorId: req.query.mine === "1" ? req.operator.id : undefined,
+         authorizedStoreLocationIds: operatorSalesYardLocationIds(req.operator)
+-      }))
++      }), { background: true })
+     });
+   } catch (error) {
+     next(error);
+@@ -13294,7 +13299,7 @@
+ app.get("/api/scm/special-stock-requests", requireSpecialStockWorkflow, async (req, res, next) => {
+   try {
+     specialStockNoStore(res);
+-    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined })) });
++    res.json({ yards: SALES_YARDS, vendors: await listSpecialCaseVendors(), requests: await readSpecialWithCurrentOrderStatuses(() => listSpecialStockCases({ ...req.query, audience: "scm", authorizedStoreLocationIds: undefined, requestedByOperatorId: undefined }), { background: true }) });
+   } catch (error) {
+     next(error);
+   }
+diff --git a/server/src/db.js b/server/src/db.js
+--- a/server/src/db.js
++++ b/server/src/db.js
+@@ -6,8 +6,13 @@
+ const transactionStorage = new AsyncLocalStorage();
+ let savepointSeq = 0;
+ 
++// node-postgres defaults to 10 connections. On 2026-11-06 a few transactions held connections while
++// waiting on other work and every page queued behind them; PostgreSQL allows 100 (about 22 in use).
++export const DATABASE_POOL_MAX = Math.min(50, Math.max(1, Number.parseInt(process.env.DATABASE_POOL_MAX || "", 10) || 30));
++
+ export const pool = new Pool({
+   connectionString: config.databaseUrl,
++  max: DATABASE_POOL_MAX,
+   options: "-c jit=off"
+ });
+ 
+diff --git a/server/src/system-resource-monitor.js b/server/src/system-resource-monitor.js
+--- a/server/src/system-resource-monitor.js
++++ b/server/src/system-resource-monitor.js
+@@ -11,7 +11,7 @@
+ import { monitorEventLoopDelay } from 'node:perf_hooks';
+ import pg from 'pg';
+ import { config } from './config.js';
+-import { query } from './db.js';
++import { pool as appDatabasePool, query } from './db.js';
+ import { recordSystemEvent } from './system-audit.js';
+ 
+ export const RESOURCE_SAMPLE_INTERVAL_MS = 30_000;
+@@ -82,7 +82,7 @@
+  * @param {{record?: (event: Record<string, any>) => unknown, cpuHighPercent?: number, cpuHighSamples?: number,
+  *  cpuRecoverPercent?: number, repeatMs?: number, memoryLowPercent?: number, memoryRecoverPercent?: number,
+  *  eventLoopBlockedMs?: number, eventLoopRepeatMs?: number, longQuerySeconds?: number,
+- *  longQueryErrorSeconds?: number}} [options] */
++ *  longQueryErrorSeconds?: number, poolWaitingWarn?: number, poolRepeatMs?: number}} [options] */
+ export function createResourceAlerts({
+   record = recordSystemEvent,
+   cpuHighPercent = 85,
+@@ -94,11 +94,14 @@
+   eventLoopBlockedMs = 1000,
+   eventLoopRepeatMs = 5 * 60_000,
+   longQuerySeconds = 60,
+-  longQueryErrorSeconds = 300
++  longQueryErrorSeconds = 300,
++  poolWaitingWarn = 5,
++  poolRepeatMs = 5 * 60_000
+ } = {}) {
+   const cpu = { streak: 0, since: 0, lastAlertAt: 0, peak: 0 };
+   const memory = { since: 0, lastAlertAt: 0, lowest: 100 };
+   let eventLoopLastAlertAt = 0;
++  let poolLastAlertAt = 0;
+   /** @type {Map<string, string>} query key -> severity already reported */
+   const reportedQueries = new Map();
+   const emit = (event) => record({ category: 'system', source: 'resource-monitor', ...event });
+@@ -172,6 +175,15 @@
+         details: { ...details, eventLoopMaxMs: blockedMs, eventLoopP99Ms: sample.eventLoopP99Ms } });
+     }
+ 
++    // Requests queued for one of the app's database connections: every page waits behind them (2026-11-06).
++    const appPool = sample.appPool;
++    if (appPool && Number.isFinite(appPool.waitingMax) && appPool.waitingMax >= poolWaitingWarn && now - poolLastAlertAt >= poolRepeatMs) {
++      poolLastAlertAt = now;
++      emit({ severity: 'warning', action: 'system.db.pool_exhausted',
++        message: `All ${appPool.max ?? '?'} app database connections were busy; up to ${appPool.waitingMax} requests waited for one. ${context(sample)}`,
++        details: { ...details, appPool } });
++    }
++
+     const seen = new Set();
+     for (const longQuery of sample.longQueries || []) {
+       const key = `${longQuery.pid}:${longQuery.queryStart}`;
+@@ -229,7 +241,8 @@
+ 
+ /** Starts sampling in this process. Returns {sampleNow, stop}; sampleNow resolves to the stored sample.
+  * @param {{processName?: string, intervalMs?: number, enabled?: boolean, alerts?: ReturnType<typeof createResourceAlerts>,
+- *  readFile?: (path: string) => Promise<string>, pool?: {query: Function, end?: Function}, now?: () => number}} [options] */
++ *  readFile?: (path: string) => Promise<string>, pool?: {query: Function, end?: Function}, now?: () => number,
++ *  appPool?: {waitingCount?: number, totalCount?: number, idleCount?: number, options?: {max?: number}}|null, poolProbeMs?: number}} [options] */
+ export function startSystemResourceMonitor({
+   processName = 'app',
+   intervalMs = Number(process.env.SYSTEM_RESOURCE_SAMPLE_MS) || RESOURCE_SAMPLE_INTERVAL_MS,
+@@ -237,7 +250,9 @@
+   alerts = createResourceAlerts(),
+   readFile = (path) => fs.readFile(path, 'utf8'),
+   pool = null,
+-  now = Date.now
++  now = Date.now,
++  appPool = appDatabasePool,
++  poolProbeMs = 1000
+ } = {}) {
+   if (!enabled) return { sampleNow: async () => null, stop: async () => {} };
+   const ownPool = !pool;
+@@ -258,6 +273,12 @@
+   let running = null;
+   let lastSweepAt = 0;
+   let lastFailureAt = 0;
++  // Peak number of requests queued for one of this process's database connections since the last
++  // sample, probed every second so a short exhaustion between two samples is still recorded.
++  let poolWaitingMax = 0;
++  const probePool = () => { poolWaitingMax = Math.max(poolWaitingMax, Number(appPool?.waitingCount) || 0); };
++  const poolTimer = appPool ? setInterval(probePool, poolProbeMs) : null;
++  poolTimer?.unref?.();
+ 
+   function reportFailure(label, error) {
+     // stderr only: console.error is captured into the audit log and would echo every failed sample.
+@@ -300,6 +321,10 @@
+     const elapsedUsec = previous ? (current.at - previous.at) * 1000 : 0;
+     const usage = process.memoryUsage();
+     const longest = db.longQueries[0] || null;
++    probePool();
++    const appPoolUse = appPool ? { max: appPool.options?.max ?? null, total: appPool.totalCount ?? null, idle: appPool.idleCount ?? null,
++      waitingNow: Number(appPool.waitingCount) || 0, waitingMax: poolWaitingMax } : null;
++    poolWaitingMax = 0;
+     const sample = {
+       sampledAt: new Date(current.at).toISOString(),
+       processName,
+@@ -322,7 +347,8 @@
+       dbParallelWorkers: db.parallel_workers ?? null,
+       dbLongestQuerySeconds: longest ? longest.seconds : (db.error ? null : 0),
+       longQueries: db.longQueries,
+-      dbError: db.error || null
++      dbError: db.error || null,
++      appPool: appPoolUse
+     };
+     eventLoop.reset();
+     previous = current;
+@@ -333,7 +359,8 @@
+     const longest = sample.longQueries[0];
+     const details = {
+       ...(longest && longest.seconds >= 5 ? { longestQuery: { ...longest, query: queryPreview(longest.query, 300) } } : {}),
+-      ...(sample.dbError ? { dbError: sample.dbError } : {})
++      ...(sample.dbError ? { dbError: sample.dbError } : {}),
++      ...(sample.appPool ? { appPool: sample.appPool } : {})
+     };
+     await db.query(INSERT_SQL, [
+       sample.sampledAt, sample.processName, sample.intervalMs, sample.hostCpuPercent, sample.hostCpuCores, sample.hostLoad1m,
+@@ -373,6 +400,7 @@
+     sampleNow,
+     async stop() {
+       clearInterval(timer);
++      if (poolTimer) clearInterval(poolTimer);
+       eventLoop.disable();
+       if (running) await running;
+       if (ownPool) await db.end();

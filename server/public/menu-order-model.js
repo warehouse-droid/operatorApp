@@ -108,6 +108,10 @@ export const MENU_CATALOG = [
       {
         "label": "Audit",
         "href": "/admin/audit"
+      },
+      {
+        "label": "Performance",
+        "href": "/admin/performance"
       }
     ]
   },

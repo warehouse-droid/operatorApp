@@ -229,10 +229,13 @@ export async function listPublicOperatorNetSuitePostingAttentionCommands() {
     .filter(Boolean);
 }
 
-/** @param {string} commandId */
-export async function resumePublicOperatorNetSuitePostingCommand(commandId) {
+/**
+ * @param {string} commandId
+ * @param {{ authorizeRepost?: boolean }} [options] Admin "Resume verification" only.
+ */
+export async function resumePublicOperatorNetSuitePostingCommand(commandId, options = {}) {
   return withTransaction(async () => {
-    const command = await resumeOperatorNetSuitePostingCommand(commandId);
+    const command = await resumeOperatorNetSuitePostingCommand(commandId, options);
     afterTransactionCommit(() => {
       void operatorNetSuitePostingRuntime.enqueue(command.id);
     });

@@ -38,6 +38,7 @@ import {
   assertSpecialPurchaseRelease,
   deriveSpecialCaseStage,
   matchSpecialOrderCoverage,
+  mapSpecialPurchaseOrderLines,
   normalizeSpecialCaseDraft,
   normalizeSpecialAdditionalLines,
   normalizeSpecialFulfillment,
@@ -235,7 +236,11 @@ function mapOrderLine(row = {}) {
     rate: numberOrNull(row.unit_rate),
     ...(row.native_discount_percent == null ? {} : { nativeDiscountPercent: Number(row.native_discount_percent) }),
     unitPurchaseCost: numberOrNull(row.unit_purchase_cost),
-    remoteLineId: numberOrNull(row.remote_line_id)
+    remoteLineId: numberOrNull(row.remote_line_id),
+    // Set only for PO-only items SCM added after the PO existed (see migration 335).
+    ...(row.po_sync_status ? { poSyncStatus: row.po_sync_status, poSyncError: row.po_sync_error || '',
+      poSyncStarted: Boolean(row.po_sync_plan) } : {}),
+    ...(row.added_at ? { addedBy: row.added_by || null, addedByName: row.added_by_name || row.added_by || '', addedAt: row.added_at } : {})
   };
 }
 
@@ -319,6 +324,8 @@ function mapCase(row = {}) {
     purchaseOrderRef: row.purchase_order_ref || null,
     purchaseOrderStatus: row.effective_purchase_status || row.purchase_order_status || null,
     purchaseOrderApproved: row.purchase_order_approved === true,
+    // A PO this application created for the request can receive SCM-added items in NetSuite.
+    purchaseOrderCreatedByApp: row.purchase_order_created_by_app === true,
     purchaseOrderPendingApproval: row.purchase_order_pending_approval === true,
     purchaseOrderReference: row.purchase_order_reference || '',
     purchaseOrderSentToVendorAt: row.purchase_order_sent_to_vendor_at || null,
@@ -441,6 +448,10 @@ async function selectCaseRows(requestIds, { forUpdate = false } = {}) {
             completion.completed AS request_completion_complete,
             completion.completed_at AS request_completed_at,
             completion.completion_source AS request_completion_source,
+            EXISTS (SELECT 1 FROM scm_netsuite_po_history history
+               WHERE history.netsuite_purchase_order_id = special.purchase_order_netsuite_id
+                 AND history.creation_snapshot->>'source' = 'special_stock_request'
+                 AND history.creation_snapshot->>'requestId' = special.request_id::text) AS purchase_order_created_by_app,
             special.*
        FROM sales_stock_requests request
        JOIN sales_special_stock_cases special ON special.request_id = request.id
@@ -588,10 +599,13 @@ async function reconcileCanonicalOrderLines(requestId, orderKind, remoteOrderId,
     if (!ready && required) throw workflowError('Wait for the linked PO lines to synchronize.', 409, 'SPECIAL_CUSTOM_PO_LINES_NOT_READY');
     return ready;
   }
+  // SCM-added items that are not on the NetSuite PO (recorded only, or still being added) are never expected there.
   const expected = await query(
     `SELECT id, case_line_id, item_id, item_name, description, quantity, uom, remote_line_id, native_discount_percent
        FROM sales_special_stock_order_lines
       WHERE request_id = $1 AND order_kind = $2
+        AND po_sync_status IS DISTINCT FROM 'local' AND po_sync_status IS DISTINCT FROM 'pending'
+        AND po_sync_status IS DISTINCT FROM 'attention'
       ORDER BY id
       FOR UPDATE`,
     [requestId, orderKind]
@@ -616,6 +630,22 @@ async function reconcileCanonicalOrderLines(requestId, orderKind, remoteOrderId,
   if (!canonical.rowCount && !required) return false;
   const canonicalLines=canonical.rows.map(row=>({id:Number(row.id),lineId:Number(row.line_id),itemId:Number(row.item_id),itemName:row.item_name,
     description:row.description,quantity:Number(row.quantity),uom:row.uom,active:row.active}));
+  if (!sales) {
+    // The created PO is independent of its reviewed draft: map what matches, never raise attention.
+    if (!canonicalLines.some(line => line.active !== false)) {
+      if (required) throw workflowError('Wait for the linked PO lines to synchronize.', 409, 'SPECIAL_CUSTOM_PO_LINES_NOT_READY');
+      return false;
+    }
+    const mappings = mapSpecialPurchaseOrderLines(expected.rows.map((row) => ({
+      id: Number(row.id), itemId: Number(row.item_id), itemName: row.item_name, description: row.description,
+      quantity: Number(row.quantity), uom: row.uom, remoteLineId: numberOrNull(row.remote_line_id)
+    })), canonicalLines);
+    for (const mapping of mappings) {
+      await query(`UPDATE sales_special_stock_order_lines SET remote_line_id = $3, updated_at = now()
+        WHERE request_id = $1 AND id = $2 AND remote_line_id IS DISTINCT FROM $3`, [requestId, mapping.expectedLineId, mapping.remoteLineId]);
+    }
+    return true;
+  }
   // A confirmed v2 plan accepts only a complete original or target order while
   // NetSuite webhooks race the local commit. It grants no dispatch permission.
   if(quantityReview?.plan?.version===2 && quantityReview.remoteStarted===true && ['applying','attention'].includes(quantityReview.status)){
@@ -672,20 +702,30 @@ async function canonicalLinksReady(requestId) {
     [independent.rows[0].sales_order_netsuite_id, independent.rows[0].purchase_order_netsuite_id]);
     return ready.rows[0].sales_ready && ready.rows[0].purchase_ready;
   }
+  // The SO lines must be exactly linked. The PO is independent of its reviewed draft once created:
+  // it is ready when its reviewed material lines are linked, or when its NetSuite material lines
+  // have synchronized even though they no longer match the draft.
   const result = await query(
-    `SELECT count(*)::int AS expected,
-            count(remote_line_id)::int AS linked
-       FROM sales_special_stock_order_lines orders
-       JOIN sales_special_stock_cases special ON special.request_id=orders.request_id
-      WHERE orders.request_id = $1 AND ancillary = false
-        AND (NOT special.purchase_order_custom_linkage OR (orders.order_kind='sales_order' AND EXISTS (
-          SELECT 1 FROM purchase_order_lines line WHERE line.purchase_order_id=special.purchase_order_netsuite_id
-            AND line.netsuite_active IS DISTINCT FROM false AND line.item_id IS NOT NULL AND line.quantity>0
-            AND line.item_id NOT IN (10716,-2,4981) AND UPPER(COALESCE(line.item_type,'')) NOT IN ('DISCOUNT','SUBTOTAL'))))`,
+    `SELECT count(orders.id)::int AS expected,
+            count(orders.remote_line_id)::int AS linked,
+            (EXISTS (SELECT 1 FROM purchase_order_lines line WHERE line.purchase_order_id=special.purchase_order_netsuite_id
+              AND line.netsuite_active IS DISTINCT FROM false AND line.item_id IS NOT NULL AND line.quantity>0
+              AND line.item_id NOT IN (10716,-2,4981) AND UPPER(COALESCE(line.item_type,'')) NOT IN ('DISCOUNT','SUBTOTAL'))
+             OR (special.purchase_order_netsuite_id IS NOT NULL AND EXISTS (SELECT 1 FROM sales_special_stock_order_lines draft
+               WHERE draft.request_id=special.request_id AND draft.order_kind='purchase_order' AND draft.ancillary=false)
+              AND NOT EXISTS (SELECT 1 FROM sales_special_stock_order_lines draft
+               WHERE draft.request_id=special.request_id AND draft.order_kind='purchase_order' AND draft.ancillary=false
+                 AND draft.remote_line_id IS NULL))) AS purchase_ready
+       FROM sales_special_stock_cases special
+       LEFT JOIN sales_special_stock_order_lines orders ON orders.request_id=special.request_id
+        AND orders.ancillary = false AND orders.order_kind = 'sales_order'
+      WHERE special.request_id = $1
+      GROUP BY special.request_id`,
     [requestId]
   );
   return Number(result.rows[0]?.expected) > 0
-    && Number(result.rows[0]?.linked) === Number(result.rows[0]?.expected);
+    && Number(result.rows[0]?.linked) === Number(result.rows[0]?.expected)
+    && result.rows[0]?.purchase_ready === true;
 }
 
 async function directAllocationLines(requestId, special) {
@@ -759,7 +799,9 @@ async function hydrateSpecialStockCases(rows, {
   const stockEvidence = regularLines.length
     ? await (await import('./stock-request-repository.js')).getBackorderStockEvidence(regularLines)
     : new Map();
-  const orderLinesResult = await query("SELECT * FROM sales_special_stock_order_lines WHERE request_id = ANY($1::bigint[]) ORDER BY order_kind, id", [ids]);
+  const orderLinesResult = await query(`SELECT line.*, actor.display_name AS added_by_name
+      FROM sales_special_stock_order_lines line LEFT JOIN operators actor ON actor.id = line.added_by
+     WHERE line.request_id = ANY($1::bigint[]) ORDER BY line.order_kind, line.id`, [ids]);
   const mediaResult = await query(
       `SELECT request_id, upload_id, object_ref, mime_type, byte_size, status, attached_sales_order_id,
               registered_at, attached_at, created_at
@@ -2554,6 +2596,9 @@ export async function replaceSpecialPurchaseOrder(requestId, input = {}, { opera
       WHERE request_id=$1`, [id, order.netsuite_id, order.tranid, order.status_text || order.status || null]);
     await query(`UPDATE sales_special_stock_order_lines SET remote_line_id=NULL, updated_at=now()
       WHERE request_id=$1 AND order_kind='purchase_order'`, [id]);
+    // Items SCM added to the replaced PO are not known to be on the replacement.
+    await query(`UPDATE sales_special_stock_order_lines SET po_sync_status='local', updated_at=now()
+      WHERE request_id=$1 AND order_kind='purchase_order' AND po_sync_status='synced'`, [id]);
     const routeReset = await repointSpecialHandoff(id, 'purchase_order', Number(order.netsuite_id), handoff);
     const updated = await selectCaseRow(id, { forUpdate: true });
     if (updated.sales_order_netsuite_id && !updated.attention
@@ -3368,6 +3413,168 @@ export async function recordSpecialSalesDescriptionsSynced(requestId, { expected
     }
     await bumpCase(id);
     await appendEvent(id, 'special_sales_descriptions_synchronized', operatorId, { changes });
+  });
+  return getSpecialStockCase(id, { audience: 'scm' });
+}
+
+/** @param {number} requestId @param {unknown} lineId */
+async function lockAddedPurchaseItem(requestId, lineId) {
+  const row = (await query(`SELECT * FROM sales_special_stock_order_lines WHERE request_id=$1 AND id=$2
+      AND order_kind='purchase_order' AND ancillary AND po_sync_status IS NOT NULL FOR UPDATE`,
+  [requestId, positiveId(lineId, 'PO item')])).rows[0];
+  if (!row) throw workflowError('This added PO item was not found.', 404, 'SPECIAL_PO_ITEM_NOT_FOUND');
+  return row;
+}
+
+/** @param {Record<string,any>} special */
+function assertPurchaseItemsOpen(special) {
+  assertCaseEditable(special);
+  if (special.workflow_kind === 'backorder') throw workflowError('Only Special requests support SCM-added PO items.', 409, 'SPECIAL_PO_ITEM_UNSUPPORTED');
+  if (special.close_status !== 'active' || mapCase(special).operationallyComplete) throw workflowError('This request is closed or completed.', 409, 'SPECIAL_CASE_CLOSED');
+}
+
+/**
+ * SCM adds a PO-only item after the PO exists. It never touches the SO, the request lines or Sales.
+ * A PO created by this application for the request is then updated in NetSuite (`sync`);
+ * otherwise the item is recorded for SCM only and the NetSuite PO is unchanged.
+ * @param {number|string} requestId @param {{expectedRevision?:unknown,line?:unknown}} input @param {{operatorId?:string}} context
+ */
+export async function addSpecialPurchaseOrderItem(requestId, input = {}, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  const actorId = String(operatorId || '').trim();
+  if (!actorId) throw workflowError('An authenticated SCM operator is required.', 401, 'SPECIAL_ACTOR_REQUIRED');
+  const line = normalizeSpecialPurchaseLine(/** @type {Record<string,any>} */ (input.line));
+  let lineId = 0, sync = false;
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    assertPurchaseItemsOpen(special);
+    if (!special.purchase_order_netsuite_id && !special.purchase_order_skipped) {
+      throw workflowError('Before the PO is created, add PO-only items in the Purchase Order review.', 409, 'SPECIAL_PO_ITEM_BEFORE_PO');
+    }
+    const existing = (await query(`SELECT po_sync_status FROM sales_special_stock_order_lines
+        WHERE request_id=$1 AND order_kind='purchase_order' AND ancillary AND item_id<>1784 FOR UPDATE`, [id])).rows;
+    if (existing.some(row => ['pending', 'attention'].includes(row.po_sync_status))) {
+      throw workflowError('Finish the NetSuite PO update of the previously added item first.', 409, 'SPECIAL_PO_ITEM_SYNC_PENDING');
+    }
+    if (existing.length >= 100) throw workflowError('A PO can hold at most 100 added items.', 400, 'SPECIAL_PO_LINES_INVALID');
+    sync = !special.purchase_order_skipped && special.purchase_order_created_by_app === true;
+    const item = await query('SELECT item_name FROM inventory_items WHERE item_id=$1 FOR SHARE', [line.itemId]);
+    if (!item.rowCount) throw workflowError('The selected PO item is missing from the synced NetSuite item master.', 400, 'SPECIAL_PO_LINES_INVALID');
+    const inserted = await query(`INSERT INTO sales_special_stock_order_lines
+        (request_id,order_kind,ancillary,item_id,item_name,description,quantity,uom,unit_purchase_cost,
+         pack_pallet_qty,pack_section_qty,pack_layer_qty,pack_piece_qty,po_sync_status,added_by,added_at)
+      VALUES($1,'purchase_order',true,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now()) RETURNING id`,
+    [id, line.itemId, item.rows[0].item_name, line.description, line.quantity, line.uom, line.unitPurchaseCost,
+      line.palletQty, line.sectionQty, line.layerQty, line.pieceQty, sync ? 'pending' : 'local', actorId]);
+    lineId = Number(inserted.rows[0].id);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_item_added', actorId, {
+      orderLineId: lineId, itemId: line.itemId, itemName: item.rows[0].item_name, description: line.description,
+      quantity: line.quantity, uom: line.uom, unitPurchaseCost: line.unitPurchaseCost,
+      purchaseOrderRef: special.purchase_order_ref || null, netSuiteUpdate: sync
+    }, { audience: 'scm' });
+  });
+  return { detail: await getSpecialStockCase(id, { audience: 'scm' }), lineId, sync };
+}
+
+/** Record the reviewed NetSuite baseline before the PO write, so a retry can never append twice. */
+export async function saveSpecialPurchaseOrderItemPlan(requestId, lineId, plan) {
+  const id = positiveId(requestId, 'Special Item case');
+  await withTransaction(async () => {
+    const row = await lockAddedPurchaseItem(id, lineId);
+    if (row.po_sync_status !== 'pending') throw workflowError('This PO item is not waiting for a NetSuite update.', 409, 'SPECIAL_PO_ITEM_SYNC_STATE');
+    if (!row.po_sync_plan) await query('UPDATE sales_special_stock_order_lines SET po_sync_plan=$3::jsonb,updated_at=now() WHERE request_id=$1 AND id=$2',
+      [id, row.id, JSON.stringify(plan)]);
+  });
+}
+
+/** @param {number|string} requestId @param {number} lineId */
+export async function readSpecialPurchaseOrderItemPlan(requestId, lineId) {
+  const row = (await query(`SELECT po_sync_plan FROM sales_special_stock_order_lines WHERE request_id=$1 AND id=$2 AND po_sync_status IS NOT NULL`,
+    [positiveId(requestId, 'Special Item case'), positiveId(lineId, 'PO item')])).rows[0];
+  return row?.po_sync_plan || null;
+}
+
+/** @param {number|string} requestId @param {number} lineId @param {{remoteLineId:number}} result @param {{operatorId?:string}} context */
+export async function finishSpecialPurchaseOrderItemSync(requestId, lineId, { remoteLineId }, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  await withTransaction(async () => {
+    const special = await selectCaseRow(id, { forUpdate: true });
+    const row = await lockAddedPurchaseItem(id, lineId);
+    if (row.po_sync_status === 'synced') return;
+    if (row.po_sync_status !== 'pending') throw workflowError('This PO item is not waiting for a NetSuite update.', 409, 'SPECIAL_PO_ITEM_SYNC_STATE');
+    await query(`UPDATE sales_special_stock_order_lines SET po_sync_status='synced',po_sync_error=NULL,remote_line_id=$3,updated_at=now()
+      WHERE request_id=$1 AND id=$2`, [id, row.id, positiveId(remoteLineId, 'NetSuite PO line')]);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_item_synced', operatorId, {
+      orderLineId: Number(row.id), purchaseOrderId: numberOrNull(special.purchase_order_netsuite_id),
+      purchaseOrderRef: special.purchase_order_ref || null, remoteLineId: Number(remoteLineId)
+    }, { audience: 'scm' });
+  });
+  return getSpecialStockCase(id, { audience: 'scm' });
+}
+
+/** @param {number|string} requestId @param {number} lineId @param {string} message @param {{operatorId?:string}} context */
+export async function failSpecialPurchaseOrderItemSync(requestId, lineId, message, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  await withTransaction(async () => {
+    await selectCaseRow(id, { forUpdate: true }); // Same lock order as every other request write.
+    const row = await lockAddedPurchaseItem(id, lineId);
+    if (row.po_sync_status !== 'pending') return;
+    await query(`UPDATE sales_special_stock_order_lines SET po_sync_status='attention',po_sync_error=$3,updated_at=now()
+      WHERE request_id=$1 AND id=$2`, [id, row.id, cleanSearch(message, 2_000) || 'The NetSuite PO update failed.']);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_item_attention', operatorId, { orderLineId: Number(row.id), error: cleanSearch(message, 2_000) }, { audience: 'scm' });
+  });
+}
+
+/** SCM retries a failed NetSuite PO update. The saved plan, if any, is reused. */
+export async function claimSpecialPurchaseOrderItemRetry(requestId, lineId, input = {}, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    assertPurchaseItemsOpen(special);
+    const row = await lockAddedPurchaseItem(id, lineId);
+    // A pending update idle for two minutes was interrupted; the saved plan makes its retry idempotent.
+    const interrupted = row.po_sync_status === 'pending' && Date.now() - new Date(row.updated_at).getTime() > 120_000;
+    if (row.po_sync_status !== 'attention' && !interrupted) throw workflowError('Only a failed or interrupted NetSuite PO update can be retried.', 409, 'SPECIAL_PO_ITEM_SYNC_STATE');
+    if (special.purchase_order_created_by_app !== true) {
+      throw workflowError('The linked PO was not created by this application. Keep the item as a record only.', 409, 'SPECIAL_PO_ITEM_NOT_APP_PO');
+    }
+    if (row.po_sync_plan && Number(row.po_sync_plan.purchaseOrderId) !== Number(special.purchase_order_netsuite_id)) {
+      throw workflowError('The linked PO changed after this item was prepared. Keep the item as a record only.', 409, 'SPECIAL_PO_ITEM_CONFLICT');
+    }
+    await query(`UPDATE sales_special_stock_order_lines SET po_sync_status='pending',updated_at=now() WHERE request_id=$1 AND id=$2`, [id, row.id]);
+    await bumpCase(id);
+    await appendEvent(id, 'special_purchase_order_item_retry', operatorId, { orderLineId: Number(row.id) }, { audience: 'scm' });
+  });
+}
+
+/**
+ * Keep a failed item as a record only (SCM handles the NetSuite PO itself), or remove an item
+ * that is recorded only. Items on the NetSuite PO are changed in NetSuite, not here.
+ * @param {number|string} requestId @param {number|string} lineId
+ * @param {{expectedRevision?:unknown,action?:unknown}} input @param {{operatorId?:string}} context
+ */
+export async function resolveSpecialPurchaseOrderItem(requestId, lineId, input = {}, { operatorId } = {}) {
+  const id = positiveId(requestId, 'Special Item case');
+  if (!['record_only', 'remove'].includes(String(input.action))) throw workflowError('Choose Keep as record only or Remove.', 400, 'SPECIAL_PO_ITEM_ACTION_INVALID');
+  await withTransaction(async () => {
+    const special = await lockCase(id, input.expectedRevision);
+    assertPurchaseItemsOpen(special);
+    const row = await lockAddedPurchaseItem(id, lineId);
+    if (input.action === 'record_only') {
+      if (row.po_sync_status !== 'attention') throw workflowError('Only an item whose NetSuite update failed can be kept as a record only.', 409, 'SPECIAL_PO_ITEM_SYNC_STATE');
+      await query(`UPDATE sales_special_stock_order_lines SET po_sync_status='local',updated_at=now() WHERE request_id=$1 AND id=$2`, [id, row.id]);
+    } else {
+      if (row.po_sync_status !== 'local') throw workflowError('Only an item recorded for SCM only can be removed. Change items on the NetSuite PO in NetSuite.', 409, 'SPECIAL_PO_ITEM_ON_PO');
+      await query('DELETE FROM sales_special_stock_order_lines WHERE request_id=$1 AND id=$2', [id, row.id]);
+    }
+    await bumpCase(id);
+    await appendEvent(id, input.action === 'remove' ? 'special_purchase_order_item_removed' : 'special_purchase_order_item_recorded_only', operatorId, {
+      orderLineId: Number(row.id), itemName: row.item_name, description: row.description, quantity: Number(row.quantity), uom: row.uom,
+      previousStatus: row.po_sync_status, netSuiteUpdateStarted: Boolean(row.po_sync_plan)
+    }, { audience: 'scm' });
   });
   return getSpecialStockCase(id, { audience: 'scm' });
 }

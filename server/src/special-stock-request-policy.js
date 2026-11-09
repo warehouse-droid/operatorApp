@@ -1,5 +1,6 @@
 import { query } from "./db.js";
 import {assertBackorderLocalAction} from '../public/backorder-workflow.js';
+import {specialPurchaseItemOnNetSuitePo} from '../public/special-stock-po-items.js';
 
 export const SPECIAL_STOCK_REQUEST_FLAG_KEY = "special_stock_request_workflow";
 export const SPECIAL_STOCK_TEST_SKIP_FLAG_KEY = 'special_stock_request_test_skip_orders';
@@ -59,6 +60,7 @@ function omitRestrictedFields(value) {
     fulfillmentChangePlan: _fulfillmentChangePlan,
     quantityReviewPlan: _quantityReviewPlan,
     closureReviewPlan: _closureReviewPlan,
+    poSyncError: _poSyncError,
     ...visible
   } = value;
   return Object.fromEntries(Object.entries(visible).map(([key, entry]) => [key, omitRestrictedFields(entry)]));
@@ -76,6 +78,8 @@ export function projectSpecialStockCase(detail, audience = "sales") {
   const visible = omitRestrictedFields(detail);
   return {
     ...visible,
+    // SCM-added items that are not on the NetSuite PO stay private to SCM.
+    ...(Array.isArray(visible.purchaseOrderLines) ? { purchaseOrderLines: visible.purchaseOrderLines.filter(specialPurchaseItemOnNetSuitePo) } : {}),
     lines: Array.isArray(detail.lines) ? detail.lines.map(omitRestrictedFields) : []
   };
 }

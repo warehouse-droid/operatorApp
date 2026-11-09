@@ -45,21 +45,25 @@ export function specialPurchaseUomField(line) {
   return `<label><span>UOM *</span><select name="uom" data-po-uom ${data?.noUnits ? '' : 'required'} data-wanted-uom="${escape(line.uom)}">${options}</select><input name="unitId" type="hidden" value="" /><small data-po-uom-message></small></label>`;
 }
 
-/** @param {Line} line */
-function extraRow(line) {
+/** @param {Line} line @param {{removable?:boolean}} [options] */
+function extraRow(line, {removable = true} = {}) {
   return `<article class="stock-request-line" data-special-po-extra="${escape(line.key)}" data-special-ancillary="po-${escape(line.key)}">
-    <header><strong>PO-only item</strong><button type="button" data-po-remove>Remove item</button></header>
-    <label><span>Search NetSuite item</span><input type="search" data-po-item-search value="${escape(line.itemName)}" placeholder="Item name or fee" autocomplete="off" required /><input name="itemId" type="hidden" value="${escape(line.itemId)}" /><div class="stock-request-suggestions" data-po-item-results></div></label>
+    <header><strong>PO-only item</strong>${removable ? '<button type="button" data-po-remove>Remove item</button>' : ''}</header>
+    <label><span>Search NetSuite item</span><span class="stock-request-item-search special-po-item-search"><input type="search" data-po-item-search value="${escape(line.itemName)}" placeholder="Item name or fee" autocomplete="off" required /><div class="stock-request-suggestions" data-po-item-results></div></span><input name="itemId" type="hidden" value="${escape(line.itemId)}" /></label>
     <div class="stock-request-line-fields"><label class="stock-request-wide"><span>Order description *</span><input name="description" required maxlength="4000" value="${escape(line.description)}" /></label>
     <label><span>Quantity *</span><input name="quantity" type="number" min="0.000001" max="1000000000" step="any" required value="${escape(line.quantity ?? 1)}" /></label>
     ${specialPurchaseUomField(line)}<label><span>Unit cost ($) *</span><input name="unitPurchaseCost" type="number" min="0" max="1000000000" step="any" required value="${escape(line.unitPurchaseCost)}" /></label></div>
     ${specialPurchasePackFields(line)}<p data-po-extra-total></p></article>`;
 }
 
+/** Forms that hold PO-only item rows: the PO review before creation, and Add item after it. */
+const EDITOR_FORMS = '[data-special-po-form], [data-special-po-add-form]';
+
 /** PO item editor owns its extra rows; the parent owns request materials.
  * @param {HTMLElement} root @param {{api:(url:string)=>Promise<any>,getDetail:()=>Detail|null,changed:()=>void}} options */
 export function createSpecialPurchaseEditor(root,{api,getDetail,changed}) {
-  /** @type {Map<number,Line[]>} */
+  /** Unsaved rows, keyed by request (PO review) or `add:<request>` (Add item after PO creation).
+   * @type {Map<string,Line[]>} */
   const drafts = new Map();
   /** @type {Map<string,Promise<Catalog>>} */
   const catalogs = new Map();
@@ -69,21 +73,27 @@ export function createSpecialPurchaseEditor(root,{api,getDetail,changed}) {
   let timer;
   /** @param {HTMLElement} row */
   const values = row => Object.fromEntries([.../** @type {NodeListOf<HTMLInputElement|HTMLSelectElement>} */ (row.querySelectorAll('[name]'))].map(input => [input.name,input.value]));
-  const extraLines = () => extraRows(root).map(values);
+  /** @param {HTMLElement} [scope] */
+  const extraLines = (scope = root) => extraRows(scope).map(values);
 
   function capture() {
-    const detail = getDetail();
-    if (!detail || !root.querySelector('[data-po-extras]')) return;
-    drafts.set(detail.id,extraRows(root).map(row => ({...values(row),
-      key:row.dataset.specialPoExtra,itemName:field(row,'[data-po-item-search]').value})));
-  }
-  /** @param {Detail} detail */
-  function extrasHtml(detail) {
-    if (!drafts.has(detail.id)) {
-      drafts.set(detail.id,(detail.purchaseOrderLines || []).filter(line => line.ancillary && Number(line.itemId) !== 1784)
-        .map(line => ({...line,key:crypto.randomUUID()})));
+    if (!getDetail()) return;
+    for (const host of /** @type {NodeListOf<HTMLElement>} */ (root.querySelectorAll('[data-po-extras]'))) {
+      drafts.set(host.dataset.poDraftKey || '',extraRows(host).map(row => ({...values(row),
+        key:row.dataset.specialPoExtra,itemName:field(row,'[data-po-item-search]').value})));
     }
-    return `<div data-po-extras>${(drafts.get(detail.id) || []).map(extraRow).join('')}</div><button type="button" data-po-add>Add Item</button><p>Add vendor fees or other items to this PO.</p>`;
+  }
+  /** @param {Detail} detail @param {{mode?:'po'|'add'}} [options] */
+  function extrasHtml(detail, {mode = 'po'} = {}) {
+    const key = mode === 'add' ? `add:${detail.id}` : String(detail.id);
+    if (!drafts.has(key)) {
+      drafts.set(key,mode === 'add' ? [{key:crypto.randomUUID(),quantity:1}]
+        : (detail.purchaseOrderLines || []).filter(line => line.ancillary && Number(line.itemId) !== 1784)
+          .map(line => ({...line,key:crypto.randomUUID()})));
+    }
+    const rows = (drafts.get(key) || []).map(line => extraRow(line,{removable:mode !== 'add'})).join('');
+    return mode === 'add' ? `<div data-po-extras data-po-draft-key="${escape(key)}">${rows}</div>`
+      : `<div data-po-extras data-po-draft-key="${escape(key)}">${rows}</div><button type="button" data-po-add>Add Item</button><p>Add vendor fees or other items to this PO.</p>`;
   }
   /** @param {string|number} rawItemId @returns {Promise<Catalog>} */
   async function catalog(rawItemId) {
@@ -138,9 +148,10 @@ export function createSpecialPurchaseEditor(root,{api,getDetail,changed}) {
       void loadUnits(select,itemId);
     }
   }
-  function totals() {
+  /** @param {HTMLElement} [scope] */
+  function totals(scope = root) {
     let cents = 0;
-    for (const row of extraRows(root)) {
+    for (const row of extraRows(scope)) {
       const line = values(row);
       const total = specialLineSubtotal(line.quantity,line.unitPurchaseCost);
       cents += Math.round(total*100);
@@ -183,7 +194,7 @@ export function createSpecialPurchaseEditor(root,{api,getDetail,changed}) {
   }
   root.addEventListener('click',event => {
     const target = /** @type {HTMLElement} */ (event.target);
-    const form = target.closest('[data-special-po-form]');
+    const form = target.closest(EDITOR_FORMS);
     if (!form || target.closest('fieldset')?.disabled) return;
     if (target.closest('[data-po-add]')) {
       const host = node(form,'[data-po-extras]');
@@ -209,5 +220,7 @@ export function createSpecialPurchaseEditor(root,{api,getDetail,changed}) {
     const target = /** @type {HTMLSelectElement} */ (event.target);
     if (target.matches('[data-po-uom]')) {chosenUnit(target);target.dataset.wantedUom=target.value;capture();changed();}
   });
-  return {extrasHtml,extraLines,refresh,totals,capture,reset:()=>{drafts.clear();searches.clear();}};
+  /** @param {string} key */
+  const discard = key => {drafts.delete(key);};
+  return {extrasHtml,extraLines,refresh,totals,capture,discard,reset:()=>{drafts.clear();searches.clear();}};
 }

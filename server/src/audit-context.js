@@ -17,3 +17,25 @@ export function trackSemanticAudit(operation) {
   context.semanticAuditPromises.push(tracked);
   return tracked;
 }
+
+// The HTTP request currently executing (request id and the Express request), set by the
+// system audit middleware so audit writers can link their rows to that request.
+const auditRequestStorage = new AsyncLocalStorage();
+
+export function runWithAuditRequest(context, fn) {
+  return auditRequestStorage.run(context, fn);
+}
+
+export function currentAuditRequest() {
+  return auditRequestStorage.getStore() || null;
+}
+
+/** Adds the current HTTP request id (auditRequestId) to audit details so every row written
+ * while handling one request can be listed together in the Admin audit log. */
+export function withAuditRequestId(details) {
+  const requestId = auditRequestStorage.getStore()?.requestId;
+  if (!requestId || !details || typeof details !== "object" || Array.isArray(details) || details.auditRequestId) {
+    return details;
+  }
+  return { ...details, auditRequestId: requestId };
+}

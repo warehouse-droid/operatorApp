@@ -6505,6 +6505,24 @@ export async function updatePurchaseOrderDispatchRef({
       ? requestedRef
       : "";
     const newVisibleRef = normalizedRef || po.tranid;
+    // A split child's visible ref is also its split header ref, and PO Split
+    // looks the split up by that header ref. A Packing Slip / Ref edit from the
+    // PO/TO Schedule reaches a split child through here, so the header has to
+    // follow or the split can no longer be opened ("SCM split ... was not found").
+    const activeSplit = (await query(
+      `SELECT *
+         FROM dispatch_scm_po_splits
+        WHERE split_po_id = $1
+          AND status = 'active'
+        LIMIT 1
+        FOR UPDATE`,
+      [po.netsuite_id]
+    )).rows[0] || null;
+    const splitRefChanges = Boolean(activeSplit)
+      && String(activeSplit.split_po_ref || "").trim() !== String(newVisibleRef || "").trim();
+    if (splitRefChanges) {
+      await assertScmPurchaseOrderSplitMutable(query, activeSplit, { action: "rename" });
+    }
     if (normalizedRef) {
       const existing = await query(
         `SELECT COALESCE(NULLIF(po.dispatch_ref, ''), po.tranid) AS tranid
@@ -6537,6 +6555,32 @@ export async function updatePurchaseOrderDispatchRef({
           AND COALESCE(dispatch_ref, '') IS DISTINCT FROM $2`,
       [po.netsuite_id, normalizedRef, updatedBy || null]
     );
+    if (splitRefChanges) {
+      await query(
+        `UPDATE dispatch_scm_po_splits
+            SET split_po_ref = $2,
+                details = COALESCE(details, '{}'::jsonb) || $3::jsonb
+          WHERE id = $1`,
+        [
+          activeSplit.id,
+          newVisibleRef,
+          JSON.stringify({
+            lastRenamedAt: new Date().toISOString(),
+            lastRenamedBy: updatedBy || "",
+            previousRefs: [
+              ...(Array.isArray(activeSplit.details?.previousRefs) ? activeSplit.details.previousRefs : []),
+              activeSplit.split_po_ref
+            ]
+          })
+        ]
+      );
+      await recordScmPurchaseOrderSplitChange(query, activeSplit, {
+        eventType: "ref_changed",
+        beforeState: { splitPoRef: activeSplit.split_po_ref },
+        afterState: { splitPoRef: newVisibleRef },
+        actor: updatedBy
+      });
+    }
     const scheduleUpdate = await query(
       `UPDATE scm_transport_schedule s
           SET order_ref = $2,

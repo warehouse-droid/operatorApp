@@ -12,6 +12,10 @@ import { createNetSuiteOrderWebhookWorker } from "./netsuite-order-webhook-worke
 import { enqueueScmPurchaseOrderCatalogRefresh } from "./scm-purchase-order-catalog-repository.js";
 import { processScmNetSuitePoHistoryWebhook } from "./scm-netsuite-po-history-service.js";
 import { processNetSuiteOrderWebhook } from "./server.js";
+import { installSystemAuditConsoleCapture, installSystemAuditProcessHooks, closeSystemAudit } from "./system-audit.js";
+
+installSystemAuditProcessHooks({ processName: "webhook-worker" });
+installSystemAuditConsoleCapture({ processName: "webhook-worker" });
 
 const workerId = `netsuite-order-webhook:${process.pid}:${crypto.randomUUID()}`;
 const leaseMs = 120_000;
@@ -84,8 +88,9 @@ async function main() {
     const result = await worker.tick();
     if (!result.processed) await sleep(pollMs);
   }
-  await closeDb();
   console.log("NetSuite order webhook serial worker stopped.");
+  await closeSystemAudit().catch(() => {});
+  await closeDb();
 }
 
 await main();

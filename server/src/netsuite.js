@@ -5,6 +5,7 @@ import { createBossNetSuiteAdapter } from './boss-approval-netsuite.js';
 import { createIfirPostingClient } from './netsuite-ifir-posting-client.js';
 import { getIfirPostingRestletEnabled } from './netsuite-ifir-posting-policy.js';
 import { netSuiteFailureAudit } from './netsuite-failure-runtime.js';
+import { auditNetSuiteWrite } from './netsuite-posting-audit.js';
 
 export function createBossApprovalNetSuite() {
   return createBossNetSuiteAdapter({rest:netsuiteRest,queryAll:suiteqlAll,mutate:queueNetSuiteMutation});
@@ -99,6 +100,15 @@ async function netsuiteFetch(url, options = {}) {
 }
 
 async function scheduledNetSuiteRequest(url, options, consume, attempt = 1) {
+  const startedAt = Date.now();
+  const result = await scheduledNetSuiteRequestUnaudited(url, options, consume, attempt);
+  auditNetSuiteWrite({ url, method: options.method || "GET", status: result.response.status, ok: result.response.ok,
+    location: result.response.headers?.get?.("location") || "", requestBody: options.body, responseValue: result.value,
+    durationMs: Date.now() - startedAt, attempt, context: netSuiteFailureAudit.snapshot() });
+  return result;
+}
+
+async function scheduledNetSuiteRequestUnaudited(url, options, consume, attempt) {
   return netSuiteFailureAudit.capture({ operation: 'netsuite.http', method: options.method || 'GET', path: String(url), attempt }, () => netSuiteRequestScheduler.run(signal => operatorPostingTelemetry.time({ operation: "netsuite.http", method: options.method || "GET",
     path: new URL(url).pathname, attempt }, async () => {
     const response = await netsuiteFetch(url, { ...options, signal });
@@ -764,6 +774,16 @@ export async function repairNetSuiteRecord(type,id,{method='GET',body=null,repla
   const parameters=method==='GET'?'?expandSubResources=true':replaceItems?'?replace=item':'';
   const run=()=>netsuiteRest(`/record/v1/${type}${suffix}${parameters}`,{method,body});
   return method==='GET'?run():queueNetSuiteMutation(run);
+}
+
+// Account applications create customers (and their signer contact / sibling
+// subsidiary) through external-ID upserts, so a retried approval updates the
+// same records instead of creating duplicates.
+const ACCOUNT_APPLICATION_RECORD_TYPES = new Set(['customer', 'contact', 'customerSubsidiaryRelationship']);
+export async function upsertAccountApplicationRecord(type, externalId, body) {
+  if (!ACCOUNT_APPLICATION_RECORD_TYPES.has(type)) throw new Error('Unsupported account application record type.');
+  if (!/^ACCTAPP-[A-Za-z0-9-]{1,80}$/u.test(String(externalId))) throw new Error('Invalid account application external ID.');
+  return queueNetSuiteMutation(() => netsuiteRest(`/record/v1/${type}/eid:${encodeURIComponent(externalId)}`, { method: 'PUT', body }));
 }
 
 export async function transformSalesOrderToItemFulfillment(orderId, payload) {
@@ -1564,6 +1584,36 @@ export async function findOperatorNetSuitePostingTransactionByExternalId(
     });
   }
   return matches[0] || null;
+}
+
+/**
+ * IF/IR transactions linked to a source order whose internal ID is above a
+ * baseline. NetSuite transaction IDs come from one increasing sequence, so this
+ * lists what was posted against the order after the baseline transaction.
+ * Admin re-post refuses when anything appears here.
+ *
+ * @param {unknown} sourceNetSuiteId @param {unknown} transactionType @param {unknown} afterTransactionId
+ * @param {{ queryAll?: Function }} [dependencies]
+ */
+export async function findLinkedPostingTransactionsAfter(sourceNetSuiteId, transactionType, afterTransactionId,
+  { queryAll = suiteqlAll } = {}) {
+  const sourceId = Number(sourceNetSuiteId);
+  const afterId = Number(afterTransactionId);
+  const type = { IF: "ItemShip", IR: "ItemRcpt" }[String(transactionType || "").trim().toUpperCase()];
+  if (!type || !Number.isSafeInteger(sourceId) || sourceId <= 0 || !Number.isSafeInteger(afterId) || afterId <= 0) {
+    throw new Error("A source order, IF/IR type and baseline transaction ID are required.");
+  }
+  const rows = await queryAll(`
+    SELECT DISTINCT next_transaction.id, next_transaction.tranid
+      FROM NextTransactionLineLink transaction_link
+      JOIN transaction next_transaction
+        ON next_transaction.id = transaction_link.nextdoc
+     WHERE transaction_link.previousdoc = ${sourceId}
+       AND next_transaction.type = '${type}'
+       AND next_transaction.id > ${afterId}
+     ORDER BY next_transaction.id
+  `);
+  return rows.map((/** @type {any} */ row) => ({ id: Number(row.id), tranId: String(row.tranid ?? "") }));
 }
 
 export async function suiteql(q, params = [], options = {}) {
@@ -4149,6 +4199,15 @@ export async function applySpecialAdjustmentPlanInNetSuite(plan,{rest=netsuiteRe
   const {applySpecialAdjustmentPlan}=await import('./special-stock-adjustment-adapter.js');
   const {createSpecialRestOrderBoundary}=await import('./special-stock-rest-orders.js');
   return mutate(()=>applySpecialAdjustmentPlan(plan,createSpecialRestOrderBoundary({rest,queryAll})));
+}
+/** Read the app-created PO and plan one appended SCM item. No NetSuite write. */
+export async function prepareSpecialPurchaseItemAppendInNetSuite(input,{rest=netsuiteRest,queryAll=suiteqlAll}={}) {
+  const {prepareSpecialPurchaseItemAppend}=await import('./special-stock-rest-orders.js');
+  return prepareSpecialPurchaseItemAppend(input,{rest,queryAll});
+}
+export async function applySpecialPurchaseItemAppendInNetSuite(plan,{rest=netsuiteRest,queryAll=suiteqlAll,mutate=queueNetSuiteMutation}={}) {
+  const {applySpecialPurchaseItemAppend}=await import('./special-stock-rest-orders.js');
+  return mutate(()=>applySpecialPurchaseItemAppend(plan,{rest,queryAll}));
 }
 export async function applySpecialQuantityPlanInNetSuite(plan) {
   const { applySpecialQuantityPlan } = await import('./special-stock-quantity-adapter.js');

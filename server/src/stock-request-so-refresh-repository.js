@@ -72,8 +72,32 @@ export async function listStockRequestSalesOrders({orderId=null,limit=200}={}) {
   return rows.map((/** @type {Record<string,any>} */ row)=>({id:Number(row.netsuite_id),ref:row.tranid,syncedAt:row.synced_at,links:row.links}));
 }
 
+/** Whether the observation changes anything a person viewing or editing the request relies on.
+ * SPREQ-000187: an hourly check that found the SO exactly as linked still bumped the revision,
+ * so SCM's PO creation in progress failed with "This Special Item case changed".
+ * @param {Link} link @param {Observation} progress @param {Record<string,any>} saved */
+function materialSalesOrderChange(link, progress, saved) {
+  const previous = saved.progress;
+  if (previous) return ['status', 'fulfillmentStatus', 'completed', 'terminal'].some(key => previous[key] !== progress[key]);
+  const caseApproval = link.kind !== 'regular' && link.kind !== 'backorder_reference'
+    && saved.sales_order_approved !== !['A', 'C', 'H'].includes(progress.status);
+  return progress.completed || progress.terminal || progress.fulfillmentStatus !== 'not_fulfilled' || caseApproval;
+}
+
 /** @param {Link} link @param {Observation & {checkedAt:string}} progress */
 async function reconcileRequest(link, progress) {
+  const saved = (await query(`SELECT request.regular_details->'salesOrderProgress' AS progress, special.sales_order_approved
+      FROM sales_stock_requests request LEFT JOIN sales_special_stock_cases special ON special.request_id=request.id
+     WHERE request.id=$1`, [link.requestId])).rows[0] || {};
+  if (!materialSalesOrderChange(link, progress, saved)) {
+    // Record the check without a new revision or audit entry, so open forms stay valid.
+    if (link.kind !== 'regular' && link.kind !== 'backorder_reference') {
+      await query('UPDATE sales_special_stock_cases SET sales_order_status=$2 WHERE request_id=$1', [link.requestId, progress.statusText]);
+    }
+    await query(`UPDATE sales_stock_requests SET regular_details=jsonb_set(regular_details,'{salesOrderProgress}',$2::jsonb) WHERE id=$1`,
+      [link.requestId, JSON.stringify(progress)]);
+    return;
+  }
   if (link.kind === 'regular' && progress.completed) {
     await query(`UPDATE sales_stock_request_lines SET status='fulfilled',updated_at=now()
       WHERE request_id=$1 AND status NOT IN ('rejected','cancelled','closed','fulfilled','received')`,[link.requestId]);

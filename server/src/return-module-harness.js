@@ -18,7 +18,7 @@ import {
   summarizePalletActivityRows
 } from "./return-netsuite.js";
 import {
-  assertReturnOrderFullyFulfilled,
+  assertReturnOrderFulfilled,
   decideReturnLine,
   getReturnReasons,
   getReturnRecordDetail,
@@ -146,74 +146,45 @@ function purePolicyAndQuantityTests() {
   assert.match(palletQuery, /INNER JOIN customer c[\s\S]*c\.id = t\.entity[\s\S]*c\.id = 9001/);
   assert.match(palletQuery, /SUM\(ABS\(NVL\(tl\.quantity, 0\)\)\)/);
   assert.doesNotMatch(palletQuery, /\btrandate\s*[<>=]|\bFETCH FIRST\b|\bSalesOrd\b|\bItemRcpt\b/i);
-  assert.doesNotThrow(() => assertReturnOrderFullyFulfilled({
+  const fulfilledLine = (salesQuantity, fulfilledQuantity) => ({ itemType: "InvtPart", salesQuantity, fulfilledQuantity });
+  assert.doesNotThrow(() => assertReturnOrderFulfilled({
     tranid: "SOB-FULL",
     status: "G",
     statusText: "Sales Order : Pending Billing"
   }));
-  assert.doesNotThrow(() => assertReturnOrderFullyFulfilled({
+  assert.doesNotThrow(() => assertReturnOrderFulfilled({
     tranid: "SOB-CLOSED",
     status: "SalesOrd:H",
     statusText: "Sales Order : Closed",
-    lines: [{
-      itemType: "InvtPart",
-      salesQuantity: 12,
-      fulfilledQuantity: 12
-    }]
+    lines: [fulfilledLine(12, 12)]
   }));
+  // Returns are limited per line by fulfilled quantity, so partly fulfilled orders are returnable.
+  for (const [status, statusText] of [["H", "Sales Order : Closed"], ["SalesOrd:E", "Sales Order : Pending Billing/Partially Fulfilled"],
+    ["D", "Sales Order : Partially Fulfilled"], ["B", "Sales Order : Pending Fulfillment"]]) {
+    assert.doesNotThrow(() => assertReturnOrderFulfilled({ tranid: "SOB-PARTIAL", status, statusText,
+      lines: [fulfilledLine(1000, 500), fulfilledLine(12, 0)] }), statusText);
+    assert.throws(
+      () => assertReturnOrderFulfilled({ tranid: "SOB-NOTHING", status, statusText, lines: [fulfilledLine(1000, 0)] }),
+      (error) => error.status === 409 && error.code === "ORDER_NOT_FULFILLED" && error.orderStatusText === statusText,
+      statusText
+    );
+  }
   assert.throws(
-    () => assertReturnOrderFullyFulfilled({
-      tranid: "SOB-CLOSED-PARTIAL",
-      status: "H",
-      statusText: "Sales Order : Closed",
-      lines: [{
-        itemType: "InvtPart",
-        salesQuantity: 12,
-        fulfilledQuantity: 8
-      }]
-    }),
-    (error) => error.code === "ORDER_NOT_FULLY_FULFILLED"
-  );
-  assert.throws(
-    () => assertReturnOrderFullyFulfilled({
+    () => assertReturnOrderFulfilled({
       tranid: "SOB-PENDING",
       statusText: "Sales Order : Pending Fulfillment"
     }),
     (error) => error.status === 409
-      && error.code === "ORDER_NOT_FULLY_FULFILLED"
+      && error.code === "ORDER_NOT_FULFILLED"
       && error.orderStatusText.includes("Pending Fulfillment")
   );
-  assert.throws(
-    () => assertReturnOrderFullyFulfilled({
-      tranid: "SOB-PARTIAL",
-      statusText: "Sales Order : Pending Billing/Partially Fulfilled"
-    }),
-    (error) => error.code === "ORDER_NOT_FULLY_FULFILLED"
-  );
-  assert.throws(
-    () => assertReturnOrderFullyFulfilled({
-      tranid: "SOB-PENDING-RAW",
-      status: "B",
-      statusText: ""
-    }),
-    (error) => error.code === "ORDER_NOT_FULLY_FULFILLED"
-  );
-  assert.throws(
-    () => assertReturnOrderFullyFulfilled({
-      tranid: "SOB-PARTIAL-RAW",
-      status: "SalesOrd:E",
-      statusText: ""
-    }),
-    (error) => error.code === "ORDER_NOT_FULLY_FULFILLED"
-  );
-  assert.throws(
-    () => assertReturnOrderFullyFulfilled({
-      tranid: "SOB-PENDING-APPROVAL",
-      status: "A",
-      statusText: "Pending Approval"
-    }),
-    (error) => error.code === "ORDER_NOT_FULLY_FULFILLED"
-  );
+  for (const [status, statusText] of [["A", "Pending Approval"], ["C", "Sales Order : Cancelled"]]) {
+    assert.throws(
+      () => assertReturnOrderFulfilled({ tranid: "SOB-BLOCKED", status, statusText, lines: [fulfilledLine(10, 10)] }),
+      (error) => error.code === "ORDER_NOT_FULFILLED" && /cannot be returned/.test(error.message),
+      statusText
+    );
+  }
   assert.deepEqual(
     assertCrossYardReturn({ orderingLocationId: 28, receivingLocationId: 28 }),
     { crossYard: false, allowed: true }
@@ -326,8 +297,8 @@ function staticIntegrationTests() {
   );
   assert.match(
     repositorySource,
-    /if \(!order\)[\s\S]*assertReturnOrderFullyFulfilled\(order\)[\s\S]*attachReturnSalesOrderRestLineMapping/,
-    "Incomplete Sales Orders must fail before REST line mapping or return-history calls."
+    /if \(!order\)[\s\S]*assertReturnOrderFulfilled\(order\)[\s\S]*attachReturnSalesOrderRestLineMapping/,
+    "Sales Orders with nothing returnable must fail before REST line mapping or return-history calls."
   );
   assert.match(
     repositorySource,

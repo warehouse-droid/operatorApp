@@ -1,5 +1,5 @@
 import { appliedSalesOrderBilledSql } from './applied-sales-order-billing.js';
-import { operatorRoundedSalesQuantity, operatorLoadedUnitCount, operatorPackUnitCapacity } from './operator-load-quantity.js';
+import { operatorRoundedSalesQuantity, operatorLoadedUnitCount, operatorPackUnitCapacity, operatorPackConversionGap } from './operator-load-quantity.js';
 import { outboundLocationIds, outboundYardLocationId } from "./outbound-location-domain.js";
 import { scopeCustomerPickupOrderYard } from './customer-pickup-yard-scope.js';
 import { captureTransferPosting } from './transfer-order-posting-repository.js';
@@ -373,7 +373,22 @@ function lineLoadSalesQuantity(line) {
         === operatorRoundedSalesQuantity(lineRequiredSalesQuantity(line), unit)) {
     return remainingSalesQty;
   }
-  return packedSalesQty;
+  return conversionGapFinalSalesQuantity(line, packedSalesQty);
+}
+
+function packConversionGap(line) {
+  return operatorPackConversionGap(lineRequiredSalesQuantity(line),
+    ["pallets", "layers", "sections", "pieces"].map(unit => unitConversion(line, unit)));
+}
+
+// The last layer of a broken pallet can exceed the open balance by the item's
+// pallet/layer conversion gap (95.6 SQFT/PLT vs 9 x 10.63 SQFT/LYR). It finishes
+// the line, so load and post exactly the balance NetSuite still has open.
+function conversionGapFinalSalesQuantity(line, salesQty) {
+  if (!hasConversion(line)) return salesQty;
+  const remaining = roundQuantity(Math.max(0, lineRequiredSalesQuantity(line) - lineLoadedSalesQuantity(line)));
+  return remaining > 0 && salesQty > remaining
+    && salesQty - remaining <= packConversionGap(line) + 0.000001 ? remaining : salesQty;
 }
 
 function orderFamily(order) {
@@ -477,7 +492,7 @@ function capConvertedPackQuantities(line, quantities) {
   for (const unit of ["pallets", "layers", "sections", "pieces"]) {
     const conversion = unitConversion(line, unit);
     next[unit] = Math.min(positiveQuantity(next[unit]),
-      operatorPackUnitCapacity(lineRequiredSalesQuantity(line), consumed, conversion, line.unit));
+      operatorPackUnitCapacity(lineRequiredSalesQuantity(line), consumed, conversion, line.unit, packConversionGap(line)));
     consumed += next[unit] * conversion;
   }
   return next;
@@ -509,7 +524,7 @@ function remainingPackAvailability(line) {
     return { pallets: 0, layers: 0, sections: 0, pieces: salesAvailable };
   }
   const unitAvailable = unit => operatorPackUnitCapacity(lineRequiredSalesQuantity(line),
-    packingLoadedSalesQuantity(line), unitConversion(line, unit), line.unit);
+    packingLoadedSalesQuantity(line), unitConversion(line, unit), line.unit, packConversionGap(line));
   return {
     pallets: unitAvailable("pallets"),
     layers: unitAvailable("layers"),
@@ -711,7 +726,8 @@ function buildDeliveryLoadValidation(order, { allowNetSuiteCompleted = false } =
     }
 
     const overpackTolerance = deliveryLoadOverpackTolerance(order);
-    if (roundQuantity(packedSalesQty - remainingSalesQty) > overpackTolerance) {
+    // Compare what is loaded and posted: a broken pallet's final layer loads the open balance.
+    if (roundQuantity(lineLoadSalesQuantity(line) - remainingSalesQty) > overpackTolerance) {
       issues.push({
         ...issue,
         code: line.sync_exception || "overpacked",
@@ -3822,7 +3838,12 @@ export function fulfillmentLineQuantity(line) {
     + (Math.max(positiveQuantity(line.packed_layer_qty) - positiveQuantity(line.fulfilled_layer_qty), 0) * positiveQuantity(line.to_lyr))
     + (Math.max(positiveQuantity(line.packed_section_qty) - positiveQuantity(line.fulfilled_section_qty), 0) * positiveQuantity(line.to_sec))
     + (Math.max(positiveQuantity(line.packed_piece_qty) - positiveQuantity(line.fulfilled_piece_qty), 0) * positiveQuantity(line.to_pcs));
-  if (convertedQuantity > 0) return roundQuantity(convertedQuantity);
+  const fulfilledBefore = ["pallet", "layer", "section", "piece"]
+    .some(unit => positiveQuantity(line[`fulfilled_${unit}_qty`]) > 0);
+  if (convertedQuantity > 0) {
+    return fulfilledBefore ? roundQuantity(convertedQuantity)
+      : conversionGapFinalSalesQuantity(line, roundQuantity(convertedQuantity));
+  }
   return roundQuantity(salesQuantity);
 }
 
@@ -5549,7 +5570,7 @@ async function applyGroupedLinePackedQuantityToOrder(groupOrder, lineId, values,
       const convertedCapacity = hasConversion(source.line)
         ? operatorPackUnitCapacity(lineRequiredSalesQuantity(source.line),
           packingLoadedSalesQuantity(source.line) + lineUnitsToSalesQuantity(source.line, source.next),
-          unitConversion(source.line, unit), source.line.unit)
+          unitConversion(source.line, unit), source.line.unit, packConversionGap(source.line))
         : Infinity;
       const canAdd = Math.min(convertedCapacity, Math.max(0, source.capacity[unit] - source.next[unit]));
       const add = Math.min(canAdd, remaining);

@@ -53,6 +53,12 @@ function itemPayload(line, { purchase = false, netsuiteLocationId, packing = tru
   return payload;
 }
 
+/** One PO line exactly as PO creation sends it; used to append an SCM-added item to an issued PO.
+ * @param {Record<string,any>} line @param {number|string} netsuiteLocationId */
+export function buildSpecialPurchaseLinePayload(line, netsuiteLocationId) {
+  return itemPayload(line, { purchase: true, netsuiteLocationId });
+}
+
 export function buildSpecialSalesOrderPayload({
   caseId,
   draft,

@@ -343,7 +343,7 @@ export async function claimOperatorNetSuitePostingCommand(input) {
       await query(
         `UPDATE operator_netsuite_posting_attempts AS attempt
             SET outcome = 'uncertain',
-                details = jsonb_build_object('reason', 'lease_expired'),
+                details = details || jsonb_build_object('reason', 'lease_expired'),
                 error = 'Worker lease expired before an outcome was recorded.',
                 finished_at = now()
            FROM operator_netsuite_posting_steps AS step
@@ -499,17 +499,22 @@ export async function startOperatorNetSuitePostingAttempt(input) {
       return {
         attemptNumber: Number(activeAttempt.rows[0].attempt_number),
         fresh: false,
-        step: publicStep(step)
+        step: publicStep(step),
+        adminRepost: { authorized: false, authorizedAt: null, secondsSinceRemoteAttempt: 0, baselineTransactionId: null }
       };
     }
+    const adminRepost = await adminRepostEvidence(step);
     const attemptNumber = Number(step.attempt_count || 0) + 1;
+    // Every attempt starts as "not sent"; markOperatorNetSuitePostingAttemptRemote
+    // flips it immediately before anything is sent to NetSuite.
     await query(
       `INSERT INTO operator_netsuite_posting_attempts (
          step_id,
          attempt_number,
-         outcome
+         outcome,
+         details
        )
-       VALUES ($1, $2, 'posting')`,
+       VALUES ($1, $2, 'posting', '{"remote": false}'::jsonb)`,
       [stepId, attemptNumber]
     );
     const updated = await query(
@@ -522,7 +527,76 @@ export async function startOperatorNetSuitePostingAttempt(input) {
         RETURNING *`,
       [stepId, attemptNumber]
     );
-    return { attemptNumber, fresh: attemptNumber === 1 && step.status === "pending", step: publicStep(updated.rows[0]) };
+    return { attemptNumber, fresh: attemptNumber === 1 && step.status === "pending", step: publicStep(updated.rows[0]),
+      adminRepost };
+  });
+}
+
+/**
+ * Evidence for an Admin re-post of an unposted step. Authorization comes only
+ * from Admin "Resume verification" and covers exactly one attempt: it must be
+ * newer than every earlier attempt, so automatic retries and lease recovery never
+ * inherit it. Attempts without a "remote": false marker (older rows, lease
+ * recoveries) count as having reached NetSuite.
+ *
+ * @param {Record<string, any>} step locked step row
+ */
+async function adminRepostEvidence(step) {
+  const result = await query(
+    `SELECT resume.requested_at AS authorized_at,
+            resume.requested_at IS NOT NULL
+              AND (attempts.last_started_at IS NULL OR resume.requested_at > attempts.last_started_at) AS authorized,
+            floor(EXTRACT(EPOCH FROM now() - attempts.last_remote_started_at))::integer AS seconds_since_remote,
+            -- Newest transaction this app posted before the command existed: anything
+            -- linked to the source order above it was posted after the command began.
+            (SELECT max(posted.netsuite_transaction_id)
+               FROM operator_netsuite_posting_steps posted
+               JOIN operator_netsuite_posting_commands own ON own.id = $3
+              WHERE posted.status = 'posted'
+                AND posted.posted_at < own.created_at) AS baseline_transaction_id
+       FROM (SELECT CASE WHEN $2::jsonb->'adminResume'->>'requestedAt' ~ '^\\d{4}-\\d{2}-\\d{2}[ T]'
+                         THEN ($2::jsonb->'adminResume'->>'requestedAt')::timestamptz END AS requested_at) AS resume,
+            (SELECT max(started_at) AS last_started_at,
+                    max(started_at) FILTER (WHERE COALESCE(details->>'remote', 'true') <> 'false') AS last_remote_started_at
+               FROM operator_netsuite_posting_attempts
+              WHERE step_id = $1) AS attempts`,
+    [step.id, JSON.stringify(step.response || {}), step.command_id]
+  );
+  const row = result.rows[0];
+  return {
+    authorized: row.authorized === true && ["uncertain", "failed"].includes(step.status),
+    authorizedAt: row.authorized_at,
+    secondsSinceRemoteAttempt: row.seconds_since_remote === null ? null : Number(row.seconds_since_remote),
+    baselineTransactionId: row.baseline_transaction_id === null ? null : Number(row.baseline_transaction_id)
+  };
+}
+
+/**
+ * Record that this attempt is about to send the step to NetSuite, before the
+ * request leaves. Optional details (Admin re-post evidence) are kept with it.
+ *
+ * @param {{ commandId: string, leaseToken: string, stepId: number, attemptNumber: number, details?: Record<string, any> }} input
+ */
+export async function markOperatorNetSuitePostingAttemptRemote(input) {
+  const commandId = requiredText(input?.commandId, "Operator posting command ID");
+  const leaseToken = requiredText(input?.leaseToken, "Operator posting lease token");
+  return withTransaction(async () => {
+    await lockedLeasedCommand(commandId, leaseToken);
+    const updated = await query(
+      `UPDATE operator_netsuite_posting_attempts
+          SET details = details || $3::jsonb || '{"remote": true}'::jsonb
+        WHERE step_id = $1
+          AND attempt_number = $2
+          AND outcome = 'posting'
+        RETURNING id`,
+      [Number(input?.stepId), Number(input?.attemptNumber), JSON.stringify(input?.details || {})]
+    );
+    if (!updated.rows[0]) {
+      throw repositoryError(
+        "OPERATOR_NETSUITE_POSTING_ATTEMPT_NOT_ACTIVE",
+        "The NetSuite posting attempt is no longer active."
+      );
+    }
   });
 }
 
@@ -555,10 +629,11 @@ export async function recordOperatorNetSuitePostingStepSuccess(input) {
     await lockedLeasedCommand(commandId, leaseToken);
     const step = await lockedStep(commandId, stepId);
     if (step.status === "posted") {return publicStep(step);}
+    // Merge: keep the attempt's remote/re-post evidence alongside the saved record.
     const attempt = await query(
       `UPDATE operator_netsuite_posting_attempts
           SET outcome = $3,
-              details = $4::jsonb,
+              details = details || $4::jsonb,
               error = NULL,
               finished_at = now()
         WHERE step_id = $1
@@ -724,6 +799,25 @@ export async function failOperatorNetSuitePostingCommand(input) {
   });
 }
 
+/**
+ * Newest NetSuite transaction this app posted before the command existed. Transaction IDs share
+ * one increasing sequence, so anything linked to the source order above it was posted after the
+ * command began. Null when there is no earlier posting to compare against.
+ * @param {string} commandId
+ */
+export async function operatorNetSuitePostingBaselineTransactionId(commandId) {
+  const result = await query(
+    `SELECT max(posted.netsuite_transaction_id) AS id
+       FROM operator_netsuite_posting_steps posted
+       JOIN operator_netsuite_posting_commands own ON own.id = $1
+      WHERE posted.status = 'posted'
+        AND posted.posted_at < own.created_at`,
+    [requiredText(commandId, "Operator posting command ID")]
+  );
+  const id = result.rows[0]?.id;
+  return id === null || id === undefined ? null : Number(id);
+}
+
 /** @param {{ limit?: number }} [input] */
 export async function listOperatorNetSuitePostingAttentionCommands({ limit = 100 } = {}) {
   const safeLimit = Math.min(Math.max(Number(limit) || 100, 1), 500);
@@ -761,8 +855,11 @@ export async function listRunnableOperatorNetSuitePostingCommandIds({ limit = 50
   return result.rows.map((/** @type {Record<string, any>} */ row) => String(row.id));
 }
 
-/** @param {string} commandId */
-export async function resumeOperatorNetSuitePostingCommand(commandId) {
+/**
+ * @param {string} commandId
+ * @param {{ authorizeRepost?: boolean }} [options] Admin "Resume verification" only.
+ */
+export async function resumeOperatorNetSuitePostingCommand(commandId, { authorizeRepost = false } = {}) {
   const id = requiredText(commandId, "Operator posting command ID");
   return withTransaction(async () => {
     const updated = await query(
@@ -790,6 +887,18 @@ export async function resumeOperatorNetSuitePostingCommand(commandId) {
       throw repositoryError(
         "OPERATOR_NETSUITE_POSTING_NOT_ATTENTION",
         "Only an attention command can be resumed."
+      );
+    }
+    // An Admin resume authorizes one re-post of each unposted step, used only
+    // when NetSuite proves the step left no transaction (see the processor).
+    if (authorizeRepost === true) {
+      await query(
+        `UPDATE operator_netsuite_posting_steps
+            SET response = response || jsonb_build_object('adminResume', jsonb_build_object('requestedAt', now())),
+                updated_at = now()
+          WHERE command_id = $1
+            AND status IN ('uncertain', 'failed')`,
+        [id]
       );
     }
     return hydratedCommand(id);

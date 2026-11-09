@@ -1,4 +1,5 @@
 import { specialItemDescription, specialPackPayload, SPECIAL_PACK_FIELDS } from '../public/special-stock-line-details.js';
+import { specialPurchaseItemOnNetSuitePo } from '../public/special-stock-po-items.js';
 import { createHash } from 'node:crypto';
 import { query, withTransaction } from './db.js';
 import { getSpecialStockCase } from './special-stock-request-repository.js';
@@ -111,7 +112,8 @@ export function specialOrderSnapshot(detail, kind, audience) {
   if (kind === 'purchase_order' && audience !== 'scm') throw invalid('Purchase Order PDFs are available to SCM only.', 403);
   const sales = kind === 'sales_order';
   const id = sales ? detail.salesOrderId : detail.purchaseOrderId;
-  const lines = (sales ? detail.salesOrderLines : detail.purchaseOrderLines) || [];
+  // SCM-added items still being added to, or recorded outside, the NetSuite PO are not on the order.
+  const lines = ((sales ? detail.salesOrderLines : detail.purchaseOrderLines) || []).filter(specialPurchaseItemOnNetSuitePo);
   const manualSalesLink = (sales && detail.salesOrderSource === 'manual_link')
     || (!sales && detail.purchaseOrderCustomLinkage) || detail.workflowKind === 'backorder';
   if (!id || (sales ? detail.salesOrderSkipped : detail.purchaseOrderSkipped) || (!lines.length && !manualSalesLink)) throw invalid('This request has no linked order to preview.', 409);
