@@ -33,6 +33,8 @@ function setup({ clickError = false } = {}) {
     returnPhotoTarget: {}, render() {}, showToast: error => errors.push(error),
     t: (_key, fallback) => fallback,
     readPhotoFile: () => new Promise((resolve, reject) => reads.push({ resolve, reject })),
+    // Load and Receive photos are resized when taken (operator-proof-photo-size); this test keeps them as read.
+    compressOperatorProofPhoto: async photo => photo,
   });
   vm.runInContext(["useBasicCameraCapture", "captureNativeCameraPhoto", "captureNativeOperatorPhoto", "operatorPhotoCameraContext", "returnModuleActive", "nextPhotoSlot"].map(extract).join("\n"), context);
   return { context, inputs, reads, errors };

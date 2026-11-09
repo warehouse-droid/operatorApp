@@ -1,0 +1,95 @@
+diff --git a/server/public/operator.js b/server/public/operator.js
+--- a/server/public/operator.js
++++ b/server/public/operator.js
+@@ -388,6 +388,10 @@
+ const OPERATOR_CAMERA_IDEAL_WIDTH = 4096;
+ const OPERATOR_CAMERA_IDEAL_HEIGHT = 3072;
+ const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
++// Load and Receive photos are kept at a 2048 px long edge, as driver photos are. Full camera
++// photos (4-8 MB each) passed the 16 MB limit of one confirmation at 3-4 photos (SN1404273).
++const OPERATOR_PROOF_PHOTO_MAX_EDGE = 2048;
++const OPERATOR_PROOF_PHOTO_JPEG_QUALITY = 0.86;
+ const operatorPhotoCamera = { key: "", opening: "", request: 0, pending: /** @type {MediaStream|null} */ (null) };
+ let nativeCameraInput = /** @type {HTMLInputElement|null} */ (null);
+ 
+@@ -521,7 +525,7 @@
+   try {
+     const captured = await captureNativeCameraPhoto();
+     if (!captured) return;
+-    const photo = kind === "return" ? await compressReturnPhoto(captured) : captured;
++    const photo = kind === "return" ? await compressReturnPhoto(captured) : await compressOperatorProofPhoto(captured);
+     if (operatorPhotoCameraContext(true)?.key !== key) return;
+     if (kind === "fulfillment") {
+       fulfillmentPhotoDataUrls[slot] = photo;
+@@ -7735,7 +7739,7 @@
+     return;
+   }
+   try {
+-    fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
++    fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await compressOperatorProofPhoto(await captureCameraPhotoDataUrl(fulfillmentCameraStream, video));
+     fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, fulfillmentPhotoSlotFloor());
+     render();
+   } catch (error) {
+@@ -8402,7 +8406,7 @@
+   const video = document.getElementById("receiptCamera");
+   if (!video || !video.videoWidth || !video.videoHeight) return showToast(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
+   try {
+-    receiptPhotoDataUrls[receiptActivePhotoSlot] = await captureCameraPhotoDataUrl(receiptCameraStream, video);
++    receiptPhotoDataUrls[receiptActivePhotoSlot] = await compressOperatorProofPhoto(await captureCameraPhotoDataUrl(receiptCameraStream, video));
+     receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
+     render();
+   } catch (error) {
+@@ -9408,7 +9412,7 @@
+   render();
+ }
+ 
+-async function compressReturnPhoto(dataUrl, maxDimension = 1800) {
++async function compressReturnPhoto(dataUrl, maxDimension = 1800, quality = 0.84) {
+   const image = new Image();
+   const loaded = new Promise((resolve, reject) => {
+     image.onload = resolve;
+@@ -9424,7 +9428,13 @@
+   const context = canvas.getContext("2d");
+   if (!context) return dataUrl;
+   context.drawImage(image, 0, 0, canvas.width, canvas.height);
+-  return canvas.toDataURL("image/jpeg", 0.84);
++  return canvas.toDataURL("image/jpeg", quality);
++}
++
++/** Load and Receive photos at a 2048 px long edge. A photo this browser cannot decode is kept as taken. */
++async function compressOperatorProofPhoto(dataUrl) {
++  try { return await compressReturnPhoto(dataUrl, OPERATOR_PROOF_PHOTO_MAX_EDGE, OPERATOR_PROOF_PHOTO_JPEG_QUALITY); }
++  catch { return dataUrl; }
+ }
+ 
+ async function captureReturnPhoto() {
+diff --git a/server/public/operator.html b/server/public/operator.html
+--- a/server/public/operator.html
++++ b/server/public/operator.html
+@@ -38,7 +38,7 @@
+     <script src="/operator-inventory.js?v=20261027-damage-reasons-zh-v1&damageCamera=20261102"></script>
+     <script src="/return-notifications.js?v=20261028-return-enhancements"></script>
+     <script src="/operator-popup-audit.js?v=20261026-popup-v1"></script>
+-    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105&operatorPush=20261105&brokenPalletLayer=20261106"></script>
++    <script src="/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105&operatorPush=20261105&brokenPalletLayer=20261106&proofPhotoSize=20261106"></script>
+     <script src="/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1"></script>
+     <script src="/scm-special-alert.js?v=20260928-special-alert-v1"></script>
+   </body>
+diff --git a/server/public/service-worker.js b/server/public/service-worker.js
+--- a/server/public/service-worker.js
++++ b/server/public/service-worker.js
+@@ -1,4 +1,4 @@
+-const CACHE_NAME = "mbbs-yard-operator-20261106-broken-pallet-layer-v1";
++const CACHE_NAME = "mbbs-yard-operator-20261106-proof-photo-size-v1";
+ const OPERATOR_CACHE_PREFIX = "mbbs-yard-operator-";
+ const APP_SHELL = [
+   "/operator",
+@@ -23,7 +23,7 @@
+   "/operator-photo-outbox.js?v=20260917-background-photos-v1&missingCleanup=20261105",
+   "/operator-delivery-refresh.js?v=20260924-operator-responsiveness-v1",
+   "/operator-popup-audit.js?v=20261026-popup-v1",
+-  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105&operatorPush=20261105&brokenPalletLayer=20261106",
++  "/operator.js?v=20261028-repair-pwa&stockExchange=20261029&returnExchangeLayout=20261029&palletBottom=20261029&repairLanguage=20261030&netsuiteErrors=20261030&damageCamera=20261102&loadHold=20261103&stepperKeypad=20261104&exchangeAnyYard=20261105&returnKeypad=20261105&returnReasonsZh=20261105&operatorPush=20261105&brokenPalletLayer=20261106&proofPhotoSize=20261106",
+   "/return-notifications.js?v=20261028-return-enhancements",
+   "/scm-aggregate-alert.js?v=20260925-aggregate-alert-v1",
+   "/scm-special-alert.js?v=20260928-special-alert-v1",

@@ -388,6 +388,10 @@ let pickupFocusTimer = null;
 const OPERATOR_CAMERA_IDEAL_WIDTH = 4096;
 const OPERATOR_CAMERA_IDEAL_HEIGHT = 3072;
 const OPERATOR_CAMERA_JPEG_QUALITY = 0.92;
+// Load and Receive photos are kept at a 2048 px long edge, as driver photos are. Full camera
+// photos (4-8 MB each) passed the 16 MB limit of one confirmation at 3-4 photos (SN1404273).
+const OPERATOR_PROOF_PHOTO_MAX_EDGE = 2048;
+const OPERATOR_PROOF_PHOTO_JPEG_QUALITY = 0.86;
 const operatorPhotoCamera = { key: "", opening: "", request: 0, pending: /** @type {MediaStream|null} */ (null) };
 let nativeCameraInput = /** @type {HTMLInputElement|null} */ (null);
 
@@ -521,7 +525,7 @@ async function captureNativeOperatorPhoto(context) {
   try {
     const captured = await captureNativeCameraPhoto();
     if (!captured) return;
-    const photo = kind === "return" ? await compressReturnPhoto(captured) : captured;
+    const photo = kind === "return" ? await compressReturnPhoto(captured) : await compressOperatorProofPhoto(captured);
     if (operatorPhotoCameraContext(true)?.key !== key) return;
     if (kind === "fulfillment") {
       fulfillmentPhotoDataUrls[slot] = photo;
@@ -7595,7 +7599,7 @@ async function captureFulfillmentPhoto() {
     return;
   }
   try {
-    fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await captureCameraPhotoDataUrl(fulfillmentCameraStream, video);
+    fulfillmentPhotoDataUrls[fulfillmentActivePhotoSlot] = await compressOperatorProofPhoto(await captureCameraPhotoDataUrl(fulfillmentCameraStream, video));
     fulfillmentActivePhotoSlot = nextPhotoSlot(fulfillmentPhotoDataUrls, fulfillmentActivePhotoSlot, fulfillmentPhotoSlotFloor());
     render();
   } catch (error) {
@@ -8262,7 +8266,7 @@ async function captureReceiptPhoto() {
   const video = document.getElementById("receiptCamera");
   if (!video || !video.videoWidth || !video.videoHeight) return showToast(t("operator.cameraPreviewNotReady", "Camera preview is not ready yet."));
   try {
-    receiptPhotoDataUrls[receiptActivePhotoSlot] = await captureCameraPhotoDataUrl(receiptCameraStream, video);
+    receiptPhotoDataUrls[receiptActivePhotoSlot] = await compressOperatorProofPhoto(await captureCameraPhotoDataUrl(receiptCameraStream, video));
     receiptActivePhotoSlot = nextPhotoSlot(receiptPhotoDataUrls, receiptActivePhotoSlot, 2);
     render();
   } catch (error) {
@@ -9268,7 +9272,7 @@ async function switchReturnCamera() {
   render();
 }
 
-async function compressReturnPhoto(dataUrl, maxDimension = 1800) {
+async function compressReturnPhoto(dataUrl, maxDimension = 1800, quality = 0.84) {
   const image = new Image();
   const loaded = new Promise((resolve, reject) => {
     image.onload = resolve;
@@ -9284,7 +9288,13 @@ async function compressReturnPhoto(dataUrl, maxDimension = 1800) {
   const context = canvas.getContext("2d");
   if (!context) return dataUrl;
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/jpeg", 0.84);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+/** Load and Receive photos at a 2048 px long edge. A photo this browser cannot decode is kept as taken. */
+async function compressOperatorProofPhoto(dataUrl) {
+  try { return await compressReturnPhoto(dataUrl, OPERATOR_PROOF_PHOTO_MAX_EDGE, OPERATOR_PROOF_PHOTO_JPEG_QUALITY); }
+  catch { return dataUrl; }
 }
 
 async function captureReturnPhoto() {
