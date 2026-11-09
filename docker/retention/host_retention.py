@@ -19,7 +19,8 @@ ARTIFACTS = REPO / 'server/test-artifacts'
 AUDIT = Path('/home/ubuntu/storage-cleanup/retention-audit')
 ROOTS = (*DEPLOYMENTS, ARTIFACTS)
 PRODUCTION = ('mbbs-operator-app-app-1', 'mbbs-operator-app-db-1',
-              'mbbs-operator-app-webhook-worker-1', 'mbbs-operator-app-ollama-1')
+              'mbbs-operator-app-webhook-worker-1', 'mbbs-operator-app-ollama-1',
+              'mbbs-operator-app-webhook-receiver-1')
 
 
 def validate_containers(rows):

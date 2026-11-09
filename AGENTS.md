@@ -31,8 +31,9 @@ Full database backups retain their existing five-copy policy. Never delete or
 modify production Docker volumes as part of artifact retention.
 
 On this host, the production allowlist is `mbbs-operator-app-app-1`,
-`mbbs-operator-app-db-1`, `mbbs-operator-app-webhook-worker-1`, and
-`mbbs-operator-app-ollama-1`. Verify after teardown that no test containers remain
+`mbbs-operator-app-db-1`, `mbbs-operator-app-webhook-worker-1`,
+`mbbs-operator-app-webhook-receiver-1` (compose project `mbbs-webhook-receiver`, receives NetSuite order
+webhooks on 127.0.0.1:3001), and `mbbs-operator-app-ollama-1`. Verify after teardown that no test containers remain
 in either `docker ps` or `docker ps -a`, and that production health still passes.
 
 All test workloads on the application host must use `mbbs-tests.slice`, which

@@ -1,6 +1,7 @@
 import {filterOrdinaryTransportOrders,assertTransportOrderOwnership} from "./mbt/bin-transport-ownership.js";
 import { getDispatchOrderUnavailableReason } from "./dispatch-repository.js";
 import { createSharedJsonRead } from "./shared-json-read.js";
+import { applyOriginKeepAlive } from "./http-keep-alive.js";
 import { mountReturnNotificationRoutes } from './return-notification-router.js';
 import { automaticReturnNotifications } from './return-automatic-notifications.js';
 import { aggregateReconciliationNightlyTick } from './aggregate-reconciliation-service.js';
@@ -25787,7 +25788,8 @@ export async function startServer() {
       `Dispatch assignment projection ready=${projectionBackfill.ready}; projected=${projectionBackfill.projected}; remaining=${projectionBackfill.remaining}.`
     );
   }
-  return app.listen(config.port, () => {
+  // cloudflared reuses idle connections for up to 90 s; Node's 5 s default made some requests fail as 502.
+  return applyOriginKeepAlive(app.listen(config.port, () => {
     console.log(`MBBS Yard Server listening on ${config.appBaseUrl}`);
     startSystemResourceMonitor({ processName: "app" });
     requestTiming.start();
@@ -25863,7 +25865,7 @@ export async function startServer() {
     }
     setTimeout(() => void dispatchActualArrivalTick(), 3000);
     setInterval(() => void dispatchActualArrivalTick(), 15000);
-  });
+  }));
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
