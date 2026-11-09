@@ -875,6 +875,7 @@ body.sales-stock-requests-page .stock-request-filters { flex-wrap: wrap; }
 .stock-request-pill.confirmed { background: #ede9fe; color: #5b21b6; }
 .stock-request-pill.wait_for_production { background: #fff1cb; color: #694a00; }
 .stock-request-pill.dispatch_arrangement { background: #dfedff; color: #174776; }
+.stock-request-pill.waiting_customer_pickup { background: #d9f3f4; color: #0d5257; }
 .stock-request-pill.completed { background: #e0f5e8; color: #19653a; }
 .special-stock-page .stock-request-pill.pending { background: #e0e7ff; color: #3730a3; }
 .special-stock-page .stock-request-pill.accepted { background: #ccfbf1; color: #115e59; }

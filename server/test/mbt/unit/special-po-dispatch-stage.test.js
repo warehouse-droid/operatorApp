@@ -50,15 +50,30 @@ test('Special approval and deliberate PO skips keep their existing rules',()=>{
   assert.equal(specialStage({...queued,purchaseOrderApproved:false}),'confirmed');
   assert.equal(backorderStage({...queued,purchaseOrderApproved:false}),'dispatch_arrangement');
   assert.equal(specialStage({salesOrderSkipped:true,purchaseOrderSkipped:true,fulfillmentMethod:'yard_pickup'}),'dispatch_arrangement');
-  assert.equal(specialStage({salesOrderSkipped:true,purchaseOrderSkipped:true,fulfillmentMethod:'vendor_pickup'}),'dispatch_arrangement');
+  assert.equal(specialStage({salesOrderSkipped:true,purchaseOrderSkipped:true,fulfillmentMethod:'vendor_pickup'}),'waiting_customer_pickup');
 });
 
-test('customer pickup at the vendor yard reaches Dispatch Arrangement with a queued PO reference',()=>{
+test('customer pickup at the vendor yard waits for the customer once the PO reference is queued',()=>{
   const pickup={...queued,fulfillmentMethod:'vendor_pickup'};
-  assert.equal(specialStage(pickup),'dispatch_arrangement');
-  assert.equal(specialStage({...pickup,purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'}),'dispatch_arrangement');
+  assert.equal(specialStage(pickup),'waiting_customer_pickup');
+  assert.equal(specialStage({...pickup,purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'}),'waiting_customer_pickup');
+  for(const status of ['Planned','In Transit','Completed']) assert.equal(specialStage({...pickup,purchaseOrderDispatchStatus:status}),'waiting_customer_pickup');
   assert.equal(specialStage({...pickup,purchaseOrderDispatchStatus:'Hold',purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'}),'waiting_vendor_confirmation');
   assert.equal(specialStage({...pickup,purchaseOrderReference:''}),'confirmed');
   assert.equal(specialStage({...pickup,purchaseOrderApproved:false}),'confirmed');
   assert.equal(specialStage({...pickup,operationallyComplete:true}),'completed');
+  assert.equal(specialStage({...pickup,pendingUpdate:true}),'pending_update');
+});
+
+test('pickup at the inquired yard waits for the customer once the PO is received, before any dispatch reference',()=>{
+  const yard={...ordered,fulfillmentMethod:'yard_pickup',purchaseOrderSentToVendorAt:'2099-01-01T00:00:00Z'};
+  assert.equal(specialStage(yard),'waiting_vendor_confirmation');
+  assert.equal(specialStage({...yard,purchaseOrderReceived:true}),'waiting_customer_pickup');
+  assert.equal(specialStage({...yard,purchaseOrderReceived:true,purchaseOrderReference:'REF',purchaseOrderDispatchStatus:'Queued'}),'waiting_customer_pickup');
+  assert.equal(specialStage({...yard,purchaseOrderReference:'REF',purchaseOrderDispatchStatus:'Queued'}),'dispatch_arrangement');
+  assert.equal(specialStage({...yard,purchaseOrderReceived:true,operationallyComplete:true}),'completed');
+  assert.equal(specialStage({...yard,purchaseOrderReceived:true,closed:true}),'closed');
+  // Delivery still needs Dispatch after the PO arrives; backorders keep their own rules.
+  assert.equal(specialStage({...queued,purchaseOrderReceived:true}),'dispatch_arrangement');
+  assert.equal(backorderStage({...queued,fulfillmentMethod:'yard_pickup',purchaseOrderReceived:true}),'dispatch_arrangement');
 });

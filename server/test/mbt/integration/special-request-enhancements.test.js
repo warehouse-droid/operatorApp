@@ -63,10 +63,13 @@ test('multi-vendor selection intersects yard and owner restrictions and supports
 test('Sales alert counts are own requests within permitted yards, regardless of list pagination',()=>fixture(async()=>{
  const a=await enquiry(),b=await enquiry({}, {...context,operatorId:'special-enhancements-b'}),outside=await enquiry({storeLocationId:28});
  for(const d of [a,b,outside])await query("UPDATE sales_special_stock_lines SET supply_status='in_stock' WHERE request_id=$1",[d.id]);
- const counts=await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[1]});assert.deepEqual(counts,{awaitCustomerConfirmation:1,dispatchArrangement:0,waitForProduction:0,pendingUpdate:0,total:1});
+ const counts=await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[1]});assert.deepEqual(counts,{awaitCustomerConfirmation:1,dispatchArrangement:0,waitingCustomerPickup:0,waitForProduction:0,pendingUpdate:0,total:1});
  const transfer=await enquiry(),dispatch=await enquiry();await query("UPDATE sales_special_stock_lines SET sales_decision='accepted',supply_status='vendor_transfer',available_date='2099-03-01' WHERE request_id=$1",[transfer.id]);
  await query("UPDATE sales_special_stock_cases SET sales_order_skipped=true,purchase_order_skipped=true WHERE request_id=$1",[dispatch.id]);
- assert.deepEqual(await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[1]}),{awaitCustomerConfirmation:2,dispatchArrangement:1,waitForProduction:0,pendingUpdate:0,total:3});
+ assert.deepEqual(await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[1]}),{awaitCustomerConfirmation:2,dispatchArrangement:1,waitingCustomerPickup:0,waitForProduction:0,pendingUpdate:0,total:3});
+ // Customer collection at the vendor yard is its own Sales alert.
+ await query("UPDATE sales_special_stock_cases SET fulfillment_method='vendor_pickup' WHERE request_id=$1",[dispatch.id]);
+ assert.deepEqual(await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[1]}),{awaitCustomerConfirmation:2,dispatchArrangement:0,waitingCustomerPickup:1,waitForProduction:0,pendingUpdate:0,total:3});
  const page=await repo.listSpecialStockCases({requestedByOperatorId:context.operatorId,authorizedStoreLocationIds:[1],limit:1});assert.equal(page.length,1);
  assert.equal((await alerts.getSpecialSalesAlertCounts({operatorId:context.operatorId,authorizedStoreLocationIds:[]})).total,0);
 }));

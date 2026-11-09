@@ -5,6 +5,7 @@ export const SPECIAL_STAGES = Object.freeze({
   confirmed: 'Confirmed',
   waiting_vendor_confirmation: 'Waiting Vendor Confirmation',
   dispatch_arrangement: 'Dispatch Arrangement',
+  waiting_customer_pickup: 'Waiting Customer Pickup',
   wait_for_production: 'Wait for production / Transfer',
   closed: 'Closed',
   completed: 'Completed'
@@ -36,7 +37,7 @@ export function specialPurchaseOrderDispatchReady(evidence = {}) {
       .includes(String(evidence.purchaseOrderDispatchStatus || '').trim().toLowerCase());
 }
 
-/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
+/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderReceived?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
 export function specialStage(evidence = {}) {
   if (evidence.closed || evidence.cancelled) return 'closed';
   if (evidence.operationallyComplete) return 'completed';
@@ -45,13 +46,15 @@ export function specialStage(evidence = {}) {
     return evidence.purchaseOrderId || evidence.purchaseOrderSkipped || evidence.waitingForProduction
       || evidence.hasPendingSalesDecision || evidence.linesResolved ? 'await_customer_confirmation' : 'new_enquiry';
   }
+  const vendorPickup = evidence.fulfillmentMethod === 'vendor_pickup';
   if (evidence.purchaseOrderId) {
-    // Customer pickup at the vendor yard also arranges collection once SCM queues the PO reference.
-    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return 'dispatch_arrangement';
+    // The customer collects a received PO at the inquired yard, or at the vendor yard once SCM queues the PO reference.
+    if (evidence.fulfillmentMethod === 'yard_pickup' && evidence.purchaseOrderReceived) return 'waiting_customer_pickup';
+    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';
     return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';
   }
   if (evidence.waitingForProduction) return 'confirmed';
-  if (evidence.purchaseOrderSkipped) return 'dispatch_arrangement';
+  if (evidence.purchaseOrderSkipped) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';
   return 'confirmed';
 }
 

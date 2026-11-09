@@ -1,0 +1,212 @@
+[
+ [
+  "src/operator-co-routing.js",
+  "\nexport function operatorCoRouteJoinSql(orderAlias) {\n",
+  "\n/** The open COs that can route an order, read once per query. Every query using\n * operatorCoRouteJoinSql lists this in its WITH clause. Reading CO details (TOAST) once\n * instead of once per candidate order keeps the operator delivery list fast. */\nexport function operatorCoCandidatesSql() {\n  return `operator_co_candidates AS MATERIALIZED (\n    SELECT co.id, co.co_ref, co.source_order_ref, co.details->'childOrderIds' AS child_order_ids,\n      co.from_location_id, lower(btrim(split_part(co.from_location,':',1))) AS from_location_key,\n      co.to_location_id, co.to_location, co.received_at, co.created_at,\n      jsonb_build_object('driverCompletionJobId', co.details->'driverCompletionJobId',\n        'driverCompletionRecordId', co.details->'driverCompletionRecordId') AS details\n    FROM local_co_orders co\n    WHERE co.status <> 'cancelled'\n  )`;\n}\n\nexport function operatorCoRouteJoinSql(orderAlias) {\n"
+ ],
+ [
+  "src/operator-co-routing.js",
+  "      co.to_location AS route_location, ${completedCoArrivalSql('co')} AS route_arrived_at\n    FROM local_co_orders co\n    WHERE co.status <> 'cancelled'\n      AND (co.source_order_ref=${order}.tranid OR co.details->'childOrderIds' ? ${order}.tranid)\n      AND (co.from_location_id=${order}.outbound_location_id\n",
+  "      co.to_location AS route_location, ${completedCoArrivalSql('co')} AS route_arrived_at\n    FROM operator_co_candidates co\n    WHERE (co.source_order_ref=${order}.tranid OR co.child_order_ids ? ${order}.tranid)\n      AND (co.from_location_id=${order}.outbound_location_id\n"
+ ],
+ [
+  "src/operator-co-routing.js",
+  "      AND (co.from_location_id=${order}.outbound_location_id\n        OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(${order}.outbound_location,':',1))))\n    ORDER BY co.created_at DESC, co.id DESC LIMIT 1\n",
+  "      AND (co.from_location_id=${order}.outbound_location_id\n        OR co.from_location_key=lower(btrim(split_part(${order}.outbound_location,':',1))))\n    ORDER BY co.created_at DESC, co.id DESC LIMIT 1\n"
+ ],
+ [
+  "src/operator-co-routing.js",
+  "  if (!ids.length) {return orders;}\n  const routes = (await query(`SELECT source.netsuite_id, ${operatorCoYardColumnsSql('source')},\n    source.outbound_location_id AS route_source_location_id,\n",
+  "  if (!ids.length) {return orders;}\n  const routes = (await query(`WITH ${operatorCoCandidatesSql()}\n    SELECT source.netsuite_id, ${operatorCoYardColumnsSql('source')},\n    source.outbound_location_id AS route_source_location_id,\n"
+ ],
+ [
+  "src/special-stock-request-repository.js",
+  "    purchaseOrderApproved: row.purchase_order_approved === true,\n    // A PO this application created for the request can receive SCM-added items in NetSuite.\n",
+  "    purchaseOrderApproved: row.purchase_order_approved === true,\n    purchaseOrderReceived: row.purchase_order_received === true,\n    // A PO this application created for the request can receive SCM-added items in NetSuite.\n"
+ ],
+ [
+  "src/special-stock-request-repository.js",
+  "    purchaseOrderApproved: detail.purchaseOrderApproved,\n    purchaseOrderReference: detail.purchaseOrderReference,\n",
+  "    purchaseOrderApproved: detail.purchaseOrderApproved,\n    purchaseOrderReceived: detail.purchaseOrderReceived,\n    purchaseOrderReference: detail.purchaseOrderReference,\n"
+ ],
+ [
+  "src/special-stock-request-repository.js",
+  "            completion.completion_source AS request_completion_source,\n            EXISTS (SELECT 1 FROM scm_netsuite_po_history history\n",
+  "            completion.completion_source AS request_completion_source,\n            receipt.received AS purchase_order_received,\n            EXISTS (SELECT 1 FROM scm_netsuite_po_history history\n"
+ ],
+ [
+  "src/special-stock-request-repository.js",
+  "       LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id\n      WHERE request.id = ANY($1::bigint[]) AND special.workflow_kind = $2\n",
+  "       LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id\n       LEFT JOIN special_stock_purchase_receipt receipt ON receipt.request_id = special.request_id\n      WHERE request.id = ANY($1::bigint[]) AND special.workflow_kind = $2\n"
+ ],
+ [
+  "src/special-stock-request-repository.js",
+  "    if (special.purchase_order_sent_to_vendor_at) return;\n    if (deriveSpecialCaseStage(detail) === 'dispatch_arrangement') {\n      throw workflowError('This Purchase Order has already moved to Dispatch Arrangement.', 409, 'SPECIAL_PO_ALREADY_DISPATCHED');\n    }\n",
+  "    if (special.purchase_order_sent_to_vendor_at) return;\n    const stage = deriveSpecialCaseStage(detail);\n    if (['dispatch_arrangement', 'waiting_customer_pickup'].includes(stage)) {\n      throw workflowError(`This Purchase Order has already moved to ${SPECIAL_STAGES[stage]}.`, 409, 'SPECIAL_PO_ALREADY_DISPATCHED');\n    }\n"
+ ],
+ [
+  "public/special-stock-workflow.js",
+  "  dispatch_arrangement: 'Dispatch Arrangement',\n  wait_for_production: 'Wait for production / Transfer',\n",
+  "  dispatch_arrangement: 'Dispatch Arrangement',\n  waiting_customer_pickup: 'Waiting Customer Pickup',\n  wait_for_production: 'Wait for production / Transfer',\n"
+ ],
+ [
+  "public/special-stock-workflow.js",
+  "\n/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */\nexport function specialStage(evidence = {}) {\n",
+  "\n/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderReceived?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */\nexport function specialStage(evidence = {}) {\n"
+ ],
+ [
+  "public/special-stock-workflow.js",
+  "  }\n  if (evidence.purchaseOrderId) {\n",
+  "  }\n  const vendorPickup = evidence.fulfillmentMethod === 'vendor_pickup';\n  if (evidence.purchaseOrderId) {\n"
+ ],
+ [
+  "public/special-stock-workflow.js",
+  "  if (evidence.purchaseOrderId) {\n    // Customer pickup at the vendor yard also arranges collection once SCM queues the PO reference.\n    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return 'dispatch_arrangement';\n    return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';\n",
+  "  if (evidence.purchaseOrderId) {\n    // The customer collects a received PO at the inquired yard, or at the vendor yard once SCM queues the PO reference.\n    if (evidence.fulfillmentMethod === 'yard_pickup' && evidence.purchaseOrderReceived) return 'waiting_customer_pickup';\n    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';\n    return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';\n"
+ ],
+ [
+  "public/special-stock-workflow.js",
+  "  if (evidence.waitingForProduction) return 'confirmed';\n  if (evidence.purchaseOrderSkipped) return 'dispatch_arrangement';\n  return 'confirmed';\n",
+  "  if (evidence.waitingForProduction) return 'confirmed';\n  if (evidence.purchaseOrderSkipped) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';\n  return 'confirmed';\n"
+ ],
+ [
+  "public/scm-special-stock-requests.js",
+  "    if (detail.purchaseOrderSentToVendorAt) return '<p role=\"status\">PO sent to vendor</p>';\n    if (detail.stage === 'dispatch_arrangement') return '';\n    return '<form data-special-po-sent-form><button type=\"submit\">PO Sent to Vendor</button></form>';\n",
+  "    if (detail.purchaseOrderSentToVendorAt) return '<p role=\"status\">PO sent to vendor</p>';\n    if (['dispatch_arrangement', 'waiting_customer_pickup'].includes(detail.stage)) return '';\n    return '<form data-special-po-sent-form><button type=\"submit\">PO Sent to Vendor</button></form>';\n"
+ ],
+ [
+  "public/scm-special-stock-requests.js",
+  "      ${manualForm}${detail.lines.every(line => line.supplyStatus === 'no_stock' && !line.availableDate) ? `<form data-special-scm-close-form><label>Closure reason<input name=\"reason\" required /></label><button class=\"danger\" type=\"submit\">Close request — no stock or ETA</button></form>` : ''}`;\n    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? (detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement · Customer pickup at vendor yard' : 'Customer pickup at vendor yard') : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;\n    const independentPurchase = detail.salesOrderSource === 'manual_link';\n",
+  "      ${manualForm}${detail.lines.every(line => line.supplyStatus === 'no_stock' && !line.availableDate) ? `<form data-special-scm-close-form><label>Closure reason<input name=\"reason\" required /></label><button class=\"danger\" type=\"submit\">Close request — no stock or ETA</button></form>` : ''}`;\n    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.stage === 'waiting_customer_pickup' ? (detail.fulfillmentMethod === 'vendor_pickup' ? 'Waiting Customer Pickup · Customer pickup at vendor yard' : 'Waiting Customer Pickup · PO received at the inquired yard') : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? (detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement · Customer pickup at vendor yard' : 'Customer pickup at vendor yard') : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;\n    const independentPurchase = detail.salesOrderSource === 'manual_link';\n"
+ ],
+ [
+  "public/special-stock-case-status.js",
+  "export function specialSupplyWaitingStatus(detail) {\n  if (['dispatch_arrangement','completed','closed'].includes(detail.stage)\n      || detail.purchaseOrderId && specialPurchaseOrderDispatchReady(detail)) return '';\n",
+  "export function specialSupplyWaitingStatus(detail) {\n  if (['dispatch_arrangement','waiting_customer_pickup','completed','closed'].includes(detail.stage)\n      || detail.purchaseOrderId && specialPurchaseOrderDispatchReady(detail)) return '';\n"
+ ],
+ [
+  "public/stock-requests.css",
+  ".stock-request-pill.dispatch_arrangement { background: #dfedff; color: #174776; }\n.stock-request-pill.completed { background: #e0f5e8; color: #19653a; }\n",
+  ".stock-request-pill.dispatch_arrangement { background: #dfedff; color: #174776; }\n.stock-request-pill.waiting_customer_pickup { background: #d9f3f4; color: #0d5257; }\n.stock-request-pill.completed { background: #e0f5e8; color: #19653a; }\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "import { assertNoCoSourcePacking } from \"./co-source-packing-handoff.js\";\nimport { operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';\nimport { deliveryOrderWithinYards } from \"./operator-yard-access.js\";\n",
+  "import { assertNoCoSourcePacking } from \"./co-source-packing-handoff.js\";\nimport { operatorCoCandidatesSql, operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';\nimport { deliveryOrderWithinYards } from \"./operator-yard-access.js\";\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "  const result = await query(\n    `WITH delivery_order_source AS (\n       SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,\n",
+  "  const result = await query(\n    `WITH ${operatorCoCandidatesSql()},\n     delivery_order_source AS (\n       SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "        LEFT JOIN active_sales_line_allocations line_allocation ON line_allocation.sales_line_id = l.id\n       UNION ALL\n",
+  "        LEFT JOIN active_sales_line_allocations line_allocation ON line_allocation.sales_line_id = l.id\n       -- The final WHERE lists only active, unfulfilled sales orders, so summarize just their lines.\n       WHERE o.fulfillment_status <> 'fulfilled'\n         AND (o.netsuite_active = true OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false)))\n       UNION ALL\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "              delivery_order_source.order_type = 'sales_order'\n              AND EXISTS (\n                SELECT 1\n                FROM sales_orders split_child\n",
+  "              delivery_order_source.order_type = 'sales_order'\n              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (\n                SELECT split_part(split_child.tranid, '-S', 1)\n                FROM sales_orders split_child\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "                FROM sales_orders split_child\n                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'\n                  AND split_child.netsuite_active = true\n",
+  "                FROM sales_orders split_child\n                WHERE split_child.tranid LIKE '%-S%'\n                  AND split_child.netsuite_active = true\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "              delivery_order_source.order_type = 'transfer_order'\n              AND EXISTS (\n                SELECT 1\n                FROM transfer_orders split_child\n",
+  "              delivery_order_source.order_type = 'transfer_order'\n              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (\n                SELECT split_part(split_child.tranid, '-S', 1)\n                FROM transfer_orders split_child\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "                FROM transfer_orders split_child\n                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'\n                  AND split_child.netsuite_active = true\n",
+  "                FROM transfer_orders split_child\n                WHERE split_child.tranid LIKE '%-S%'\n                  AND split_child.netsuite_active = true\n"
+ ],
+ [
+  "src/delivery-repository.js",
+  "  const result = await query(\n    `WITH planned_delivery_orders AS (\n       SELECT dispatch_truck_plate, dispatch_load_name,\n",
+  "  const result = await query(\n    `WITH ${operatorCoCandidatesSql()},\n     planned_delivery_orders AS (\n       SELECT dispatch_truck_plate, dispatch_load_name,\n"
+ ],
+ [
+  "src/special-stock-alerts.js",
+  "import { query } from './db.js';\n\n",
+  "import { query } from './db.js';\n\nconst SALES_ALERT_STAGES=['await_customer_confirmation','dispatch_arrangement','waiting_customer_pickup','wait_for_production','pending_update'];\n\n"
+ ],
+ [
+  "src/special-stock-alerts.js",
+  "export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLocationIds=[],includeRequests=false} = {}) {\n  const empty={awaitCustomerConfirmation:0,dispatchArrangement:0,waitForProduction:0,pendingUpdate:0,total:0};\n  if (!operatorId || !authorizedStoreLocationIds.length) return {...empty,...(includeRequests ? {requests:[]} : {})};\n",
+  "export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLocationIds=[],includeRequests=false} = {}) {\n  const empty={awaitCustomerConfirmation:0,dispatchArrangement:0,waitingCustomerPickup:0,waitForProduction:0,pendingUpdate:0,total:0};\n  if (!operatorId || !authorizedStoreLocationIds.length) return {...empty,...(includeRequests ? {requests:[]} : {})};\n"
+ ],
+ [
+  "src/special-stock-alerts.js",
+  "    count(*) FILTER(WHERE workflow.stage='dispatch_arrangement')::int AS dispatch,\n    count(*) FILTER(WHERE workflow.stage='wait_for_production')::int AS production,\n",
+  "    count(*) FILTER(WHERE workflow.stage='dispatch_arrangement')::int AS dispatch,\n    count(*) FILTER(WHERE workflow.stage='waiting_customer_pickup')::int AS customer_pickup,\n    count(*) FILTER(WHERE workflow.stage='wait_for_production')::int AS production,\n"
+ ],
+ [
+  "src/special-stock-alerts.js",
+  "    WHERE request.request_type='special' AND request.requested_by=$1 AND request.destination_location_id=ANY($2::bigint[])\n      AND workflow.stage IN ('await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update')`,[operatorId,authorizedStoreLocationIds]);\n  return {awaitCustomerConfirmation:row.confirmation,dispatchArrangement:row.dispatch,waitForProduction:row.production,\n    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.production+row.pending_update,\n    ...(includeRequests ? {requests:await specialAlertRequests({audience:'sales',operatorId,authorizedStoreLocationIds})} : {})};\n",
+  "    WHERE request.request_type='special' AND request.requested_by=$1 AND request.destination_location_id=ANY($2::bigint[])\n      AND workflow.stage=ANY($3::text[])`,[operatorId,authorizedStoreLocationIds,SALES_ALERT_STAGES]);\n  return {awaitCustomerConfirmation:row.confirmation,dispatchArrangement:row.dispatch,waitingCustomerPickup:row.customer_pickup,waitForProduction:row.production,\n    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.customer_pickup+row.production+row.pending_update,\n    ...(includeRequests ? {requests:await specialAlertRequests({audience:'sales',operatorId,authorizedStoreLocationIds})} : {})};\n"
+ ],
+ [
+  "src/special-stock-alerts.js",
+  "    ORDER BY request.updated_at DESC,request.id DESC`,\n  [sales ? ['await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update'] : ['new_enquiry','confirmed'],\n    ...(sales ? [operatorId,authorizedStoreLocationIds] : [])]);\n",
+  "    ORDER BY request.updated_at DESC,request.id DESC`,\n  [sales ? SALES_ALERT_STAGES : ['new_enquiry','confirmed'],\n    ...(sales ? [operatorId,authorizedStoreLocationIds] : [])]);\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "\n  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitForProduction = 0, pendingUpdate = 0;\n\n",
+  "\n  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitingCustomerPickup = 0, waitForProduction = 0, pendingUpdate = 0;\n\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "      : `${count || 0} special requests: ${awaitCustomerConfirmation} await customer confirmation, ${dispatchArrangement} dispatch arrangement, ${waitForProduction} wait for production / Transfer`;\n    const fullDescription = description + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');\n    const labelNode = link.querySelector('[data-special-alert-label]');\n",
+  "      : `${count || 0} special requests: ${awaitCustomerConfirmation} await customer confirmation, ${dispatchArrangement} dispatch arrangement, ${waitForProduction} wait for production / Transfer`;\n    const fullDescription = description\n      + (waitingCustomerPickup ? (chinese() ? `，${waitingCustomerPickup} 份等待客户提货` : `, ${waitingCustomerPickup} waiting customer pickup`) : '')\n      + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');\n    const labelNode = link.querySelector('[data-special-alert-label]');\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "    awaitCustomerConfirmation = 0;\n    dispatchArrangement = 0;\n    waitForProduction = 0; pendingUpdate = 0;\n",
+  "    awaitCustomerConfirmation = 0;\n    dispatchArrangement = 0; waitingCustomerPickup = 0;\n    waitForProduction = 0; pendingUpdate = 0;\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "      if (response.status === 401 || response.status === 403) { stop(); checkedSession = ''; return; }\n      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }\n      if (!response.ok) { return; }\n",
+  "      if (response.status === 401 || response.status === 403) { stop(); checkedSession = ''; return; }\n      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitingCustomerPickup = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }\n      if (!response.ok) { return; }\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "      data.pendingUpdate ??= 0;\n      if (request !== controller || readToken() !== session) { return; }\n",
+  "      data.pendingUpdate ??= 0;\n      data.waitingCustomerPickup ??= 0;\n      if (request !== controller || readToken() !== session) { return; }\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "      if (request !== controller || readToken() !== session) { return; }\n      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)\n          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitForProduction + data.pendingUpdate) { return; }\n      awaitCustomerConfirmation = data.awaitCustomerConfirmation;\n",
+  "      if (request !== controller || readToken() !== session) { return; }\n      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitingCustomerPickup, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)\n          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitingCustomerPickup + data.waitForProduction + data.pendingUpdate) { return; }\n      awaitCustomerConfirmation = data.awaitCustomerConfirmation;\n"
+ ],
+ [
+  "public/sales-special-alert.js",
+  "      dispatchArrangement = data.dispatchArrangement;\n      waitForProduction = data.waitForProduction;\n",
+  "      dispatchArrangement = data.dispatchArrangement;\n      waitingCustomerPickup = data.waitingCustomerPickup;\n      waitForProduction = data.waitForProduction;\n"
+ ],
+ [
+  "public/sales-stock-requests.html",
+  "    <link rel=\"stylesheet\" href=\"/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1\" />\n    <link rel=\"stylesheet\" href=\"/stock-requests.css?lineDetails=20261104-v1&replaceOrders=20261104-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&delivery=20261007-line-selection&multiFilters=20261009&scrollChaining=20261009-v1&filterApply=20261010-v1&specialSummary=20261013-v1\" />\n    <link rel=\"stylesheet\" href=\"/special-stock-documents.css?inlineLayout=20261027-v1&v=20261002-stock-updates-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1\" data-special-document-styles />\n",
+  "    <link rel=\"stylesheet\" href=\"/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1\" />\n    <link rel=\"stylesheet\" href=\"/stock-requests.css?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&delivery=20261007-line-selection&multiFilters=20261009&scrollChaining=20261009-v1&filterApply=20261010-v1&specialSummary=20261013-v1\" />\n    <link rel=\"stylesheet\" href=\"/special-stock-documents.css?inlineLayout=20261027-v1&v=20261002-stock-updates-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1\" data-special-document-styles />\n"
+ ],
+ [
+  "public/sales-stock-requests.html",
+  "    <script src=\"/sales-stock-requests.js?poRouting=20261029-v1&salesNote=20261028-v1&addItems=20261027-backorder-v2&poProgress=20261027-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20261007-line-selection&purchase=20260930-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&sales150=20261005-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&requestLoading=20261008&statusFilter=20261009&workflowStatus=20261009&multiFilters=20261009&requestScroll=20261009-v1&filterApply=20261010-v1\" defer></script>\n    <script src=\"/sales-special-stock-requests.js?lineDetails=20261104-v1&replaceOrders=20261104-v1&plannedMethod=20261027-v2&inlineLayout=20261027-v1&alertSearch=20261023&transferEta=20261016&conversation=20261016-followup&v=20261001-delivery-fee-v1&stockUpdates=20261002-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&headerDeliveryFee=20261006-v1&confirmedNote=20261006-v1&manualLinks=20261006-request-po-v2&filterApply=20261010-v1&specialSummary=20261013-v1&scmResponse=20261015-v1&adjustmentEdit=20261015-v1&suiteRepair=20261030-v1\" defer></script>\n  </body>\n",
+  "    <script src=\"/sales-stock-requests.js?poRouting=20261029-v1&salesNote=20261028-v1&addItems=20261027-backorder-v2&poProgress=20261027-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20261007-line-selection&purchase=20260930-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&sales150=20261005-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&requestLoading=20261008&statusFilter=20261009&workflowStatus=20261009&multiFilters=20261009&requestScroll=20261009-v1&filterApply=20261010-v1\" defer></script>\n    <script src=\"/sales-special-stock-requests.js?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&plannedMethod=20261027-v2&inlineLayout=20261027-v1&alertSearch=20261023&transferEta=20261016&conversation=20261016-followup&v=20261001-delivery-fee-v1&stockUpdates=20261002-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&headerDeliveryFee=20261006-v1&confirmedNote=20261006-v1&manualLinks=20261006-request-po-v2&filterApply=20261010-v1&specialSummary=20261013-v1&scmResponse=20261015-v1&adjustmentEdit=20261015-v1&suiteRepair=20261030-v1\" defer></script>\n  </body>\n"
+ ],
+ [
+  "public/scm-stock-requests.html",
+  "    <link rel=\"stylesheet\" href=\"/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1\" />\n    <link rel=\"stylesheet\" href=\"/stock-requests.css?lineDetails=20261104-v1&replaceOrders=20261104-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1\" />\n    <link rel=\"stylesheet\" href=\"/scm-stock-check-lines.css?v=20261015-ollama\" />\n",
+  "    <link rel=\"stylesheet\" href=\"/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1\" />\n    <link rel=\"stylesheet\" href=\"/stock-requests.css?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1\" />\n    <link rel=\"stylesheet\" href=\"/scm-stock-check-lines.css?v=20261015-ollama\" />\n"
+ ],
+ [
+  "public/scm-stock-requests.html",
+  "    <script src=\"/scm-stock-requests.js?poRouting=20261029-v1&supplyStatus=20261028-v1&poProgress=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&liveStock=20261014-v1&requestLoading=20261008&requestScroll=20261009-v1&filterApply=20261010-v1\" defer></script>\n    <script src=\"/scm-special-stock-requests.js?poItems=20261105-v2&lineDetails=20261104-v1&replaceOrders=20261104-v1&independentPo=20261029&childPo=20261028&readinessStatus=20261026&alertSearch=20261023&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20261001-custom-po-v1&stockUpdates=20261002-v1&scmPlanning=20261002-v2&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&manualLinks=20261006-request-po-v2&backorder=20261007-v4&stockCheckRevision=20261009-v1&filterApply=20261010-v1&compactStockCheck=20261013-v1&etaRow=20261013-v1&liveStock=20261014-v1\" defer></script>\n  </body>\n",
+  "    <script src=\"/scm-stock-requests.js?poRouting=20261029-v1&supplyStatus=20261028-v1&poProgress=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&liveStock=20261014-v1&requestLoading=20261008&requestScroll=20261009-v1&filterApply=20261010-v1\" defer></script>\n    <script src=\"/scm-special-stock-requests.js?poItems=20261105-v2&pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&independentPo=20261029&childPo=20261028&readinessStatus=20261026&alertSearch=20261023&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20261001-custom-po-v1&stockUpdates=20261002-v1&scmPlanning=20261002-v2&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&manualLinks=20261006-request-po-v2&backorder=20261007-v4&stockCheckRevision=20261009-v1&filterApply=20261010-v1&compactStockCheck=20261013-v1&etaRow=20261013-v1&liveStock=20261014-v1\" defer></script>\n  </body>\n"
+ ]
+]

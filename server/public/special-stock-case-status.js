@@ -4,7 +4,7 @@ const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&
 
 /** @param {Record<string,any>} detail */
 export function specialSupplyWaitingStatus(detail) {
-  if (['dispatch_arrangement','completed','closed'].includes(detail.stage)
+  if (['dispatch_arrangement','waiting_customer_pickup','completed','closed'].includes(detail.stage)
       || detail.purchaseOrderId && specialPurchaseOrderDispatchReady(detail)) return '';
   const statuses = new Set((detail.lines || []).filter(line => !line.removedAt
     && !['declined','closed'].includes(line.salesDecision)).map(line => line.supplyStatus));

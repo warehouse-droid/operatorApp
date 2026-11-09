@@ -15,7 +15,7 @@ import { isLocalCoLoaded, projectLoadedCoLine } from "./local-co-loaded-policy.j
 import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
 import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
 import { assertNoCoSourcePacking } from "./co-source-packing-handoff.js";
-import { operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
+import { operatorCoCandidatesSql, operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
 import { deliveryOrderWithinYards } from "./operator-yard-access.js";
 import crypto from "node:crypto";
 import { query, withTransaction } from "./db.js";
@@ -1942,7 +1942,8 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
   }
 
   const result = await query(
-    `WITH delivery_order_source AS (
+    `WITH ${operatorCoCandidatesSql()},
+     delivery_order_source AS (
        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
               foreign_total, order_location_id, order_location, ${operatorCoYardColumnsSql("sales_orders")},
               delivery_method_id, sales_order_type AS delivery_method,
@@ -2026,6 +2027,9 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
         FROM sales_order_lines l
         JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
         LEFT JOIN active_sales_line_allocations line_allocation ON line_allocation.sales_line_id = l.id
+       -- The final WHERE lists only active, unfulfilled sales orders, so summarize just their lines.
+       WHERE o.fulfillment_status <> 'fulfilled'
+         AND (o.netsuite_active = true OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false)))
        UNION ALL
        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
               item_description, item_type, item_type_text, quantity, unit,
@@ -2089,19 +2093,19 @@ export async function listDeliveryOrders({ locationId = null, status = "active",
           AND (
             (
               delivery_order_source.order_type = 'sales_order'
-              AND EXISTS (
-                SELECT 1
+              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (
+                SELECT split_part(split_child.tranid, '-S', 1)
                 FROM sales_orders split_child
-                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
+                WHERE split_child.tranid LIKE '%-S%'
                   AND split_child.netsuite_active = true
               )
             )
             OR (
               delivery_order_source.order_type = 'transfer_order'
-              AND EXISTS (
-                SELECT 1
+              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (
+                SELECT split_part(split_child.tranid, '-S', 1)
                 FROM transfer_orders split_child
-                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
+                WHERE split_child.tranid LIKE '%-S%'
                   AND split_child.netsuite_active = true
               )
             )
@@ -2176,7 +2180,8 @@ export async function listDeliveryLoadTrucks({ locationId = null, planDate = nul
   const sandboxSql = isNetSuiteSandboxEnvironment() ? "true" : "false";
   const locationClause = locationId ? `AND outbound_location_id = ANY($${params.push(outboundLocationIds(locationId))}::bigint[])` : "";
   const result = await query(
-    `WITH planned_delivery_orders AS (
+    `WITH ${operatorCoCandidatesSql()},
+     planned_delivery_orders AS (
        SELECT dispatch_truck_plate, dispatch_load_name,
               COALESCE(operator_co_route.route_location_id,sales_orders.outbound_location_id) AS outbound_location_id, operator_status,
               local_yard_order_status, 'sales_order'::text AS order_type,

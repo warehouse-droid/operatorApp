@@ -324,6 +324,7 @@ function mapCase(row = {}) {
     purchaseOrderRef: row.purchase_order_ref || null,
     purchaseOrderStatus: row.effective_purchase_status || row.purchase_order_status || null,
     purchaseOrderApproved: row.purchase_order_approved === true,
+    purchaseOrderReceived: row.purchase_order_received === true,
     // A PO this application created for the request can receive SCM-added items in NetSuite.
     purchaseOrderCreatedByApp: row.purchase_order_created_by_app === true,
     purchaseOrderPendingApproval: row.purchase_order_pending_approval === true,
@@ -394,6 +395,7 @@ function stageFor(detail) {
     purchaseOrderId: detail.purchaseOrderId,
     purchaseOrderSkipped: detail.purchaseOrderSkipped,
     purchaseOrderApproved: detail.purchaseOrderApproved,
+    purchaseOrderReceived: detail.purchaseOrderReceived,
     purchaseOrderReference: detail.purchaseOrderReference,
     purchaseOrderSentToVendorAt: detail.purchaseOrderSentToVendorAt,
     purchaseOrderDispatchStatus: detail.purchaseOrderDispatchStatus,
@@ -448,6 +450,7 @@ async function selectCaseRows(requestIds, { forUpdate = false } = {}) {
             completion.completed AS request_completion_complete,
             completion.completed_at AS request_completed_at,
             completion.completion_source AS request_completion_source,
+            receipt.received AS purchase_order_received,
             EXISTS (SELECT 1 FROM scm_netsuite_po_history history
                WHERE history.netsuite_purchase_order_id = special.purchase_order_netsuite_id
                  AND history.creation_snapshot->>'source' = 'special_stock_request'
@@ -465,6 +468,7 @@ async function selectCaseRows(requestIds, { forUpdate = false } = {}) {
        LEFT JOIN purchase_orders operational_purchase ON operational_purchase.netsuite_id=purchase_target.po_id
        JOIN special_stock_purchase_dispatch_state dispatch_state ON dispatch_state.request_id = special.request_id
        LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id
+       LEFT JOIN special_stock_purchase_receipt receipt ON receipt.request_id = special.request_id
       WHERE request.id = ANY($1::bigint[]) AND special.workflow_kind = $2
         AND request.request_type = CASE WHEN $2='backorder' THEN 'regular' ELSE 'special' END
       ${forUpdate ? "FOR UPDATE OF request, special" : ""}`,
@@ -2222,8 +2226,9 @@ export async function markSpecialPurchaseOrderSentToVendor(requestId, input = {}
     assertCaseEditable(special);
     if (!special.purchase_order_netsuite_id) throw workflowError('Link a Purchase Order before marking it sent to the vendor.', 409, 'SPECIAL_PO_LINK_REQUIRED');
     if (special.purchase_order_sent_to_vendor_at) return;
-    if (deriveSpecialCaseStage(detail) === 'dispatch_arrangement') {
-      throw workflowError('This Purchase Order has already moved to Dispatch Arrangement.', 409, 'SPECIAL_PO_ALREADY_DISPATCHED');
+    const stage = deriveSpecialCaseStage(detail);
+    if (['dispatch_arrangement', 'waiting_customer_pickup'].includes(stage)) {
+      throw workflowError(`This Purchase Order has already moved to ${SPECIAL_STAGES[stage]}.`, 409, 'SPECIAL_PO_ALREADY_DISPATCHED');
     }
     await query(`UPDATE sales_special_stock_cases SET purchase_order_sent_to_vendor_at=now(),
       purchase_order_sent_to_vendor_by=$2,updated_at=now() WHERE request_id=$1`, [id, operatorId]);

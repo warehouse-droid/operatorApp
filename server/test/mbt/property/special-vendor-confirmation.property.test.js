@@ -17,7 +17,8 @@ test('sent linked PO waits for the vendor until its existing dispatch handoff',(
     assert.equal(specialStage({...input,purchaseOrderSentToVendorAt:null}),'confirmed');
     assert.equal(specialStage({...input,purchaseOrderId:null}),'confirmed');
     const queued={...input,purchaseOrderApproved:true,purchaseOrderReference:'VENDOR-REF',purchaseOrderDispatchStatus:'Queued'};
-    assert.equal(specialStage(queued),e.fulfillmentMethod==='vendor_pickup'?'waiting_vendor_confirmation':'dispatch_arrangement');
+    // Customer collection at the vendor yard needs no dispatch: a queued reference means the goods can be collected.
+    assert.equal(specialStage(queued),e.fulfillmentMethod==='vendor_pickup'?'waiting_customer_pickup':'dispatch_arrangement');
   }),{numRuns:200,seed:20261017});
 });
 test('terminal and pending-information states retain precedence over vendor acknowledgement',()=>{

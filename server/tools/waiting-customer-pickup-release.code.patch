@@ -1,0 +1,468 @@
+diff --git a/server/public/sales-special-alert.js b/server/public/sales-special-alert.js
+--- a/server/public/sales-special-alert.js
++++ b/server/public/sales-special-alert.js
+@@ -9,7 +9,7 @@
+   let timer = null, retry = null, events = null, observer = null, request = null, authority = null, refreshAgain = false;
+   let link = null, status = null;
+ 
+-  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitForProduction = 0, pendingUpdate = 0;
++  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitingCustomerPickup = 0, waitForProduction = 0, pendingUpdate = 0;
+ 
+   function paint() {
+     if (!allowed) { return; }
+@@ -27,7 +27,9 @@
+     const label = chinese() ? '我的特殊商品申请' : 'My special requests';
+     const description = chinese() ? `${count || 0} 份申请：${awaitCustomerConfirmation} 份待客户确认，${dispatchArrangement} 份待安排发货，${waitForProduction} 份待生产 / 调货`
+       : `${count || 0} special requests: ${awaitCustomerConfirmation} await customer confirmation, ${dispatchArrangement} dispatch arrangement, ${waitForProduction} wait for production / Transfer`;
+-    const fullDescription = description + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');
++    const fullDescription = description
++      + (waitingCustomerPickup ? (chinese() ? `，${waitingCustomerPickup} 份等待客户提货` : `, ${waitingCustomerPickup} waiting customer pickup`) : '')
++      + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');
+     const labelNode = link.querySelector('[data-special-alert-label]');
+     const countNode = link.querySelector('[data-special-alert-count]');
+     if (labelNode.textContent !== label) { labelNode.textContent = label; }
+@@ -49,7 +51,7 @@
+     allowed = false;
+     count = null;
+     awaitCustomerConfirmation = 0;
+-    dispatchArrangement = 0;
++    dispatchArrangement = 0; waitingCustomerPickup = 0;
+     waitForProduction = 0; pendingUpdate = 0;
+     window.clearInterval(timer);
+     window.clearTimeout(retry);
+@@ -79,15 +81,17 @@
+         headers: { Accept: 'application/json', Authorization: `Bearer ${session}` } });
+       if (request !== controller || readToken() !== session) { return; }
+       if (response.status === 401 || response.status === 403) { stop(); checkedSession = ''; return; }
+-      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }
++      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitingCustomerPickup = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }
+       if (!response.ok) { return; }
+       const data = await response.json();
+       data.pendingUpdate ??= 0;
++      data.waitingCustomerPickup ??= 0;
+       if (request !== controller || readToken() !== session) { return; }
+-      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)
+-          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitForProduction + data.pendingUpdate) { return; }
++      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitingCustomerPickup, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)
++          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitingCustomerPickup + data.waitForProduction + data.pendingUpdate) { return; }
+       awaitCustomerConfirmation = data.awaitCustomerConfirmation;
+       dispatchArrangement = data.dispatchArrangement;
++      waitingCustomerPickup = data.waitingCustomerPickup;
+       waitForProduction = data.waitForProduction;
+       pendingUpdate = data.pendingUpdate;
+       count = data.total;
+diff --git a/server/public/sales-stock-requests.html b/server/public/sales-stock-requests.html
+--- a/server/public/sales-stock-requests.html
++++ b/server/public/sales-stock-requests.html
+@@ -8,7 +8,7 @@
+     <link rel="stylesheet" href="/stock-request-conversation.css?v=20261016" />
+     <link rel="stylesheet" href="/dispatch.css?v=20260811-stock-request-v1" />
+     <link rel="stylesheet" href="/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?lineDetails=20261104-v1&replaceOrders=20261104-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&delivery=20261007-line-selection&multiFilters=20261009&scrollChaining=20261009-v1&filterApply=20261010-v1&specialSummary=20261013-v1" />
++    <link rel="stylesheet" href="/stock-requests.css?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&delivery=20261007-line-selection&multiFilters=20261009&scrollChaining=20261009-v1&filterApply=20261010-v1&specialSummary=20261013-v1" />
+     <link rel="stylesheet" href="/special-stock-documents.css?inlineLayout=20261027-v1&v=20261002-stock-updates-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1" data-special-document-styles />
+     <link rel="stylesheet" href="/regular-stock-dialog.css?v=20260930-purchase" />
+     <link rel="stylesheet" href="/special-stock-request-actions.css?v=20261027-add-items" />
+@@ -39,6 +39,6 @@
+     <script src="/regular-stock-quantity.js?v=20261027-sales-uom" defer></script>
+     <script src="/stock-request-view.js?v=20261006-document-scroll-v1" defer></script>
+     <script src="/sales-stock-requests.js?poRouting=20261029-v1&salesNote=20261028-v1&addItems=20261027-backorder-v2&poProgress=20261027-v1&inlineLayout=20261027-v1&salesUom=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20261007-line-selection&purchase=20260930-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&sales150=20261005-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&requestLoading=20261008&statusFilter=20261009&workflowStatus=20261009&multiFilters=20261009&requestScroll=20261009-v1&filterApply=20261010-v1" defer></script>
+-    <script src="/sales-special-stock-requests.js?lineDetails=20261104-v1&replaceOrders=20261104-v1&plannedMethod=20261027-v2&inlineLayout=20261027-v1&alertSearch=20261023&transferEta=20261016&conversation=20261016-followup&v=20261001-delivery-fee-v1&stockUpdates=20261002-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&headerDeliveryFee=20261006-v1&confirmedNote=20261006-v1&manualLinks=20261006-request-po-v2&filterApply=20261010-v1&specialSummary=20261013-v1&scmResponse=20261015-v1&adjustmentEdit=20261015-v1&suiteRepair=20261030-v1" defer></script>
++    <script src="/sales-special-stock-requests.js?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&plannedMethod=20261027-v2&inlineLayout=20261027-v1&alertSearch=20261023&transferEta=20261016&conversation=20261016-followup&v=20261001-delivery-fee-v1&stockUpdates=20261002-v1&internalRemark=20261003-v1&requestCorrections=20261003-v1&lineDecline=20261003-v1&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&headerDeliveryFee=20261006-v1&confirmedNote=20261006-v1&manualLinks=20261006-request-po-v2&filterApply=20261010-v1&specialSummary=20261013-v1&scmResponse=20261015-v1&adjustmentEdit=20261015-v1&suiteRepair=20261030-v1" defer></script>
+   </body>
+ </html>
+diff --git a/server/public/scm-special-stock-requests.js b/server/public/scm-special-stock-requests.js
+--- a/server/public/scm-special-stock-requests.js
++++ b/server/public/scm-special-stock-requests.js
+@@ -255,7 +255,7 @@
+     if (!detail.purchaseOrderId || detail.informationRequest?.status === 'pending' || detail.quantityReviewPending
+         || ['closed','completed'].includes(detail.stage) || detail.closeStatus === 'closure_pending') return '';
+     if (detail.purchaseOrderSentToVendorAt) return '<p role="status">PO sent to vendor</p>';
+-    if (detail.stage === 'dispatch_arrangement') return '';
++    if (['dispatch_arrangement', 'waiting_customer_pickup'].includes(detail.stage)) return '';
+     return '<form data-special-po-sent-form><button type="submit">PO Sent to Vendor</button></form>';
+   }
+ 
+@@ -312,7 +312,7 @@
+     if (detail.quantityReviewPending) return `<p>PO creation waits for the order adjustment review above.</p>${manualForm}`;
+     if (!detail.salesOrderId && !detail.salesOrderSkipped) return `<div class="stock-request-notice">Sales can create the SO after the customer confirms the available stock or accepts the ETA.</div>
+       ${manualForm}${detail.lines.every(line => line.supplyStatus === 'no_stock' && !line.availableDate) ? `<form data-special-scm-close-form><label>Closure reason<input name="reason" required /></label><button class="danger" type="submit">Close request — no stock or ETA</button></form>` : ''}`;
+-    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? (detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement · Customer pickup at vendor yard' : 'Customer pickup at vendor yard') : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
++    if (detail.purchaseOrderId || detail.purchaseOrderSkipped) return `<section><h3>${detail.purchaseOrderSkipped ? 'PO creation skipped (test)' : 'Purchase Order'}</h3><p>${detail.salesOrderSkipped ? 'SO creation skipped (test) · ' : ''}${detail.stage === 'waiting_vendor_confirmation' ? 'Waiting Vendor Confirmation' : detail.stage === 'waiting_customer_pickup' ? (detail.fulfillmentMethod === 'vendor_pickup' ? 'Waiting Customer Pickup · Customer pickup at vendor yard' : 'Waiting Customer Pickup · PO received at the inquired yard') : detail.purchaseOrderApproved === false ? 'Waiting for NetSuite PO approval' : waitingForStock ? 'Waiting for SCM readiness confirmation' : detail.fulfillmentMethod === 'vendor_pickup' ? (detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement · Customer pickup at vendor yard' : 'Customer pickup at vendor yard') : detail.stage === 'dispatch_arrangement' ? 'Dispatch Arrangement' : 'PO linked'}</p>${detail.purchaseOrderCustomLinkage ? '<p>Custom PO linkage: SO and PO details are independent. SO descriptions stay unchanged. Arrange this PO via the yard before SO delivery.</p>' : ''}</section>`;
+     const independentPurchase = detail.salesOrderSource === 'manual_link';
+     if (!detail.salesOrderApproved && !independentPurchase) return `<section><h3>SO approval pending</h3><p>NetSuite status updates automatically.</p></section>${manualForm}`;
+     const retry = detail.purchaseOrderOperationStatus === 'attention' && Boolean(detail.purchaseOrderSubmissionStartedAt);
+diff --git a/server/public/scm-stock-requests.html b/server/public/scm-stock-requests.html
+--- a/server/public/scm-stock-requests.html
++++ b/server/public/scm-stock-requests.html
+@@ -8,7 +8,7 @@
+     <link rel="stylesheet" href="/stock-request-conversation.css?v=20261016" />
+     <link rel="stylesheet" href="/dispatch.css?v=20260930-po-text-v1" />
+     <link rel="stylesheet" href="/regular-stock-status.css?v=20261019-unified&suiteRepair=20261030-v1" />
+-    <link rel="stylesheet" href="/stock-requests.css?lineDetails=20261104-v1&replaceOrders=20261104-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1" />
++    <link rel="stylesheet" href="/stock-requests.css?pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&input=20261020-v1&v=20260928-enhancements-v1&regular=20260930-purchase&special=20261001-header-note-v1&auditScroll=20261006-v2&backorder=20261014-material-layout&scrollChaining=20261009-v1&filterApply=20261010-v1" />
+     <link rel="stylesheet" href="/scm-stock-check-lines.css?v=20261015-ollama" />
+     <link rel="stylesheet" href="/aggregate-requests.css?v=20260925-aggregate-alert-v1" />
+     <link rel="stylesheet" href="/scm-stock-pickup.css?v=20260930-purchase" />
+@@ -49,6 +49,6 @@
+     <script src="/scm-stock-check-lines.js?v=20261015-description" defer></script>
+     <script src="/scm-request-line-visibility.js?v=20261016" defer></script>
+     <script src="/scm-stock-requests.js?poRouting=20261029-v1&supplyStatus=20261028-v1&poProgress=20261027-v1&closeInline=20261023&alertSearch=20261023&reviewFlow=20261022-v1&customerRequired=20261022&arrival=20261020-v1&input=20261020-v1&unified=20261019&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20260927-yard-layout-v1&regular=20260930-delivery-progress&purchase=20260930-v1&resolve=20261002-v1&waitlist=20261002-v1&stockUpdates=20261002-v1&stableView=20261006-document-scroll-v1&stockingReply=20261006-v1&actions=20261006-v1&lineActions=20261006-v1&backorder=20261014-material-layout&liveStock=20261014-v1&requestLoading=20261008&requestScroll=20261009-v1&filterApply=20261010-v1" defer></script>
+-    <script src="/scm-special-stock-requests.js?poItems=20261105-v2&lineDetails=20261104-v1&replaceOrders=20261104-v1&independentPo=20261029&childPo=20261028&readinessStatus=20261026&alertSearch=20261023&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20261001-custom-po-v1&stockUpdates=20261002-v1&scmPlanning=20261002-v2&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&manualLinks=20261006-request-po-v2&backorder=20261007-v4&stockCheckRevision=20261009-v1&filterApply=20261010-v1&compactStockCheck=20261013-v1&etaRow=20261013-v1&liveStock=20261014-v1" defer></script>
++    <script src="/scm-special-stock-requests.js?poItems=20261105-v2&pickupStage=20261109-v1&lineDetails=20261104-v1&replaceOrders=20261104-v1&independentPo=20261029&childPo=20261028&readinessStatus=20261026&alertSearch=20261023&transferEta=20261016&lineVisibility=20261016&conversation=20261016-followup&v=20261001-custom-po-v1&stockUpdates=20261002-v1&scmPlanning=20261002-v2&lineFields=20261003-v1&uomOne=20261003-v1&scmLines=20261003-v1&stableView=20261006-document-scroll-v1&manualLinks=20261006-request-po-v2&backorder=20261007-v4&stockCheckRevision=20261009-v1&filterApply=20261010-v1&compactStockCheck=20261013-v1&etaRow=20261013-v1&liveStock=20261014-v1" defer></script>
+   </body>
+ </html>
+diff --git a/server/public/special-stock-case-status.js b/server/public/special-stock-case-status.js
+--- a/server/public/special-stock-case-status.js
++++ b/server/public/special-stock-case-status.js
+@@ -4,7 +4,7 @@
+ 
+ /** @param {Record<string,any>} detail */
+ export function specialSupplyWaitingStatus(detail) {
+-  if (['dispatch_arrangement','completed','closed'].includes(detail.stage)
++  if (['dispatch_arrangement','waiting_customer_pickup','completed','closed'].includes(detail.stage)
+       || detail.purchaseOrderId && specialPurchaseOrderDispatchReady(detail)) return '';
+   const statuses = new Set((detail.lines || []).filter(line => !line.removedAt
+     && !['declined','closed'].includes(line.salesDecision)).map(line => line.supplyStatus));
+diff --git a/server/public/special-stock-workflow.js b/server/public/special-stock-workflow.js
+--- a/server/public/special-stock-workflow.js
++++ b/server/public/special-stock-workflow.js
+@@ -5,6 +5,7 @@
+   confirmed: 'Confirmed',
+   waiting_vendor_confirmation: 'Waiting Vendor Confirmation',
+   dispatch_arrangement: 'Dispatch Arrangement',
++  waiting_customer_pickup: 'Waiting Customer Pickup',
+   wait_for_production: 'Wait for production / Transfer',
+   closed: 'Closed',
+   completed: 'Completed'
+@@ -36,7 +37,7 @@
+       .includes(String(evidence.purchaseOrderDispatchStatus || '').trim().toLowerCase());
+ }
+ 
+-/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
++/** @param {{closed?:boolean,cancelled?:boolean,operationallyComplete?:boolean,pendingUpdate?:boolean,waitingForProduction?:boolean,purchaseOrderId?:number|null,purchaseOrderApproved?:boolean,purchaseOrderReceived?:boolean,purchaseOrderSentToVendorAt?:unknown,purchaseOrderReference?:unknown,purchaseOrderDispatchStatus?:unknown,salesOrderId?:number|null,salesOrderSkipped?:boolean,purchaseOrderSkipped?:boolean,fulfillmentMethod?:string,hasPendingSalesDecision?:boolean,linesResolved?:boolean,hasAcceptedLines?:boolean}} evidence */
+ export function specialStage(evidence = {}) {
+   if (evidence.closed || evidence.cancelled) return 'closed';
+   if (evidence.operationallyComplete) return 'completed';
+@@ -45,13 +46,15 @@
+     return evidence.purchaseOrderId || evidence.purchaseOrderSkipped || evidence.waitingForProduction
+       || evidence.hasPendingSalesDecision || evidence.linesResolved ? 'await_customer_confirmation' : 'new_enquiry';
+   }
++  const vendorPickup = evidence.fulfillmentMethod === 'vendor_pickup';
+   if (evidence.purchaseOrderId) {
+-    // Customer pickup at the vendor yard also arranges collection once SCM queues the PO reference.
+-    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return 'dispatch_arrangement';
++    // The customer collects a received PO at the inquired yard, or at the vendor yard once SCM queues the PO reference.
++    if (evidence.fulfillmentMethod === 'yard_pickup' && evidence.purchaseOrderReceived) return 'waiting_customer_pickup';
++    if (evidence.purchaseOrderApproved !== false && specialPurchaseOrderDispatchReady(evidence)) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';
+     return evidence.purchaseOrderSentToVendorAt ? 'waiting_vendor_confirmation' : 'confirmed';
+   }
+   if (evidence.waitingForProduction) return 'confirmed';
+-  if (evidence.purchaseOrderSkipped) return 'dispatch_arrangement';
++  if (evidence.purchaseOrderSkipped) return vendorPickup ? 'waiting_customer_pickup' : 'dispatch_arrangement';
+   return 'confirmed';
+ }
+ 
+diff --git a/server/public/stock-requests.css b/server/public/stock-requests.css
+--- a/server/public/stock-requests.css
++++ b/server/public/stock-requests.css
+@@ -875,6 +875,7 @@
+ .stock-request-pill.confirmed { background: #ede9fe; color: #5b21b6; }
+ .stock-request-pill.wait_for_production { background: #fff1cb; color: #694a00; }
+ .stock-request-pill.dispatch_arrangement { background: #dfedff; color: #174776; }
++.stock-request-pill.waiting_customer_pickup { background: #d9f3f4; color: #0d5257; }
+ .stock-request-pill.completed { background: #e0f5e8; color: #19653a; }
+ .special-stock-page .stock-request-pill.pending { background: #e0e7ff; color: #3730a3; }
+ .special-stock-page .stock-request-pill.accepted { background: #ccfbf1; color: #115e59; }
+diff --git a/server/src/delivery-repository.js b/server/src/delivery-repository.js
+--- a/server/src/delivery-repository.js
++++ b/server/src/delivery-repository.js
+@@ -15,7 +15,7 @@
+ import { deliveryPackingRemainder, deliveryPackingRemainderSql, DELIVERY_PACK_ROUNDING_TOLERANCE as LOAD_SALES_QTY_TOLERANCE } from "./delivery-packing-progress.js";
+ import { withConsolidatedLoadMutation } from "./consolidation-load-locks.js";
+ import { assertNoCoSourcePacking } from "./co-source-packing-handoff.js";
+-import { operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
++import { operatorCoCandidatesSql, operatorCoRouteJoinSql, operatorCoYardColumnsSql, routeOperatorSalesOrders } from './operator-co-routing.js';
+ import { deliveryOrderWithinYards } from "./operator-yard-access.js";
+ import crypto from "node:crypto";
+ import { query, withTransaction } from "./db.js";
+@@ -1942,7 +1942,8 @@
+   }
+ 
+   const result = await query(
+-    `WITH delivery_order_source AS (
++    `WITH ${operatorCoCandidatesSql()},
++     delivery_order_source AS (
+        SELECT netsuite_id, tranid, trandate, customer_id, customer, status, status_text,
+               foreign_total, order_location_id, order_location, ${operatorCoYardColumnsSql("sales_orders")},
+               delivery_method_id, sales_order_type AS delivery_method,
+@@ -2026,6 +2027,9 @@
+         FROM sales_order_lines l
+         JOIN sales_orders o ON o.netsuite_id = l.sales_order_id
+         LEFT JOIN active_sales_line_allocations line_allocation ON line_allocation.sales_line_id = l.id
++       -- The final WHERE lists only active, unfulfilled sales orders, so summarize just their lines.
++       WHERE o.fulfillment_status <> 'fulfilled'
++         AND (o.netsuite_active = true OR (${sandboxSql} AND COALESCE(o.is_test_fixture, false)))
+        UNION ALL
+        SELECT transfer_order_id AS order_id, id, line_id, item_id, item_name, sku,
+               item_description, item_type, item_type_text, quantity, unit,
+@@ -2089,19 +2093,19 @@
+           AND (
+             (
+               delivery_order_source.order_type = 'sales_order'
+-              AND EXISTS (
+-                SELECT 1
++              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (
++                SELECT split_part(split_child.tranid, '-S', 1)
+                 FROM sales_orders split_child
+-                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
++                WHERE split_child.tranid LIKE '%-S%'
+                   AND split_child.netsuite_active = true
+               )
+             )
+             OR (
+               delivery_order_source.order_type = 'transfer_order'
+-              AND EXISTS (
+-                SELECT 1
++              AND delivery_order_source.tranid IS NOT NULL AND delivery_order_source.tranid IN (
++                SELECT split_part(split_child.tranid, '-S', 1)
+                 FROM transfer_orders split_child
+-                WHERE split_child.tranid LIKE delivery_order_source.tranid || '-S%'
++                WHERE split_child.tranid LIKE '%-S%'
+                   AND split_child.netsuite_active = true
+               )
+             )
+@@ -2176,7 +2180,8 @@
+   const sandboxSql = isNetSuiteSandboxEnvironment() ? "true" : "false";
+   const locationClause = locationId ? `AND outbound_location_id = ANY($${params.push(outboundLocationIds(locationId))}::bigint[])` : "";
+   const result = await query(
+-    `WITH planned_delivery_orders AS (
++    `WITH ${operatorCoCandidatesSql()},
++     planned_delivery_orders AS (
+        SELECT dispatch_truck_plate, dispatch_load_name,
+               COALESCE(operator_co_route.route_location_id,sales_orders.outbound_location_id) AS outbound_location_id, operator_status,
+               local_yard_order_status, 'sales_order'::text AS order_type,
+diff --git a/server/src/operator-co-routing.js b/server/src/operator-co-routing.js
+--- a/server/src/operator-co-routing.js
++++ b/server/src/operator-co-routing.js
+@@ -7,16 +7,30 @@
+   return alias;
+ }
+ 
++/** The open COs that can route an order, read once per query. Every query using
++ * operatorCoRouteJoinSql lists this in its WITH clause. Reading CO details (TOAST) once
++ * instead of once per candidate order keeps the operator delivery list fast. */
++export function operatorCoCandidatesSql() {
++  return `operator_co_candidates AS MATERIALIZED (
++    SELECT co.id, co.co_ref, co.source_order_ref, co.details->'childOrderIds' AS child_order_ids,
++      co.from_location_id, lower(btrim(split_part(co.from_location,':',1))) AS from_location_key,
++      co.to_location_id, co.to_location, co.received_at, co.created_at,
++      jsonb_build_object('driverCompletionJobId', co.details->'driverCompletionJobId',
++        'driverCompletionRecordId', co.details->'driverCompletionRecordId') AS details
++    FROM local_co_orders co
++    WHERE co.status <> 'cancelled'
++  )`;
++}
++
+ export function operatorCoRouteJoinSql(orderAlias) {
+   const order = safeAlias(orderAlias);
+   return `LEFT JOIN LATERAL (
+     SELECT co.co_ref AS route_co_ref, co.to_location_id AS route_location_id,
+       co.to_location AS route_location, ${completedCoArrivalSql('co')} AS route_arrived_at
+-    FROM local_co_orders co
+-    WHERE co.status <> 'cancelled'
+-      AND (co.source_order_ref=${order}.tranid OR co.details->'childOrderIds' ? ${order}.tranid)
++    FROM operator_co_candidates co
++    WHERE (co.source_order_ref=${order}.tranid OR co.child_order_ids ? ${order}.tranid)
+       AND (co.from_location_id=${order}.outbound_location_id
+-        OR lower(btrim(split_part(co.from_location,':',1)))=lower(btrim(split_part(${order}.outbound_location,':',1))))
++        OR co.from_location_key=lower(btrim(split_part(${order}.outbound_location,':',1))))
+     ORDER BY co.created_at DESC, co.id DESC LIMIT 1
+   ) operator_co_route ON true`;
+ }
+@@ -31,7 +45,8 @@
+   const ids = orders.filter(order => order.order_type === 'sales_order' && !order.is_dispatch_group)
+     .map(order => order.netsuite_id);
+   if (!ids.length) {return orders;}
+-  const routes = (await query(`SELECT source.netsuite_id, ${operatorCoYardColumnsSql('source')},
++  const routes = (await query(`WITH ${operatorCoCandidatesSql()}
++    SELECT source.netsuite_id, ${operatorCoYardColumnsSql('source')},
+     source.outbound_location_id AS route_source_location_id,
+     operator_co_route.route_co_ref, operator_co_route.route_arrived_at
+     FROM sales_orders source ${operatorCoRouteJoinSql('source')}
+diff --git a/server/src/special-stock-alerts.js b/server/src/special-stock-alerts.js
+--- a/server/src/special-stock-alerts.js
++++ b/server/src/special-stock-alerts.js
+@@ -1,5 +1,7 @@
+ import { query } from './db.js';
+ 
++const SALES_ALERT_STAGES=['await_customer_confirmation','dispatch_arrangement','waiting_customer_pickup','wait_for_production','pending_update'];
++
+ export async function getSpecialStockAlertCounts({includeRequests=false} = {}) {
+   const { rows: [row] } = await query(`
+     SELECT count(*) FILTER (WHERE stage = 'new_enquiry')::integer AS new_requests,
+@@ -13,18 +15,19 @@
+ }
+ 
+ export async function getSpecialSalesAlertCounts({operatorId,authorizedStoreLocationIds=[],includeRequests=false} = {}) {
+-  const empty={awaitCustomerConfirmation:0,dispatchArrangement:0,waitForProduction:0,pendingUpdate:0,total:0};
++  const empty={awaitCustomerConfirmation:0,dispatchArrangement:0,waitingCustomerPickup:0,waitForProduction:0,pendingUpdate:0,total:0};
+   if (!operatorId || !authorizedStoreLocationIds.length) return {...empty,...(includeRequests ? {requests:[]} : {})};
+   const {rows:[row]}=await query(`SELECT
+     count(*) FILTER(WHERE workflow.stage='await_customer_confirmation')::int AS confirmation,
+     count(*) FILTER(WHERE workflow.stage='dispatch_arrangement')::int AS dispatch,
++    count(*) FILTER(WHERE workflow.stage='waiting_customer_pickup')::int AS customer_pickup,
+     count(*) FILTER(WHERE workflow.stage='wait_for_production')::int AS production,
+     count(*) FILTER(WHERE workflow.stage='pending_update')::int AS pending_update
+     FROM special_stock_workflow_stages workflow JOIN sales_stock_requests request ON request.id=workflow.request_id
+     WHERE request.request_type='special' AND request.requested_by=$1 AND request.destination_location_id=ANY($2::bigint[])
+-      AND workflow.stage IN ('await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update')`,[operatorId,authorizedStoreLocationIds]);
+-  return {awaitCustomerConfirmation:row.confirmation,dispatchArrangement:row.dispatch,waitForProduction:row.production,
+-    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.production+row.pending_update,
++      AND workflow.stage=ANY($3::text[])`,[operatorId,authorizedStoreLocationIds,SALES_ALERT_STAGES]);
++  return {awaitCustomerConfirmation:row.confirmation,dispatchArrangement:row.dispatch,waitingCustomerPickup:row.customer_pickup,waitForProduction:row.production,
++    pendingUpdate:row.pending_update,total:row.confirmation+row.dispatch+row.customer_pickup+row.production+row.pending_update,
+     ...(includeRequests ? {requests:await specialAlertRequests({audience:'sales',operatorId,authorizedStoreLocationIds})} : {})};
+ }
+ 
+@@ -37,7 +40,7 @@
+       AND workflow.stage=ANY($1::text[])
+       ${sales ? 'AND request.requested_by=$2 AND request.destination_location_id=ANY($3::bigint[])' : ''}
+     ORDER BY request.updated_at DESC,request.id DESC`,
+-  [sales ? ['await_customer_confirmation','dispatch_arrangement','wait_for_production','pending_update'] : ['new_enquiry','confirmed'],
++  [sales ? SALES_ALERT_STAGES : ['new_enquiry','confirmed'],
+     ...(sales ? [operatorId,authorizedStoreLocationIds] : [])]);
+   return rows.map(row=>({id:Number(row.id),requestRef:row.request_ref,customerName:row.customer_name,stage:row.stage}));
+ }
+diff --git a/server/src/special-stock-request-repository.js b/server/src/special-stock-request-repository.js
+--- a/server/src/special-stock-request-repository.js
++++ b/server/src/special-stock-request-repository.js
+@@ -324,6 +324,7 @@
+     purchaseOrderRef: row.purchase_order_ref || null,
+     purchaseOrderStatus: row.effective_purchase_status || row.purchase_order_status || null,
+     purchaseOrderApproved: row.purchase_order_approved === true,
++    purchaseOrderReceived: row.purchase_order_received === true,
+     // A PO this application created for the request can receive SCM-added items in NetSuite.
+     purchaseOrderCreatedByApp: row.purchase_order_created_by_app === true,
+     purchaseOrderPendingApproval: row.purchase_order_pending_approval === true,
+@@ -394,6 +395,7 @@
+     purchaseOrderId: detail.purchaseOrderId,
+     purchaseOrderSkipped: detail.purchaseOrderSkipped,
+     purchaseOrderApproved: detail.purchaseOrderApproved,
++    purchaseOrderReceived: detail.purchaseOrderReceived,
+     purchaseOrderReference: detail.purchaseOrderReference,
+     purchaseOrderSentToVendorAt: detail.purchaseOrderSentToVendorAt,
+     purchaseOrderDispatchStatus: detail.purchaseOrderDispatchStatus,
+@@ -448,6 +450,7 @@
+             completion.completed AS request_completion_complete,
+             completion.completed_at AS request_completed_at,
+             completion.completion_source AS request_completion_source,
++            receipt.received AS purchase_order_received,
+             EXISTS (SELECT 1 FROM scm_netsuite_po_history history
+                WHERE history.netsuite_purchase_order_id = special.purchase_order_netsuite_id
+                  AND history.creation_snapshot->>'source' = 'special_stock_request'
+@@ -465,6 +468,7 @@
+        LEFT JOIN purchase_orders operational_purchase ON operational_purchase.netsuite_id=purchase_target.po_id
+        JOIN special_stock_purchase_dispatch_state dispatch_state ON dispatch_state.request_id = special.request_id
+        LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id
++       LEFT JOIN special_stock_purchase_receipt receipt ON receipt.request_id = special.request_id
+       WHERE request.id = ANY($1::bigint[]) AND special.workflow_kind = $2
+         AND request.request_type = CASE WHEN $2='backorder' THEN 'regular' ELSE 'special' END
+       ${forUpdate ? "FOR UPDATE OF request, special" : ""}`,
+@@ -2222,8 +2226,9 @@
+     assertCaseEditable(special);
+     if (!special.purchase_order_netsuite_id) throw workflowError('Link a Purchase Order before marking it sent to the vendor.', 409, 'SPECIAL_PO_LINK_REQUIRED');
+     if (special.purchase_order_sent_to_vendor_at) return;
+-    if (deriveSpecialCaseStage(detail) === 'dispatch_arrangement') {
+-      throw workflowError('This Purchase Order has already moved to Dispatch Arrangement.', 409, 'SPECIAL_PO_ALREADY_DISPATCHED');
++    const stage = deriveSpecialCaseStage(detail);
++    if (['dispatch_arrangement', 'waiting_customer_pickup'].includes(stage)) {
++      throw workflowError(`This Purchase Order has already moved to ${SPECIAL_STAGES[stage]}.`, 409, 'SPECIAL_PO_ALREADY_DISPATCHED');
+     }
+     await query(`UPDATE sales_special_stock_cases SET purchase_order_sent_to_vendor_at=now(),
+       purchase_order_sent_to_vendor_by=$2,updated_at=now() WHERE request_id=$1`, [id, operatorId]);
+diff --git a/server/migrations/333_special_waiting_customer_pickup.sql b/server/migrations/333_special_waiting_customer_pickup.sql
+--- /dev/null
++++ b/server/migrations/333_special_waiting_customer_pickup.sql
+@@ -0,0 +1,81 @@
++-- Special requests waiting for the customer to collect get their own stage, Waiting Customer Pickup:
++-- 1. Pickup at inquired yard: the linked PO has been received (local receipt or PO drop-off, or a
++--    NetSuite Received/Billed status). SPREQ-000147 showed Waiting Vendor Confirmation instead.
++-- 2. Customer pickup at the vendor yard: the approved PO's SCM reference is Queued (or a later
++--    transport status), or the PO step was skipped. These were Dispatch Arrangement (migration 331).
++-- Completion rules and special_stock_completion_evidence are unchanged; receipt uses the same
++-- evidence as its yard-pickup and vendor-pickup rules. Backorder stages are unchanged.
++-- No request or order data changes.
++CREATE OR REPLACE VIEW special_stock_purchase_receipt AS
++SELECT special.request_id,
++  COALESCE(special.purchase_order_netsuite_id IS NOT NULL AND (
++    (COALESCE(purchase.receipt_status,'') !~* 'partial'
++      AND (purchase.receipt_status = 'received' OR completion.purchase_order_delivered_at IS NOT NULL))
++    OR (purchase.netsuite_active IS DISTINCT FROM false AND
++      lower(btrim(regexp_replace(COALESCE(purchase.status_text,''),'^.*: *','')))
++        IN ('received','fully received','pending bill','billed','fully billed'))), false) AS received
++FROM sales_special_stock_cases special
++JOIN special_stock_purchase_targets target ON target.request_id = special.request_id
++LEFT JOIN purchase_orders purchase ON purchase.netsuite_id = target.po_id
++LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id;
++
++CREATE OR REPLACE VIEW special_stock_workflow_stages AS
++SELECT special.request_id,
++  CASE
++    WHEN special.close_status = 'closed' OR request.status = 'cancelled' THEN 'closed'
++    WHEN special.workflow_kind = 'backorder'
++      AND EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id AND supply_status='already_ordered')
++      AND NOT EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id
++        AND supply_status IS DISTINCT FROM 'already_ordered' AND sales_decision NOT IN ('declined','closed')) THEN 'completed'
++    WHEN special.workflow_kind = 'backorder' AND EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id)
++      AND NOT EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id AND sales_decision NOT IN ('declined','closed')) THEN 'closed'
++    WHEN completion.completed THEN 'completed'
++    WHEN special.information_request->>'status' = 'pending' THEN 'pending_update'
++    WHEN special.workflow_kind = 'backorder' AND special.purchase_order_netsuite_id IS NOT NULL
++      THEN CASE WHEN dispatch_state.ready THEN 'dispatch_arrangement' ELSE 'confirmed' END
++    WHEN special.workflow_kind = 'backorder' AND special.sales_order_netsuite_id IS NOT NULL THEN 'confirmed'
++    WHEN special.workflow_kind = 'backorder' AND EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id AND supply_status IS DISTINCT FROM 'already_ordered' AND sales_decision='accepted')
++      AND NOT EXISTS(SELECT 1 FROM sales_special_stock_lines WHERE removed_at IS NULL AND request_id=special.request_id AND supply_status IS DISTINCT FROM 'already_ordered' AND sales_decision NOT IN ('accepted','declined','closed')) THEN 'confirmed'
++    WHEN special.workflow_kind = 'special' AND special.sales_order_netsuite_id IS NULL
++      AND NOT special.sales_order_skipped AND (
++        special.purchase_order_netsuite_id IS NOT NULL OR special.purchase_order_skipped
++        OR (EXISTS (SELECT 1 FROM sales_special_stock_lines WHERE request_id=special.request_id AND removed_at IS NULL)
++          AND (NOT EXISTS (SELECT 1 FROM sales_special_stock_lines WHERE request_id=special.request_id AND removed_at IS NULL
++            AND sales_decision NOT IN ('accepted','declined','closed'))
++            OR NOT EXISTS (SELECT 1 FROM sales_special_stock_lines WHERE request_id=special.request_id AND removed_at IS NULL
++              AND sales_decision NOT IN ('declined','closed') AND (supply_status IS NULL OR sales_decision='request_update')))))
++      THEN 'await_customer_confirmation'
++    WHEN special.workflow_kind = 'special' AND special.purchase_order_netsuite_id IS NOT NULL
++      THEN CASE
++        WHEN special.fulfillment_method = 'yard_pickup' AND receipt.received THEN 'waiting_customer_pickup'
++        WHEN approval.approved AND dispatch_state.ready
++          THEN CASE WHEN special.fulfillment_method = 'vendor_pickup' THEN 'waiting_customer_pickup' ELSE 'dispatch_arrangement' END
++        WHEN special.purchase_order_sent_to_vendor_at IS NOT NULL THEN 'waiting_vendor_confirmation' ELSE 'confirmed' END
++    WHEN NOT EXISTS (SELECT 1 FROM sales_special_stock_lines line
++      WHERE line.removed_at IS NULL AND line.request_id = special.request_id AND line.sales_decision NOT IN ('accepted','declined','closed'))
++      AND EXISTS (SELECT 1 FROM sales_special_stock_lines line
++        WHERE line.removed_at IS NULL AND line.request_id = special.request_id AND line.sales_decision = 'accepted'
++          AND COALESCE(line.supply_status,'') NOT IN ('in_stock','low_inventory')) THEN 'confirmed'
++    WHEN special.purchase_order_skipped THEN CASE WHEN special.workflow_kind = 'special' AND special.fulfillment_method = 'vendor_pickup'
++      THEN 'waiting_customer_pickup' ELSE 'dispatch_arrangement' END
++    WHEN special.sales_order_netsuite_id IS NOT NULL OR special.sales_order_skipped THEN 'confirmed'
++    WHEN special.workflow_kind = 'special'
++      AND EXISTS (SELECT 1 FROM sales_special_stock_lines line WHERE line.removed_at IS NULL AND line.request_id=special.request_id AND line.sales_decision='accepted')
++      AND NOT EXISTS (SELECT 1 FROM sales_special_stock_lines line WHERE line.removed_at IS NULL AND line.request_id=special.request_id AND line.sales_decision NOT IN ('accepted','declined','closed')) THEN 'confirmed'
++    WHEN special.line_edit_state->>'revision' = request.revision::text
++      AND special.line_edit_state->>'stage' IN ('new_enquiry','await_customer_confirmation','wait_for_production','pending_update')
++      AND special.sales_order_netsuite_id IS NULL AND special.purchase_order_netsuite_id IS NULL
++      AND NOT special.sales_order_skipped AND NOT special.purchase_order_skipped
++      THEN special.line_edit_state->>'stage'
++    WHEN NOT EXISTS (SELECT 1 FROM sales_special_stock_lines line
++      WHERE line.removed_at IS NULL AND line.request_id = special.request_id AND (line.supply_status IS NULL OR line.sales_decision = 'request_update')
++        AND (special.workflow_kind = 'backorder' OR line.sales_decision NOT IN ('declined','closed'))
++        AND (special.workflow_kind <> 'backorder' OR line.supply_status IS DISTINCT FROM 'already_ordered')) THEN 'await_customer_confirmation'
++    ELSE 'new_enquiry'
++  END AS stage
++FROM sales_special_stock_cases special
++JOIN sales_stock_requests request ON request.id = special.request_id
++JOIN special_stock_purchase_approval approval ON approval.request_id = special.request_id
++JOIN special_stock_purchase_dispatch_state dispatch_state ON dispatch_state.request_id = special.request_id
++LEFT JOIN special_stock_completion_evidence completion ON completion.request_id = special.request_id
++LEFT JOIN special_stock_purchase_receipt receipt ON receipt.request_id = special.request_id;

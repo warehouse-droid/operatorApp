@@ -9,7 +9,7 @@
   let timer = null, retry = null, events = null, observer = null, request = null, authority = null, refreshAgain = false;
   let link = null, status = null;
 
-  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitForProduction = 0, pendingUpdate = 0;
+  let awaitCustomerConfirmation = 0, dispatchArrangement = 0, waitingCustomerPickup = 0, waitForProduction = 0, pendingUpdate = 0;
 
   function paint() {
     if (!allowed) { return; }
@@ -27,7 +27,9 @@
     const label = chinese() ? '我的特殊商品申请' : 'My special requests';
     const description = chinese() ? `${count || 0} 份申请：${awaitCustomerConfirmation} 份待客户确认，${dispatchArrangement} 份待安排发货，${waitForProduction} 份待生产 / 调货`
       : `${count || 0} special requests: ${awaitCustomerConfirmation} await customer confirmation, ${dispatchArrangement} dispatch arrangement, ${waitForProduction} wait for production / Transfer`;
-    const fullDescription = description + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');
+    const fullDescription = description
+      + (waitingCustomerPickup ? (chinese() ? `，${waitingCustomerPickup} 份等待客户提货` : `, ${waitingCustomerPickup} waiting customer pickup`) : '')
+      + (pendingUpdate ? (chinese() ? `，${pendingUpdate} 份待更新资料` : `, ${pendingUpdate} Pending Update — information required by SCM`) : '');
     const labelNode = link.querySelector('[data-special-alert-label]');
     const countNode = link.querySelector('[data-special-alert-count]');
     if (labelNode.textContent !== label) { labelNode.textContent = label; }
@@ -49,7 +51,7 @@
     allowed = false;
     count = null;
     awaitCustomerConfirmation = 0;
-    dispatchArrangement = 0;
+    dispatchArrangement = 0; waitingCustomerPickup = 0;
     waitForProduction = 0; pendingUpdate = 0;
     window.clearInterval(timer);
     window.clearTimeout(retry);
@@ -79,15 +81,17 @@
         headers: { Accept: 'application/json', Authorization: `Bearer ${session}` } });
       if (request !== controller || readToken() !== session) { return; }
       if (response.status === 401 || response.status === 403) { stop(); checkedSession = ''; return; }
-      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }
+      if (response.status === 404) { count = 0; awaitCustomerConfirmation = 0; dispatchArrangement = 0; waitingCustomerPickup = 0; waitForProduction = 0; pendingUpdate = 0; paint(); return; }
       if (!response.ok) { return; }
       const data = await response.json();
       data.pendingUpdate ??= 0;
+      data.waitingCustomerPickup ??= 0;
       if (request !== controller || readToken() !== session) { return; }
-      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)
-          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitForProduction + data.pendingUpdate) { return; }
+      if (![data.pendingUpdate, data.awaitCustomerConfirmation, data.dispatchArrangement, data.waitingCustomerPickup, data.waitForProduction, data.total].every(value => Number.isSafeInteger(value) && value >= 0)
+          || data.total !== data.awaitCustomerConfirmation + data.dispatchArrangement + data.waitingCustomerPickup + data.waitForProduction + data.pendingUpdate) { return; }
       awaitCustomerConfirmation = data.awaitCustomerConfirmation;
       dispatchArrangement = data.dispatchArrangement;
+      waitingCustomerPickup = data.waitingCustomerPickup;
       waitForProduction = data.waitForProduction;
       pendingUpdate = data.pendingUpdate;
       count = data.total;

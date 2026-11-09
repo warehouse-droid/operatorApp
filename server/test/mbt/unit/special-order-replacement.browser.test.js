@@ -126,15 +126,16 @@ test('Sales sees replacement history but no replace form once the request is com
   });
 });
 
-test('SCM replaces the linked PO and sees vendor pickup Dispatch Arrangement on desktop and phone', async () => {
+test('SCM replaces the linked PO and sees vendor pickup Waiting Customer Pickup on desktop and phone', async () => {
   for (const width of [1440, 390]) {
-    await withPage({ html: scmHtml, width, detail: record({ stage: 'dispatch_arrangement', fulfillmentMethod: 'vendor_pickup', purchaseOrderReference: 'TEST-REF', purchaseOrderDispatchStatus: 'Queued' }),
+    await withPage({ html: scmHtml, width, detail: record({ stage: 'waiting_customer_pickup', fulfillmentMethod: 'vendor_pickup', purchaseOrderReference: 'TEST-REF', purchaseOrderDispatchStatus: 'Queued' }),
       onPost: (state, path, input) => {
         state.detail = record({ revision: 4, purchaseOrderId: 61, purchaseOrderRef: input.purchaseOrderRef, purchaseOrderCustomLinkage: true, fulfillmentMethod: 'vendor_pickup',
           events: [replacedEvent('purchase_order', 'TEST-PO-OLD', input.purchaseOrderRef, input.reason)] });
         return { body: state.detail };
       } }, async (page, state) => {
-      await page.getByText('Dispatch Arrangement · Customer pickup at vendor yard').waitFor();
+      await page.getByText('Waiting Customer Pickup · Customer pickup at vendor yard').waitFor();
+      assert.equal(await page.locator('.stock-request-heading .stock-request-pill').innerText(), 'Waiting Customer Pickup');
       await page.locator('details.special-order-replace summary').click();
       const form = page.locator('[data-special-po-replace-form]');
       await form.locator('[name=purchaseOrderRef]').fill('TEST-PO-NEW');

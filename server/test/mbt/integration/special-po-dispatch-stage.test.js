@@ -91,7 +91,8 @@ test('Special and Backorder wait for a PO reference with Queued, including accep
     const original=(await query('SELECT * FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0];
     await query(readFileSync(new URL('../../../migrations/289_special_po_dispatch_stage.sql',import.meta.url),'utf8'));
     await query(readFileSync(new URL('../../../migrations/296_special_vendor_confirmation.sql',import.meta.url),'utf8'));
-    await query(readFileSync(new URL('../../../migrations/331_special_vendor_pickup_completion.sql',import.meta.url),'utf8'));
+    // 333 supersedes 331's view definitions (its evidence view has one more column).
+    await query(readFileSync(new URL('../../../migrations/333_special_waiting_customer_pickup.sql',import.meta.url),'utf8'));
     await projections(await load(d),'dispatch_arrangement');
     assert.deepEqual((await query('SELECT * FROM sales_special_stock_cases WHERE request_id=$1',[d.id])).rows[0],original);
   }
@@ -133,4 +134,30 @@ test('Backorder SO linkage completes only when the linked orders have actual com
     }
     await projections(await load(d),'completed');
   }
+});
+
+test('customer pickups wait for the customer: vendor yard once the PO reference is queued, inquired yard once the PO is received',async()=>{
+  let vendor=await fixture('special','vendor_pickup');await projections(vendor,'confirmed');
+  vendor=await schedule(vendor,'Queued','TEST-DISPATCH-VENDOR-PICKUP');await projections(vendor,'waiting_customer_pickup');
+  await assert.rejects(cases.markSpecialPurchaseOrderSentToVendor(vendor.id,{expectedRevision:vendor.revision},{operatorId:users.scm.id}),
+    {code:'SPECIAL_PO_ALREADY_DISPATCHED',message:/Waiting Customer Pickup/});
+
+  let yard=await fixture('special','yard_pickup');
+  await query("UPDATE sales_special_stock_cases SET purchase_order_sent_to_vendor_at=now() WHERE request_id=$1",[yard.id]);
+  await projections(await load(yard),'waiting_vendor_confirmation');
+  await query("UPDATE purchase_orders SET receipt_status='partially_received' WHERE netsuite_id=$1",[yard.purchaseOrderId]);
+  await projections(await load(yard),'waiting_vendor_confirmation');
+  await query("UPDATE purchase_orders SET receipt_status='received',received_at='2099-02-02T13:00:00Z' WHERE netsuite_id=$1",[yard.purchaseOrderId]);
+  yard=await load(yard);await projections(yard,'waiting_customer_pickup');assert.equal(yard.purchaseOrderReceived,true);
+  // A NetSuite-billed PO without a local receipt (SPREQ-000147 shape) also counts as received.
+  await query("UPDATE purchase_orders SET receipt_status=NULL,received_at=NULL,status='G',status_text='Purchase Order : Fully Billed' WHERE netsuite_id=$1",[yard.purchaseOrderId]);
+  await projections(await load(yard),'waiting_customer_pickup');
+  await query("UPDATE sales_orders SET status='F',status_text='Sales Order : Pending Billing',fulfilled_at='2099-02-03T10:00:00Z',fulfillment_status='fulfilled' WHERE netsuite_id=$1",[yard.salesOrderId]);
+  await query("UPDATE purchase_orders SET receipt_status='received',received_at='2099-02-02T13:00:00Z' WHERE netsuite_id=$1",[yard.purchaseOrderId]);
+  await projections(await load(yard),'completed');
+
+  // Delivery keeps Dispatch Arrangement after the PO arrives.
+  const delivery=await schedule(await fixture('special','mbt_delivery'),'Queued','TEST-DISPATCH-DELIVERY-RECEIVED');
+  await query("UPDATE purchase_orders SET receipt_status='received',received_at='2099-02-02T13:00:00Z' WHERE netsuite_id=$1",[delivery.purchaseOrderId]);
+  await projections(await load(delivery),'dispatch_arrangement');
 });

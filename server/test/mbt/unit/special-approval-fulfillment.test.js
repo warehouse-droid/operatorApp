@@ -8,7 +8,7 @@ test('property: real POs require approval and a queued reference before dispatch
  fc.assert(fc.property(fc.boolean(),fc.boolean(),fc.boolean(),fc.boolean(),fc.constantFrom('vendor_pickup','yard_pickup','mbt_delivery'),(waiting,approved,reference,queued,method)=>{
  const e={salesOrderId:11,purchaseOrderId:12,purchaseOrderApproved:approved,waitingForProduction:waiting,fulfillmentMethod:method,
    purchaseOrderReference:reference?'TEST-REF':'',purchaseOrderDispatchStatus:queued?'Queued':'Hold'};
- assert.equal(specialStage(e),approved&&reference&&queued?'dispatch_arrangement':'confirmed');
+ assert.equal(specialStage(e),approved&&reference&&queued?(method==='vendor_pickup'?'waiting_customer_pickup':'dispatch_arrangement'):'confirmed');
  assert.equal(specialStage({...e,closed:true}),'closed');assert.equal(specialStage({...e,operationallyComplete:true}),'completed');
  }),{seed:20261030,numRuns:500});
 });

@@ -112,15 +112,15 @@ after(async () => {
   } finally { await closeDb(); }
 });
 
-test('Special vendor pickup arranges collection once the PO reference is Queued and completes on a fulfilled or billed SO', async () => {
+test('Special vendor pickup waits for the customer once the PO reference is Queued and completes on a fulfilled or billed SO', async () => {
   for (const [status, statusText, fulfillment] of [['G', 'Sales Order : Billed', 'not_fulfilled'], ['F', 'Sales Order : Pending Billing', 'not_fulfilled'],
     ['B', 'Sales Order : Pending Fulfillment', 'fulfilled']]) {
     let d = await fixture('vendor_pickup'); await projections(d, 'confirmed');
     await query('UPDATE sales_special_stock_cases SET purchase_order_sent_to_vendor_at=now() WHERE request_id=$1', [d.id]);
     d = await schedule(await load(d), 'Hold', 'TEST-VPR-REF-' + d.id); await projections(d, 'waiting_vendor_confirmation');
-    d = await schedule(d, 'Queued'); await projections(d, 'dispatch_arrangement');
+    d = await schedule(d, 'Queued'); await projections(d, 'waiting_customer_pickup');
     await query("UPDATE sales_orders SET status='E',status_text='Sales Order : Partially Fulfilled' WHERE netsuite_id=$1", [d.salesOrderId]);
-    await projections(await load(d), 'dispatch_arrangement');
+    await projections(await load(d), 'waiting_customer_pickup');
     await query('UPDATE sales_orders SET status=$2,status_text=$3,fulfillment_status=$4 WHERE netsuite_id=$1', [d.salesOrderId, status, statusText, fulfillment]);
     d = await load(d); await projections(d, 'completed');
     assert.equal(d.operationalCompletionSource, 'netsuite_order_completion');
